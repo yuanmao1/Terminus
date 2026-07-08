@@ -14,6 +14,14 @@
     "skill"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuanmao1/Terminus.git"
+  },
+  "homepage": "https://github.com/yuanmao1/Terminus#readme",
+  "bugs": {
+    "url": "https://github.com/yuanmao1/Terminus/issues"
+  },
   "os": [
     "win32"
   ],
@@ -26,7 +34,8 @@
   "files": [
     "bin/terminus.js",
     "bin/Terminus.exe",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=16"

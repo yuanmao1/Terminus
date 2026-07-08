@@ -7,7 +7,7 @@ const path = require("path");
 
 if (process.platform !== "win32") {
   console.error("terminus: prebuilt binaries currently ship for Windows x64 only.");
-  console.error("Linux/macOS support is planned; build from source: https://github.com/terminus-shell/terminus");
+  console.error("Linux/macOS support is planned; build from source: https://github.com/yuanmao1/Terminus");
   process.exit(1);
 }
 
