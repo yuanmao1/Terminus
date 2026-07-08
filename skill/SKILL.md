@@ -68,6 +68,8 @@ terminus doctor <server> --json      # shell, OS, tmux?, disk, memoryKeys
 
 # One-shot remote command (no tmux needed on the server)
 terminus exec <server> --json -- uname -a
+# If your tool-call layer or shell mangles the bare '--', use --cmd instead:
+terminus exec <server> --json --cmd "uname -a"
 
 # Set a default working directory once, stop writing `cd X && ...`
 terminus workspace set <server> /srv/app

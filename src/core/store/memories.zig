@@ -87,7 +87,7 @@ pub fn keys(store: *Store, arena: Allocator, server_id: i64) (Db.Error || Alloca
         if (stmt.columnOptText(0)) |key| {
             try out.append(arena, try arena.dupe(u8, key));
         } else {
-            try out.append(arena, try std.fmt.allocPrint(arena, "(id? \"{s}…\")", .{stmt.columnText(1)}));
+            try out.append(arena, try std.fmt.allocPrint(arena, "(id? \"{s}...\")", .{stmt.columnText(1)}));
         }
     }
     return out.toOwnedSlice(arena);

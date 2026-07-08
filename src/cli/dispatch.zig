@@ -26,7 +26,7 @@ pub const TopCommand = enum {
 };
 
 const usage =
-    \\Terminus — agent-friendly persistent remote shell.
+    \\Terminus - agent-friendly persistent remote shell.
     \\
     \\usage: terminus <command> [...]
     \\

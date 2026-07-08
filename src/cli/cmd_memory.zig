@@ -50,9 +50,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 
     if (std.mem.eql(u8, verb, "add")) {
-        const rest = parsed.rest orelse fatal("memory content goes after '--'\n{s}", .{usage});
-        if (rest.len == 0) fatal("empty memory content", .{});
-        const content = try std.mem.join(ctx.arena, " ", rest);
+        const content = (try parsed.trailing(ctx.arena, 1)) orelse
+            fatal("no memory content given (use '-- <content>' or --cmd \"<content>\")\n{s}", .{usage});
         const result = Store.memories.add(&store, scope, .{
             .key = parsed.flag("key"),
             .content = content,

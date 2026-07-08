@@ -1,9 +1,21 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Terminus = @import("Terminus");
 const Cli = Terminus.Cli;
 
+// Not exposed by std; needed to render UTF-8 (our own text and remote
+// command output) correctly on consoles whose default codepage is not
+// UTF-8 (e.g. GBK cp936 on Chinese Windows).
+extern "kernel32" fn SetConsoleOutputCP(wCodePageID: c_uint) callconv(.winapi) c_int;
+
 pub fn main(init: std.process.Init) !void {
+    if (builtin.os.tag == .windows) {
+        // Console-wide setting; affects only this console session. Redirected
+        // output (pipes/files) is unaffected either way.
+        _ = SetConsoleOutputCP(65001); // CP_UTF8
+    }
+
     // Lives as long as the process; freed automatically on exit.
     const arena: std.mem.Allocator = init.arena.allocator();
     const raw_args = try init.minimal.args.toSlice(arena);

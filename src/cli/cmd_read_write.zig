@@ -19,6 +19,7 @@ const read_usage =
 ;
 const write_usage =
     \\usage: terminus write <server>:<session> [--no-enter] -- <input...>
+    \\       (if your shell eats '--', use: terminus write <target> --cmd "<input>")
     \\
 ;
 
@@ -45,9 +46,8 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
 
     switch (verb) {
         .write => {
-            const rest = parsed.rest orelse fatal("input goes after '--'\n{s}", .{write_usage});
-            if (rest.len == 0) fatal("empty input", .{});
-            const input = try std.mem.join(ctx.arena, " ", rest);
+            const input = (try parsed.trailing(ctx.arena, 1)) orelse
+                fatal("no input given\n{s}", .{write_usage});
             Tmux.sendKeys(executor, ctx.arena, session_name, input, parsed.boolean("no-enter")) catch |err|
                 fatalTmux(err, executor, session_name);
             Store.sessions.touch(&store, session_id, ctx.now) catch |err| Cli.storeFatal(&store, err);

@@ -24,6 +24,26 @@ pub const Parsed = struct {
     pub fn positional(p: *const Parsed, index: usize) ?[]const u8 {
         return if (index < p.positionals.len) p.positionals[index] else null;
     }
+
+    /// The trailing command/content for exec/run/write/memory-add, from
+    /// (in priority order): `--cmd "<string>"`, everything after `--`, or
+    /// — because some shells (notably PowerShell) swallow a bare `--` —
+    /// any positionals beyond the first `expected` ones. Returns null when
+    /// none of the three provide anything.
+    pub fn trailing(p: *const Parsed, arena: Allocator, expected_positionals: usize) !?[]const u8 {
+        if (p.flag("cmd")) |explicit| {
+            if (explicit.len == 0) return null;
+            return explicit;
+        }
+        if (p.rest) |rest| {
+            if (rest.len == 0) return null;
+            return try std.mem.join(arena, " ", rest);
+        }
+        if (p.positionals.len > expected_positionals) {
+            return try std.mem.join(arena, " ", p.positionals[expected_positionals..]);
+        }
+        return null;
+    }
 };
 
 pub const ParseError = error{
@@ -91,4 +111,27 @@ test parse {
     try t.expectEqualStrings("2222", parsed.flag("port").?);
     try t.expect(parsed.boolean("json"));
     try t.expectEqual(2, parsed.rest.?.len);
+}
+
+test "trailing: --cmd, --, and bare positionals" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Explicit --cmd wins.
+    var p = try parse(arena, &.{ "prod", "--cmd", "uname -a" });
+    try t.expectEqualStrings("uname -a", (try p.trailing(arena, 1)).?);
+
+    // Standard -- form.
+    p = try parse(arena, &.{ "prod", "--", "echo", "hi" });
+    try t.expectEqualStrings("echo hi", (try p.trailing(arena, 1)).?);
+
+    // Shell swallowed the --: extra positionals become the command.
+    p = try parse(arena, &.{ "prod", "hostname" });
+    try t.expectEqualStrings("hostname", (try p.trailing(arena, 1)).?);
+
+    // Nothing given.
+    p = try parse(arena, &.{"prod"});
+    try t.expectEqual(null, try p.trailing(arena, 1));
 }

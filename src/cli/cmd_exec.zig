@@ -17,6 +17,7 @@ const Tmux = Core.Tmux;
 
 const usage =
     \\usage: terminus exec <server>[:<session>] [--json] [--timeout <sec>] -- <cmd...>
+    \\       (if your shell eats '--', use: terminus exec <server> --cmd "<cmd>")
     \\
 ;
 
@@ -25,9 +26,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     if (parsed.boolean("json")) ctx.out.format = .json;
 
     const target = Cli.Target.parse(parsed.positional(0) orelse fatal("{s}", .{usage}));
-    const rest = parsed.rest orelse fatal("the remote command goes after '--'\n{s}", .{usage});
-    if (rest.len == 0) fatal("empty remote command", .{});
-    const command = try std.mem.join(ctx.arena, " ", rest);
+    const command = (try parsed.trailing(ctx.arena, 1)) orelse
+        fatal("no remote command given\n{s}", .{usage});
     const timeout_ms: i64 = 1000 * (if (parsed.flag("timeout")) |t|
         std.fmt.parseInt(i64, t, 10) catch fatal("invalid --timeout '{s}'", .{t})
     else
