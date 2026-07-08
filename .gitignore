@@ -1,0 +1,4 @@
+.zig-cache/
+zig-out/
+npm/bin/Terminus.exe
+npm/*.tgz

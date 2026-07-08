@@ -1,0 +1,34 @@
+{
+  "name": "terminus-shell",
+  "version": "0.1.0",
+  "description": "Agent-friendly persistent remote shell: SSH exec, durable tmux sessions, cursor-based output reading, and per-server memory for AI agents.",
+  "keywords": [
+    "ssh",
+    "remote-shell",
+    "tmux",
+    "agent",
+    "ai-agent",
+    "cli",
+    "claude",
+    "mcp",
+    "skill"
+  ],
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "bin": {
+    "terminus": "bin/terminus.js"
+  },
+  "files": [
+    "bin/terminus.js",
+    "bin/Terminus.exe",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
