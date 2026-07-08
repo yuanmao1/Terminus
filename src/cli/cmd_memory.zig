@@ -12,10 +12,11 @@ const Store = Core.Store;
 const usage =
     \\usage: terminus memory <verb> <server>[:<session>] [...]
     \\
-    \\  memory add  <target> [--key K] [--tags t1,t2] -- <content...>
-    \\  memory ls   <target> [--tags t] [--json]
-    \\  memory show <target> --key K | --id N [--json]
-    \\  memory rm   <target> --key K | --id N
+    \\  memory add    <target> [--key K] [--tags t1,t2] -- <content...>
+    \\  memory ls     <target> [--tags t] [--json]
+    \\  memory show   <target> --key K | --id N [--json]
+    \\  memory rm     <target> --key K | --id N
+    \\  memory export <server>            all memories+facts as JSON (backup/migration)
     \\
 ;
 
@@ -31,6 +32,25 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const target = Cli.Target.parse(parsed.positional(0) orelse fatal("{s}", .{usage}));
     const server = (Store.servers.getByName(&store, ctx.arena, target.server) catch |err|
         Cli.storeFatal(&store, err)) orelse fatal("unknown server '{s}'", .{target.server});
+
+    // Export ignores session targets: it dumps the server's full knowledge
+    // (all memories incl. session-scoped, plus facts) as one JSON document.
+    if (std.mem.eql(u8, verb, "export")) {
+        ctx.out.format = .json;
+        const all_memories = Store.memories.exportAll(&store, ctx.arena, server.id) catch |err|
+            Cli.storeFatal(&store, err);
+        const all_facts = Store.facts.list(&store, ctx.arena, server.id) catch |err|
+            Cli.storeFatal(&store, err);
+        try ctx.out.json(.{
+            .ok = true,
+            .server = server.name,
+            .host = server.host,
+            .exportedAt = ctx.now,
+            .memories = all_memories,
+            .facts = all_facts,
+        });
+        return;
+    }
 
     // `add` creates the session metadata row on demand; read/delete verbs
     // on an unknown session fail loudly instead of silently narrowing to

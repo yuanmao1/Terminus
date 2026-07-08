@@ -84,6 +84,80 @@ pub fn setCwd(store: *Store, server_id: i64, cwd: ?[]const u8, now: i64) Db.Erro
     _ = try stmt.step();
 }
 
+pub const RenameError = Db.Error || error{NameTaken};
+
+pub fn rename(store: *Store, server_id: i64, new_name: []const u8, now: i64) RenameError!void {
+    var stmt = try store.db.prepare("UPDATE servers SET name = ?1, updated_at = ?2 WHERE id = ?3");
+    defer stmt.deinit();
+    try stmt.bindText(1, new_name);
+    try stmt.bindInt(2, now);
+    try stmt.bindInt(3, server_id);
+    _ = stmt.step() catch |err| return switch (err) {
+        error.Constraint => error.NameTaken,
+        else => err,
+    };
+}
+
+pub const Update = struct {
+    host: ?[]const u8 = null,
+    port: ?u16 = null,
+    username: ?[]const u8 = null,
+    key_id: ?i64 = null,
+    note: ?[]const u8 = null,
+};
+
+/// Partial update: only non-null fields change.
+pub fn update(store: *Store, server_id: i64, changes: Update, now: i64) Db.Error!void {
+    if (changes.host) |v| try updateColumn(store, server_id, "host", .{ .text = v }, now);
+    if (changes.port) |v| try updateColumn(store, server_id, "port", .{ .int = v }, now);
+    if (changes.username) |v| try updateColumn(store, server_id, "username", .{ .text = v }, now);
+    if (changes.key_id) |v| try updateColumn(store, server_id, "key_id", .{ .int = v }, now);
+    if (changes.note) |v| try updateColumn(store, server_id, "note", .{ .text = v }, now);
+}
+
+const Value = union(enum) { text: []const u8, int: i64 };
+
+fn updateColumn(store: *Store, server_id: i64, comptime column: []const u8, value: Value, now: i64) Db.Error!void {
+    var stmt = try store.db.prepare(
+        "UPDATE servers SET " ++ column ++ " = ?1, updated_at = ?2 WHERE id = ?3",
+    );
+    defer stmt.deinit();
+    switch (value) {
+        .text => |v| try stmt.bindText(1, v),
+        .int => |v| try stmt.bindInt(1, v),
+    }
+    try stmt.bindInt(2, now);
+    try stmt.bindInt(3, server_id);
+    _ = try stmt.step();
+}
+
+pub const CascadeCounts = struct {
+    sessions: i64,
+    memories: i64,
+    jobs: i64,
+    facts: i64,
+    history: i64,
+};
+
+/// What `remove` would cascade-delete; shown to the user first.
+pub fn cascadeCounts(store: *Store, server_id: i64) Db.Error!CascadeCounts {
+    return .{
+        .sessions = try countRows(store, "sessions", server_id),
+        .memories = try countRows(store, "memories", server_id),
+        .jobs = try countRows(store, "jobs", server_id),
+        .facts = try countRows(store, "facts", server_id),
+        .history = try countRows(store, "history", server_id),
+    };
+}
+
+fn countRows(store: *Store, comptime table: []const u8, server_id: i64) Db.Error!i64 {
+    var stmt = try store.db.prepare("SELECT COUNT(*) FROM " ++ table ++ " WHERE server_id = ?1");
+    defer stmt.deinit();
+    try stmt.bindInt(1, server_id);
+    if (!try stmt.step()) return 0;
+    return stmt.columnInt(0);
+}
+
 pub fn list(store: *Store, arena: Allocator) (Db.Error || Allocator.Error)![]Server {
     var out: std.ArrayList(Server) = .empty;
     var stmt = try store.db.prepare(select_columns ++ " ORDER BY s.name");

@@ -103,3 +103,19 @@ pub fn remove(store: *Store, name: []const u8) Db.Error!bool {
     _ = try stmt.step();
     return store.db.changes() > 0;
 }
+
+pub const RenameError = Db.Error || error{NameTaken};
+
+/// Returns false if no key with the old name existed. Servers reference
+/// keys by id, so they follow automatically.
+pub fn rename(store: *Store, old_name: []const u8, new_name: []const u8) RenameError!bool {
+    var stmt = try store.db.prepare("UPDATE keys SET name = ?1 WHERE name = ?2");
+    defer stmt.deinit();
+    try stmt.bindText(1, new_name);
+    try stmt.bindText(2, old_name);
+    _ = stmt.step() catch |err| return switch (err) {
+        error.Constraint => error.NameTaken,
+        else => err,
+    };
+    return store.db.changes() > 0;
+}

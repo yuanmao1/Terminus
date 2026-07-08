@@ -154,7 +154,13 @@ Job names are unique per server while running; finished names can be reused.
 ```bash
 terminus key add mykey --kind rsa --private-file ~/.ssh/id_rsa
 terminus server add prod --host 1.2.3.4 --port 22 --user ubuntu --key mykey
-terminus exec prod -- echo ok    # verify
+terminus server ping prod    # verify connect+auth (~1 round trip)
 ```
 
 Passwords: `terminus key add pw --kind password --passphrase '...'`.
+
+Housekeeping: `server rename/set` change names and connection details in
+place — memories, facts, jobs, and history follow automatically (never
+rm+re-add, that erases accumulated knowledge; `rm` warns and requires
+`--force` when data would be lost). `memory export <server>` dumps all
+memories+facts as JSON for backup or migrating to another machine.

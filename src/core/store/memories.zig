@@ -144,6 +144,37 @@ pub fn list(store: *Store, arena: Allocator, scope: Scope, opts: ListOptions) (D
     return out.toOwnedSlice(arena);
 }
 
+/// Every memory on the server, session-scoped ones included (annotated
+/// with their session name). For `memory export`.
+pub const Exported = struct {
+    session: ?[]const u8,
+    key: ?[]const u8,
+    content: []const u8,
+    tags: ?[]const u8,
+    updated_at: i64,
+};
+
+pub fn exportAll(store: *Store, arena: Allocator, server_id: i64) (Db.Error || Allocator.Error)![]Exported {
+    var out: std.ArrayList(Exported) = .empty;
+    var stmt = try store.db.prepare(
+        \\SELECT s.name, m.key, m.content, m.tags, m.updated_at
+        \\FROM memories m LEFT JOIN sessions s ON s.id = m.session_id
+        \\WHERE m.server_id = ?1 ORDER BY m.id
+    );
+    defer stmt.deinit();
+    try stmt.bindInt(1, server_id);
+    while (try stmt.step()) {
+        try out.append(arena, .{
+            .session = if (stmt.columnOptText(0)) |v| try arena.dupe(u8, v) else null,
+            .key = if (stmt.columnOptText(1)) |v| try arena.dupe(u8, v) else null,
+            .content = try arena.dupe(u8, stmt.columnText(2)),
+            .tags = if (stmt.columnOptText(3)) |v| try arena.dupe(u8, v) else null,
+            .updated_at = stmt.columnInt(4),
+        });
+    }
+    return out.toOwnedSlice(arena);
+}
+
 pub const Selector = union(enum) {
     key: []const u8,
     id: i64,

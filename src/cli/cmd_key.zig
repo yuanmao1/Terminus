@@ -9,9 +9,10 @@ const Store = Core.Store;
 const usage =
     \\usage: terminus key <verb> [...]
     \\
-    \\  key add <name> --kind ed25519|rsa|password [--private-file <path>] [--public-file <path>] [--passphrase ...]
-    \\  key ls [--json]
-    \\  key rm <name>
+    \\  key add    <name> --kind ed25519|rsa|password [--private-file <path>] [--public-file <path>] [--passphrase ...]
+    \\  key ls     [--json]
+    \\  key rename <old-name> <new-name>
+    \\  key rm     <name>
     \\
 ;
 
@@ -65,6 +66,18 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                     });
                 }
             },
+        }
+    } else if (std.mem.eql(u8, verb, "rename")) {
+        const old_name = parsed.positional(0) orelse fatal("{s}", .{usage});
+        const new_name = parsed.positional(1) orelse fatal("{s}", .{usage});
+        const renamed = Store.keys.rename(&store, old_name, new_name) catch |err| switch (err) {
+            error.NameTaken => fatal("key '{s}' already exists", .{new_name}),
+            else => Cli.storeFatal(&store, err),
+        };
+        if (!renamed) fatal("unknown key '{s}'", .{old_name});
+        switch (ctx.out.format) {
+            .json => try ctx.out.json(.{ .ok = true, .action = "renamed", .from = old_name, .to = new_name }),
+            .human => try ctx.out.print("renamed key '{s}' -> '{s}' (servers using it follow)\n", .{ old_name, new_name }),
         }
     } else if (std.mem.eql(u8, verb, "rm")) {
         const name = parsed.positional(0) orelse fatal("{s}", .{usage});
