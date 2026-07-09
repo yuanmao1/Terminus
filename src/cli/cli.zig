@@ -208,6 +208,58 @@ pub fn parseArgs(ctx: *Ctx, raw: []const []const u8) Args.Parsed {
     };
 }
 
+/// Trailing command/content with quote-proof input channels, in priority:
+/// `--stdin` (read all of standard input — immune to any shell parsing),
+/// `--<file_flag> <path>` (read a local file), then Args.trailing
+/// (--cmd/--content, `--`, bare positionals).
+pub fn trailingContent(
+    ctx: *Ctx,
+    parsed: *const Args.Parsed,
+    comptime file_flag: []const u8,
+    expected_positionals: usize,
+) !?[]const u8 {
+    if (parsed.boolean("stdin")) {
+        var buffer: [4096]u8 = undefined;
+        var reader = std.Io.File.stdin().readerStreaming(ctx.io, &buffer);
+        const content = reader.interface.allocRemaining(ctx.arena, .limited(16 << 20)) catch
+            fail("cannot read stdin", .{});
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        return if (trimmed.len == 0) null else trimmed;
+    }
+    if (parsed.flag(file_flag)) |path| {
+        const content = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(16 << 20)) catch
+            fail("cannot read {s}", .{path});
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        return if (trimmed.len == 0) null else trimmed;
+    }
+    return parsed.trailing(ctx.arena, expected_positionals);
+}
+
+/// Wraps a command in an interactive login shell so it sees the user's
+/// full PATH. Login alone (-l) is not enough: distros guard ~/.bashrc
+/// with an interactive-only early return, and version managers (nvm,
+/// bun) initialize exactly there — so -i is required too. The known
+/// job-control warnings that -i emits without a tty are stripped from
+/// stderr by `stripLoginNoise`.
+pub fn loginWrap(arena: std.mem.Allocator, command: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "bash -ilc {s}", .{try Core.Tmux.shellQuote(arena, command)});
+}
+
+/// Removes bash's tty-less interactive-mode warnings from stderr.
+pub fn stripLoginNoise(arena: std.mem.Allocator, stderr: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "no job control in this shell") != null) continue;
+        if (std.mem.indexOf(u8, line, "cannot set terminal process group") != null) continue;
+        if (std.mem.indexOf(u8, line, "Inappropriate ioctl for device") != null) continue;
+        try out.appendSlice(arena, line);
+        try out.append(arena, '\n');
+    }
+    const result = out.items;
+    return std.mem.trimEnd(u8, result, "\n");
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

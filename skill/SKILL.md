@@ -14,6 +14,42 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
+**Requires terminus >= 0.1.2.** If a documented flag is rejected, the
+installed binary is older than this document: check `terminus version`
+and upgrade with `npm install -g terminus-shell@latest`.
+
+## Passing commands and content reliably (Windows/PowerShell!)
+
+PowerShell and some tool-call layers mangle `--`, `;`, `*` in bare
+arguments. Prefer the quote-proof channels, most robust first:
+
+```bash
+terminus exec <server> --stdin                      # command from stdin
+terminus exec <server> --cmd-file ./script.sh       # run a local script remotely
+terminus exec <server> --cmd "uname -a"             # single flag value
+terminus exec <server> -- uname -a                  # classic; fine in bash
+
+terminus memory add <server> --key gotchas --stdin  # content from stdin
+terminus memory add <server> --key gotchas --content-file notes.txt
+terminus memory add <server> --key gotchas --content "text with ; and *"
+```
+
+For agents: **use `--cmd`/`--content` for one-liners and `--stdin` for
+anything with quotes, semicolons, globs, or multiple lines.**
+
+## Tools missing in non-interactive shells (nvm/pm2/bun)
+
+Plain SSH exec skips ~/.bashrc, where nvm/bun/pm2 set up PATH. If a tool
+"exists on the server but isn't found":
+
+```bash
+terminus doctor <server> --json    # loginOnlyTools lists exactly these
+terminus exec <server> --login --cmd "pm2 list"   # wraps in bash -ilc
+```
+
+Sessions (`<server>:<sess>`) don't need `--login` — they are real
+interactive shells already.
+
 ## Golden rule: recall before you act
 
 Before touching a server you may have seen before:
@@ -57,8 +93,9 @@ terminus memory add prod --key deploy -- "cd /srv/app && git pull && docker comp
 terminus memory add prod --key gotchas -- "docker compose v1 NOT v2 — use 'docker-compose' with dash"
 ```
 
-Update (`--key` upserts), don't append duplicates. Keep each entry short
-and factual — it's an index card, not a log.
+Same `--key` **replaces** the entry (the JSON response includes `previous`
+so nothing vanishes silently); use `--append` to add a line instead. Keep
+each entry short and factual — it's an index card, not a log.
 
 ## Quick reference
 
@@ -67,8 +104,6 @@ and factual — it's an index card, not a log.
 terminus doctor <server> --json      # shell, OS, tmux?, disk, memoryKeys
 
 # One-shot remote command (no tmux needed on the server)
-terminus exec <server> --json -- uname -a
-# If your tool-call layer or shell mangles the bare '--', use --cmd instead:
 terminus exec <server> --json --cmd "uname -a"
 
 # Set a default working directory once, stop writing `cd X && ...`

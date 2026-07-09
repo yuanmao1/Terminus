@@ -1,6 +1,6 @@
 {
   "name": "terminus-shell",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Agent-friendly persistent remote shell: SSH exec, durable tmux sessions, cursor-based output reading, and per-server memory for AI agents.",
   "keywords": [
     "ssh",

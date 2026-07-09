@@ -16,8 +16,16 @@ const Store = Core.Store;
 const Tmux = Core.Tmux;
 
 const usage =
-    \\usage: terminus exec <server>[:<session>] [--json] [--timeout <sec>] -- <cmd...>
-    \\       (if your shell eats '--', use: terminus exec <server> --cmd "<cmd>")
+    \\usage: terminus exec <server>[:<session>] [--json] [--timeout <sec>] [--login] <command input>
+    \\
+    \\command input, most quote-proof first:
+    \\  --stdin              read the command/script from standard input
+    \\  --cmd-file <path>    run a local script file's contents remotely
+    \\  --cmd "<command>"    a single flag value (survives PowerShell)
+    \\  -- <command...>      everything after --
+    \\
+    \\--login wraps the command in `bash -lc` so it sees the user's full
+    \\PATH (nvm/bun/pm2 live in profile files that plain SSH exec skips).
     \\
 ;
 
@@ -26,8 +34,9 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     if (parsed.boolean("json")) ctx.out.format = .json;
 
     const target = Cli.Target.parse(parsed.positional(0) orelse fatal("{s}", .{usage}));
-    const command = (try parsed.trailing(ctx.arena, 1)) orelse
+    var command = (try Cli.trailingContent(ctx, &parsed, "cmd-file", 1)) orelse
         fatal("no remote command given\n{s}", .{usage});
+    if (parsed.boolean("login")) command = try Cli.loginWrap(ctx.arena, command);
     const timeout_ms: i64 = 1000 * (if (parsed.flag("timeout")) |t|
         std.fmt.parseInt(i64, t, 10) catch fatal("invalid --timeout '{s}'", .{t})
     else
@@ -74,7 +83,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             fatal("exec failed: {s} ({s})", .{ executor.errorMessage(), @errorName(err) });
         exit_code = result.exit_code;
         stdout_text = result.stdout;
-        stderr_text = result.stderr;
+        stderr_text = if (parsed.boolean("login"))
+            try Cli.stripLoginNoise(ctx.arena, result.stderr)
+        else
+            result.stderr;
     }
 
     const duration_ms: i64 = @intCast(@divTrunc(

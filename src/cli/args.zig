@@ -4,7 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// Flags that never consume a value.
-const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force" };
+const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force", "stdin", "login", "append" };
 
 pub const Parsed = struct {
     positionals: []const []const u8,
@@ -26,12 +26,12 @@ pub const Parsed = struct {
     }
 
     /// The trailing command/content for exec/run/write/memory-add, from
-    /// (in priority order): `--cmd "<string>"`, everything after `--`, or
-    /// — because some shells (notably PowerShell) swallow a bare `--` —
-    /// any positionals beyond the first `expected` ones. Returns null when
-    /// none of the three provide anything.
+    /// (in priority order): `--cmd`/`--content` "<string>", everything
+    /// after `--`, or — because some shells (notably PowerShell) swallow a
+    /// bare `--` — any positionals beyond the first `expected` ones.
+    /// Returns null when none of the three provide anything.
     pub fn trailing(p: *const Parsed, arena: Allocator, expected_positionals: usize) !?[]const u8 {
-        if (p.flag("cmd")) |explicit| {
+        if (p.flag("cmd") orelse p.flag("content")) |explicit| {
             if (explicit.len == 0) return null;
             return explicit;
         }

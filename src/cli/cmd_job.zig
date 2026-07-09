@@ -20,8 +20,10 @@ const Tmux = Core.Tmux;
 const fatalTmux = @import("cmd_exec.zig").fatalTmux;
 
 const run_usage =
-    \\usage: terminus run <server> --name <job-name> [--cwd <dir>] [--json] -- <cmd...>
-    \\       (if your shell eats '--', use: terminus run <server> --name <n> --cmd "<cmd>")
+    \\usage: terminus run <server> --name <job-name> [--cwd <dir>] [--login] [--json] <command input>
+    \\
+    \\command input: --stdin | --cmd-file <path> | --cmd "<command>" | -- <command...>
+    \\--login wraps in `bash -lc` for the full user PATH (nvm/pm2/etc).
     \\
 ;
 const job_usage =
@@ -48,8 +50,9 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const server_name = parsed.positional(0) orelse fatal("{s}", .{run_usage});
     const job_name = parsed.flag("name") orelse fatal("--name is required\n{s}", .{run_usage});
     validateJobName(job_name);
-    const command = (try parsed.trailing(ctx.arena, 1)) orelse
+    var command = (try Cli.trailingContent(ctx, &parsed, "cmd-file", 1)) orelse
         fatal("no command given\n{s}", .{run_usage});
+    if (parsed.boolean("login")) command = try Cli.loginWrap(ctx.arena, command);
 
     var store = try Cli.openStore(ctx, &parsed);
     defer store.close();

@@ -24,6 +24,11 @@ const probe_script =
     \\echo "home_writable=$(touch $HOME/.terminus_probe 2>/dev/null && rm -f $HOME/.terminus_probe && echo yes || echo no)"
     \\echo "disk_home=$(df -h $HOME 2>/dev/null | tail -1 | awk '{print $4}' || echo unknown)"
     \\echo "nproc=$(nproc 2>/dev/null || echo unknown)"
+    \\for t in node npm bun pm2 docker git python3 pip3 cargo; do
+    \\  plain=$(command -v $t 2>/dev/null || echo -)
+    \\  login=$(bash -ilc "command -v $t" 2>/dev/null | tail -1)
+    \\  echo "tool=$t|$plain|${login:--}"
+    \\done
 ;
 
 pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
@@ -45,11 +50,31 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         fatal("probe failed: {s} ({s})", .{ executor.errorMessage(), @errorName(err) });
 
     var facts: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    var tools: std.ArrayList(Tool) = .empty;
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
         const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (std.mem.eql(u8, trimmed[0..eq], "tool")) {
+            var fields = std.mem.splitScalar(u8, trimmed[eq + 1 ..], '|');
+            const tool_name = fields.next() orelse continue;
+            const plain = fields.next() orelse "-";
+            const login = fields.next() orelse "-";
+            try tools.append(ctx.arena, .{
+                .name = tool_name,
+                .plain = if (std.mem.eql(u8, plain, "-")) null else plain,
+                .login = if (std.mem.eql(u8, login, "-")) null else login,
+            });
+            continue;
+        }
         try facts.put(ctx.arena, trimmed[0..eq], trimmed[eq + 1 ..]);
+    }
+
+    // The single most common remote gotcha: a tool that exists for humans
+    // but not for plain SSH exec. Surface it and the fix.
+    var login_only: std.ArrayList([]const u8) = .empty;
+    for (tools.items) |t| {
+        if (t.plain == null and t.login != null) try login_only.append(ctx.arena, t.name);
     }
 
     const tmux_version = facts.get("tmux") orelse "missing";
@@ -70,6 +95,12 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             .homeWritable = std.mem.eql(u8, facts.get("home_writable") orelse "no", "yes"),
             .diskFreeHome = facts.get("disk_home") orelse "unknown",
             .nproc = facts.get("nproc") orelse "unknown",
+            .tools = tools.items,
+            .loginOnlyTools = login_only.items,
+            .hint = if (login_only.items.len > 0)
+                @as(?[]const u8, "some tools are only on the interactive-shell PATH; run them with 'terminus exec <server> --login ...'")
+            else
+                null,
             .capabilities = .{
                 .exec = true, // we just proved it
                 .sessions = has_tmux,
@@ -90,7 +121,25 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 if (has_tmux) "yes" else "NO (tmux missing)",
                 if (has_tmux) "yes" else "NO (tmux missing)",
             });
+            for (tools.items) |t| {
+                if (t.plain != null or t.login != null) {
+                    try ctx.out.print("tool {s}: {s}{s}\n", .{
+                        t.name,
+                        t.plain orelse "(login shell only)",
+                        if (t.plain == null and t.login != null) "" else "",
+                    });
+                }
+            }
+            if (login_only.items.len > 0) {
+                try ctx.out.print("hint: {d} tools only on login-shell PATH; use 'exec --login' for them\n", .{login_only.items.len});
+            }
             try ctx.out.print("memories:  {d} keys\n", .{memory_keys.len});
         },
     }
 }
+
+const Tool = struct {
+    name: []const u8,
+    plain: ?[]const u8,
+    login: ?[]const u8,
+};

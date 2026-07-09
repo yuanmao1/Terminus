@@ -12,11 +12,20 @@ const Store = Core.Store;
 const usage =
     \\usage: terminus memory <verb> <server>[:<session>] [...]
     \\
-    \\  memory add    <target> [--key K] [--tags t1,t2] -- <content...>
+    \\  memory add    <target> [--key K] [--tags t1,t2] [--append] <content input>
     \\  memory ls     <target> [--tags t] [--json]
     \\  memory show   <target> --key K | --id N [--json]
     \\  memory rm     <target> --key K | --id N
     \\  memory export <server>            all memories+facts as JSON (backup/migration)
+    \\
+    \\content input, most quote-proof first (PowerShell mangles ';' '*' in bare args):
+    \\  --stdin                    read from standard input
+    \\  --content-file <path>      read from a local file
+    \\  --content "<text>"         a single flag value
+    \\  -- <text...>               everything after --
+    \\
+    \\add semantics: --key upserts (same key replaces content; shown as
+    \\"updated" with the previous value). --append appends a line instead.
     \\
 ;
 
@@ -70,22 +79,52 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 
     if (std.mem.eql(u8, verb, "add")) {
-        const content = (try parsed.trailing(ctx.arena, 1)) orelse
-            fatal("no memory content given (use '-- <content>' or --cmd \"<content>\")\n{s}", .{usage});
+        var content = (try Cli.trailingContent(ctx, &parsed, "content-file", 1)) orelse
+            fatal("no memory content given (use --stdin, --content-file, --content, or '-- <content>')\n{s}", .{usage});
+
+        // Transparency: report exactly what an existing key held before this
+        // write, and support append instead of replace.
+        var previous: ?[]const u8 = null;
+        if (parsed.flag("key")) |key| {
+            if (Store.memories.find(&store, ctx.arena, scope, .{ .key = key }) catch |err|
+                Cli.storeFatal(&store, err)) |existing|
+            {
+                // find() falls back to server scope for session targets;
+                // only treat it as "existing" when scopes actually match.
+                const same_scope = (scope.session_id == null) == (existing.scope == .server);
+                if (same_scope) {
+                    previous = existing.content;
+                    if (parsed.boolean("append"))
+                        content = try std.fmt.allocPrint(ctx.arena, "{s}\n{s}", .{ existing.content, content });
+                }
+            }
+        }
+
         const result = Store.memories.add(&store, scope, .{
             .key = parsed.flag("key"),
             .content = content,
             .tags = parsed.flag("tags"),
             .now = ctx.now,
         }) catch |err| Cli.storeFatal(&store, err);
+        const action: []const u8 = if (result == .inserted)
+            "inserted"
+        else if (parsed.boolean("append"))
+            "appended"
+        else
+            "replaced";
         switch (ctx.out.format) {
             .json => try ctx.out.json(.{
                 .ok = true,
-                .action = @tagName(result),
+                .action = action,
                 .target = targetName(parsed),
                 .key = parsed.flag("key"),
+                .content = content,
+                .previous = previous,
             }),
-            .human => try ctx.out.print("{t} memory for '{s}'\n", .{ result, targetName(parsed) }),
+            .human => try ctx.out.print("{s} memory for '{s}'{s}\n", .{
+                action,             targetName(parsed),
+                if (previous != null and !parsed.boolean("append")) " (previous content replaced)" else "",
+            }),
         }
     } else if (std.mem.eql(u8, verb, "ls")) {
         const list = Store.memories.list(&store, ctx.arena, scope, .{

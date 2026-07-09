@@ -35,7 +35,7 @@ fn tmuxName(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
 }
 
 /// Wraps `s` in single quotes for POSIX shells ('a'\''b' pattern).
-fn shellQuote(arena: Allocator, s: []const u8) Allocator.Error![]u8 {
+pub fn shellQuote(arena: Allocator, s: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '\'');
     for (s) |ch| {
