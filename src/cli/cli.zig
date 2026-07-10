@@ -230,6 +230,9 @@ pub fn parseArgs(ctx: *Ctx, raw: []const []const u8) Args.Parsed {
 /// `--stdin` (read all of standard input — immune to any shell parsing),
 /// `--<file_flag> <path>` (read a local file), then Args.trailing
 /// (--cmd/--content, `--`, bare positionals).
+///
+/// Only fully-blank input collapses to null; interior newlines and
+/// trailing structure are preserved (heredocs need their final newline).
 pub fn trailingContent(
     ctx: *Ctx,
     parsed: *const Args.Parsed,
@@ -241,14 +244,14 @@ pub fn trailingContent(
         var reader = std.Io.File.stdin().readerStreaming(ctx.io, &buffer);
         const content = reader.interface.allocRemaining(ctx.arena, .limited(16 << 20)) catch
             fail("cannot read stdin", .{});
-        const trimmed = std.mem.trim(u8, content, " \t\r\n");
-        return if (trimmed.len == 0) null else trimmed;
+        if (std.mem.trim(u8, content, " \t\r\n").len == 0) return null;
+        return content;
     }
     if (parsed.flag(file_flag)) |path| {
         const content = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(16 << 20)) catch
             fail("cannot read {s}", .{path});
-        const trimmed = std.mem.trim(u8, content, " \t\r\n");
-        return if (trimmed.len == 0) null else trimmed;
+        if (std.mem.trim(u8, content, " \t\r\n").len == 0) return null;
+        return content;
     }
     return parsed.trailing(ctx.arena, expected_positionals);
 }

@@ -60,8 +60,8 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         Cli.fail("unknown command '{s}'; run 'terminus help'", .{args[0]});
     switch (command) {
         .version => switch (ctx.out.format) {
-            .json => try ctx.out.json(.{ .ok = true, .version = "0.1.3" }),
-            .human => try ctx.out.print("terminus 0.1.3\n", .{}),
+            .json => try ctx.out.json(.{ .ok = true, .version = "0.1.4" }),
+            .human => try ctx.out.print("terminus 0.1.4\n", .{}),
         },
         .help => try ctx.out.print("{s}", .{usage}),
         .server => try @import("cmd_server.zig").run(ctx, args[1..]),

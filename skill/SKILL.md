@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.3.** If a documented flag is rejected, the
+**Requires terminus >= 0.1.4.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -36,6 +36,28 @@ terminus memory add <server> --key gotchas --content "text with ; and *"
 
 For agents: **use `--cmd`/`--content` for one-liners and `--stdin` for
 anything with quotes, semicolons, globs, or multiple lines.**
+
+## Multiline scripts run byte-exact
+
+Multiline input to `exec`/`run` is automatically staged as a remote temp
+file and executed as one script — heredocs, nested quoting, `$VAR`, and
+error line numbers all behave exactly as in a local script. Two flags:
+
+```bash
+# Deploy script: stop at the first failing line, exit code = that line's
+printf 'git pull\nnpm ci\nnpm run build\n' | terminus exec prod --stdin --strict
+
+# Any interpreter, not just bash:
+terminus exec prod --stdin --interpreter python3 <<'EOF'
+import json, pathlib
+print(json.dumps({"files": len(list(pathlib.Path(".").iterdir()))}))
+EOF
+```
+
+**Use `--strict` for deploy/migration scripts** — without it bash keeps
+going after a failed line and only the last line's exit code is reported.
+Staged files are removed after exec and swept daily; single-line commands
+skip staging entirely (no overhead).
 
 ## Tools missing in non-interactive shells (nvm/pm2/bun)
 
