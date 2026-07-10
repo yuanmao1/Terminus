@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.2.** If a documented flag is rejected, the
+**Requires terminus >= 0.1.3.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -186,8 +186,23 @@ Job names are unique per server while running; finished names can be reused.
 
 ## Setup (once per machine)
 
+**Key requirement (Windows crypto backend): PKCS#1 PEM RSA only** —
+the file must start with `-----BEGIN RSA PRIVATE KEY-----`. OPENSSH-format
+(`ssh-keygen` default since 2018), ed25519, and ECDSA keys are rejected
+with conversion instructions. When in doubt, generate a dedicated key:
+
 ```bash
-terminus key add mykey --kind rsa --private-file ~/.ssh/id_rsa
+ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key   # then add .pub to the server
+```
+
+Convert an existing OPENSSH-format RSA key (copy first — this rewrites in place):
+
+```bash
+copy id_rsa id_rsa.pem && ssh-keygen -p -m PEM -f id_rsa.pem -N ""
+```
+
+```bash
+terminus key add mykey --kind rsa --private-file ./terminus_key
 terminus server add prod --host 1.2.3.4 --port 22 --user ubuntu --key mykey
 terminus server ping prod    # verify connect+auth (~1 round trip)
 ```

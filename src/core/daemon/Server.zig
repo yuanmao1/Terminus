@@ -48,6 +48,14 @@ const Pooled = struct {
 };
 
 var last_activity_ns: std.atomic.Value(i64) = .init(0);
+/// Nonzero while a request is being processed (its start timestamp). The
+/// daemon serves one request at a time, so a wedged SSH operation (hung
+/// network, misbehaving crypto call) would block status/stop forever;
+/// the watchdog kills the whole process instead — the CLI falls back to
+/// direct SSH and the next invocation respawns a fresh daemon.
+var request_started_ns: std.atomic.Value(i64) = .init(0);
+
+const request_stuck_ns: i96 = 120 * std.time.ns_per_s;
 
 pub fn socketPath(arena: std.mem.Allocator, environ: *std.process.Environ.Map) ![]u8 {
     const home = environ.get("USERPROFILE") orelse environ.get("HOME") orelse
@@ -113,10 +121,18 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, server: *std.Io.net.Server, path: [
 fn watchdogMain(io: std.Io, path: []const u8, idle_ns: i96) void {
     while (true) {
         std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_s }, .awake) catch {};
-        const idle: i96 = nowNs(io) - last_activity_ns.load(.monotonic);
+        const now = nowNs(io);
+        const idle: i96 = now - last_activity_ns.load(.monotonic);
         if (idle > idle_ns) {
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             std.process.exit(0);
+        }
+        // Stuck request: better a dead daemon (auto-respawned, with direct
+        // fallback meanwhile) than one that blocks every CLI call.
+        const started = request_started_ns.load(.monotonic);
+        if (started != 0 and now - started > request_stuck_ns) {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            std.process.exit(1);
         }
     }
 }
@@ -142,6 +158,8 @@ fn handleConnection(
         const line = (reader.interface.takeDelimiter('\n') catch return false) orelse return false;
         if (line.len == 0) continue;
         last_activity_ns.store(nowNs(io), .monotonic);
+        request_started_ns.store(nowNs(io), .monotonic);
+        defer request_started_ns.store(0, .monotonic);
 
         // Per-request arena: request/response buffers die with the request.
         var request_arena = std.heap.ArenaAllocator.init(gpa);

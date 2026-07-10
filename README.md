@@ -31,9 +31,14 @@ recalled memory    > re-discovery
 ## Quick start
 
 ```bash
-# Register a key and a server
-terminus key add mykey --kind rsa --private-file ~/.ssh/id_rsa
+# Keys: the Windows crypto backend needs PKCS#1 PEM RSA
+# ("-----BEGIN RSA PRIVATE KEY-----"). Other formats are rejected with
+# conversion instructions. Simplest: generate a dedicated key.
+ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key
+
+terminus key add mykey --kind rsa --private-file ./terminus_key
 terminus server add prod --host 1.2.3.4 --port 22 --user ubuntu --key mykey
+terminus server ping prod
 
 # Probe what the server supports (shell, tmux, disk, capabilities)
 terminus doctor prod --json

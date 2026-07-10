@@ -96,9 +96,68 @@ pub const Auth = union(enum) {
     },
 };
 
-pub const AuthError = error{AuthFailed};
+pub const AuthError = error{ AuthFailed, UnsupportedKeyFormat };
+
+/// What the WinCNG backend can actually parse. Everything else must be
+/// rejected *before* reaching libssh2: feeding it any other format does
+/// not fail cleanly — it wedges the session (observed with OPENSSH-format
+/// RSA and PEM EC keys: the auth call never returns and ignores the
+/// session timeout). Empirically only PKCS#1 PEM RSA works end-to-end.
+pub const KeyFormat = enum {
+    pem_rsa, // -----BEGIN RSA PRIVATE KEY----- (PKCS#1) — the ONLY supported format
+    pem_ec, // -----BEGIN EC PRIVATE KEY----- — wedges WinCNG (expects openssh-key-v1)
+    openssh, // -----BEGIN OPENSSH PRIVATE KEY----- — wedges WinCNG
+    pkcs8, // -----BEGIN (ENCRYPTED) PRIVATE KEY----- — unsupported
+    unknown,
+
+    pub fn detect(key_bytes: []const u8) KeyFormat {
+        if (std.mem.indexOf(u8, key_bytes, "BEGIN OPENSSH PRIVATE KEY") != null) return .openssh;
+        if (std.mem.indexOf(u8, key_bytes, "BEGIN RSA PRIVATE KEY") != null) return .pem_rsa;
+        if (std.mem.indexOf(u8, key_bytes, "BEGIN EC PRIVATE KEY") != null) return .pem_ec;
+        if (std.mem.indexOf(u8, key_bytes, "BEGIN ENCRYPTED PRIVATE KEY") != null) return .pkcs8;
+        if (std.mem.indexOf(u8, key_bytes, "BEGIN PRIVATE KEY") != null) return .pkcs8;
+        return .unknown;
+    }
+
+    pub fn supported(format: KeyFormat) bool {
+        return format == .pem_rsa;
+    }
+
+    /// User-facing conversion instructions for unsupported formats.
+    pub fn adviceFor(format: KeyFormat) []const u8 {
+        return switch (format) {
+            .openssh =>
+            \\OPENSSH-format private keys are not supported by the Windows crypto backend.
+            \\If this is an RSA key, convert a COPY to PEM (rewrites the file in place):
+            \\  copy id_rsa id_rsa.pem && ssh-keygen -p -m PEM -f id_rsa.pem -N ""
+            \\ed25519/ECDSA keys cannot be used at all (backend limitation). Generate a
+            \\dedicated RSA key for Terminus and add its .pub to the server:
+            \\  ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key
+            ,
+            .pem_ec =>
+            \\EC (ECDSA) private keys are not supported by the Windows crypto backend.
+            \\Generate a dedicated RSA key for Terminus and add its .pub to the server:
+            \\  ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key
+            ,
+            .pkcs8 =>
+            \\PKCS#8-format private keys are not supported. Convert to traditional PEM:
+            \\  openssl rsa -in key.pk8 -out key.pem -traditional
+            ,
+            else =>
+            \\Unrecognized private key format. Terminus needs a PKCS#1 PEM RSA key
+            \\("-----BEGIN RSA PRIVATE KEY-----"). Generate one:
+            \\  ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key
+            ,
+        };
+    }
+};
 
 pub fn authenticate(client: *Client, username: []const u8, auth: Auth) AuthError!void {
+    if (auth == .key) {
+        // Guard: see KeyFormat docs — unsupported formats wedge libssh2.
+        if (!KeyFormat.detect(auth.key.private).supported())
+            return error.UnsupportedKeyFormat;
+    }
     const rc = switch (auth) {
         .password => |password| c.libssh2_userauth_password_ex(
             client.session,

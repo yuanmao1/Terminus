@@ -36,6 +36,13 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         const public = try readFileFlag(ctx, &parsed, "public-file");
         if (private == null and passphrase == null)
             fatal("provide --private-file (key auth) or --passphrase (password auth)", .{});
+        // Reject unusable key formats at add time, not first connect: the
+        // WinCNG backend wedges on OPENSSH-format keys instead of failing.
+        if (private) |key_bytes| {
+            const format = Core.Ssh.KeyFormat.detect(key_bytes);
+            if (!format.supported())
+                fatal("this private key cannot be used.\n{s}", .{Core.Ssh.KeyFormat.adviceFor(format)});
+        }
         _ = Store.keys.add(&store, .{
             .name = name,
             .kind = kind,

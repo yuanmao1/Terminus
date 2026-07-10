@@ -80,6 +80,13 @@ pub fn resolveServer(ctx: *Ctx, store: *Store, name: []const u8) struct {
             .public = material.public,
             .passphrase = material.passphrase,
         } };
+    // Validate key format before any transport is attempted (keys stored
+    // by pre-0.1.3 versions were never format-checked).
+    if (auth == .key) {
+        const format = Ssh.KeyFormat.detect(auth.key.private);
+        if (!format.supported())
+            fail("key '{s}' is in an unsupported format.\n{s}", .{ key_name, Ssh.KeyFormat.adviceFor(format) });
+    }
     return .{ .server = server, .auth = auth };
 }
 
@@ -89,10 +96,17 @@ pub fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh {
         fail("cannot connect to {s}:{d}: {s} ({s})", .{
             server.host, server.port, @errorName(err), Ssh.lastConnectError(),
         });
-    client.authenticate(server.username, auth) catch
-        fail("authentication failed for {s}@{s}: {s}", .{
+    client.authenticate(server.username, auth) catch |err| switch (err) {
+        error.UnsupportedKeyFormat => {
+            const format = Ssh.KeyFormat.detect(auth.key.private);
+            fail("the key for '{s}' is in an unsupported format.\n{s}", .{
+                server.name, Ssh.KeyFormat.adviceFor(format),
+            });
+        },
+        else => fail("authentication failed for {s}@{s}: {s}", .{
             server.username, server.host, client.errorMessage(),
-        });
+        }),
+    };
     return client;
 }
 
@@ -125,16 +139,20 @@ pub const Connection = struct {
     }
 };
 
-/// Daemon-first connect. `--no-daemon` skips the daemon; a daemon failure
-/// falls back to direct SSH but is never silent — the failure reason is
-/// carried on the Connection and surfaced in command output.
+/// Daemon-first connect. `--no-daemon` or TERMINUS_NO_DAEMON=1 skips the
+/// daemon; a daemon failure falls back to direct SSH but is never silent —
+/// the failure reason is carried on the Connection and surfaced in output.
 pub fn connect(
     ctx: *Ctx,
     parsed: *const Args.Parsed,
     server: Store.servers.Server,
     auth: Ssh.Auth,
 ) Connection {
-    if (!parsed.boolean("no-daemon")) {
+    const env_disabled = if (ctx.environ.get("TERMINUS_NO_DAEMON")) |v|
+        !std.mem.eql(u8, v, "0")
+    else
+        false;
+    if (!parsed.boolean("no-daemon") and !env_disabled) {
         const request = daemonRequest(server, auth);
         switch (DaemonClient.acquire(ctx.io, ctx.arena, ctx.environ, request)) {
             .ok => |client| return .{ .inner = .{ .daemon = client }, .transport = "daemon" },
