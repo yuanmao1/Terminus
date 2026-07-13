@@ -29,8 +29,30 @@ const Target = enum { claude, codex, cursor, windsurf, agents };
 const Result = struct {
     target: []const u8,
     path: []const u8,
-    action: []const u8, // "installed" | "updated" | "skipped"
+    action: []const u8, // "installed" | "updated" | "up-to-date"
 };
+
+/// Self-healing skill: if a user-wide skill file exists but differs from
+/// the one embedded in this binary (npm upgrade without re-running
+/// setup), silently rewrite it. Called on every CLI startup — costs two
+/// small file reads; never *installs* anywhere the user hasn't opted in.
+pub fn autoRefresh(ctx: *Cli.Ctx) void {
+    const targets = [_][]const []const u8{
+        &.{ ".claude", "skills", "terminus", "SKILL.md" },
+        &.{ ".codex", "skills", "terminus", "SKILL.md" },
+    };
+    const home = ctx.environ.get("USERPROFILE") orelse ctx.environ.get("HOME") orelse return;
+    const cwd = std.Io.Dir.cwd();
+    for (targets) |parts| {
+        const all = std.mem.concat(ctx.arena, []const u8, &.{ &.{home}, parts }) catch return;
+        const path = std.fs.path.join(ctx.arena, all) catch return;
+        const existing = cwd.readFileAlloc(ctx.io, path, ctx.arena, .limited(1 << 20)) catch continue;
+        if (std.mem.eql(u8, existing, skill_md)) continue;
+        cwd.writeFile(ctx.io, .{ .sub_path = path, .data = skill_md }) catch continue;
+        // stderr: stdout may be machine-parsed JSON.
+        std.debug.print("terminus: refreshed agent skill at {s}\n", .{path});
+    }
+}
 
 pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const parsed = Cli.parseArgs(ctx, raw_args);
@@ -89,7 +111,7 @@ fn writeSkillFile(ctx: *Cli.Ctx, target: []const u8, dir: []const u8, file_name:
     const existing = cwd.readFileAlloc(ctx.io, path, ctx.arena, .limited(1 << 20)) catch null;
     if (existing) |old| {
         if (std.mem.eql(u8, old, content))
-            return .{ .target = target, .path = path, .action = "skipped" };
+            return .{ .target = target, .path = path, .action = "up-to-date" };
     }
     cwd.writeFile(ctx.io, .{ .sub_path = path, .data = content }) catch |err|
         fatal("cannot write {s}: {s}", .{ path, @errorName(err) });
@@ -135,7 +157,7 @@ fn appendAgentsMd(ctx: *Cli.Ctx) !Result {
             content = try std.mem.concat(ctx.arena, u8, &.{ old[0..begin], block, tail });
             action = "updated";
             if (std.mem.eql(u8, old, content))
-                return .{ .target = "agents", .path = "AGENTS.md", .action = "skipped" };
+                return .{ .target = "agents", .path = "AGENTS.md", .action = "up-to-date" };
         } else {
             content = try std.mem.concat(ctx.arena, u8, &.{ old, "\n", block });
             action = "updated";

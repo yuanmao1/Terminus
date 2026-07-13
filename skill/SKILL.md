@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.5.** If a documented flag is rejected, the
+**Requires terminus >= 0.1.6.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 

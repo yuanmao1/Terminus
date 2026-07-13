@@ -4,6 +4,7 @@ const std = @import("std");
 pub const Output = @import("output.zig");
 pub const Dispatch = @import("dispatch.zig");
 pub const Args = @import("args.zig");
+pub const Setup = @import("cmd_setup.zig");
 
 const Core = @import("../core/core.zig");
 const Store = Core.Store;

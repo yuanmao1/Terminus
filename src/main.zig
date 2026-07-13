@@ -36,6 +36,10 @@ pub fn main(init: std.process.Init) !void {
     };
     Cli.setActiveCtx(&ctx);
 
+    // Keep installed agent skills in sync with this binary's embedded
+    // copy (npm upgrades don't re-run `terminus setup`).
+    Cli.Setup.autoRefresh(&ctx);
+
     // Global flags (--json, --db <path>) may appear anywhere; hoist them
     // out so both `terminus --json help` and `terminus help --json` work.
     var args: std.ArrayList([]const u8) = .empty;
