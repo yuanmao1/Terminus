@@ -175,6 +175,19 @@ pub fn exportAll(store: *Store, arena: Allocator, server_id: i64) (Db.Error || A
     return out.toOwnedSlice(arena);
 }
 
+/// Whether an identical keyless memory already exists in the exact scope
+/// (used by import to avoid duplicating free-form entries).
+pub fn hasContent(store: *Store, scope: Scope, content: []const u8) Db.Error!bool {
+    var stmt = try store.db.prepare(
+        "SELECT 1 FROM memories WHERE server_id = ?1 AND session_id IS ?2 AND key IS NULL AND content = ?3",
+    );
+    defer stmt.deinit();
+    try stmt.bindInt(1, scope.server_id);
+    try stmt.bindOptInt(2, scope.session_id);
+    try stmt.bindText(3, content);
+    return try stmt.step();
+}
+
 pub const Selector = union(enum) {
     key: []const u8,
     id: i64,

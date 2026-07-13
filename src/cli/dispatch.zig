@@ -19,6 +19,8 @@ pub const TopCommand = enum {
     sync,
     doctor,
     history,
+    @"export",
+    import,
     setup,
     daemon,
     help,
@@ -46,6 +48,8 @@ const usage =
     \\  sync       recursive directory transfer      (push/pull; tar+md5)
     \\  doctor     probe remote environment capabilities
     \\  history    local audit trail of remote actions
+    \\  export     dump all servers+memories+facts as JSON
+    \\  import     merge an export (dry-run plan, conflict strategies)
     \\  setup      install the Terminus skill into coding agents
     \\  daemon     connection daemon lifecycle       (status/stop/run)
     \\
@@ -60,8 +64,8 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         Cli.fail("unknown command '{s}'; run 'terminus help'", .{args[0]});
     switch (command) {
         .version => switch (ctx.out.format) {
-            .json => try ctx.out.json(.{ .ok = true, .version = "0.1.4" }),
-            .human => try ctx.out.print("terminus 0.1.4\n", .{}),
+            .json => try ctx.out.json(.{ .ok = true, .version = "0.1.5" }),
+            .human => try ctx.out.print("terminus 0.1.5\n", .{}),
         },
         .help => try ctx.out.print("{s}", .{usage}),
         .server => try @import("cmd_server.zig").run(ctx, args[1..]),
@@ -80,6 +84,8 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .sync => try @import("cmd_sync.zig").run(ctx, args[1..]),
         .doctor => try @import("cmd_doctor.zig").run(ctx, args[1..]),
         .history => try @import("cmd_history.zig").run(ctx, args[1..]),
+        .@"export" => try @import("cmd_export_import.zig").exportCmd(ctx, args[1..]),
+        .import => try @import("cmd_export_import.zig").importCmd(ctx, args[1..]),
         .setup => try @import("cmd_setup.zig").run(ctx, args[1..]),
         .daemon => try @import("cmd_daemon.zig").run(ctx, args[1..]),
     }

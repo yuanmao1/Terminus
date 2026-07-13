@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.4.** If a documented flag is rejected, the
+**Requires terminus >= 0.1.5.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -234,5 +234,27 @@ Passwords: `terminus key add pw --kind password --passphrase '...'`.
 Housekeeping: `server rename/set` change names and connection details in
 place — memories, facts, jobs, and history follow automatically (never
 rm+re-add, that erases accumulated knowledge; `rm` warns and requires
-`--force` when data would be lost). `memory export <server>` dumps all
-memories+facts as JSON for backup or migrating to another machine.
+`--force` when data would be lost).
+
+## Moving knowledge between machines
+
+`export`/`import` move all servers + memories + facts as one JSON file,
+with agent-controlled merging (never a blind overwrite):
+
+```bash
+# On the old machine:
+terminus export --out terminus-backup.json          # config + knowledge
+terminus export --include-keys --out full.json      # + PLAINTEXT key material
+
+# On the new machine — ALWAYS dry-run first and review the plan:
+terminus import backup.json --dry-run --json
+#   every item is labeled new | identical | conflict (local vs incoming shown)
+
+terminus import backup.json                    # apply additions only; conflicts stay local
+terminus import backup.json --strategy theirs  # conflicts: incoming wins
+terminus import backup.json --only web1,prod   # limit to specific servers
+```
+
+For conflicts you want to resolve individually: read both values from the
+dry-run plan, then write the merged truth with `memory add --key ...`
+(it upserts). Re-import is idempotent — identical items are skipped.
