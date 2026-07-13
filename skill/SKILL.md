@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.6.** If a documented flag is rejected, the
+**Requires terminus >= 0.1.7.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -171,10 +171,15 @@ terminus memory add <server> --key deploy_dir -- "app in /srv/app, deploy via co
 | Situation | Use |
 |---|---|
 | Single command, no state needed | `exec <server>` — works everywhere, no tmux required |
-| Anything longer than ~60s | `run --name X` then poll `job status` — exit code never lost |
+| Anything longer than ~60s | `run --name X` then poll `job status` — exit code never lost, other commands stay free |
 | Multiple related commands (cd, env, activate) | `exec <server>:<sess>` — state persists between calls |
 | Interactive process (REPL, log follow) | `write` + `read --from-cursor` |
 | Remote has no tmux | plain `exec <server>` only; `doctor` tells you upfront |
+
+Long `exec` calls (multi-minute scans/builds) are fine — they don't block
+other terminus commands, which run concurrently on their own connections.
+Jobs are still preferred past ~60s: they survive your process dying and
+report status without holding anything open.
 
 All failures are `{"ok":false,"error":"..."}` with exit 1 in `--json` mode.
 Responses include `transport` ("daemon" or "direct") and `daemonError` when

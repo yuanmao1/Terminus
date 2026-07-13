@@ -196,6 +196,12 @@ pub const ExecError = error{
 
 /// Runs one command over a fresh session channel and drains stdout/stderr
 /// to completion.
+///
+/// The session's 30s timeout guards connect/handshake/auth, but a command
+/// may legitimately stay silent for many minutes (large table scans,
+/// builds). While waiting on command output the timeout is lifted; a dead
+/// peer is eventually caught by TCP, the caller's own timeout, or the
+/// user interrupting.
 pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!ExecResult {
     const channel = c.libssh2_channel_open_ex(
         client.session,
@@ -215,6 +221,9 @@ pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!Ex
         command.ptr,
         @intCast(command.len),
     ) != 0) return error.ExecFailed;
+
+    c.libssh2_session_set_timeout(client.session, 0); // block until output
+    defer c.libssh2_session_set_timeout(client.session, 30_000);
 
     var stdout: std.ArrayList(u8) = .empty;
     var stderr: std.ArrayList(u8) = .empty;

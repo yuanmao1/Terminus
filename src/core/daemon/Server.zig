@@ -5,25 +5,33 @@
 //! * Single instance: binding the unix socket is the lock. If the address
 //!   is in use, another daemon is already serving — exit immediately.
 //! * Idle suicide: a watchdog thread exits the process after `idle_exit`
-//!   with no requests. The CLI transparently respawns on demand, so an
-//!   idle daemon costs nothing and can never accumulate.
+//!   with no requests in flight. The CLI transparently respawns on
+//!   demand, so an idle daemon costs nothing and can never accumulate.
 //! * Stale sockets: on startup, an existing-but-dead socket file (bind
 //!   fails, connect also fails) is deleted and rebound.
 //! * The socket file is removed on every exit path.
 //!
-//! Serves one connection at a time: CLI requests are short-lived and
-//! serialized per user; simplicity beats throughput here (M4+ can thread).
+//! Each client connection gets its own thread, so ping/status/stop stay
+//! responsive while a long exec (multi-minute table scans are legitimate)
+//! is in flight. The pooled SSH session is mutex-guarded — libssh2
+//! sessions are not thread-safe — and a request that finds it busy dials
+//! a fresh one-shot connection instead of queueing behind the long one.
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const Ssh = @import("../ssh/Client.zig");
 
 const default_idle_exit_ns: i96 = 5 * std.time.ns_per_min;
+/// Backstop for a truly wedged request (transport hang the key-format
+/// guards didn't catch): after this long with no request starting or
+/// finishing, the daemon exits rather than linger forever. Long
+/// legitimate work keeps the daemon alive as long as *something*
+/// completes now and then; a lone request older than this is presumed
+/// dead. Override with TERMINUS_DAEMON_REQUEST_MAX_SECS.
+const default_request_max_ns: i96 = 60 * std.time.ns_per_min;
 
-/// TERMINUS_DAEMON_IDLE_SECS overrides the idle-exit timeout (mainly for
-/// tests; also lets users tune how long connections stay warm).
-fn idleExitNs(environ: *std.process.Environ.Map) i96 {
-    const text = environ.get("TERMINUS_DAEMON_IDLE_SECS") orelse return default_idle_exit_ns;
-    const secs = std.fmt.parseInt(u32, text, 10) catch return default_idle_exit_ns;
+fn envNs(environ: *std.process.Environ.Map, name: []const u8, default: i96) i96 {
+    const text = environ.get(name) orelse return default;
+    const secs = std.fmt.parseInt(u32, text, 10) catch return default;
     return @as(i96, secs) * std.time.ns_per_s;
 }
 
@@ -48,14 +56,9 @@ const Pooled = struct {
 };
 
 var last_activity_ns: std.atomic.Value(i64) = .init(0);
-/// Nonzero while a request is being processed (its start timestamp). The
-/// daemon serves one request at a time, so a wedged SSH operation (hung
-/// network, misbehaving crypto call) would block status/stop forever;
-/// the watchdog kills the whole process instead — the CLI falls back to
-/// direct SSH and the next invocation respawns a fresh daemon.
-var request_started_ns: std.atomic.Value(i64) = .init(0);
-
-const request_stuck_ns: i96 = 120 * std.time.ns_per_s;
+var active_requests: std.atomic.Value(i64) = .init(0);
+var pool_mutex: std.Io.Mutex = .init;
+var pool: ?Pooled = null;
 
 pub fn socketPath(arena: std.mem.Allocator, environ: *std.process.Environ.Map) ![]u8 {
     const home = environ.get("USERPROFILE") orelse environ.get("HOME") orelse
@@ -70,7 +73,8 @@ fn nowNs(io: std.Io) i64 {
 pub fn run(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, environ: *std.process.Environ.Map) !void {
     const path = try socketPath(arena, environ);
     std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?) catch {};
-    const idle_ns = idleExitNs(environ);
+    const idle_ns = envNs(environ, "TERMINUS_DAEMON_IDLE_SECS", default_idle_exit_ns);
+    const request_max_ns = envNs(environ, "TERMINUS_DAEMON_REQUEST_MAX_SECS", default_request_max_ns);
 
     const address = try std.Io.net.UnixAddress.init(path);
     var server = address.listen(io, .{}) catch |err| switch (err) {
@@ -80,11 +84,11 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, environ
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             var retry_address = try std.Io.net.UnixAddress.init(path);
             var retry = try retry_address.listen(io, .{});
-            return serve(io, gpa, &retry, path, idle_ns);
+            return serve(io, gpa, &retry, path, idle_ns, request_max_ns);
         },
         else => return err,
     };
-    return serve(io, gpa, &server, path, idle_ns);
+    return serve(io, gpa, &server, path, idle_ns, request_max_ns);
 }
 
 fn isLive(io: std.Io, path: []const u8) bool {
@@ -94,46 +98,53 @@ fn isLive(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn serve(io: std.Io, gpa: std.mem.Allocator, server: *std.Io.net.Server, path: []const u8, idle_ns: i96) !void {
+fn serve(io: std.Io, gpa: std.mem.Allocator, server: *std.Io.net.Server, path: []const u8, idle_ns: i96, request_max_ns: i96) !void {
     last_activity_ns.store(nowNs(io), .monotonic);
 
-    // Watchdog: exit the whole process after idle_ns with no requests.
+    // Watchdog: exits the whole process on idle (or wedge, see above).
     // process.exit skips defers, so it removes the socket file itself.
-    const watchdog = try std.Thread.spawn(.{}, watchdogMain, .{ io, path, idle_ns });
+    const watchdog = try std.Thread.spawn(.{}, watchdogMain, .{ io, path, idle_ns, request_max_ns });
     watchdog.detach();
 
-    var pool: ?Pooled = null;
-    defer if (pool) |*p| p.deinit();
-
     while (true) {
-        var stream = server.accept(io) catch break;
-        defer stream.close(io);
-        last_activity_ns.store(nowNs(io), .monotonic);
-
-        const stop = handleConnection(io, gpa, &stream, &pool) catch false;
-        last_activity_ns.store(nowNs(io), .monotonic);
-        if (stop) break;
+        const stream = server.accept(io) catch break;
+        const thread = std.Thread.spawn(.{}, connectionMain, .{ io, gpa, stream, path }) catch {
+            var s = stream;
+            s.close(io);
+            continue;
+        };
+        thread.detach();
     }
 
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
-fn watchdogMain(io: std.Io, path: []const u8, idle_ns: i96) void {
+fn watchdogMain(io: std.Io, path: []const u8, idle_ns: i96, request_max_ns: i96) void {
     while (true) {
         std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_s }, .awake) catch {};
-        const now = nowNs(io);
-        const idle: i96 = now - last_activity_ns.load(.monotonic);
-        if (idle > idle_ns) {
+        const idle: i96 = nowNs(io) - last_activity_ns.load(.monotonic);
+        const active = active_requests.load(.monotonic);
+        if (active == 0 and idle > idle_ns) {
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             std.process.exit(0);
         }
-        // Stuck request: better a dead daemon (auto-respawned, with direct
-        // fallback meanwhile) than one that blocks every CLI call.
-        const started = request_started_ns.load(.monotonic);
-        if (started != 0 and now - started > request_stuck_ns) {
+        // In-flight requests hold the daemon open — unless nothing has
+        // started or finished for so long that the transport is presumed
+        // wedged (the CLI falls back to direct SSH and respawns).
+        if (active > 0 and idle > request_max_ns) {
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             std.process.exit(1);
         }
+    }
+}
+
+fn connectionMain(io: std.Io, gpa: std.mem.Allocator, stream_value: std.Io.net.Stream, path: []const u8) void {
+    var stream = stream_value;
+    defer stream.close(io);
+    const stop = handleConnection(io, gpa, &stream) catch false;
+    if (stop) {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        std.process.exit(0);
     }
 }
 
@@ -144,7 +155,6 @@ fn handleConnection(
     io: std.Io,
     gpa: std.mem.Allocator,
     stream: *std.Io.net.Stream,
-    pool: *?Pooled,
 ) !bool {
     var read_buffer: [1 << 20]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
@@ -158,8 +168,11 @@ fn handleConnection(
         const line = (reader.interface.takeDelimiter('\n') catch return false) orelse return false;
         if (line.len == 0) continue;
         last_activity_ns.store(nowNs(io), .monotonic);
-        request_started_ns.store(nowNs(io), .monotonic);
-        defer request_started_ns.store(0, .monotonic);
+        _ = active_requests.fetchAdd(1, .monotonic);
+        defer {
+            _ = active_requests.fetchSub(1, .monotonic);
+            last_activity_ns.store(nowNs(io), .monotonic);
+        }
 
         // Per-request arena: request/response buffers die with the request.
         var request_arena = std.heap.ArenaAllocator.init(gpa);
@@ -190,16 +203,7 @@ fn handleConnection(
             .exec => {},
         }
 
-        const client = acquire(pool, request) catch |err| {
-            try respondError(&writer.interface, @errorName(err));
-            continue;
-        };
-
-        const result = client.exec(arena, request.command) catch |err| {
-            // Pooled connection may have died (server restart, network
-            // drop); drop it so the next request reconnects fresh.
-            if (pool.*) |*p| p.deinit();
-            pool.* = null;
+        const result = execRequest(io, arena, request) catch |err| {
             try respondError(&writer.interface, @errorName(err));
             continue;
         };
@@ -214,31 +218,51 @@ fn handleConnection(
     }
 }
 
-fn respondError(writer: *std.Io.Writer, message: []const u8) !void {
-    try protocol.writeMessage(writer, protocol.Response{
-        .v = protocol.version,
-        .ok = false,
-        .@"error" = message,
-    });
+/// Runs one exec, preferring the pooled connection. If another thread
+/// holds it (a long-running command), dial a fresh one-shot connection
+/// rather than queue — concurrent CLI calls stay independent.
+fn execRequest(io: std.Io, arena: std.mem.Allocator, request: protocol.Request) !Ssh.ExecResult {
+    if (pool_mutex.tryLock()) {
+        defer pool_mutex.unlock(io);
+        const client = acquirePooledLocked(request) catch |err| return err;
+        return client.exec(arena, request.command) catch |err| {
+            // Pooled connection may have died (server restart, network
+            // drop); drop it so the next request reconnects fresh.
+            if (pool) |*p| p.deinit();
+            pool = null;
+            return err;
+        };
+    }
+
+    // Pool busy: independent short-lived connection for this request.
+    var client = try connectFor(request);
+    defer client.deinit();
+    return client.exec(arena, request.command);
 }
 
-fn acquire(pool: *?Pooled, request: protocol.Request) !*Ssh {
+/// Caller holds pool_mutex.
+fn acquirePooledLocked(request: protocol.Request) !*Ssh {
     const gpa = std.heap.smp_allocator;
     const key = try Pooled.keyOf(gpa, request);
 
-    if (pool.*) |*p| {
+    if (pool) |*p| {
         if (std.mem.eql(u8, p.key, key)) {
             gpa.free(key);
             return &p.client;
         }
         p.deinit();
-        pool.* = null;
+        pool = null;
     }
 
     errdefer gpa.free(key);
+    const client = try connectFor(request);
+    pool = .{ .client = client, .key = key, .gpa = gpa };
+    return &pool.?.client;
+}
+
+fn connectFor(request: protocol.Request) !Ssh {
     var client = try Ssh.connect(request.host, request.port);
     errdefer client.deinit();
-
     const auth: Ssh.Auth = switch (request.auth) {
         .none => return error.AuthMissing,
         .password => |password| .{ .password = password },
@@ -249,11 +273,15 @@ fn acquire(pool: *?Pooled, request: protocol.Request) !*Ssh {
         } },
     };
     try client.authenticate(request.username, auth);
+    return client;
+}
 
-    // Dupe key/auth-independent state into the pool's own allocator: the
-    // request arena dies when this connection closes.
-    pool.* = .{ .client = client, .key = key, .gpa = gpa };
-    return &pool.*.?.client;
+fn respondError(writer: *std.Io.Writer, message: []const u8) !void {
+    try protocol.writeMessage(writer, protocol.Response{
+        .v = protocol.version,
+        .ok = false,
+        .@"error" = message,
+    });
 }
 
 fn currentPid() u32 {
