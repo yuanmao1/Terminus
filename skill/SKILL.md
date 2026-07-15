@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.8.** If a documented flag is rejected, the
+**Requires terminus >= 0.1.9.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -148,8 +148,10 @@ terminus exec <server>:<name> --json -- docker compose ps
 terminus push <server> ./local-file /remote/path [--mode 755]
 terminus pull <server> /remote/file ./local-path
 # No scp binary on the server (minimal images, OpenSSH 9+)? add --via exec
-# — moves bytes over the plain command channel (base64); push any size,
-# pull up to ~1.5 MB. push/pull auto-fall back to exec if scp is absent.
+# — moves bytes over the plain command channel (needs only base64), any
+# size, md5-verified. Downloads are slow (libssh2 read speed; the scp
+# backend is no faster) but reliable. push/pull auto-fall back to exec if
+# scp is absent.
 terminus push <server> ./cfg /etc/app/cfg --via exec
 terminus sync push <server> ./dist /srv/app/dist --exclude node_modules,.git [--dry-run] [--delete]
 terminus sync pull <server> /var/log/myapp ./logs [--exclude *.gz]

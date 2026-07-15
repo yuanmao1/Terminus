@@ -19,6 +19,9 @@ session: *c.LIBSSH2_SESSION,
 /// flag suffices.
 var libssh2_ready = false;
 
+/// Flip to true and rebuild to dump libssh2 protocol trace to stderr.
+const trace_enabled = false;
+
 /// Failure detail for `connect` errors, which have no live session for
 /// `errorMessage` to query. Single-threaded CLI, module-level is fine.
 var connect_error_buf: [512]u8 = undefined;
@@ -203,6 +206,7 @@ pub const ExecError = error{
 /// peer is eventually caught by TCP, the caller's own timeout, or the
 /// user interrupting.
 pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!ExecResult {
+    if (trace_enabled) _ = c.libssh2_trace(client.session, ~@as(c_int, 0));
     const channel = c.libssh2_channel_open_ex(
         client.session,
         "session",
@@ -308,29 +312,25 @@ fn drainBoth(
     out: *std.ArrayList(u8),
     err: *std.ArrayList(u8),
 ) ExecError!void {
-    var buffer: [32768]u8 = undefined;
+    var buffer: [256 * 1024]u8 = undefined;
     var out_eof = false;
     var err_eof = false;
     while (!out_eof or !err_eof) {
-        // Blocking mode: read_ex returns >0 for data, 0 at stream EOF, and
-        // a negative libssh2 error otherwise. Reading a stream that has
-        // already hit 0 again would block forever waiting for the remote
-        // EOF packet, so once a stream returns 0 we stop reading it.
+        // Read stdout greedily first; only poll stderr once stdout is
+        // drained (or the channel signals EOF) so an idle stderr never
+        // stalls the loop, and each iteration moves as much as possible.
         if (!out_eof) {
             const no = c.libssh2_channel_read_ex(channel, 0, &buffer, buffer.len);
             if (no > 0) {
                 try out.appendSlice(arena, buffer[0..@intCast(no)]);
+                continue; // keep pulling stdout while it flows
             } else if (no == 0) {
                 out_eof = true;
             } else if (no != c.LIBSSH2_ERROR_EAGAIN) {
                 return error.ReadFailed;
             }
         }
-        // stderr rarely carries data. A blocking read on an idle stderr
-        // stream would hang, so only touch it once the channel has EOF'd
-        // (all pending stream data has arrived); then a single read drains
-        // whatever stderr holds and the next returns 0.
-        if (!err_eof and (out_eof or c.libssh2_channel_eof(channel) != 0)) {
+        if (!err_eof) {
             const ne = c.libssh2_channel_read_ex(channel, c.SSH_EXTENDED_DATA_STDERR, &buffer, buffer.len);
             if (ne > 0) {
                 try err.appendSlice(arena, buffer[0..@intCast(ne)]);
@@ -520,9 +520,24 @@ fn tcpConnect(host: []const u8, port: u16) ConnectError!c.libssh2_socket_t {
     while (it != null) : (it = it.*.ai_next) {
         const socket = c.socket(it.*.ai_family, it.*.ai_socktype, it.*.ai_protocol);
         if (socket == c.INVALID_SOCKET) continue;
-        if (c.connect(socket, it.*.ai_addr, @intCast(it.*.ai_addrlen)) == 0)
+        if (c.connect(socket, it.*.ai_addr, @intCast(it.*.ai_addrlen)) == 0) {
+            tuneSocket(socket);
             return socket;
+        }
         _ = c.closesocket(socket);
     }
     return error.ConnectFailed;
+}
+
+/// TCP_NODELAY + large SO_RCVBUF. Without NODELAY, libssh2's small
+/// request writes interleave with reads under Nagle + delayed-ACK, adding
+/// ~40-200 ms per round trip — which turns a many-packet bulk transfer
+/// into minutes. A big receive buffer lets the kernel pull whole windows.
+fn tuneSocket(socket: c.libssh2_socket_t) void {
+    // IPPROTO_TCP = 6, TCP_NODELAY = 1, SOL_SOCKET = 0xffff, SO_RCVBUF = 0x1002
+    // (Winsock constants; translate-c can't render the macros).
+    var one: c_int = 1;
+    _ = c.setsockopt(socket, 6, 1, @ptrCast(&one), @sizeOf(c_int));
+    var rcvbuf: c_int = 4 * 1024 * 1024;
+    _ = c.setsockopt(socket, 0xffff, 0x1002, @ptrCast(&rcvbuf), @sizeOf(c_int));
 }

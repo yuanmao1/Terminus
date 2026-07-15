@@ -178,8 +178,7 @@ fn fatalExecTransfer(err: anyerror, client: *Core.Ssh, src: []const u8, dst: []c
     switch (err) {
         error.RemoteFileMissing => fatal("remote file '{s}' does not exist", .{src}),
         error.RemoteWriteFailed => fatal("cannot write '{s}' on the remote (permission? disk full?)", .{dst}),
-        error.RemoteToolMissing => fatal("remote lacks base64/dd for the exec transfer fallback", .{}),
-        error.FileTooLarge => fatal("'{s}' is too large for the scp-free download path ({d} KiB max); install scp on the server or split the file", .{ src, Core.transfer.pull_max / 1024 }),
+        error.RemoteToolMissing => fatal("remote lacks base64 for the exec transfer fallback", .{}),
         error.ChecksumMismatch => fatal("transfer corrupted (md5 mismatch) — retry", .{}),
         else => fatal("transfer failed: {s} ({s})", .{ client.errorMessage(), @errorName(err) }),
     }
