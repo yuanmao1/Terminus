@@ -6,3 +6,4 @@ pub const DaemonClient = @import("daemon/Client.zig");
 pub const daemon_protocol = @import("daemon/protocol.zig");
 pub const Executor = @import("exec.zig").Executor;
 pub const script = @import("script.zig");
+pub const transfer = @import("transfer.zig");

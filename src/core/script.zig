@@ -20,7 +20,12 @@ const Executor = @import("exec.zig").Executor;
 
 const remote_dir = "/tmp/.terminus";
 
-/// Base64 inflates 4/3 and the whole command must clear ARG_MAX.
+/// One SSH exec request caps near 32 KiB (libssh2/OpenSSH); chunk the
+/// upload so scripts of any reasonable size stage correctly.
+const stage_chunk = 20 * 1024;
+
+/// Scripts beyond this are almost certainly data, not code; push+exec is
+/// the right tool there.
 pub const max_inline_script = 768 * 1024;
 
 pub const Options = struct {
@@ -71,14 +76,28 @@ pub fn stage(
         try script.append(arena, '\n');
 
     const encoder = std.base64.standard.Encoder;
-    const encoded = try arena.alloc(u8, encoder.calcSize(script.items.len));
-    _ = encoder.encode(encoded, script.items);
 
-    const upload = try std.fmt.allocPrint(arena,
-        \\mkdir -p {s} && printf '%s' '{s}' | base64 -d > {s} && chmod 700 {s}
-    , .{ remote_dir, encoded, remote_path, remote_path });
-    const result = try executor.exec(arena, upload);
-    if (result.exit_code != 0) return error.StagingFailed;
+    // Truncate-create, then append chunk by chunk (one exec request caps
+    // near 32 KiB, so big scripts can't travel in a single command).
+    const init_cmd = try std.fmt.allocPrint(arena, "mkdir -p {s} && : > {s} && chmod 700 {s}", .{
+        remote_dir, remote_path, remote_path,
+    });
+    const init_result = try executor.exec(arena, init_cmd);
+    if (init_result.exit_code != 0) return error.StagingFailed;
+
+    var offset: usize = 0;
+    while (offset < script.items.len) {
+        const end = @min(offset + stage_chunk, script.items.len);
+        const chunk = script.items[offset..end];
+        const encoded = try arena.alloc(u8, encoder.calcSize(chunk.len));
+        _ = encoder.encode(encoded, chunk);
+        const append = try std.fmt.allocPrint(arena,
+            \\printf '%s' '{s}' | base64 -d >> {s}
+        , .{ encoded, remote_path });
+        const result = try executor.exec(arena, append);
+        if (result.exit_code != 0) return error.StagingFailed;
+        offset = end;
+    }
 
     const base = try std.fmt.allocPrint(arena, "{s} {s}", .{ options.interpreter, remote_path });
     const command = if (options.login)

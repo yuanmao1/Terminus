@@ -222,13 +222,15 @@ pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!Ex
         @intCast(command.len),
     ) != 0) return error.ExecFailed;
 
-    c.libssh2_session_set_timeout(client.session, 0); // block until output
-    defer c.libssh2_session_set_timeout(client.session, 30_000);
-
+    // Read output under no timeout (a command may be silent for minutes),
+    // then restore the default timeout *before* channel teardown so a slow
+    // close can't wedge the next exec on the pooled connection.
+    c.libssh2_session_set_timeout(client.session, 0);
     var stdout: std.ArrayList(u8) = .empty;
     var stderr: std.ArrayList(u8) = .empty;
-    try drainStream(channel, 0, arena, &stdout);
-    try drainStream(channel, c.SSH_EXTENDED_DATA_STDERR, arena, &stderr);
+    const drain_result = drainBoth(channel, arena, &stdout, &stderr);
+    c.libssh2_session_set_timeout(client.session, 30_000);
+    try drain_result;
 
     _ = c.libssh2_channel_close(channel);
     _ = c.libssh2_channel_wait_closed(channel);
@@ -241,21 +243,100 @@ pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!Ex
     };
 }
 
-fn drainStream(
+/// Runs a command feeding `input` to its stdin, then drains stdout/stderr.
+/// The channel is 8-bit clean, so arbitrary binary can stream through —
+/// this is how exec-based file transfer moves bytes in one round trip.
+///
+/// Unlike `exec`, the 30s session timeout stays armed: transfer data
+/// should flow continuously, so a 30s stall means the channel is wedged
+/// (an intermittent libssh2 blocking-read issue under bulk traffic) and
+/// the caller retries rather than hanging forever.
+pub fn execWithStdin(client: *Client, arena: Allocator, command: []const u8, input: []const u8) ExecError!ExecResult {
+    const channel = c.libssh2_channel_open_ex(
+        client.session,
+        "session",
+        "session".len,
+        c.LIBSSH2_CHANNEL_WINDOW_DEFAULT,
+        c.LIBSSH2_CHANNEL_PACKET_DEFAULT,
+        null,
+        0,
+    ) orelse return error.ChannelOpenFailed;
+    defer _ = c.libssh2_channel_free(channel);
+
+    if (c.libssh2_channel_process_startup(
+        channel,
+        "exec",
+        "exec".len,
+        command.ptr,
+        @intCast(command.len),
+    ) != 0) return error.ExecFailed;
+
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const n = c.libssh2_channel_write_ex(channel, 0, input.ptr + offset, input.len - offset);
+        if (n < 0) return error.ExecFailed;
+        offset += @intCast(n);
+    }
+    _ = c.libssh2_channel_send_eof(channel);
+
+    c.libssh2_session_set_timeout(client.session, 0);
+    defer c.libssh2_session_set_timeout(client.session, 30_000);
+
+    var stdout: std.ArrayList(u8) = .empty;
+    var stderr: std.ArrayList(u8) = .empty;
+    try drainBoth(channel, arena, &stdout, &stderr);
+
+    _ = c.libssh2_channel_close(channel);
+    _ = c.libssh2_channel_wait_closed(channel);
+
+    return .{
+        .exit_code = c.libssh2_channel_get_exit_status(channel),
+        .stdout = try stdout.toOwnedSlice(arena),
+        .stderr = try stderr.toOwnedSlice(arena),
+    };
+}
+
+/// Interleaved blocking drain of stdout+stderr until channel EOF. Reading
+/// one stream to EOF before the other can deadlock — libssh2's per-channel
+/// receive window is shared, so draining both keeps it moving. Callers
+/// keep any single command's stdout under a few hundred KiB (see
+/// core/transfer.zig chunking); beyond that libssh2's blocking reader can
+/// still wedge on window bookkeeping.
+fn drainBoth(
     channel: *c.LIBSSH2_CHANNEL,
-    stream_id: c_int,
     arena: Allocator,
     out: *std.ArrayList(u8),
+    err: *std.ArrayList(u8),
 ) ExecError!void {
-    var buffer: [8192]u8 = undefined;
-    while (true) {
-        const n = c.libssh2_channel_read_ex(channel, stream_id, &buffer, buffer.len);
-        if (n > 0) {
-            try out.appendSlice(arena, buffer[0..@intCast(n)]);
-        } else if (n == 0) {
-            return; // EOF on this stream.
-        } else {
-            return error.ReadFailed;
+    var buffer: [32768]u8 = undefined;
+    var out_eof = false;
+    var err_eof = false;
+    while (!out_eof or !err_eof) {
+        // Blocking mode: read_ex returns >0 for data, 0 at stream EOF, and
+        // a negative libssh2 error otherwise. Reading a stream that has
+        // already hit 0 again would block forever waiting for the remote
+        // EOF packet, so once a stream returns 0 we stop reading it.
+        if (!out_eof) {
+            const no = c.libssh2_channel_read_ex(channel, 0, &buffer, buffer.len);
+            if (no > 0) {
+                try out.appendSlice(arena, buffer[0..@intCast(no)]);
+            } else if (no == 0) {
+                out_eof = true;
+            } else if (no != c.LIBSSH2_ERROR_EAGAIN) {
+                return error.ReadFailed;
+            }
+        }
+        // stderr rarely carries data. A blocking read on an idle stderr
+        // stream would hang, so only touch it once the channel has EOF'd
+        // (all pending stream data has arrived); then a single read drains
+        // whatever stderr holds and the next returns 0.
+        if (!err_eof and (out_eof or c.libssh2_channel_eof(channel) != 0)) {
+            const ne = c.libssh2_channel_read_ex(channel, c.SSH_EXTENDED_DATA_STDERR, &buffer, buffer.len);
+            if (ne > 0) {
+                try err.appendSlice(arena, buffer[0..@intCast(ne)]);
+            } else {
+                err_eof = true; // 0 (EOF) or error: stop reading stderr
+            }
         }
     }
 }

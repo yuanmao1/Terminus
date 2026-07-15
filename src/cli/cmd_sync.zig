@@ -170,11 +170,14 @@ fn push(
     std.crypto.hash.Md5.hash(tar_bytes, &md5, .{});
     const md5_hex = try std.fmt.allocPrint(ctx.arena, "{x}", .{&md5});
 
-    // Stage the archive remotely, verify its checksum, then unpack.
+    // Stage the archive remotely (scp, or base64-over-exec when the
+    // server has no scp binary), verify its checksum, then unpack.
     const remote_tmp = try std.fmt.allocPrint(ctx.arena, "/tmp/.terminus_sync_{d}.tar", .{ctx.now});
     const remote_tmp_z = try ctx.arena.dupeZ(u8, remote_tmp);
-    _ = client.scpSendBytes(ctx.io, tar_bytes, remote_tmp_z, 0o600) catch |err|
-        fatal("upload failed: {s} ({s})", .{ client.errorMessage(), @errorName(err) });
+    _ = client.scpSendBytes(ctx.io, tar_bytes, remote_tmp_z, 0o600) catch {
+        Core.transfer.pushBytes(client, ctx.arena, tar_bytes, remote_tmp, 0o600) catch |err|
+            fatal("upload failed (scp and exec both): {s} ({s})", .{ client.errorMessage(), @errorName(err) });
+    };
 
     const delete_clause = if (delete)
         try std.fmt.allocPrint(ctx.arena, "rm -rf '{s}' && ", .{remote_dir})
@@ -240,8 +243,9 @@ fn pull(
     const remote_md5 = std.mem.trim(u8, result.stdout, " \n\r");
 
     const remote_tmp_z = try ctx.arena.dupeZ(u8, remote_tmp);
-    const tar_bytes = client.scpRecvBytes(ctx.io, ctx.arena, remote_tmp_z) catch |err|
-        fatal("download failed: {s} ({s})", .{ client.errorMessage(), @errorName(err) });
+    const tar_bytes = client.scpRecvBytes(ctx.io, ctx.arena, remote_tmp_z) catch
+        Core.transfer.pullBytes(client, ctx.arena, remote_tmp) catch |err|
+            fatal("download failed (scp and exec both): {s} ({s})", .{ client.errorMessage(), @errorName(err) });
     _ = client.exec(ctx.arena, try std.fmt.allocPrint(ctx.arena, "rm -f {s}", .{remote_tmp})) catch {};
 
     var md5: [16]u8 = undefined;

@@ -24,7 +24,7 @@ const probe_script =
     \\echo "home_writable=$(touch $HOME/.terminus_probe 2>/dev/null && rm -f $HOME/.terminus_probe && echo yes || echo no)"
     \\echo "disk_home=$(df -h $HOME 2>/dev/null | tail -1 | awk '{print $4}' || echo unknown)"
     \\echo "nproc=$(nproc 2>/dev/null || echo unknown)"
-    \\for t in node npm bun pm2 docker git python3 pip3 cargo; do
+    \\for t in node npm bun pm2 docker git python3 pip3 cargo scp base64; do
     \\  plain=$(command -v $t 2>/dev/null || echo -)
     \\  login=$(bash -ilc "command -v $t" 2>/dev/null | tail -1)
     \\  echo "tool=$t|$plain|${login:--}"
