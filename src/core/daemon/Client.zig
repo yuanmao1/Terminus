@@ -176,3 +176,66 @@ pub fn pingDaemon(io: std.Io, arena: std.mem.Allocator, environ: *std.process.En
     defer client.deinit();
     return client.ping();
 }
+
+pub const ForceKill = struct {
+    /// A daemon process was found and terminated.
+    killed: bool,
+    /// The pid that was targeted (from the pidfile), if any.
+    pid: ?u32,
+};
+
+/// Hard-restart path for a wedged daemon whose socket no longer responds:
+/// read the pidfile and terminate that process directly (bypassing the
+/// hung socket protocol), then delete the stale socket + pid files so the
+/// next request spawns a clean daemon. Best-effort — a graceful `stop`
+/// should be tried first; this is the sledgehammer.
+pub fn forceKillDaemon(io: std.Io, arena: std.mem.Allocator, environ: *std.process.Environ.Map) ForceKill {
+    // Try a graceful stop first so a *responsive* daemon exits cleanly and
+    // removes its own files; only fall through to killing by pid if it's
+    // truly wedged.
+    _ = stopDaemon(io, arena, environ);
+
+    const pid = readPidFile(io, arena, environ);
+    var killed = false;
+    if (pid) |p| killed = terminatePid(p);
+
+    // Whether or not a process was killed, clear the stale artifacts so the
+    // next CLI call spawns fresh.
+    if (Server.socketPath(arena, environ)) |sock| std.Io.Dir.cwd().deleteFile(io, sock) catch {} else |_| {}
+    if (Server.pidFilePath(arena, environ)) |pf| std.Io.Dir.cwd().deleteFile(io, pf) catch {} else |_| {}
+
+    return .{ .killed = killed, .pid = pid };
+}
+
+fn readPidFile(io: std.Io, arena: std.mem.Allocator, environ: *std.process.Environ.Map) ?u32 {
+    const path = Server.pidFilePath(arena, environ) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64)) catch return null;
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return std.fmt.parseInt(u32, trimmed, 10) catch null;
+}
+
+/// Terminates a process by pid. Returns true on a successful kill (or if
+/// the process was already gone). Windows-only for now (M4); POSIX kill(2)
+/// arrives with the POSIX daemon in M5.
+fn terminatePid(pid: u32) bool {
+    if (@import("builtin").os.tag != .windows) return false;
+    const windows = std.os.windows;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+    // A null handle usually means the process is already gone — treat that
+    // as success (the daemon we wanted dead is dead).
+    if (handle == null or handle == windows.INVALID_HANDLE_VALUE) return true;
+    defer windows.CloseHandle(handle.?);
+    return TerminateProcess(handle.?, 1) != 0;
+}
+
+extern "kernel32" fn OpenProcess(
+    dwDesiredAccess: u32,
+    bInheritHandle: i32,
+    dwProcessId: u32,
+) callconv(.winapi) ?std.os.windows.HANDLE;
+
+extern "kernel32" fn TerminateProcess(
+    hProcess: std.os.windows.HANDLE,
+    uExitCode: u32,
+) callconv(.winapi) i32;

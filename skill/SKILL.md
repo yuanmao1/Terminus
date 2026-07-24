@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.9.** If a documented flag is rejected, the
+**Requires terminus >= 0.1.10.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -36,6 +36,11 @@ terminus memory add <server> --key gotchas --content "text with ; and *"
 
 For agents: **use `--cmd`/`--content` for one-liners and `--stdin` for
 anything with quotes, semicolons, globs, or multiple lines.**
+
+Windows CRLF is handled automatically: `--stdin` and `--cmd-file` input
+is normalized from CRLF/CR to LF before it reaches the remote shell, so a
+`\r` can never turn `true` into `true\r`. Pass `--raw` to keep bytes
+exactly (rare — only for binary-in-script cases).
 
 ## Multiline scripts run byte-exact
 
@@ -136,8 +141,9 @@ terminus exec <server> -- git status          # runs in /srv/app
 terminus run <server> --name build -- npm run build
 terminus job status <server> build --json     # running | exited | killed + exitCode
 terminus job read <server> build --from-cursor --json
+terminus job watch <server> build --interval 30s --json  # block until it ends
 terminus job kill <server> build
-terminus job ls <server> --json
+terminus job ls <server> --active --limit 20 --json
 
 # Persistent interactive session (requires tmux on the server)
 terminus session new <server> <name>
@@ -206,6 +212,39 @@ terminus job rm prod migrate              # cleanup when done
 ```
 
 Job names are unique per server while running; finished names can be reused.
+
+### Waiting on a job and reporting business state
+
+- **Don't poll in a busy loop.** `terminus job watch <server> <name>
+  --interval 30s --json` blocks and returns the instant the job reaches a
+  terminal state (or after `--max` polls, reported as `timedOut:true`).
+- **Exit code ≠ business success.** A job can exit 0 yet fail its actual
+  purpose (0 rows migrated, health check red). Have the job print a
+  marker line and Terminus surfaces it as `businessResult`, separate from
+  `exitCode`, in `job status`/`job read`/`job watch`:
+
+  ```bash
+  terminus run db --name migrate -- 'bash -c "./migrate.sh; echo __TERMINUS_RESULT__:rows=$(count)"'
+  terminus job watch db migrate --json   # -> {"exitCode":0,"businessResult":"rows=1240",...}
+  ```
+
+  Use `__TERMINUS_RESULT__:success` / `:failed` / `:<any value>` — the
+  last such line wins, so a job can update its verdict as it runs.
+
+### Recovering a wedged daemon
+
+Every response carries `transport` ("daemon"/"direct") and `daemonError`.
+If the daemon repeatedly errors or a call hangs unusually long:
+
+```bash
+terminus daemon status --json           # is it up? which pid?
+terminus daemon restart                 # graceful; next call respawns it
+terminus daemon restart --force --json  # hard-kill a wedged daemon by pidfile
+```
+
+`--force` bypasses the (possibly hung) socket, kills the pid, and clears
+stale files. Remote tmux jobs are unaffected — they live on the server,
+not in the daemon. Commands always fall back to direct SSH meanwhile.
 
 ## Memory discipline
 

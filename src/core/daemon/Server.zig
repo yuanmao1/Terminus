@@ -66,12 +66,27 @@ pub fn socketPath(arena: std.mem.Allocator, environ: *std.process.Environ.Map) !
     return std.fs.path.join(arena, &.{ home, ".terminus", "daemon.sock" });
 }
 
+/// Records the daemon's pid so `daemon restart --force` can hard-kill a
+/// wedged instance without going through the (possibly hung) socket.
+pub fn pidFilePath(arena: std.mem.Allocator, environ: *std.process.Environ.Map) ![]u8 {
+    const home = environ.get("USERPROFILE") orelse environ.get("HOME") orelse
+        return error.NoHomeDirectory;
+    return std.fs.path.join(arena, &.{ home, ".terminus", "daemon.pid" });
+}
+
+fn writePidFile(io: std.Io, path: []const u8) void {
+    var buffer: [16]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{d}", .{currentPid()}) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch {};
+}
+
 fn nowNs(io: std.Io) i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, 1));
 }
 
 pub fn run(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, environ: *std.process.Environ.Map) !void {
     const path = try socketPath(arena, environ);
+    const pid_path = try pidFilePath(arena, environ);
     std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?) catch {};
     const idle_ns = envNs(environ, "TERMINUS_DAEMON_IDLE_SECS", default_idle_exit_ns);
     const request_max_ns = envNs(environ, "TERMINUS_DAEMON_REQUEST_MAX_SECS", default_request_max_ns);
@@ -84,11 +99,11 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, environ
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             var retry_address = try std.Io.net.UnixAddress.init(path);
             var retry = try retry_address.listen(io, .{});
-            return serve(io, gpa, &retry, path, idle_ns, request_max_ns);
+            return serve(io, gpa, &retry, path, pid_path, idle_ns, request_max_ns);
         },
         else => return err,
     };
-    return serve(io, gpa, &server, path, idle_ns, request_max_ns);
+    return serve(io, gpa, &server, path, pid_path, idle_ns, request_max_ns);
 }
 
 fn isLive(io: std.Io, path: []const u8) bool {
@@ -98,17 +113,18 @@ fn isLive(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn serve(io: std.Io, gpa: std.mem.Allocator, server: *std.Io.net.Server, path: []const u8, idle_ns: i96, request_max_ns: i96) !void {
+fn serve(io: std.Io, gpa: std.mem.Allocator, server: *std.Io.net.Server, path: []const u8, pid_path: []const u8, idle_ns: i96, request_max_ns: i96) !void {
     last_activity_ns.store(nowNs(io), .monotonic);
+    writePidFile(io, pid_path);
 
     // Watchdog: exits the whole process on idle (or wedge, see above).
-    // process.exit skips defers, so it removes the socket file itself.
-    const watchdog = try std.Thread.spawn(.{}, watchdogMain, .{ io, path, idle_ns, request_max_ns });
+    // process.exit skips defers, so it removes the socket + pid files itself.
+    const watchdog = try std.Thread.spawn(.{}, watchdogMain, .{ io, path, pid_path, idle_ns, request_max_ns });
     watchdog.detach();
 
     while (true) {
         const stream = server.accept(io) catch break;
-        const thread = std.Thread.spawn(.{}, connectionMain, .{ io, gpa, stream, path }) catch {
+        const thread = std.Thread.spawn(.{}, connectionMain, .{ io, gpa, stream, path, pid_path }) catch {
             var s = stream;
             s.close(io);
             continue;
@@ -117,15 +133,17 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, server: *std.Io.net.Server, path: [
     }
 
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, pid_path) catch {};
 }
 
-fn watchdogMain(io: std.Io, path: []const u8, idle_ns: i96, request_max_ns: i96) void {
+fn watchdogMain(io: std.Io, path: []const u8, pid_path: []const u8, idle_ns: i96, request_max_ns: i96) void {
     while (true) {
         std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_s }, .awake) catch {};
         const idle: i96 = nowNs(io) - last_activity_ns.load(.monotonic);
         const active = active_requests.load(.monotonic);
         if (active == 0 and idle > idle_ns) {
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, pid_path) catch {};
             std.process.exit(0);
         }
         // In-flight requests hold the daemon open — unless nothing has
@@ -133,17 +151,19 @@ fn watchdogMain(io: std.Io, path: []const u8, idle_ns: i96, request_max_ns: i96)
         // wedged (the CLI falls back to direct SSH and respawns).
         if (active > 0 and idle > request_max_ns) {
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, pid_path) catch {};
             std.process.exit(1);
         }
     }
 }
 
-fn connectionMain(io: std.Io, gpa: std.mem.Allocator, stream_value: std.Io.net.Stream, path: []const u8) void {
+fn connectionMain(io: std.Io, gpa: std.mem.Allocator, stream_value: std.Io.net.Stream, path: []const u8, pid_path: []const u8) void {
     var stream = stream_value;
     defer stream.close(io);
     const stop = handleConnection(io, gpa, &stream) catch false;
     if (stop) {
         std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, pid_path) catch {};
         std.process.exit(0);
     }
 }

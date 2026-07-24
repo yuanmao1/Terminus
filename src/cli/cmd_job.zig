@@ -31,11 +31,15 @@ const run_usage =
 const job_usage =
     \\usage: terminus job <verb> <server> [<name>] [...]
     \\
-    \\  job ls     <server> [--json]
-    \\  job status <server> <name> [--json]     probe: running? exit code?
+    \\  job ls     <server> [--active] [--name <substr>] [--limit N] [--json]
+    \\  job status <server> <name> [--json]     probe: running? exit code? businessResult?
     \\  job read   <server> <name> [--from-cursor] [--limit BYTES] [--json]
+    \\  job watch  <server> <name> [--interval 15s] [--max N] [--json]  block until it ends
     \\  job kill   <server> <name>               terminate the job's session
     \\  job rm     <server> <name>               forget the job (kills if running)
+    \\
+    \\A job can print '__TERMINUS_RESULT__:<value>' to report business state
+    \\(success/failure/rows=N) separately from its process exit code.
     \\
 ;
 
@@ -151,15 +155,43 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const resolved = Cli.resolveServer(ctx, &store, server_name);
 
     if (std.mem.eql(u8, verb, "ls")) {
-        const list = Store.jobs.list(&store, ctx.arena, resolved.server.id) catch |err|
+        var list = Store.jobs.list(&store, ctx.arena, resolved.server.id) catch |err|
             Cli.storeFatal(&store, err);
+        // Filters: --active keeps only running jobs; --name <substr> keeps
+        // matching names; --limit N caps the (newest-first) result count.
+        const only_active = parsed.boolean("active");
+        const name_filter = parsed.flag("name");
+        const limit: usize = if (parsed.flag("limit")) |l|
+            std.fmt.parseInt(usize, l, 10) catch fatal("invalid --limit '{s}'", .{l})
+        else
+            20;
+        var filtered: std.ArrayList(Store.jobs.Job) = .empty;
+        for (list) |j| {
+            if (only_active and j.status != .running) continue;
+            if (name_filter) |nf| if (std.mem.indexOf(u8, j.name, nf) == null) continue;
+            try filtered.append(ctx.arena, j);
+        }
+        const total = filtered.items.len;
+        const shown = filtered.items[0..@min(limit, total)];
+        list = shown;
         switch (ctx.out.format) {
-            .json => try ctx.out.json(.{ .ok = true, .server = server_name, .jobs = list }),
+            .json => try ctx.out.json(.{
+                .ok = true,
+                .server = server_name,
+                .jobs = list,
+                .total = total,
+                .shown = shown.len,
+            }),
             .human => {
-                if (list.len == 0) return ctx.out.print("no jobs on '{s}'\n", .{server_name});
+                if (total == 0) return ctx.out.print("no jobs on '{s}'\n", .{server_name});
                 for (list) |j| {
-                    try ctx.out.print("{s}  {t}  exit={?d}  cmd: {s}\n", .{ j.name, j.status, j.exit_code, j.command });
+                    // Compact: name, status, exit code, first line of cmd.
+                    const first_line = std.mem.sliceTo(j.command, '\n');
+                    const brief = if (first_line.len > 60) first_line[0..60] else first_line;
+                    try ctx.out.print("{s}\t{t}\texit={?d}\t{s}\n", .{ j.name, j.status, j.exit_code, brief });
                 }
+                if (shown.len < total)
+                    try ctx.out.print("... {d} more (raise --limit to see all)\n", .{total - shown.len});
             },
         }
         return;
@@ -183,13 +215,18 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 .job = job.name,
                 .status = @tagName(state.status),
                 .exitCode = state.exit_code,
+                .businessResult = state.business_result,
                 .command = job.command,
                 .createdAt = job.created_at,
                 .finishedAt = state.finished_at,
                 .transport = conn.transport,
                 .daemonError = conn.daemon_error,
             }),
-            .human => try ctx.out.print("job '{s}': {t} (exit={?d})\n", .{ job.name, state.status, state.exit_code }),
+            .human => {
+                try ctx.out.print("job '{s}': {t} (exit={?d})", .{ job.name, state.status, state.exit_code });
+                if (state.business_result) |br| try ctx.out.print(" result={s}", .{br});
+                try ctx.out.print("\n", .{});
+            },
         }
     } else if (std.mem.eql(u8, verb, "read")) {
         const limit: i64 = if (parsed.flag("limit")) |l|
@@ -209,11 +246,60 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 .job = job.name,
                 .status = @tagName(state.status),
                 .exitCode = state.exit_code,
+                .businessResult = state.business_result,
                 .from = from,
                 .to = probe.next_cursor,
                 .data = probe.output,
             }),
             .human => try ctx.out.print("{s}", .{probe.output}),
+        }
+    } else if (std.mem.eql(u8, verb, "watch")) {
+        // Poll until the job reaches a terminal state (or --max polls),
+        // sleeping --interval between probes. One blocking call replaces an
+        // agent's manual poll loop; it returns the moment the job ends.
+        const interval_ns = parseInterval(parsed.flag("interval") orelse "15s");
+        const max_polls: u32 = if (parsed.flag("max")) |m|
+            std.fmt.parseInt(u32, m, 10) catch fatal("invalid --max '{s}'", .{m})
+        else
+            240; // 240 * 15s default ≈ 1h ceiling
+        var polls: u32 = 0;
+        var current = job;
+        var state = refresh(ctx, &store, executor, session, current);
+        while (state.status == .running and polls < max_polls) {
+            std.Io.sleep(ctx.io, .{ .nanoseconds = @intCast(interval_ns) }, .awake) catch {};
+            polls += 1;
+            // Re-read the row so a completion persisted by refresh sticks.
+            current = (Store.jobs.getByName(&store, ctx.arena, resolved.server.id, job_name) catch |err|
+                Cli.storeFatal(&store, err)) orelse current;
+            state = refresh(ctx, &store, executor, session, current);
+        }
+        const timed_out = state.status == .running;
+        switch (ctx.out.format) {
+            .json => try ctx.out.json(.{
+                .ok = true,
+                .server = server_name,
+                .job = current.name,
+                .status = @tagName(state.status),
+                .exitCode = state.exit_code,
+                .businessResult = state.business_result,
+                .timedOut = timed_out,
+                .polls = polls,
+            }),
+            .human => {
+                if (timed_out)
+                    try ctx.out.print("job '{s}' still running after {d} polls\n", .{ current.name, polls })
+                else {
+                    try ctx.out.print("job '{s}' {t} (exit={?d})", .{ current.name, state.status, state.exit_code });
+                    if (state.business_result) |br| try ctx.out.print(" result={s}", .{br});
+                    try ctx.out.print("\n", .{});
+                }
+            },
+        }
+        if (state.status == .exited) {
+            if (state.exit_code) |code| if (code != 0) {
+                try ctx.out.flush();
+                std.process.exit(@intCast(std.math.clamp(code, 1, 255)));
+            };
         }
     } else if (std.mem.eql(u8, verb, "kill")) {
         Tmux.kill(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session);
@@ -241,6 +327,7 @@ const State = struct {
     status: Store.jobs.Status,
     exit_code: ?i64,
     finished_at: ?i64,
+    business_result: ?[]const u8 = null,
 };
 
 /// One SSH probe from the stored cursor; persists any completion it sees.
@@ -254,17 +341,17 @@ fn refresh(ctx: *Cli.Ctx, store: *Store, executor: Core.Executor, session: []con
 
 fn applyProbe(ctx: *Cli.Ctx, store: *Store, job: Store.jobs.Job, probe: Tmux.JobProbe) State {
     if (job.status != .running)
-        return .{ .status = job.status, .exit_code = job.exit_code, .finished_at = job.finished_at };
+        return .{ .status = job.status, .exit_code = job.exit_code, .finished_at = job.finished_at, .business_result = probe.business_result };
     if (probe.exit_code) |code| {
         Store.jobs.markFinished(store, job.id, .exited, code, ctx.now) catch |err| Cli.storeFatal(store, err);
-        return .{ .status = .exited, .exit_code = code, .finished_at = ctx.now };
+        return .{ .status = .exited, .exit_code = code, .finished_at = ctx.now, .business_result = probe.business_result };
     }
     if (!probe.session_alive) {
         // Session gone without a sentinel: killed externally or crashed.
         Store.jobs.markFinished(store, job.id, .killed, null, ctx.now) catch |err| Cli.storeFatal(store, err);
-        return .{ .status = .killed, .exit_code = null, .finished_at = ctx.now };
+        return .{ .status = .killed, .exit_code = null, .finished_at = ctx.now, .business_result = probe.business_result };
     }
-    return .{ .status = .running, .exit_code = null, .finished_at = null };
+    return .{ .status = .running, .exit_code = null, .finished_at = null, .business_result = probe.business_result };
 }
 
 fn validateJobName(name: []const u8) void {
@@ -275,4 +362,22 @@ fn validateJobName(name: []const u8) void {
             else => fatal("job name may only contain [a-zA-Z0-9._-]", .{}),
         }
     }
+}
+
+/// Parses "15s" / "5m" / "1h" (bare number = seconds) into nanoseconds,
+/// clamped to [1s, 1h] so a watch can never busy-spin or hang forever.
+fn parseInterval(spec: []const u8) i64 {
+    if (spec.len == 0) fatal("empty --interval", .{});
+    const last = spec[spec.len - 1];
+    const unit_ns: i64 = switch (last) {
+        's' => std.time.ns_per_s,
+        'm' => std.time.ns_per_min,
+        'h' => std.time.ns_per_hour,
+        '0'...'9' => std.time.ns_per_s,
+        else => fatal("invalid --interval '{s}' (e.g. 15s, 5m, 1h)", .{spec}),
+    };
+    const digits = if (last >= '0' and last <= '9') spec else spec[0 .. spec.len - 1];
+    const value = std.fmt.parseInt(i64, digits, 10) catch fatal("invalid --interval '{s}'", .{spec});
+    const ns = value * unit_ns;
+    return std.math.clamp(ns, std.time.ns_per_s, std.time.ns_per_hour);
 }

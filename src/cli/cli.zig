@@ -240,21 +240,46 @@ pub fn trailingContent(
     comptime file_flag: []const u8,
     expected_positionals: usize,
 ) !?[]const u8 {
+    // stdin and file channels are byte-exact, so on Windows they carry the
+    // CRLF line endings of the local editor/heredoc. A remote POSIX shell
+    // treats a trailing `\r` as part of the token (`true\r` is not `true`),
+    // which is the single most common Windows footgun. Normalize CRLF -> LF
+    // by default; --raw preserves the bytes for the rare binary-in-script case.
+    const keep_raw = parsed.boolean("raw");
     if (parsed.boolean("stdin")) {
         var buffer: [4096]u8 = undefined;
         var reader = std.Io.File.stdin().readerStreaming(ctx.io, &buffer);
         const content = reader.interface.allocRemaining(ctx.arena, .limited(16 << 20)) catch
             fail("cannot read stdin", .{});
         if (std.mem.trim(u8, content, " \t\r\n").len == 0) return null;
-        return content;
+        return if (keep_raw) content else try stripCarriageReturns(ctx.arena, content);
     }
     if (parsed.flag(file_flag)) |path| {
         const content = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(16 << 20)) catch
             fail("cannot read {s}", .{path});
         if (std.mem.trim(u8, content, " \t\r\n").len == 0) return null;
-        return content;
+        return if (keep_raw) content else try stripCarriageReturns(ctx.arena, content);
     }
     return parsed.trailing(ctx.arena, expected_positionals);
+}
+
+/// Rewrites CRLF and lone CR into LF. Returns the input unchanged (no copy)
+/// when it already contains no carriage returns — the common Unix case.
+pub fn stripCarriageReturns(arena: std.mem.Allocator, content: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, content, '\r') == null) return content;
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, content.len);
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (content[i] == '\r') {
+            // Collapse CRLF to LF; a lone CR also becomes LF (old-Mac endings).
+            if (i + 1 < content.len and content[i + 1] == '\n') continue;
+            out.appendAssumeCapacity('\n');
+        } else {
+            out.appendAssumeCapacity(content[i]);
+        }
+    }
+    return out.items;
 }
 
 /// Wraps a command in an interactive login shell so it sees the user's

@@ -10,9 +10,11 @@ const Core = @import("../core/core.zig");
 const usage =
     \\usage: terminus daemon <verb>
     \\
-    \\  daemon status [--json]   is a daemon running? (pid)
-    \\  daemon stop              ask the daemon to exit now
-    \\  daemon run               serve in the foreground (internal; CLI spawns this)
+    \\  daemon status [--json]     is a daemon running? (pid)
+    \\  daemon stop                ask the daemon to exit now (graceful)
+    \\  daemon restart [--force]   stop then let the next call respawn; --force
+    \\                             hard-kills a wedged daemon via its pidfile
+    \\  daemon run                 serve in the foreground (internal; CLI spawns this)
     \\
 ;
 
@@ -41,6 +43,26 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         switch (ctx.out.format) {
             .json => try ctx.out.json(.{ .ok = true, .stopped = stopped }),
             .human => try ctx.out.print("{s}\n", .{if (stopped) "daemon stopped" else "daemon was not running"}),
+        }
+    } else if (std.mem.eql(u8, verb, "restart")) {
+        // Graceful stop leaves respawn to the next SSH-bearing call (which
+        // carries the auth material the daemon needs). --force hard-kills a
+        // wedged daemon whose socket no longer answers.
+        if (parsed.boolean("force")) {
+            const result = Core.DaemonClient.forceKillDaemon(ctx.io, ctx.arena, ctx.environ);
+            switch (ctx.out.format) {
+                .json => try ctx.out.json(.{ .ok = true, .forced = true, .killed = result.killed, .pid = result.pid }),
+                .human => if (result.killed)
+                    try ctx.out.print("daemon force-killed (pid {?d}); next command respawns it\n", .{result.pid})
+                else
+                    try ctx.out.print("no daemon to kill; stale files cleared, next command respawns it\n", .{}),
+            }
+        } else {
+            const stopped = Core.DaemonClient.stopDaemon(ctx.io, ctx.arena, ctx.environ);
+            switch (ctx.out.format) {
+                .json => try ctx.out.json(.{ .ok = true, .forced = false, .stopped = stopped }),
+                .human => try ctx.out.print("{s}; next command respawns it\n", .{if (stopped) "daemon stopped" else "daemon was not running"}),
+            }
         }
     } else {
         fatal("unknown verb 'daemon {s}'\n{s}", .{ verb, usage });

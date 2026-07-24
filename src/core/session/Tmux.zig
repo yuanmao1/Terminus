@@ -248,7 +248,35 @@ pub const JobProbe = struct {
     /// Set when the sentinel result line appeared: the job finished.
     exit_code: ?i32,
     session_alive: bool,
+    /// Business-state marker: the value from the last `__TERMINUS_RESULT__:<v>`
+    /// line the job printed, distinct from the process exit code (a job can
+    /// exit 0 yet report a business failure). Null when the job printed none.
+    business_result: ?[]const u8 = null,
 };
+
+/// Jobs opt into business-state reporting by printing this marker; the
+/// value after the colon becomes `businessResult` in status/read output.
+pub const business_marker = "__TERMINUS_RESULT__";
+
+/// Returns the value from the LAST `__TERMINUS_RESULT__:<value>` line in
+/// `data` (line-start match), or null. Last wins so a job can update its
+/// verdict as it progresses.
+fn findBusinessResult(arena: Allocator, data: []const u8) Allocator.Error!?[]const u8 {
+    var search_from: usize = 0;
+    var last: ?[]const u8 = null;
+    while (std.mem.indexOfPos(u8, data, search_from, business_marker)) |pos| {
+        const line_start = if (std.mem.lastIndexOfScalar(u8, data[0..pos], '\n')) |nl| nl + 1 else 0;
+        const line_end = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse data.len;
+        if (line_start == pos) {
+            const after = data[pos + business_marker.len .. line_end];
+            if (after.len >= 1 and after[0] == ':') {
+                last = std.mem.trim(u8, after[1..], " \t\r");
+            }
+        }
+        search_from = pos + business_marker.len;
+    }
+    return if (last) |v| try arena.dupe(u8, v) else null;
+}
 
 /// One SSH round to answer "how is this job doing": reads new log output,
 /// looks for the sentinel result line, checks pane liveness. Used by both
@@ -274,6 +302,7 @@ pub fn probeJob(
         .next_cursor = chunk.next_cursor,
         .exit_code = exit_code,
         .session_alive = try isAlive(executor, arena, name),
+        .business_result = try findBusinessResult(arena, cleaned),
     };
 }
 
