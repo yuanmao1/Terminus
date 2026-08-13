@@ -221,6 +221,111 @@ test "blackbox: the binary runs and reports a version" {
     try r.expectCode(0);
 }
 
+test "blackbox: a bare `exit` cannot swallow the wrapper's exit marker" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "wrapper");
+    defer f.deinit();
+
+    // Run the real supervision wrapper through a real POSIX shell. Every
+    // other gate on this wrapper inspects the text it produces, which cannot
+    // catch the failure mode: `exit 42` used to terminate the very shell that
+    // was going to write the marker, so a command whose status was never in
+    // doubt came back `indeterminate`.
+    //
+    // A missing `sh` fails this gate rather than skipping it. A shell-quoting
+    // rule is not something to take on trust because the machine was awkward.
+    const nonce: u64 = 987654321;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{ "exit 42", "sh -c 'exit 42'", "false; exit 42" }, 0..) |command, i| {
+        const script = try Terminus.Core.supervisor.wrapShell(arena, command, nonce);
+
+        // Via a file rather than `sh -c <text>`: the script is multi-line and
+        // full of quotes, and this gate is about the wrapper, not about how
+        // two layers of argument quoting survive a Windows command line.
+        const path = try std.fmt.allocPrint(arena, "{s}/wrap_{d}.sh", .{ f.dir, i });
+        try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = path, .data = script });
+        defer std.Io.Dir.cwd().deleteFile(f.io, path) catch {};
+
+        const result = try std.process.run(arena, f.io, .{
+            .argv = &.{ "sh", path },
+            .stdout_limit = .limited(1 << 16),
+            .stderr_limit = .limited(1 << 16),
+        });
+
+        const observed = try Terminus.Core.supervisor.parseShell(arena, nonce, result.stdout, result.stderr);
+        std.testing.expectEqual(@as(?i32, 42), observed.exit_code) catch |err| {
+            std.debug.print("command {s} lost its marker\nstdout:\n{s}\n", .{ command, result.stdout });
+            return err;
+        };
+    }
+}
+
+/// A job-name reservation left behind by a launcher that did not finish,
+/// with its owning attempt parked at `status`.
+fn seedReservation(f: *Fixture, request_id: []const u8, name: []const u8, status: []const u8) !void {
+    var store = try f.open();
+    defer store.close();
+
+    try Store.operations.create(&store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "box",
+        .kind = .job,
+        .scope_kind = .job,
+        .scope_key = name,
+        .alias = name,
+        .mutating = true,
+        .now = 1000,
+    });
+    try Store.operations.advance(&store, request_id, .connecting, 1001);
+    if (std.mem.eql(u8, status, "submitted")) {
+        try Store.operations.advance(&store, request_id, .submitted, 1002);
+    }
+    _ = try Store.jobs.create(&store, 1, name, "make deploy", "__TERMINUS_JOB_9__", request_id, 1002);
+}
+
+test "blackbox: a stranded reservation is reclaimed only when its launch never submitted" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "reclaim");
+    defer f.deinit();
+    try f.seedServer();
+
+    // Killed while still dialling. The attempt provably handed nothing over,
+    // so the name it was holding is free — refusing forever would make every
+    // crashed launch a manual cleanup, and deleting it on age would sooner or
+    // later delete the row of a launcher that was merely slow.
+    try seedReservation(&f, "01AAAAAAAA0123456789ABCDEF", "dialling", "connecting");
+    var reclaimed = try run(&f, &.{
+        "run", "box", "--name", "dialling", "--cmd", "make deploy", "--db", f.db,
+    });
+    defer reclaimed.deinit(f.allocator);
+    try reclaimed.expectSaysNot("is pending");
+    try reclaimed.expectSays("connect"); // got past the guard, died at the network
+
+    // Killed after submitting. Something may be running under that name, so
+    // the reservation stands and `--force` does not move it: forcing means "I
+    // accept an unknown outcome", not "tear the name off a live job".
+    try seedReservation(&f, "01BBBBBBBB0123456789ABCDEF", "sent", "submitted");
+    var refused = try run(&f, &.{
+        "run", "box", "--name", "sent", "--cmd", "make deploy", "--force", "--db", f.db,
+    });
+    defer refused.deinit(f.allocator);
+    try refused.expectCode(1);
+    try refused.expectSays("is pending");
+    try refused.expectSays("nothing was sent");
+    try refused.expectSaysNot("cannot connect");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const survivor = (try Store.jobs.getByName(&store, arena_state.allocator(), 1, "sent")).?;
+    try t.expectEqualStrings("01BBBBBBBB0123456789ABCDEF", survivor.owner_request_id.?);
+}
+
 test "blackbox: an in-flight attempt is visible and says it blocks its scope" {
     const t = std.testing;
     var f = try Fixture.init(t.allocator, "inflight");

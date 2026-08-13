@@ -2,3 +2,4 @@
 zig-out/
 npm/bin/Terminus.exe
 npm/*.tgz
+CLAUDE.md

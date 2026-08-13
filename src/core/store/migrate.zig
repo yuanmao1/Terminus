@@ -383,6 +383,22 @@ const migrations = [_][:0]const u8{
     // predate the notion; those are unowned and only a human can clear them.
     \\ALTER TABLE jobs ADD COLUMN owner_request_id TEXT;
     ,
+    // v10: whether an attempt claims its scope as a writer.
+    //
+    // The scope guard blocks a mutation while an overlapping attempt's
+    // outcome is unknown. `--read-only` declared "I am not a mutation" — but
+    // the flag lived only in memory, so once the attempt was stored the
+    // ledger could no longer tell. A read-only exec that then lost its
+    // connection blocked every later mutation on that server exactly like a
+    // writer: the opposite of what the flag promised, and asymmetric with its
+    // own behaviour a minute earlier.
+    //
+    // Default 1. Every row written before this column existed came from a
+    // build with no read-only concept, and reading an unrecorded role as
+    // "read-only" would quietly unblock scopes that were being held for a
+    // reason.
+    \\ALTER TABLE operations ADD COLUMN mutating INTEGER NOT NULL DEFAULT 1;
+    ,
 };
 
 /// Number of schema versions this binary knows about.

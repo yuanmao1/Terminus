@@ -59,6 +59,10 @@ pub const CreateOptions = struct {
     shell: ?[]const u8 = null,
     capability_json: ?[]const u8 = null,
     transport: ?[]const u8 = null,
+    /// Whether this attempt claims its scope as a writer. Recorded, because
+    /// the guard has to answer the same question later, when the caller that
+    /// knew the answer is long gone.
+    mutating: bool = true,
     now: i64,
 };
 
@@ -81,6 +85,7 @@ pub const Operation = struct {
     shell: ?[]const u8,
     capability_json: ?[]const u8,
     transport: ?[]const u8,
+    mutating: bool,
     created_at: i64,
     updated_at: i64,
 
@@ -116,8 +121,8 @@ pub fn create(store: *Store, opts: CreateOptions) Error!void {
         \\  request_id, schema_version, server_id, server_name, kind,
         \\  scope_kind, scope_key, alias, status,
         \\  argv_redacted, argv_sha256, cwd, shell, capability_json, transport,
-        \\  created_at, updated_at
-        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'created', ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+        \\  mutating, created_at, updated_at
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'created', ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?15, ?15)
     );
     defer stmt.deinit();
     try stmt.bindText(1, opts.request_id);
@@ -135,6 +140,7 @@ pub fn create(store: *Store, opts: CreateOptions) Error!void {
     try stmt.bindOptText(13, opts.capability_json);
     try stmt.bindOptText(14, opts.transport);
     try stmt.bindInt(15, opts.now);
+    try stmt.bindInt(16, @intFromBool(opts.mutating));
     _ = try stmt.step();
 }
 
@@ -142,7 +148,7 @@ const select_columns =
     \\SELECT request_id, schema_version, server_id, server_name, kind,
     \\       scope_kind, scope_key, alias, status, resolved_status,
     \\       reconciled_at, resolution_evidence, argv_redacted, argv_sha256,
-    \\       cwd, shell, capability_json, transport, created_at, updated_at
+    \\       cwd, shell, capability_json, transport, mutating, created_at, updated_at
     \\FROM operations
 ;
 
@@ -172,8 +178,9 @@ fn rowToOperation(arena: Allocator, stmt: *Db.Stmt) (Allocator.Error || error{Un
         .shell = try dupOpt(arena, stmt.columnOptText(15)),
         .capability_json = try dupOpt(arena, stmt.columnOptText(16)),
         .transport = try dupOpt(arena, stmt.columnOptText(17)),
-        .created_at = stmt.columnInt(18),
-        .updated_at = stmt.columnInt(19),
+        .mutating = stmt.columnInt(18) != 0,
+        .created_at = stmt.columnInt(19),
+        .updated_at = stmt.columnInt(20),
     };
 }
 
@@ -252,17 +259,40 @@ const unsettled_predicate =
     \\  OR (status = 'indeterminate' AND resolved_status IS NULL))
 ;
 
+/// The scope barrier is held by writers only.
+///
+/// A read whose outcome is unknown is still worth surfacing — `request ls`
+/// lists it, a handoff carries it — but it cannot make a later change unsafe,
+/// because whatever it did or did not do, it did not change anything. Holding
+/// the barrier for one would also be inconsistent with the same attempt while
+/// it ran, which was allowed to proceed alongside a mutation.
+const holds_scope_predicate = unsettled_predicate ++ " AND mutating = 1";
+
 pub fn unsettled(store: *Store, arena: Allocator, server_id: i64) (Error || Allocator.Error)![]Operation {
+    return selectWhere(store, arena, server_id, unsettled_predicate);
+}
+
+/// The subset of `unsettled` that actually bars a change: writers.
+fn holdingScope(store: *Store, arena: Allocator, server_id: i64) (Error || Allocator.Error)![]Operation {
+    return selectWhere(store, arena, server_id, holds_scope_predicate);
+}
+
+fn selectWhere(
+    store: *Store,
+    arena: Allocator,
+    server_id: i64,
+    comptime predicate: []const u8,
+) (Error || Allocator.Error)![]Operation {
     var out: std.ArrayList(Operation) = .empty;
     var stmt = try store.db.prepare(select_columns ++
-        " WHERE server_id = ?1 AND " ++ unsettled_predicate ++ " ORDER BY created_at DESC");
+        " WHERE server_id = ?1 AND " ++ predicate ++ " ORDER BY created_at DESC");
     defer stmt.deinit();
     try stmt.bindInt(1, server_id);
     while (try stmt.step()) try out.append(arena, try rowToOperation(arena, &stmt));
     return out.toOwnedSlice(arena);
 }
 
-/// Unsettled attempts overlapping a scope, for the mutation guard.
+/// Unsettled *writers* overlapping a scope, for the mutation guard.
 ///
 /// Overlap is decided in Zig using the shared `scope.Scope.overlaps` rules —
 /// the same ones leases use. SQL equality on (kind, key) was not the same
@@ -271,16 +301,17 @@ pub fn unsettled(store: *Store, arena: Allocator, server_id: i64) (Error || Allo
 /// touch the same thing" is the whole point; two nearly-identical ones is
 /// how a hole appears.
 ///
-/// An unsettled operation that never declared a scope is treated as covering
+/// An unsettled attempt that never declared a scope is treated as covering
 /// the whole server: work that may still be running and whose blast radius
-/// we cannot name has to block, rather than be assumed harmless.
+/// we cannot name has to block, rather than be assumed harmless. A read-only
+/// attempt does not block at all — see `holds_scope_predicate`.
 pub fn unsettledInScope(
     store: *Store,
     arena: Allocator,
     server_id: i64,
     target: scope.Scope,
 ) (Error || Allocator.Error)![]Operation {
-    const candidates = try unsettled(store, arena, server_id);
+    const candidates = try holdingScope(store, arena, server_id);
     var out: std.ArrayList(Operation) = .empty;
     for (candidates) |op| {
         if (op.scopeOf().overlaps(target)) try out.append(arena, op);

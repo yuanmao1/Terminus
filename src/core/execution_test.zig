@@ -385,7 +385,6 @@ test "M2 gate: an unsettled peer blocks a mutation but only warns a read" {
     var read_exec = read_start.ready;
     defer read_exec.deinit();
     try t.expect(read_exec.advisory != null);
-
     // Forcing past the blocker is allowed and leaves an audit event.
     const forced_start = try h.begin(.{
         .kind = .job,
@@ -398,6 +397,52 @@ test "M2 gate: an unsettled peer blocks a mutation but only warns a read" {
     const rows = try receipts.list(&h.store, h.arena, forced.id());
     try t.expectEqualStrings("audit", rows[0].kind);
     try t.expect(std.mem.indexOf(u8, rows[0].detail_json.?, "forced_past_blocker") != null);
+}
+
+test "M2e gate: an unsettled read holds no scope, before or after it is stored" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2e_readonly_scope");
+    defer h.deinit();
+
+    const job_scope: scope_mod.Scope = .{ .kind = .job, .key = "deploy" };
+
+    // A read-only attempt that lost its connection after submission. Its
+    // outcome is genuinely unknown — and irrelevant to anyone else, because
+    // whatever it did or did not do, it did not change anything.
+    var reader_id: [26]u8 = undefined;
+    {
+        const start = try h.begin(.{ .kind = .exec, .scope = job_scope, .mutating = false });
+        var exec = start.ready;
+        @memcpy(&reader_id, exec.id());
+        try exec.connecting();
+        try mustSubmit(&exec);
+        _ = try exec.transportLoss("eof");
+    }
+    try t.expectEqual(op_state.Status.indeterminate, (try h.operationOf(&reader_id)).status);
+
+    // It is still visible — an operator looking for loose ends must find it,
+    // and a handoff has to carry it.
+    const listed = try operations.unsettled(&h.store, h.arena, 1);
+    try t.expectEqual(@as(usize, 1), listed.len);
+    try t.expectEqualStrings(&reader_id, listed[0].request_id);
+
+    // But it bars nothing. This is the half that used to be missing: the flag
+    // lived only in memory, so once the attempt was stored the guard saw a
+    // plain unsettled row and refused every later change on the scope —
+    // asymmetric with the same attempt while it was running, which had been
+    // allowed to proceed alongside a mutation.
+    try t.expectEqual(@as(usize, 0), (try operations.unsettledInScope(&h.store, h.arena, 1, job_scope)).len);
+
+    const after = try h.begin(.{ .kind = .job, .scope = job_scope, .mutating = true });
+    var mutation = after.ready;
+    defer mutation.deinit();
+    try t.expectEqual(@as(?execution.Blocker, null), mutation.advisory);
+
+    // And the writer that follows does hold it, so nothing was loosened
+    // beyond the read.
+    try mutation.connecting();
+    try mustSubmit(&mutation);
+    try t.expectEqual(@as(usize, 1), (try operations.unsettledInScope(&h.store, h.arena, 1, job_scope)).len);
 }
 
 test "M2 gate: a dropped execution still records why nothing was decided" {

@@ -42,11 +42,21 @@ pub const BeginOptions = struct {
     /// radius is treated as covering the whole server.
     scope: Scope = scope_mod.unknown,
     alias: ?[]const u8 = null,
-    /// Whether this attempt changes remote state. Mutations are blocked by
-    /// an unsettled peer or a foreign lease; read-only work is only warned
-    /// about, because refusing every `exec` while one job is unsettled would
-    /// make the guard unusable and get it switched off.
-    mutating: bool = false,
+    /// Whether this attempt changes remote state.
+    ///
+    /// Mutations are blocked by an unsettled writer on the same scope or by a
+    /// foreign lease; read-only work is only warned about, because refusing
+    /// every `exec` while one job is unsettled would make the guard unusable
+    /// and get it switched off.
+    ///
+    /// Defaults to `true`, and the asymmetry of the two mistakes is why:
+    /// wrongly treating a read as a mutation costs a refusal the caller can
+    /// override, while wrongly treating a mutation as a read can apply a
+    /// change twice. A caller that knows better says so.
+    ///
+    /// The value is persisted with the operation, so the guard can still tell
+    /// which role an attempt claimed long after the caller is gone.
+    mutating: bool = true,
     /// Already redacted. Raw argv must never reach the ledger.
     argv_redacted: ?[]const u8 = null,
     argv_sha256: ?[]const u8 = null,
@@ -134,8 +144,9 @@ pub const Execution = struct {
     scope: Scope,
     capability: Capability,
     /// Whether this attempt changes remote state. Decides whether a claim on
-    /// the same scope refuses it or merely warns.
-    mutating: bool = false,
+    /// the same scope refuses it or merely warns. Safe default; see
+    /// `BeginOptions.mutating`.
+    mutating: bool = true,
     /// The caller chose to proceed past a blocker. Carried through to
     /// `submitted`, where the guard is actually binding.
     force: bool = false,
@@ -381,6 +392,7 @@ pub fn begin(
         .shell = opts.shell,
         .capability_json = capability_json,
         .transport = opts.transport,
+        .mutating = opts.mutating,
         .now = opts.now,
     });
 

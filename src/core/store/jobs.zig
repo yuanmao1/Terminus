@@ -46,6 +46,10 @@ pub const Job = struct {
     read_cursor: i64,
     created_at: i64,
     finished_at: ?i64,
+    /// The launch that reserved this row. Null for rows written by 0.1.x,
+    /// which predate the notion — those have no owner and only a human can
+    /// clear them.
+    owner_request_id: ?[]const u8,
 };
 
 /// An unreadable status is an error, never a default. Guessing `running` here
@@ -140,11 +144,13 @@ fn rowToJob(arena: Allocator, stmt: *Db.Stmt) (Allocator.Error || error{UnknownS
         .read_cursor = stmt.columnInt(6),
         .created_at = stmt.columnInt(7),
         .finished_at = stmt.columnOptInt(8),
+        .owner_request_id = if (stmt.columnOptText(9)) |v| try arena.dupe(u8, v) else null,
     };
 }
 
 const select_columns =
-    \\SELECT id, name, command, sentinel, status, exit_code, read_cursor, created_at, finished_at
+    \\SELECT id, name, command, sentinel, status, exit_code, read_cursor, created_at,
+    \\       finished_at, owner_request_id
     \\FROM jobs
 ;
 

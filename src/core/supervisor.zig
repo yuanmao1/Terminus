@@ -120,17 +120,28 @@ pub const Observed = struct {
 /// output by prefix match, and a command that happens to print the same text
 /// would otherwise have its output mangled.
 ///
-/// Note what this does *not* do. `$$` is the pid of the shell that runs the
-/// command, which is the right process for a simple exec but is not a proof
-/// of anything after the connection drops, and reading the start token is
-/// best-effort across platforms. Hence `pid_proof = .weak`.
+/// The command runs in a subshell, and that is load-bearing rather than
+/// stylistic. Run inline, a command ending in `exit 42` — or any script whose
+/// last act is `exit` — terminates the very shell that was going to write the
+/// exit marker. The marker never appears, the outcome reads as unknown, and
+/// `terminus exec -- exit 42` comes back `indeterminate` for a command whose
+/// status was never in doubt. The subshell absorbs the exit; `$?` then carries
+/// it to the marker.
+///
+/// Note what this does *not* do. `$$` is the pid of the wrapper shell, which
+/// is the parent of the subshell rather than the command itself; it shares the
+/// process group, so it is usable for signalling but is not proof of anything
+/// once the connection drops, and reading the start token is best-effort
+/// across platforms. Hence `pid_proof = .weak`.
 pub fn wrapShell(arena: Allocator, command: []const u8, nonce: u64) Allocator.Error![]u8 {
     return std.fmt.allocPrint(arena,
         \\__t_pid=$$
         \\__t_pgid=$(ps -o pgid= -p $__t_pid 2>/dev/null | tr -d ' ')
         \\__t_tok=$(awk '{{print $22}}' /proc/$__t_pid/stat 2>/dev/null || ps -o lstart= -p $__t_pid 2>/dev/null | tr -d ' \n')
         \\printf '__TERMINUS_START_{d}__ pid=%s pgid=%s token=%s\n' "$__t_pid" "$__t_pgid" "$__t_tok"
+        \\(
         \\{s}
+        \\)
         \\__t_rc=$?
         \\printf '__TERMINUS_EXIT_{d}__ code=%s\n' "$__t_rc"
     , .{ nonce, command, nonce });

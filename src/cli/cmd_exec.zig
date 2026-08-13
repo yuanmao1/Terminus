@@ -300,11 +300,27 @@ fn runInSession(
         };
     };
 
-    Store.sessions.setCursor(store, session_id, result.next_cursor, ctx.now) catch |err|
-        Cli.storeFatal(store, err);
+    // Terminal receipt first, derived state second.
+    //
+    // The cursor is a convenience: it remembers where this session's reader
+    // got to. The receipt is the record that the command ran and how it
+    // ended. Writing the cursor first meant a failure there took the whole
+    // command down through `storeFatal` — exit 1, "database error" — for an
+    // exec whose exit status we were holding in our hand. Losing a cursor
+    // costs a re-read; losing the terminal costs the outcome.
     _ = execution.settle(.{ .exited = .{ .exit_code = result.exit_code } }, .{
         .stdout = .{ .bytes = @intCast(result.output.len) },
     }) catch |err| Cli.receiptFatal(execution.id(), err, "remote reported an exit status");
+
+    Store.sessions.setCursor(store, session_id, result.next_cursor, ctx.now) catch |err| {
+        // Reported, not fatal, and explicitly not swallowed: the next
+        // `--from-cursor` read will start further back and repeat output.
+        std.debug.print(
+            "terminus: could not advance the read cursor for session '{s}': {s}; " ++
+                "the next cursor read will repeat this command's output\n",
+            .{ session_name, @errorName(err) },
+        );
+    };
 
     return .{
         .status = execution.status,

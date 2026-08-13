@@ -60,6 +60,28 @@ fn jobScope(name: []const u8) Core.execution.Scope {
     return .{ .kind = .job, .key = name };
 }
 
+/// Whether a still-live job row may be quietly taken over by a new launch.
+///
+/// A `pending` row is a reservation, and a launcher killed between taking one
+/// and reaching the remote shell leaves one behind. Refusing forever would
+/// make every crashed launch a manual cleanup; deleting it on age would
+/// eventually delete the row of a launcher that is merely slow. Neither is
+/// needed, because the owning attempt already records how far it got.
+///
+/// So the test is the scope guard's own predicate, asked of the owner: if
+/// that operation no longer blocks a scope, it either provably never
+/// submitted or its outcome is established, and nothing is running under this
+/// name. Everything else stays put — including a `running` row, a row from
+/// 0.1.x with no owner at all, and one whose operation has vanished. Those
+/// need `job rm`, which looks at the host before it agrees.
+fn reclaimable(store: *Store, arena: std.mem.Allocator, row: Store.jobs.Job) bool {
+    if (row.status != .pending) return false;
+    const owner = row.owner_request_id orelse return false;
+    const op = (Store.operations.get(store, arena, owner) catch |err|
+        Cli.storeFatal(store, err)) orelse return false;
+    return !op.effectiveStatus().blocksScope();
+}
+
 pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const parsed = Cli.parseArgs(ctx, raw_args);
     if (parsed.boolean("json")) ctx.out.format = .json;
@@ -112,11 +134,22 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         execution.deinit();
     }
 
+    // A name held by a live job is not something `--force` may take.
+    //
+    // `--force` means one thing: "I accept the risk of acting while an
+    // overlapping operation's outcome is unknown." Letting it also mean "and
+    // tear the name away from a launcher that is mid-setup, or from a job
+    // that is running right now" is a different and much sharper decision,
+    // and merging the two put it behind a flag people reach for casually.
+    // Stopping a live job is `job kill` or `job rm`, both of which say what
+    // they are doing and leave a record.
     if (Store.jobs.getByName(&store, ctx.arena, resolved.server.id, job_name) catch |err|
         Cli.storeFatal(&store, err)) |existing|
     {
-        if (existing.status.live() and !parsed.boolean("force"))
-            fatal("job '{s}' is {t} (started {d}); pick another --name, 'job rm' it, or pass --force", .{ job_name, existing.status, existing.created_at });
+        if (existing.status.live() and !reclaimable(&store, ctx.arena, existing)) fatal(
+            "job '{s}' is {t} (since {d}); nothing was sent. Stop it first ('terminus job kill {s} {s}' or 'job rm'), or pick another --name — --force does not take a live job's name",
+            .{ job_name, existing.status, existing.created_at, server_name, job_name },
+        );
         _ = Store.jobs.remove(&store, resolved.server.id, job_name) catch |err| Cli.storeFatal(&store, err);
     }
 
@@ -734,8 +767,24 @@ fn removeJob(
                 .already_settled => |r| r.status.text(),
             };
         } else {
-            settled_status = "already settled";
-            proven = true;
+            // `attach` returns null for an attempt that is already terminal.
+            // That is not the same as proven: an attempt settled
+            // `indeterminate` is exactly the case where nothing was ever
+            // established, and reporting "outcome recorded from its log"
+            // would turn the unknown into a success in the caller's eyes.
+            // Ask the ledger what it actually holds.
+            const op = (Store.operations.get(store, ctx.arena, a.request_id) catch |err|
+                Cli.storeFatal(store, err));
+            if (op) |settled| {
+                const effective = settled.effectiveStatus();
+                settled_status = effective.text();
+                proven = effective != .indeterminate;
+            } else {
+                // The attempt row names a request the ledger does not have.
+                // Nothing here is established; say so rather than guess.
+                settled_status = "unknown";
+                proven = false;
+            }
         }
     }
 
