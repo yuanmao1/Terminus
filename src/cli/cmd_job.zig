@@ -144,13 +144,15 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // database failed afterwards, the command would be running on the server
     // with nothing locally able to find it — `status`, `kill` and `reconcile`
     // all key off this row and the attempt.
-    const job_id = Store.jobs.create(&store, resolved.server.id, job_name, raw_command, sentinel, ctx.now) catch |err| switch (err) {
+    _ = Store.jobs.create(&store, resolved.server.id, job_name, raw_command, sentinel, execution.id(), ctx.now) catch |err| switch (err) {
         error.NameTaken => fatal("job '{s}' was claimed by another launch just now; nothing was sent", .{job_name}),
         else => Cli.storeFatal(&store, err),
     };
     // `fail` exits without running defers, so the release is a hook rather
-    // than a `defer`. It stays registered until the keys are gone.
-    Cli.registerReservation(&store, resolved.server.id, job_name);
+    // than a `defer`. It is keyed on this launch's request id: if someone
+    // takes the name over while we are still setting up, the row stops being
+    // ours and we must not delete theirs on the way out.
+    Cli.registerReservation(&store, execution.id(), job_name);
 
     // A leftover session from a forgotten job must be *confirmed* gone before
     // we reuse the name. `ensure` treats an existing session as ready, so a
@@ -236,11 +238,42 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         Cli.commitReservation();
         _ = execution.transportLoss(executor.errorMessage()) catch |receipt_err|
             Cli.receiptFatal(execution.id(), receipt_err, "submitted");
-        Cli.failIndeterminateAfterOutput(execution.id());
+        // Nothing has been printed yet, so this needs the full body — an
+        // agent parsing `--json` must get an object, not an empty stream and
+        // a bare exit code.
+        Cli.failIndeterminate(
+            execution.id(),
+            "the connection broke while handing the job to its remote shell; it may be running",
+            "submitted",
+        );
     };
     // The command is in the remote shell. The reservation is now a job.
     Cli.commitReservation();
-    Store.jobs.markStarted(&store, job_id) catch |err| Cli.storeFatal(&store, err);
+
+    // Promotion can legitimately fail to find its row: another launcher may
+    // have forced this name away while we were setting up. Either way the
+    // command has already been sent, so neither a database error nor a
+    // zero-row update may leave through the generic failure path — that reads
+    // as "safe to retry" for work that is running right now.
+    const promoted = Store.jobs.markStarted(&store, execution.id()) catch |err| promoted: {
+        std.debug.print(
+            "terminus: could not promote the tracking row for job '{s}': {s}\n",
+            .{ job_name, @errorName(err) },
+        );
+        break :promoted false;
+    };
+    if (!promoted) {
+        // The attempt row still carries this launch's own sentinel and
+        // session, so the request id remains a complete handle on it even
+        // though the job *name* may now belong to somebody else.
+        execution.detach("job was handed to its remote shell; the local tracking row is not ours") catch |err|
+            Cli.receiptFatal(execution.id(), err, "submitted");
+        Cli.failIndeterminate(
+            execution.id(),
+            "the job was sent, but its local tracking row could not be promoted (another launcher may hold the name); settle it by request id",
+            "submitted",
+        );
+    }
 
     if (Tmux.panePid(executor, ctx.arena, session) catch null) |pid| {
         execution.remoteStarted(.{ .pid = pid }) catch |err|

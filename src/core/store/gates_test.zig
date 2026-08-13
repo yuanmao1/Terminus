@@ -960,8 +960,10 @@ test "gate: job attempts survive a same-name rerun and job rm" {
 }
 
 /// One thread racing to claim a job name, the way `run --name deploy` does.
+/// Each carries its own request id, because that is what owns the row.
 const ReserveCtx = struct {
     path: [:0]const u8,
+    request_id: []const u8,
     gate: *std.atomic.Value(bool),
     reserved: bool = false,
     taken: bool = false,
@@ -975,7 +977,7 @@ fn reserveInThread(ctx: *ReserveCtx) void {
         return;
     };
     defer store.close();
-    _ = Store.jobs.create(&store, 1, "deploy", "make deploy", "__TERMINUS_JOB_1__", 1000) catch |err| {
+    _ = Store.jobs.create(&store, 1, "deploy", "make deploy", "__TERMINUS_JOB_1__", ctx.request_id, 1000) catch |err| {
         switch (err) {
             error.NameTaken => ctx.taken = true,
             else => ctx.err = err,
@@ -984,6 +986,13 @@ fn reserveInThread(ctx: *ReserveCtx) void {
     };
     ctx.reserved = true;
 }
+
+const reserve_ids = [_][]const u8{
+    "01AAAAAAAA0123456789ABCDEF",
+    "01BBBBBBBB0123456789ABCDEF",
+    "01CCCCCCCC0123456789ABCDEF",
+    "01DDDDDDDD0123456789ABCDEF",
+};
 
 test "M2 gate: only one launcher may reserve a job name" {
     const t = std.testing;
@@ -999,12 +1008,11 @@ test "M2 gate: only one launcher may reserve a job name" {
         try seedServer(&store);
     }
 
-    const thread_count = 4;
     var gate: std.atomic.Value(bool) = .init(false);
-    var ctxs: [thread_count]ReserveCtx = undefined;
-    var threads: [thread_count]std.Thread = undefined;
+    var ctxs: [reserve_ids.len]ReserveCtx = undefined;
+    var threads: [reserve_ids.len]std.Thread = undefined;
     for (&ctxs, 0..) |*c, i| {
-        c.* = .{ .path = scratch.path, .gate = &gate };
+        c.* = .{ .path = scratch.path, .request_id = reserve_ids[i], .gate = &gate };
         threads[i] = try std.Thread.spawn(.{}, reserveInThread, .{c});
     }
     gate.store(true, .release);
@@ -1012,9 +1020,13 @@ test "M2 gate: only one launcher may reserve a job name" {
 
     var reserved: usize = 0;
     var taken: usize = 0;
+    var winner: ?[]const u8 = null;
     for (ctxs) |c| {
         try t.expectEqual(@as(?anyerror, null), c.err);
-        if (c.reserved) reserved += 1;
+        if (c.reserved) {
+            reserved += 1;
+            winner = c.request_id;
+        }
         if (c.taken) taken += 1;
     }
     // Exactly one launcher owns the name, and the losers learned it from a
@@ -1026,10 +1038,11 @@ test "M2 gate: only one launcher may reserve a job name" {
     // rebuilt. A loser that got as far as that teardown would be killing the
     // session the winner had already filled with real work.
     try t.expectEqual(@as(usize, 1), reserved);
-    try t.expectEqual(@as(usize, thread_count - 1), taken);
+    try t.expectEqual(@as(usize, reserve_ids.len - 1), taken);
 
     var store = try Store.open(scratch.path);
     defer store.close();
+    const owner = winner.?;
 
     // The winner holds a *pending* row, not a running one. Nothing has been
     // typed into the remote shell yet, so claiming `running` would put a job
@@ -1039,20 +1052,55 @@ test "M2 gate: only one launcher may reserve a job name" {
     try t.expectEqual(Store.jobs.Status.pending, row.status);
     try t.expect(row.status.live());
 
-    // Only reaching the remote promotes it.
-    try Store.jobs.markStarted(&store, row.id);
+    // A loser may not release the winner's row. It never owned it.
+    for (ctxs) |c| {
+        if (c.reserved) continue;
+        try t.expect(!try Store.jobs.releaseReservation(&store, c.request_id));
+    }
+    try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+
+    // Only reaching the remote promotes it, and the promotion reports that it
+    // found its row — the launcher needs to know, because by then the command
+    // has already been sent.
+    try t.expect(try Store.jobs.markStarted(&store, owner));
     try t.expectEqual(Store.jobs.Status.running, (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.status);
 
+    // Once promoted the row is no longer a reservation, so its own owner
+    // cannot drop it either: it may name work running on the host.
+    try t.expect(!try Store.jobs.releaseReservation(&store, owner));
+
     // A promotion arriving after somebody observed the job's end must not
-    // walk it back: the settlement is the newer truth.
+    // walk it back: the settlement is the newer truth, and the launcher is
+    // told it no longer owns the row.
     try Store.jobs.markFinished(&store, row.id, .exited, 0, 2000);
-    try Store.jobs.markStarted(&store, row.id);
+    try t.expect(!try Store.jobs.markStarted(&store, owner));
     try t.expectEqual(Store.jobs.Status.exited, (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.status);
+
+    // The takeover case, which is why ownership is the request id and not the
+    // row id: sqlite hands the next INSERT the id of the row just deleted, so
+    // a successor can and does inherit the aborted launcher's rowid.
+    const stale_owner = owner;
+    _ = try Store.jobs.remove(&store, 1, "deploy");
+    const successor_owner: []const u8 = "01EEEEEEEE0123456789ABCDEF";
+    const successor_id = try Store.jobs.create(&store, 1, "deploy", "make deploy", "__TERMINUS_JOB_2__", successor_owner, 3000);
+    try t.expectEqual(row.id, successor_id); // the rowid really is recycled
+
+    // The aborted launcher now fails and releases. It must not take the
+    // successor's row with it — that row may already have a command running.
+    try t.expect(!try Store.jobs.releaseReservation(&store, stale_owner));
+    const survivor = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    try t.expectEqual(Store.jobs.Status.pending, survivor.status);
+    try t.expectEqualStrings("__TERMINUS_JOB_2__", survivor.sentinel);
+
+    // And the successor can still release its own.
+    try t.expect(try Store.jobs.releaseReservation(&store, successor_owner));
+    try t.expectEqual(@as(?Store.jobs.Job, null), try Store.jobs.getByName(&store, arena, 1, "deploy"));
 
     // An unreadable status is an error, not a guess. This row is the shape a
     // future version writing a state this binary does not know would leave
     // behind; the old `orelse .running` renamed it to a state it had no
     // evidence for and reported that in `job ls`.
+    _ = try Store.jobs.create(&store, 1, "deploy", "make deploy", "__TERMINUS_JOB_3__", "01FFFFFFFF0123456789ABCDEF", 4000);
     try store.db.exec("UPDATE jobs SET status = 'quantum' WHERE name = 'deploy'");
     try t.expectError(error.UnknownStatus, Store.jobs.getByName(&store, arena, 1, "deploy"));
 }

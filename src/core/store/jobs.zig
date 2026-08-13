@@ -54,22 +54,35 @@ pub const Job = struct {
 pub const ReadError = Db.Error || Allocator.Error || error{UnknownStatus};
 pub const CreateError = Db.Error || error{NameTaken};
 
-/// Reserves the job name. The row starts `pending`: it says "this name is
-/// claimed and the remote is being prepared", not "this job is running".
+/// Reserves the job name for one launch. The row starts `pending`: it says
+/// "this name is claimed and the remote is being prepared", not "this job is
+/// running".
 ///
 /// `error.NameTaken` is the serialisation point of the whole launch path —
 /// whoever loses here has not touched the remote host yet.
-pub fn create(store: *Store, server_id: i64, name: []const u8, command: []const u8, sentinel: []const u8, now: i64) CreateError!i64 {
+///
+/// `owner_request_id` is what makes the reservation releasable. See the v9
+/// migration for why neither the name nor the rowid can play that part.
+pub fn create(
+    store: *Store,
+    server_id: i64,
+    name: []const u8,
+    command: []const u8,
+    sentinel: []const u8,
+    owner_request_id: []const u8,
+    now: i64,
+) CreateError!i64 {
     var stmt = try store.db.prepare(
-        \\INSERT INTO jobs (server_id, name, command, sentinel, status, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
+        \\INSERT INTO jobs (server_id, name, command, sentinel, status, owner_request_id, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)
     );
     defer stmt.deinit();
     try stmt.bindInt(1, server_id);
     try stmt.bindText(2, name);
     try stmt.bindText(3, command);
     try stmt.bindText(4, sentinel);
-    try stmt.bindInt(5, now);
+    try stmt.bindText(5, owner_request_id);
+    try stmt.bindInt(6, now);
     _ = stmt.step() catch |err| return switch (err) {
         error.Constraint => error.NameTaken,
         else => err,
@@ -78,15 +91,42 @@ pub fn create(store: *Store, server_id: i64, name: []const u8, command: []const 
 }
 
 /// Promotes a reservation once the command has actually reached the remote
-/// shell. Scoped to `pending` so a concurrent observer that already settled
-/// this job cannot be walked backwards into `running`.
-pub fn markStarted(store: *Store, job_id: i64) Db.Error!void {
+/// shell.
+///
+/// Returns false when this row was not ours to promote — it has been taken
+/// over by another launcher, or an observer already settled it. The caller
+/// must not read that as success: by the time this runs the command has been
+/// sent, so a false here means something is running on the host that nothing
+/// local is tracking under this name.
+pub fn markStarted(store: *Store, owner_request_id: []const u8) Db.Error!bool {
     var stmt = try store.db.prepare(
-        "UPDATE jobs SET status = 'running' WHERE id = ?1 AND status = 'pending'",
+        \\UPDATE jobs SET status = 'running'
+        \\WHERE owner_request_id = ?1 AND status = 'pending'
     );
     defer stmt.deinit();
-    try stmt.bindInt(1, job_id);
+    try stmt.bindText(1, owner_request_id);
     _ = try stmt.step();
+    return store.db.changes() > 0;
+}
+
+/// Gives back a reservation this launcher still owns.
+///
+/// Keyed on the owning request and on the row still being `pending` — never
+/// on the name, and never on the rowid. A name is what a takeover transfers;
+/// a rowid is reused by the very next INSERT after a delete. Either would
+/// have an aborted launcher remove the *replacement's* row, leaving that
+/// launcher's command running on the host with nothing tracking it.
+///
+/// Returns false when the row is no longer ours, which is not an error: it
+/// means somebody else owns the name now.
+pub fn releaseReservation(store: *Store, owner_request_id: []const u8) Db.Error!bool {
+    var stmt = try store.db.prepare(
+        "DELETE FROM jobs WHERE owner_request_id = ?1 AND status = 'pending'",
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, owner_request_id);
+    _ = try stmt.step();
+    return store.db.changes() > 0;
 }
 
 fn rowToJob(arena: Allocator, stmt: *Db.Stmt) (Allocator.Error || error{UnknownStatus})!Job {

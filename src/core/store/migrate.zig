@@ -365,6 +365,24 @@ const migrations = [_][:0]const u8{
     \\  created_at INTEGER NOT NULL
     \\);
     ,
+    // v9: which launch owns a job row.
+    //
+    // The row is written before the remote is touched, so `UNIQUE(server_id,
+    // name)` can pick a winner between two simultaneous launches. That makes
+    // it a reservation, and a reservation needs an owner: a launcher that
+    // aborts has to be able to release *its* row and nobody else's.
+    //
+    // Neither the name nor the rowid can serve. The name is what a takeover
+    // transfers. The rowid is reused — sqlite hands the next INSERT the id of
+    // the row that was just deleted, so an aborted launcher releasing "id 5,
+    // still pending" would delete the replacement that inherited id 5 and
+    // leave its command running on the host with nothing tracking it.
+    //
+    // `request_id` is unique by construction and is already the identity the
+    // rest of the ledger is keyed on. Nullable because rows written by 0.1.x
+    // predate the notion; those are unowned and only a human can clear them.
+    \\ALTER TABLE jobs ADD COLUMN owner_request_id TEXT;
+    ,
 };
 
 /// Number of schema versions this binary knows about.

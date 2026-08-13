@@ -86,15 +86,21 @@ fn settleActiveExecution(reason: []const u8) void {
 /// Reserving that early means every fatal exit in between would strand a row
 /// for a job that never started — and `fail` exits with `std.process.exit`,
 /// which skips defers. Hence this hook, the same shape as the execution one.
+///
+/// The reservation is identified by the launch that owns it, not by the job
+/// name and not by the row id. A name is what a takeover transfers; a rowid
+/// is reused by the next INSERT after a delete. Either would let an aborted
+/// launcher release the row of the launcher that replaced it.
 const Reservation = struct {
     store: *Store,
-    server_id: i64,
+    request_id: []const u8,
+    /// For the failure message only. Identity is `request_id`.
     name: []const u8,
 };
 var active_reservation: ?Reservation = null;
 
-pub fn registerReservation(store: *Store, server_id: i64, name: []const u8) void {
-    active_reservation = .{ .store = store, .server_id = server_id, .name = name };
+pub fn registerReservation(store: *Store, request_id: []const u8, name: []const u8) void {
+    active_reservation = .{ .store = store, .request_id = request_id, .name = name };
 }
 
 /// Keeps the reservation: the command is in the remote's hands now, so the
@@ -103,15 +109,16 @@ pub fn commitReservation() void {
     active_reservation = null;
 }
 
-/// Gives the name back, if it is still held.
+/// Gives the name back, if this launch still owns it.
 ///
 /// Called from `fail` (which skips defers) and from the launch path's own
 /// `defer` — the latter both covers a plain error return and guarantees the
-/// borrowed `*Store` never outlives the frame that owns it.
+/// borrowed `*Store` never outlives the frame that owns it. A row that is no
+/// longer `pending`, or no longer ours, is left exactly where it is.
 pub fn releaseReservation() void {
     const held = active_reservation orelse return;
     active_reservation = null; // never re-enter
-    _ = Store.jobs.remove(held.store, held.server_id, held.name) catch |err| {
+    _ = Store.jobs.releaseReservation(held.store, held.request_id) catch |err| {
         // Reported, not swallowed: what is left behind is a name that will
         // refuse the next launch until it is removed by hand.
         std.debug.print(
