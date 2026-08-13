@@ -35,6 +35,7 @@ pub fn setActiveCtx(ctx: *Ctx) void {
 /// Fail-loud exit: in JSON mode emits `{"ok":false,"error":...}` on stdout
 /// (agents parse one stream); in human mode writes stderr. Always exit 1.
 pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    settleActiveExecution("command failed before recording an outcome");
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
@@ -44,6 +45,32 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
         }
     }
     std.process.fatal(fmt, args);
+}
+
+/// The execution owning the current command, if any.
+///
+/// `fail` ends the process with `std.process.exit`, which skips defers — so
+/// without this hook every fatal path would leave an attempt with no
+/// terminal, and the boundary would be bypassable simply by erroring out.
+var active_execution: ?*Core.execution.Execution = null;
+
+pub fn registerExecution(e: *Core.execution.Execution) void {
+    active_execution = e;
+}
+
+pub fn clearExecution() void {
+    active_execution = null;
+}
+
+fn settleActiveExecution(reason: []const u8) void {
+    const execution = active_execution orelse return;
+    active_execution = null; // never re-enter, even if settling itself fails
+    execution.abandon(reason) catch |err| {
+        std.debug.print(
+            "terminus: RECEIPT_PERSIST_FAILED for {s}: {s} (remote state unknown)\n",
+            .{ execution.id(), @errorName(err) },
+        );
+    };
 }
 
 /// Process exit codes with a defined meaning to callers.
@@ -84,6 +111,26 @@ pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observ
             "indeterminate: {s}\n  request: {s}\n  last observed: {s}\n  reconcile before retrying: terminus request reconcile {s}\n",
             .{ reason, request_id, last_observed, request_id },
         ) catch {};
+        ctx.out.flush() catch {};
+    }
+    std.process.exit(exit_code.indeterminate);
+}
+
+/// Ends a command whose response has already been written.
+///
+/// The caller has printed a full result carrying `status: "indeterminate"`;
+/// all that remains is the exit code, which must not be 1 — an agent has to
+/// be able to tell "it did not work" from "we do not know", because only the
+/// first is safe to retry.
+pub fn failIndeterminateAfterOutput(request_id: []const u8) noreturn {
+    clearExecution(); // already settled by the execution itself
+    if (active_ctx) |ctx| {
+        if (ctx.out.format == .human) {
+            std.debug.print(
+                "indeterminate: the remote outcome is unknown; reconcile before retrying: terminus request reconcile {s}\n",
+                .{request_id},
+            );
+        }
         ctx.out.flush() catch {};
     }
     std.process.exit(exit_code.indeterminate);

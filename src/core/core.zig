@@ -7,3 +7,14 @@ pub const daemon_protocol = @import("daemon/protocol.zig");
 pub const Executor = @import("exec.zig").Executor;
 pub const script = @import("script.zig");
 pub const transfer = @import("transfer.zig");
+pub const supervisor = @import("supervisor.zig");
+/// The execution boundary: every remote side effect goes through it.
+pub const execution = @import("execution.zig");
+pub const Scripted = @import("exec.zig").Scripted;
+
+test {
+    // Zig only compiles tests in files it actually analyzes. Without this,
+    // a module that nothing references yet (execution.zig before the CLI is
+    // rewired onto it) silently contributes zero tests.
+    @import("std").testing.refAllDecls(@This());
+}

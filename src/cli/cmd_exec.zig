@@ -6,8 +6,12 @@
 //! its cwd/env/history, and advances the session's read cursor past the
 //! command's output.
 //!
-//! The remote exit code becomes this process's exit code, so agents can
-//! rely on it in both output formats.
+//! Both paths run under `Core.execution`, which owns operation identity, the
+//! scope guard, state transitions and the terminal receipt. Nothing here
+//! decides what a dropped connection meant — that judgement belongs to one
+//! function, and this command only reports it. In particular a local timeout
+//! is `indeterminate`, not a failure: the remote command is very likely
+//! still running, and an agent that retries on "failed" would run it twice.
 const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
@@ -33,6 +37,9 @@ const usage =
     \\--login wraps execution in `bash -ilc` for the full user PATH
     \\(nvm/bun/pm2 live in profile files that plain SSH exec skips).
     \\
+    \\Exit codes: the remote command's own code, or 75 when the outcome could
+    \\not be established (never retry blindly on 75 — reconcile first).
+    \\
 ;
 
 pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
@@ -56,16 +63,120 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const memory_keys = Store.memories.keys(&store, ctx.arena, resolved.server.id) catch |err|
         Cli.storeFatal(&store, err);
 
+    const owner_token = Store.policy.ownerToken(&store, ctx.arena, ctx.io, ctx.now) catch |err|
+        Cli.storeFatal(&store, err);
+
+    // `exec` is not declared mutating: it is the most common command, and a
+    // guard that refuses every read while one job is unsettled is a guard
+    // people turn off. Blockers are reported instead.
+    const start = Core.execution.begin(&store, ctx.arena, ctx.io, .{
+        .server_id = resolved.server.id,
+        .server_name = resolved.server.name,
+        .kind = .exec,
+        .scope = if (target.session) |name|
+            .{ .kind = .job, .key = name }
+        else
+            .{ .kind = .server },
+        .alias = target.session,
+        .mutating = false,
+        .argv_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch raw_command,
+        .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
+        .shell = if (parsed.boolean("login")) "bash-login" else "bash",
+        .owner_token = owner_token,
+        .force = parsed.boolean("force"),
+        .now = ctx.now,
+    }) catch |err| Cli.storeFatal(&store, err);
+
+    var execution = switch (start) {
+        .ready => |e| e,
+        .blocked => |blocker| return reportBlocked(ctx, blocker),
+    };
+    Cli.registerExecution(&execution);
+    defer {
+        Cli.clearExecution();
+        execution.deinit();
+    }
+
     const started = std.Io.Timestamp.now(ctx.io, .awake);
+    execution.connecting() catch |err| Cli.storeFatal(&store, err);
+
     var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
     defer conn.deinit();
     const executor = conn.executor();
 
-    // Multiline (or explicitly non-bash) content becomes a staged remote
-    // script; single-line commands stay inline on the fast path.
-    const wants_script = Core.script.shouldStage(raw_command) or parsed.flag("interpreter") != null;
+    const outcome = if (target.session) |session_name|
+        try runInSession(ctx, &store, &execution, executor, &parsed, session_name, raw_command, timeout_ms)
+    else
+        try runOneShot(ctx, &store, &execution, executor, &parsed, raw_command, resolved.server.cwd);
+
+    const duration_ms: i64 = @intCast(@divTrunc(
+        started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds,
+        std.time.ns_per_ms,
+    ));
+
+    const capability_json = execution.capability.toJson(ctx.arena) catch null;
+
+    switch (ctx.out.format) {
+        .json => try ctx.out.json(.{
+            .ok = outcome.status != .indeterminate,
+            .requestId = execution.id(),
+            .status = outcome.status.text(),
+            .server = resolved.server.name,
+            .session = target.session,
+            .command = raw_command,
+            .exitCode = outcome.exit_code,
+            .stdout = outcome.stdout,
+            .stderr = outcome.stderr,
+            .durationMs = duration_ms,
+            .transport = conn.transport,
+            .daemonError = conn.daemon_error,
+            .capability = capability_json,
+            .runningAlongside = advisoryText(ctx, execution.advisory),
+            .memoryKeys = memory_keys,
+        }),
+        .human => {
+            try ctx.out.print("{s}", .{outcome.stdout});
+            if (outcome.stderr.len != 0) std.debug.print("{s}", .{outcome.stderr});
+            if (advisoryText(ctx, execution.advisory)) |note|
+                std.debug.print("note: {s}\n", .{note});
+            if (outcome.exit_code) |code| {
+                if (code != 0) std.debug.print("(exit {d})\n", .{code});
+            }
+        },
+    }
+
+    // An unknown outcome gets its own exit code so it can never be mistaken
+    // for a plain failure and retried.
+    if (outcome.status == .indeterminate) {
+        try ctx.out.flush();
+        Cli.failIndeterminateAfterOutput(execution.id());
+    }
+    if (outcome.exit_code) |code| {
+        if (code != 0) {
+            try ctx.out.flush();
+            std.process.exit(@intCast(std.math.clamp(code, 1, 255)));
+        }
+    }
+}
+
+const Outcome = Core.execution.RunOutcome;
+
+/// One-shot exec on a plain server target.
+fn runOneShot(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    execution: *Core.execution.Execution,
+    executor: Core.Executor,
+    parsed: *const Cli.Args.Parsed,
+    raw_command: []const u8,
+    server_cwd: ?[]const u8,
+) !Outcome {
     var command = raw_command;
     var staged_path: ?[]const u8 = null;
+
+    // Staging happens before submission: it is setup, and a failure there
+    // provably never ran the user's command.
+    const wants_script = Core.script.shouldStage(raw_command) or parsed.flag("interpreter") != null;
     if (wants_script) {
         const nonce: u64 = @intCast(@mod(std.Io.Timestamp.now(ctx.io, .real).nanoseconds, 1_000_000_000_000));
         const staged = Core.script.stage(executor, ctx.arena, raw_command, .{
@@ -80,7 +191,6 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         command = staged.command;
         staged_path = staged.remote_path;
     } else if (parsed.boolean("strict")) {
-        // Single-line strict still means "fail loudly".
         command = try std.fmt.allocPrint(ctx.arena, "set -euo pipefail; {s}", .{raw_command});
         if (parsed.boolean("login")) command = try Cli.loginWrap(ctx.arena, command);
     } else if (parsed.boolean("login")) {
@@ -88,78 +198,135 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
     defer if (staged_path) |path| Core.script.cleanup(executor, ctx.arena, path);
 
-    var exit_code: i32 = undefined;
-    var stdout_text: []const u8 = undefined;
-    var stderr_text: []const u8 = "";
+    const effective = if (parsed.flag("cwd") orelse server_cwd) |dir|
+        try std.fmt.allocPrint(ctx.arena, "cd {s} && ({s})", .{ dir, command })
+    else
+        command;
 
-    if (target.session) |session_name| {
-        const session_id = Store.sessions.ensure(&store, resolved.server.id, session_name, ctx.now) catch |err|
-            Cli.storeFatal(&store, err);
-        Tmux.ensure(executor, ctx.arena, session_name) catch |err|
-            fatalTmux(err, executor, session_name);
-        const cursor = Store.sessions.cursor(&store, session_id) catch |err| Cli.storeFatal(&store, err);
-        const result = Tmux.execIn(executor, ctx.arena, ctx.io, session_name, command, cursor, timeout_ms) catch |err|
-            fatalTmux(err, executor, session_name);
-        Store.sessions.setCursor(&store, session_id, result.next_cursor, ctx.now) catch |err|
-            Cli.storeFatal(&store, err);
-        exit_code = result.exit_code;
-        stdout_text = result.output; // tmux merges the two streams in the pane
-    } else {
-        // Workspace: plain exec runs in the server's default cwd when one
-        // is set (session targets keep their own live cwd instead).
-        const effective = if (parsed.flag("cwd") orelse resolved.server.cwd) |dir|
-            try std.fmt.allocPrint(ctx.arena, "cd {s} && ({s})", .{ dir, command })
+    const outcome = Core.execution.runCommand(execution, executor, effective) catch |err|
+        Cli.storeFatal(store, err);
+
+    return .{
+        .status = outcome.status,
+        .exit_code = outcome.exit_code,
+        .stdout = outcome.stdout,
+        .stderr = if (parsed.boolean("login"))
+            try Cli.stripLoginNoise(ctx.arena, outcome.stderr)
         else
-            command;
-        const result = executor.exec(ctx.arena, effective) catch |err|
-            fatal("exec failed: {s} ({s})", .{ executor.errorMessage(), @errorName(err) });
-        exit_code = result.exit_code;
-        stdout_text = result.stdout;
-        stderr_text = if (parsed.boolean("login"))
-            try Cli.stripLoginNoise(ctx.arena, result.stderr)
-        else
-            result.stderr;
+            outcome.stderr,
+        .identity = outcome.identity,
+    };
+}
+
+/// Exec inside a persistent tmux session.
+///
+/// The session shell already exists, so identity comes from the session
+/// rather than a supervisor wrapper. What matters here is the timeout: a
+/// local deadline expiring says nothing about the remote command, which is
+/// still running in the session — reporting that as a failure (as this
+/// command used to) invites a retry that runs the work twice.
+fn runInSession(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    execution: *Core.execution.Execution,
+    executor: Core.Executor,
+    parsed: *const Cli.Args.Parsed,
+    session_name: []const u8,
+    raw_command: []const u8,
+    timeout_ms: i64,
+) !Outcome {
+    const session_id = Store.sessions.ensure(store, execution.server_id.?, session_name, ctx.now) catch |err|
+        Cli.storeFatal(store, err);
+    Tmux.ensure(executor, ctx.arena, session_name) catch |err|
+        fatalTmux(err, executor, session_name);
+
+    var command = raw_command;
+    if (Core.script.shouldStage(raw_command) or parsed.flag("interpreter") != null) {
+        const nonce: u64 = @intCast(@mod(std.Io.Timestamp.now(ctx.io, .real).nanoseconds, 1_000_000_000_000));
+        const staged = Core.script.stage(executor, ctx.arena, raw_command, .{
+            .interpreter = parsed.flag("interpreter") orelse "bash",
+            .strict = parsed.boolean("strict"),
+            .login = parsed.boolean("login"),
+        }, nonce) catch fatal("could not stage the script on the remote host", .{});
+        command = staged.command;
+    } else if (parsed.boolean("strict")) {
+        command = try std.fmt.allocPrint(ctx.arena, "set -euo pipefail; {s}", .{raw_command});
     }
 
-    const duration_ms: i64 = @intCast(@divTrunc(
-        started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds,
-        std.time.ns_per_ms,
-    ));
+    const cursor = Store.sessions.cursor(store, session_id) catch |err| Cli.storeFatal(store, err);
 
-    Store.history.add(&store, resolved.server.id, .{
-        .kind = "exec",
-        .detail = raw_command,
-        .cwd = if (target.session == null) parsed.flag("cwd") orelse resolved.server.cwd else target.session,
-        .exit_code = exit_code,
-        .transport = conn.transport,
-        .duration_ms = duration_ms,
-    }, ctx.now) catch {};
+    // Keys are about to be typed into a live shell: from here the remote may
+    // act, so the attempt is submitted.
+    execution.submitted() catch |err| Cli.storeFatal(store, err);
 
-    switch (ctx.out.format) {
-        .json => try ctx.out.json(.{
-            .ok = true,
-            .server = resolved.server.name,
-            .session = target.session,
-            .command = raw_command,
-            .exitCode = exit_code,
-            .stdout = stdout_text,
-            .stderr = stderr_text,
-            .durationMs = duration_ms,
-            .transport = conn.transport,
-            .daemonError = conn.daemon_error,
-            .memoryKeys = memory_keys,
-        }),
-        .human => {
-            try ctx.out.print("{s}", .{stdout_text});
-            if (stderr_text.len != 0) std.debug.print("{s}", .{stderr_text});
-            if (exit_code != 0) std.debug.print("(exit {d})\n", .{exit_code});
-        },
+    const result = Tmux.execIn(executor, ctx.arena, ctx.io, session_name, command, cursor, timeout_ms) catch |err| {
+        const settled = switch (err) {
+            // The command is still running in the session. We do not know
+            // how it will end, and must not say that it failed.
+            error.CommandTimeout => execution.settle(.{ .indeterminate = .{
+                .reason = "local timeout expired; the command is still running in the session",
+                .last_observed = execution.status,
+            } }, .{}),
+            // The shell died mid-command: it may have completed first.
+            error.SessionDied => execution.settle(.{ .indeterminate = .{
+                .reason = "session ended while the command was running",
+                .last_observed = execution.status,
+            } }, .{}),
+            else => execution.transportLoss(executor.errorMessage()),
+        } catch |settle_err| Cli.storeFatal(store, settle_err);
+        _ = settled;
+        return .{
+            .status = execution.status,
+            .exit_code = null,
+            .stdout = "",
+            .stderr = "",
+            .identity = null,
+        };
+    };
+
+    Store.sessions.setCursor(store, session_id, result.next_cursor, ctx.now) catch |err|
+        Cli.storeFatal(store, err);
+    _ = execution.settle(.{ .exited = .{ .exit_code = result.exit_code } }, .{
+        .stdout = .{ .bytes = @intCast(result.output.len) },
+    }) catch |err| Cli.storeFatal(store, err);
+
+    return .{
+        .status = execution.status,
+        .exit_code = result.exit_code,
+        .stdout = result.output, // tmux merges the two streams in the pane
+        .stderr = "",
+        .identity = null,
+    };
+}
+
+fn advisoryText(ctx: *Cli.Ctx, advisory: ?Core.execution.Blocker) ?[]const u8 {
+    const blocker = advisory orelse return null;
+    return switch (blocker) {
+        .unsettled => |op| std.fmt.allocPrint(
+            ctx.arena,
+            "request {s} ({s}) is unsettled on an overlapping scope; reconcile it before changing anything",
+            .{ op.request_id, op.status.text() },
+        ) catch null,
+        .lease => |lease| std.fmt.allocPrint(
+            ctx.arena,
+            "{s} holds a lease on an overlapping scope until {d}",
+            .{ lease.owner_token, lease.expires_at },
+        ) catch null,
+    };
+}
+
+fn reportBlocked(ctx: *Cli.Ctx, blocker: Core.execution.Blocker) !void {
+    switch (blocker) {
+        .unsettled => |op| fatal(
+            "refused: request {s} is {s} on an overlapping scope, so this change could be applied twice; reconcile it ('terminus request reconcile {s}') or pass --force",
+            .{ op.request_id, op.status.text(), op.request_id },
+        ),
+        .lease => |lease| fatal(
+            "refused: {s} holds a lease on an overlapping scope until {d}; wait, take it over, or pass --force",
+            .{ lease.owner_token, lease.expires_at },
+        ),
     }
-
-    if (exit_code != 0) {
-        try ctx.out.flush();
-        std.process.exit(@intCast(std.math.clamp(exit_code, 1, 255)));
-    }
+    _ = ctx;
 }
 
 pub fn fatalTmux(err: anyerror, executor: Core.Executor, session_name: []const u8) noreturn {
