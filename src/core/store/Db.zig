@@ -15,6 +15,14 @@ pub const Error = error{
     Sqlite,
     /// A UNIQUE/FOREIGN KEY/CHECK constraint rejected the statement.
     Constraint,
+    /// The database could not be put into WAL mode within the retry budget.
+    ///
+    /// Distinct from `Sqlite` on purpose: this contention is invisible to
+    /// `busy_timeout` (see `ensureWal`) and the retry budget is measured in
+    /// iterations rather than time, so a heavily loaded machine is the one
+    /// place it could plausibly run out. Naming it means a future occurrence
+    /// identifies itself instead of arriving as an unexplained failure.
+    WalSetupExhausted,
 };
 
 /// SQLITE_TRANSIENT: sqlite copies the buffer before returning from bind.
@@ -62,8 +70,11 @@ pub fn open(path: [:0]const u8) Error!Db {
 /// budget while the lock holder never gets scheduled, which showed up as an
 /// intermittent ReleaseSafe failure.
 fn ensureWal(db: *Db) Error!void {
+    // Generous: the lock is held only for a peer's own header write, so the
+    // only way to exhaust this is a machine so loaded that nothing runs.
+    const max_rounds = 64 * 1024;
     var round: usize = 0;
-    while (round < 4096) : (round += 1) {
+    while (round < max_rounds) : (round += 1) {
         if (db.exec("PRAGMA journal_mode=WAL")) |_| return else |_| {}
         if (try db.inWalMode()) return;
         var spin: usize = 0;
@@ -73,7 +84,7 @@ fn ensureWal(db: *Db) Error!void {
     // Never report success in a different journal mode: the concurrency
     // guarantees the rest of the code assumes would not hold.
     if (try db.inWalMode()) return;
-    return error.Sqlite;
+    return error.WalSetupExhausted;
 }
 
 fn inWalMode(db: *Db) Error!bool {

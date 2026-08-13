@@ -133,6 +133,51 @@ pub fn sendKeys(executor: Executor, arena: Allocator, name: []const u8, input: [
     }
 }
 
+/// State probe: reads the *end* of the log rather than walking forward from a
+/// cursor.
+///
+/// Detecting that a job finished is a different problem from streaming its
+/// output, and conflating them is a bug: a reader that walks forward in 1 MiB
+/// windows from the user's cursor never reaches the sentinel on a job that
+/// produced 5 MiB, so the job stays "running" forever. The sentinel is always
+/// the last thing written, so reading a tail window finds it in one round
+/// trip regardless of how much came before — and it cannot be truncated
+/// mid-marker, because the window ends where the log ends.
+pub fn probeTail(
+    executor: Executor,
+    arena: Allocator,
+    name: []const u8,
+    sentinel: []const u8,
+    tail_bytes: i64,
+) Error!JobProbe {
+    const path = try logPath(arena, name);
+    const script = try std.fmt.allocPrint(arena,
+        \\f={s}
+        \\[ -f "$f" ] || {{ echo 0; exit 0; }}
+        \\wc -c < "$f"
+        \\tail -c {d} "$f"
+    , .{ path, tail_bytes });
+    const result = try run(executor, arena, script);
+    if (result.exit_code != 0) return error.RemoteFailed;
+
+    const newline = std.mem.indexOfScalar(u8, result.stdout, '\n') orelse
+        return .{ .output = "", .next_cursor = 0, .exit_code = null, .session_alive = try isAlive(executor, arena, name) };
+    const size_text = std.mem.trim(u8, result.stdout[0..newline], " \t\r");
+    const log_size = std.fmt.parseInt(i64, size_text, 10) catch return error.RemoteFailed;
+    const cleaned = try stripTerminalNoise(arena, result.stdout[newline + 1 ..]);
+
+    var exit_code: ?i32 = null;
+    if (findSentinel(cleaned, sentinel)) |found| exit_code = found.exit_code;
+
+    return .{
+        .output = cleaned,
+        .next_cursor = log_size,
+        .exit_code = exit_code,
+        .session_alive = try isAlive(executor, arena, name),
+        .business_result = try findBusinessResult(arena, cleaned),
+    };
+}
+
 pub const ReadResult = struct {
     data: []const u8,
     /// Byte offset to continue from next time.

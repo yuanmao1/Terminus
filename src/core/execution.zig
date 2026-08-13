@@ -239,30 +239,42 @@ fn reportLostReceipt(self: *Execution, err: anyerror) void {
 
 /// Opens an execution, applying the scope guard and lease check first.
 ///
-/// Order matters: the blockers are evaluated *before* the operation row
-/// exists, so a refused mutation leaves nothing behind.
+/// The check and the insert happen inside one `BEGIN IMMEDIATE`. Splitting
+/// them — even by a few microseconds — lets two concurrent `run --name
+/// deploy` both observe an empty scope and both submit, which is exactly the
+/// double-application this guard exists to prevent. The write lock serializes
+/// them, so the loser sees the winner's operation and is refused.
 pub fn begin(
     store: *Store,
     arena: Allocator,
     io: std.Io,
     opts: BeginOptions,
 ) Error!Start {
-    var advisory: ?Blocker = null;
+    const request_id = ids.generate(io);
+    const capability_json = try opts.capability.toJson(arena);
 
+    try store.db.exec("BEGIN IMMEDIATE");
+    errdefer store.db.exec("ROLLBACK") catch {};
+
+    var advisory: ?Blocker = null;
     if (opts.server_id) |server_id| {
         const unsettled = try operations.unsettledInScope(store, arena, server_id, opts.scope);
         if (unsettled.len > 0) {
-            if (opts.mutating and !opts.force) return .{ .blocked = .{ .unsettled = unsettled[0] } };
+            if (opts.mutating and !opts.force) {
+                try store.db.exec("ROLLBACK");
+                return .{ .blocked = .{ .unsettled = unsettled[0] } };
+            }
             advisory = .{ .unsettled = unsettled[0] };
         }
-        if (try leases.conflictFor(store, arena, server_id, opts.scope, opts.owner_token, opts.now)) |lease| {
-            if (opts.mutating and !opts.force) return .{ .blocked = .{ .lease = lease } };
+        if (try leases.conflictForLocked(store, arena, server_id, opts.scope, opts.owner_token, opts.now)) |lease| {
+            if (opts.mutating and !opts.force) {
+                // The expiry pass is worth keeping even when we refuse.
+                try store.db.exec("COMMIT");
+                return .{ .blocked = .{ .lease = lease } };
+            }
             if (advisory == null) advisory = .{ .lease = lease };
         }
     }
-
-    const request_id = ids.generate(io);
-    const capability_json = try opts.capability.toJson(arena);
 
     try operations.create(store, .{
         .request_id = &request_id,
@@ -280,6 +292,8 @@ pub fn begin(
         .transport = opts.transport,
         .now = opts.now,
     });
+
+    try store.db.exec("COMMIT");
 
     var execution: Execution = .{
         .request_id = request_id,

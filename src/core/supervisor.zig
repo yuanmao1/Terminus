@@ -50,6 +50,12 @@ pub const Capability = struct {
 };
 
 /// What a plain POSIX shell can honestly claim.
+///
+/// Note `pid_proof = .weak`, and what follows from it: a tmux session
+/// disappearing does **not** establish that the work stopped. A command that
+/// daemonized, called `disown`, or ran under `setsid` outlives the pane that
+/// launched it. Shell mode can observe that the session is gone; it cannot
+/// prove the process tree is.
 pub const shell_capability: Capability = .{
     .supervisor = .shell,
     .pid_proof = .weak,

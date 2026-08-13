@@ -22,6 +22,7 @@ pub const TopCommand = enum {
     @"export",
     import,
     setup,
+    request,
     daemon,
     help,
     version,
@@ -87,6 +88,7 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .@"export" => try @import("cmd_export_import.zig").exportCmd(ctx, args[1..]),
         .import => try @import("cmd_export_import.zig").importCmd(ctx, args[1..]),
         .setup => try @import("cmd_setup.zig").run(ctx, args[1..]),
+        .request => try @import("cmd_request.zig").run(ctx, args[1..]),
         .daemon => try @import("cmd_daemon.zig").run(ctx, args[1..]),
     }
 }

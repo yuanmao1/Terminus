@@ -327,6 +327,10 @@ pub fn openStore(ctx: *Ctx, parsed: *const Args.Parsed) !Store {
             "database at {s} was created by a pre-release build whose schema has since changed; delete it (and its -wal/-shm files) or point --db elsewhere",
             .{path},
         ),
+        error.WalSetupExhausted => fail(
+            "database at {s} could not be switched to WAL mode; another terminus process may be starting at the same instant under heavy load — retry",
+            .{path},
+        ),
         else => fail("cannot open database at {s}", .{path}),
     };
 }

@@ -137,6 +137,27 @@ fn activeLocked(store: *Store, arena: Allocator, server_id: i64) Error![]Lease {
     return out.toOwnedSlice(arena);
 }
 
+/// Expiry + read, for a caller that already holds the write transaction.
+///
+/// The scope guard needs the conflict check and the operation insert to be
+/// one atomic step; without this it would have to open a second transaction
+/// and reintroduce the race it exists to close.
+pub fn conflictForLocked(
+    store: *Store,
+    arena: Allocator,
+    server_id: i64,
+    target: Scope,
+    owner_token: []const u8,
+    now: i64,
+) Error!?Lease {
+    try expireLapsedLocked(store, server_id, now);
+    for (try activeLocked(store, arena, server_id)) |lease| {
+        if (lease.heldBy(owner_token)) continue;
+        if (lease.scope().overlaps(target)) return lease;
+    }
+    return null;
+}
+
 /// Currently-held leases on a server (expired ones filtered out and marked).
 pub fn active(store: *Store, arena: Allocator, server_id: i64, now: i64) Error![]Lease {
     try store.db.exec("BEGIN IMMEDIATE");

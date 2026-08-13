@@ -28,12 +28,24 @@ const Scratch = struct {
 
     const dir = ".zig-cache/tmp";
 
+    /// Scratch names must be unique per process: the gates are otherwise
+    /// safe to run in parallel, and a shared filename turns that into a pile
+    /// of false failures that look like real races.
+    var counter: std.atomic.Value(u32) = .init(0);
+
+    fn uniqueName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        const n = counter.fetchAdd(1, .monotonic);
+        return std.fmt.allocPrint(allocator, "{s}_{d}_{d}", .{ name, std.Thread.getCurrentId(), n });
+    }
+
     fn init(allocator: std.mem.Allocator, name: []const u8) !Scratch {
         const threaded = try allocator.create(std.Io.Threaded);
         threaded.* = .init(allocator, .{});
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.db", .{ dir, name }, 0);
+        const unique = try uniqueName(allocator, name);
+        defer allocator.free(unique);
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.db", .{ dir, unique }, 0);
         var s: Scratch = .{ .io = io, .threaded = threaded, .path = path, .allocator = allocator };
         s.removeFiles();
         return s;

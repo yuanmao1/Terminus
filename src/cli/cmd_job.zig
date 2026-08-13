@@ -87,7 +87,10 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         .scope = jobScope(job_name),
         .alias = job_name,
         .mutating = true,
-        .argv_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch raw_command,
+        .argv_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch
+            // Falling back to the raw text would write the very secrets the
+            // redaction exists to keep out of an append-only ledger.
+            fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
         .argv_sha256 = try sha256Hex(ctx.arena, raw_command),
         .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
         .shell = if (parsed.boolean("login")) "bash-login" else "bash",
@@ -109,8 +112,8 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     if (Store.jobs.getByName(&store, ctx.arena, resolved.server.id, job_name) catch |err|
         Cli.storeFatal(&store, err)) |existing|
     {
-        if (existing.status == .running)
-            fatal("job '{s}' is already running (started {d}); pick another --name or 'job rm' it", .{ job_name, existing.created_at });
+        if (existing.status == .running and !parsed.boolean("force"))
+            fatal("job '{s}' is already running (started {d}); pick another --name, 'job rm' it, or pass --force", .{ job_name, existing.created_at });
         _ = Store.jobs.remove(&store, resolved.server.id, job_name) catch |err| Cli.storeFatal(&store, err);
     }
 
@@ -153,17 +156,13 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     else
         try std.fmt.allocPrint(ctx.arena, "({s}); echo {s}:$?", .{ command, sentinel });
 
-    // Keys are about to enter a live shell: from here the remote may act.
-    execution.submitted() catch |err| Cli.storeFatal(&store, err);
-    Tmux.sendKeys(executor, ctx.arena, session, full, false) catch |err| {
-        _ = execution.transportLoss(executor.errorMessage()) catch {};
-        fatalTmux(err, executor, session);
-    };
-
-    if (Tmux.panePid(executor, ctx.arena, session) catch null) |pid| {
-        execution.remoteStarted(.{ .pid = pid }) catch |err| Cli.storeFatal(&store, err);
-    }
-
+    // Persist *before* handing anything to the remote.
+    //
+    // The sentinel and session name are already fixed, so the record can be
+    // written first — and it must be. If these writes happened after
+    // `sendKeys` and the local database then failed, the command would be
+    // running on the server with nothing locally able to find it: `status`,
+    // `kill` and `reconcile` all key off the job row and the attempt.
     const job_id = Store.jobs.create(&store, resolved.server.id, job_name, raw_command, sentinel, ctx.now) catch |err| switch (err) {
         error.NameTaken => fatal("job '{s}' already exists", .{job_name}),
         else => Cli.storeFatal(&store, err),
@@ -185,12 +184,25 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         .cwd = cwd,
         .interpreter = parsed.flag("interpreter") orelse "bash",
         .shell = if (parsed.boolean("login")) "bash-login" else "bash",
-        .script_body_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch raw_command,
+        .script_body_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch
+            fatal("cannot redact the script for the audit record; refusing to store it unredacted", .{}),
         .script_sha256 = try sha256Hex(ctx.arena, raw_command),
         .script_bytes = @intCast(raw_command.len),
         .entry_path = staged_path,
         .now = ctx.now,
     }) catch |err| Cli.storeFatal(&store, err);
+
+    // Keys are about to enter a live shell: from here the remote may act.
+    execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "about to submit");
+    Tmux.sendKeys(executor, ctx.arena, session, full, false) catch |err| {
+        _ = execution.transportLoss(executor.errorMessage()) catch {};
+        fatalTmux(err, executor, session);
+    };
+
+    if (Tmux.panePid(executor, ctx.arena, session) catch null) |pid| {
+        execution.remoteStarted(.{ .pid = pid }) catch |err|
+            Cli.receiptFatal(execution.id(), err, "remote_started");
+    }
 
     // The work outlives this process. Detaching says so explicitly, and the
     // attempt keeps holding its scope until somebody establishes how it ended.
@@ -279,6 +291,10 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             }),
             .human => try ctx.out.print("{s}", .{probe.output}),
         }
+        if (state.status == .indeterminate) {
+            try ctx.out.flush();
+            Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
+        }
     } else if (std.mem.eql(u8, verb, "watch")) {
         try watchJob(ctx, &store, executor, session, job, attempt, &parsed, server_name, conn);
     } else if (std.mem.eql(u8, verb, "kill")) {
@@ -297,8 +313,18 @@ const State = struct {
     business_result: ?[]const u8 = null,
 };
 
-/// One SSH probe from the stored cursor; settles the operation if the probe
-/// establishes an outcome.
+/// How much of the log's end a state probe reads. The sentinel is one short
+/// line at the very end, so this only has to be large enough to survive a
+/// burst of trailing output.
+const probe_tail_bytes: i64 = 256 * 1024;
+
+/// One SSH probe of the log's *end*; settles the operation if it establishes
+/// an outcome.
+///
+/// Deliberately does not use `jobs.read_cursor`. That cursor belongs to
+/// whoever is streaming output, and a probe that shared it would (a) move a
+/// consumer's position underneath them and (b) never reach the sentinel on a
+/// job whose output exceeds one read window.
 fn refresh(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -307,8 +333,16 @@ fn refresh(
     job: Store.jobs.Job,
     attempt: ?Store.job_attempts.Attempt,
 ) State {
-    const probe = Tmux.probeJob(executor, ctx.arena, session, job.sentinel, job.read_cursor, 1 << 20) catch |err|
+    const probe = Tmux.probeTail(executor, ctx.arena, session, job.sentinel, probe_tail_bytes) catch |err|
         fatalTmux(err, executor, session);
+    if (attempt) |a| {
+        Store.job_attempts.recordProbe(store, a.request_id, .{
+            .probe_cursor = probe.next_cursor,
+            .latest_business_result = probe.business_result,
+            .session_alive = probe.session_alive,
+            .now = ctx.now,
+        }) catch |err| Cli.storeFatal(store, err);
+    }
     return applyProbe(ctx, store, job, probe, attempt);
 }
 
@@ -467,12 +501,18 @@ fn watchJob(
     }
 }
 
-/// Kills a job and verifies it is gone.
+/// Kills a job's session and records what that actually established.
 ///
-/// Not a new operation: a kill settles the attempt that is already in flight.
-/// The receipt therefore shows the launch and its cancellation on one trail.
-/// If the session refuses to die, that is `indeterminate` — a cancellation
-/// nobody confirmed is not a cancellation.
+/// Not a new operation: a kill settles the attempt already in flight, so the
+/// receipt shows the launch and its cancellation on one trail.
+///
+/// The hard part is what counts as proof. `tmux has-session` reporting the
+/// session gone is *not* evidence that the work stopped: a command that
+/// daemonized, called `disown`, or ran under `setsid` outlives the pane that
+/// launched it. Under a supervisor whose capability says it cannot prove a
+/// process is gone, this therefore settles `indeterminate` — which keeps the
+/// scope held — rather than `cancelled`, which would release it and invite a
+/// relaunch alongside a process that is still running.
 fn killJob(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -486,27 +526,34 @@ fn killJob(
     try requireNoForeignLease(ctx, store, server_id, job.name, parsed);
 
     Tmux.kill(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session);
-    const gone = !(Tmux.isAlive(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session));
+    const session_gone = !(Tmux.isAlive(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session));
 
-    var settled_status: []const u8 = "killed";
+    const capability = Core.supervisor.shell_capability;
+    const can_prove = Core.supervisor.Requirement.verified_cancellation.satisfiedBy(capability);
+
+    var settled_status: []const u8 = "unknown";
     if (attempt) |a| {
         if (Core.execution.attach(store, ctx.arena, ctx.io, a.request_id) catch |err|
             Cli.storeFatal(store, err)) |loaded|
         {
             var execution = loaded;
-            const outcome = if (gone)
+            const outcome = if (session_gone and can_prove)
                 execution.settleAttached(.{ .remote_cancel_confirmed = .{
+                    .pid = null,
                     .term_sent = true,
                     .kill_sent = true,
                     .absence_verified_at = ctx.now,
-                    .verification_method = "tmux has-session reports the job session absent",
+                    .verification_method = "supervisor verified the process group is gone",
                 } }, .{})
             else
                 execution.settleAttached(.{ .indeterminate = .{
-                    .reason = "kill issued but the job session is still present",
+                    .reason = if (session_gone)
+                        "job session killed, but this supervisor cannot prove the process tree stopped (a daemonized or disowned child survives its pane)"
+                    else
+                        "kill issued but the job session is still present",
                     .last_observed = execution.status,
                 } }, .{});
-            const settled = outcome catch |err| Cli.storeFatal(store, err);
+            const settled = outcome catch |err| Cli.receiptFatal(a.request_id, err, "kill issued");
             settled_status = switch (settled) {
                 .recorded => |r| r.status.text(),
                 .already_settled => |r| r.status.text(),
@@ -519,21 +566,29 @@ fn killJob(
             Cli.storeFatal(store, err);
     }
 
+    const proven = session_gone and can_prove;
     switch (ctx.out.format) {
         .json => try ctx.out.json(.{
-            .ok = gone,
+            .ok = proven,
             .action = "killed",
             .job = job.name,
             .status = settled_status,
-            .absenceVerified = gone,
+            .sessionGone = session_gone,
+            .cancellationProven = proven,
             .requestId = if (attempt) |a| a.request_id else null,
+            .hint = if (proven) null else @as(?[]const u8, Core.supervisor.Requirement.verified_cancellation.explain()),
         }),
-        .human => if (gone)
-            try ctx.out.print("killed job '{s}' (session confirmed gone)\n", .{job.name})
-        else
-            try ctx.out.print("kill issued for '{s}' but the session is still present\n", .{job.name}),
+        .human => {
+            if (proven) {
+                try ctx.out.print("killed job '{s}' (absence verified)\n", .{job.name});
+            } else if (session_gone) {
+                try ctx.out.print("job '{s}': session killed, but absence of the process tree is unproven\n", .{job.name});
+            } else {
+                try ctx.out.print("kill issued for '{s}' but the session is still present\n", .{job.name});
+            }
+        },
     }
-    if (!gone) {
+    if (!proven) {
         try ctx.out.flush();
         Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
     }
@@ -568,12 +623,12 @@ fn removeJob(
             Cli.storeFatal(store, err)) |loaded|
         {
             var execution = loaded;
-            _ = execution.settleAttached(.{ .remote_cancel_confirmed = .{
-                .term_sent = true,
-                .kill_sent = true,
-                .absence_verified_at = ctx.now,
-                .verification_method = "job removed; tmux has-session reports the session absent",
-            } }, .{}) catch |err| Cli.storeFatal(store, err);
+            // Same proof limit as `job kill`: the session being gone does not
+            // establish that the work stopped.
+            _ = execution.settleAttached(.{ .indeterminate = .{
+                .reason = "job removed; session absent, but this supervisor cannot prove the process tree stopped",
+                .last_observed = execution.status,
+            } }, .{}) catch |err| Cli.receiptFatal(a.request_id, err, "job removed");
         }
     }
 

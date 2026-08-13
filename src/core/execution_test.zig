@@ -31,12 +31,24 @@ const Harness = struct {
 
     const dir = ".zig-cache/tmp";
 
+    /// Scratch names must be unique per process: the gates are otherwise
+    /// safe to run in parallel, and a shared filename turns that into a pile
+    /// of false failures that look like real races.
+    var counter: std.atomic.Value(u32) = .init(0);
+
+    fn uniqueName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        const n = counter.fetchAdd(1, .monotonic);
+        return std.fmt.allocPrint(allocator, "{s}_{d}_{d}", .{ name, std.Thread.getCurrentId(), n });
+    }
+
     fn init(allocator: std.mem.Allocator, name: []const u8) !Harness {
         const threaded = try allocator.create(std.Io.Threaded);
         threaded.* = .init(allocator, .{});
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.db", .{ dir, name }, 0);
+        const unique = try uniqueName(allocator, name);
+        defer allocator.free(unique);
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.db", .{ dir, unique }, 0);
 
         // WAL sidecars must go with the database; a stale one silently shows
         // an empty view instead of failing.
@@ -571,4 +583,177 @@ test "M2b gate: relaunching a job whose fate is unknown is refused" {
     var second = allowed.ready;
     defer second.deinit();
     try t.expect(allowed == .ready);
+}
+
+const ConcurrentStart = struct {
+    path: [:0]const u8,
+    gate: *std.atomic.Value(bool),
+    won: bool = false,
+    blocked: bool = false,
+    err: ?anyerror = null,
+};
+
+fn beginInThread(ctx: *ConcurrentStart) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+
+    while (!ctx.gate.load(.acquire)) std.atomic.spinLoopHint();
+    var store = Store.open(ctx.path) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    defer store.close();
+
+    const start = execution.begin(&store, arena_state.allocator(), threaded.io(), .{
+        .server_id = 1,
+        .server_name = "box",
+        .kind = .job,
+        .scope = .{ .kind = .job, .key = "deploy" },
+        .alias = "deploy",
+        .mutating = true,
+        .owner_token = "owner-a",
+        .now = 1000,
+    }) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    switch (start) {
+        .ready => |e| {
+            var owned = e;
+            ctx.won = true;
+            // The winner leaves it in flight, as `run` does.
+            owned.connecting() catch {};
+            owned.submitted() catch {};
+            owned.detach("running") catch {};
+        },
+        .blocked => ctx.blocked = true,
+    }
+}
+
+test "M2 gate: concurrent starts on one scope produce exactly one winner" {
+    const t = std.testing;
+    const thread_count = 4;
+
+    for (0..6) |round| {
+        var name_buf: [40]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "m2_concurrent_{d}", .{round});
+        var h = try Harness.init(t.allocator, name);
+        defer h.deinit();
+
+        // The guard checks for a conflict and inserts the operation. Unless
+        // both happen inside one write transaction, every thread sees an
+        // empty scope and every thread submits — the exact double-application
+        // the guard exists to stop.
+        var gate: std.atomic.Value(bool) = .init(false);
+        var ctxs: [thread_count]ConcurrentStart = undefined;
+        var threads: [thread_count]std.Thread = undefined;
+        for (&ctxs, 0..) |*ctx, i| {
+            ctx.* = .{ .path = h.path, .gate = &gate };
+            threads[i] = try std.Thread.spawn(.{}, beginInThread, .{ctx});
+        }
+        gate.store(true, .release);
+        for (threads) |thread| thread.join();
+
+        var winners: usize = 0;
+        var blocked: usize = 0;
+        for (&ctxs) |*ctx| {
+            if (ctx.err) |err| {
+                std.debug.print("round {d}: {s}\n", .{ round, @errorName(err) });
+                return err;
+            }
+            if (ctx.won) winners += 1;
+            if (ctx.blocked) blocked += 1;
+        }
+        try t.expectEqual(@as(usize, 1), winners);
+        try t.expectEqual(@as(usize, thread_count - 1), blocked);
+    }
+}
+
+test "M2 gate: a weak supervisor cannot claim a verified cancellation" {
+    const t = std.testing;
+
+    // The capability is not decoration: killing a tmux session does not prove
+    // a daemonized or disowned child stopped, so shell mode must be unable to
+    // record `cancelled` — which would release the scope while the work runs.
+    try t.expect(!supervisor.Requirement.verified_cancellation.satisfiedBy(supervisor.shell_capability));
+
+    const helper: supervisor.Capability = .{
+        .supervisor = .helper,
+        .pid_proof = .strong,
+        .binary_framing = true,
+        .remote_deadline = true,
+        .audit_isolation = true,
+    };
+    try t.expect(supervisor.Requirement.verified_cancellation.satisfiedBy(helper));
+
+    // And the state machine agrees about what the weaker outcome preserves.
+    var h = try Harness.init(t.allocator, "m2_weak_cancel");
+    defer h.deinit();
+    const start = try h.begin(.{ .kind = .job, .alias = "svc", .mutating = true });
+    var exec = start.ready;
+    try exec.connecting();
+    try exec.submitted();
+    try exec.detach("running");
+
+    var attached = (try execution.attach(&h.store, h.arena, h.io, exec.id())).?;
+    _ = try attached.settleAttached(.{ .indeterminate = .{
+        .reason = "job session killed, but this supervisor cannot prove the process tree stopped",
+        .last_observed = attached.status,
+    } }, .{});
+    const op = try h.operationOf(exec.id());
+    try t.expectEqual(op_state.Status.indeterminate, op.status);
+    // Still held: a relaunch must not slip past an unproven cancellation.
+    try t.expect(op.status.blocksScope());
+}
+
+test "M2 gate: a submitted attempt is findable even if the next local write fails" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2_submit_first");
+    defer h.deinit();
+
+    const start = try h.begin(.{ .kind = .job, .alias = "deploy", .mutating = true });
+    var exec = start.ready;
+    try exec.connecting();
+    try exec.submitted();
+
+    // Whatever happens locally after this point, the attempt exists and is
+    // reachable by request id and by alias — which is what `status`, `kill`
+    // and `reconcile` key off.
+    const by_alias = (try Store.operations.latestByAlias(&h.store, h.arena, 1, "deploy")).?;
+    try t.expectEqualStrings(exec.id(), by_alias.request_id);
+    try t.expectEqual(op_state.Status.submitted, by_alias.status);
+    try t.expectEqual(@as(usize, 1), (try Store.operations.unsettled(&h.store, h.arena, 1)).len);
+}
+
+test "M2 gate: reconciliation releases a scope only with evidence" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2_reconcile_gate");
+    defer h.deinit();
+
+    const scope: scope_mod.Scope = .{ .kind = .job, .key = "deploy" };
+    const start = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
+    var exec = start.ready;
+    try exec.connecting();
+    try exec.submitted();
+    _ = try exec.transportLoss("eof");
+
+    // An override needs a named owner and is marked as a decision, but it is
+    // available — otherwise a forgotten job blocks its name forever, and the
+    // guard becomes something people route around.
+    try t.expect((try receipts.resolve(&h.store, h.arena, exec.id(), .failed, .{
+        .operator_override = .{ .reason = "checked the host by hand; nothing ran", .by = "czykl" },
+    }, 3000)) == .resolved);
+
+    const op = try h.operationOf(exec.id());
+    try t.expectEqual(op_state.Status.indeterminate, op.status); // observation kept
+    try t.expect(!op.effectiveStatus().blocksScope()); // scope released
+    try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "\"mechanical\":false") != null);
+
+    // And the scope is genuinely usable again.
+    const again = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
+    var second = again.ready;
+    defer second.deinit();
+    try t.expect(again == .ready);
 }

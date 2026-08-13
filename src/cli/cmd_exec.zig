@@ -66,9 +66,13 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const owner_token = Store.policy.ownerToken(&store, ctx.arena, ctx.io, ctx.now) catch |err|
         Cli.storeFatal(&store, err);
 
-    // `exec` is not declared mutating: it is the most common command, and a
-    // guard that refuses every read while one job is unsettled is a guard
-    // people turn off. Blockers are reported instead.
+    // An arbitrary shell command is assumed to change things.
+    //
+    // We cannot inspect `systemctl restart api` and know what it touches, and
+    // the cost of the two mistakes is not symmetric: wrongly treating a read
+    // as a mutation costs a refusal the caller can override, while wrongly
+    // treating a mutation as a read can apply a change twice. `--read-only`
+    // declares the safe case explicitly.
     const start = Core.execution.begin(&store, ctx.arena, ctx.io, .{
         .server_id = resolved.server.id,
         .server_name = resolved.server.name,
@@ -78,7 +82,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         else
             .{ .kind = .server },
         .alias = target.session,
-        .mutating = false,
+        .mutating = !parsed.boolean("read-only"),
         .argv_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch raw_command,
         .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
         .shell = if (parsed.boolean("login")) "bash-login" else "bash",
