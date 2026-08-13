@@ -14,10 +14,14 @@ const Store = @import("Store.zig");
 const Db = @import("Db.zig");
 const ids = @import("ids.zig");
 const op_state = @import("op_state.zig");
+const scope = @import("scope.zig");
 
 pub const Status = op_state.Status;
 pub const ResolvedStatus = op_state.ResolvedStatus;
 pub const Terminal = op_state.Terminal;
+/// Shared with leases, so both safety barriers use one overlap definition.
+pub const ScopeKind = scope.Kind;
+pub const Scope = scope.Scope;
 
 /// Bumped when the row layout gains meaning that a reader must understand.
 pub const schema_version: i64 = 1;
@@ -35,16 +39,6 @@ pub const Kind = enum {
 
     pub fn parse(text: []const u8) error{UnknownKind}!Kind {
         return std.meta.stringToEnum(Kind, text) orelse error.UnknownKind;
-    }
-};
-
-pub const ScopeKind = enum {
-    server,
-    job,
-    path,
-
-    pub fn parse(text: []const u8) error{UnknownScopeKind}!ScopeKind {
-        return std.meta.stringToEnum(ScopeKind, text) orelse error.UnknownScopeKind;
     }
 };
 
@@ -89,6 +83,16 @@ pub const Operation = struct {
     transport: ?[]const u8,
     created_at: i64,
     updated_at: i64,
+
+    /// The mutation scope this attempt claims. An attempt that never
+    /// declared one is treated as covering the whole server: we cannot
+    /// bound what it might be touching, so it must block rather than be
+    /// assumed harmless.
+    pub fn scopeOf(op: Operation) Scope {
+        const kind_text = op.scope_kind orelse return scope.unknown;
+        const kind = ScopeKind.parse(kind_text) catch return scope.unknown;
+        return .{ .kind = kind, .key = op.scope_key orelse "" };
+    }
 
     /// What the caller should act on: the proven truth if we have one, else
     /// what we last observed.
@@ -247,26 +251,28 @@ pub fn unsettled(store: *Store, arena: Allocator, server_id: i64) (Error || Allo
 }
 
 /// Unsettled attempts overlapping a scope, for the mutation guard.
+///
+/// Overlap is decided in Zig using the shared `scope.Scope.overlaps` rules —
+/// the same ones leases use. SQL equality on (kind, key) was not the same
+/// thing: it missed `/srv/app` against `/srv/app/dist`, and a whole-server
+/// mutation did not see a narrower path scope. One definition of "these two
+/// touch the same thing" is the whole point; two nearly-identical ones is
+/// how a hole appears.
+///
+/// An unsettled operation that never declared a scope is treated as covering
+/// the whole server: work that may still be running and whose blast radius
+/// we cannot name has to block, rather than be assumed harmless.
 pub fn unsettledInScope(
     store: *Store,
     arena: Allocator,
     server_id: i64,
-    scope_kind: ScopeKind,
-    scope_key: []const u8,
+    target: scope.Scope,
 ) (Error || Allocator.Error)![]Operation {
+    const candidates = try unsettled(store, arena, server_id);
     var out: std.ArrayList(Operation) = .empty;
-    var stmt = try store.db.prepare(select_columns ++
-        \\ WHERE server_id = ?1 AND
-    ++ unsettled_predicate ++
-        \\   AND (scope_kind = 'server'
-        \\        OR (scope_kind = ?2 AND scope_key = ?3))
-        \\ ORDER BY created_at DESC
-    );
-    defer stmt.deinit();
-    try stmt.bindInt(1, server_id);
-    try stmt.bindText(2, @tagName(scope_kind));
-    try stmt.bindText(3, scope_key);
-    while (try stmt.step()) try out.append(arena, try rowToOperation(arena, &stmt));
+    for (candidates) |op| {
+        if (op.scopeOf().overlaps(target)) try out.append(arena, op);
+    }
     return out.toOwnedSlice(arena);
 }
 

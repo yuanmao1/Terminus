@@ -28,10 +28,14 @@ pub const schema_version = migrate.latest_version;
 
 db: Db,
 
-pub fn open(path: [:0]const u8) Db.Error!Store {
+pub const OpenError = Db.Error || error{PreReleaseSchemaDrift};
+
+pub fn open(path: [:0]const u8) OpenError!Store {
     var db = try Db.open(path);
     errdefer db.close();
     try migrate.apply(&db);
+    // Only meaningful before 0.2.0 ships; see checkPreReleaseDrift.
+    try migrate.checkPreReleaseDrift(&db);
     return .{ .db = db };
 }
 

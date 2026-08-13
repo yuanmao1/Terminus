@@ -377,6 +377,30 @@ pub fn apply(db: *Db) Db.Error!void {
     inline for (migrations, 1..) |sql, target| try applyOne(db, sql, target);
 }
 
+/// Detects a database built by a *pre-release* revision of a migration.
+///
+/// Migrations are frozen once shipped, but before 0.2.0 exists the v5+ SQL is
+/// still being corrected in place. A database created by an earlier commit of
+/// this branch reports the right `user_version` while missing columns that
+/// were added afterwards, and the failures that follow are confusing SQL
+/// errors far from the cause. Detecting it here turns that into one clear
+/// message. Costs a single query on databases at v5 or above.
+pub fn checkPreReleaseDrift(db: *Db) (Db.Error || error{PreReleaseSchemaDrift})!void {
+    if (try userVersion(db) < 5) return;
+    if (!try hasColumn(db, "operation_events", "last_observed"))
+        return error.PreReleaseSchemaDrift;
+}
+
+fn hasColumn(db: *Db, table: [:0]const u8, column: []const u8) Db.Error!bool {
+    // pragma_table_info is a table-valued function, so this needs no string
+    // interpolation of the column name.
+    var stmt = try db.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2");
+    defer stmt.deinit();
+    try stmt.bindText(1, table);
+    try stmt.bindText(2, column);
+    return try stmt.step();
+}
+
 /// Applies one migration, safe against a second process racing the same
 /// upgrade.
 ///

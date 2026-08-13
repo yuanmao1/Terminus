@@ -273,8 +273,15 @@ fn daemonRequest(server: Store.servers.Server, auth: Ssh.Auth) Core.daemon_proto
 /// %APPDATA%\terminus\terminus.db (or ~/.terminus/terminus.db).
 pub fn openStore(ctx: *Ctx, parsed: *const Args.Parsed) !Store {
     const path = try dbPath(ctx, parsed.flag("db") orelse ctx.db_override);
-    return Store.open(path) catch
-        fail("cannot open database at {s}", .{path});
+    return Store.open(path) catch |err| switch (err) {
+        // Only reachable on a machine that ran a pre-release build of the
+        // 0.2.0 branch; say exactly that instead of leaking a SQL error.
+        error.PreReleaseSchemaDrift => fail(
+            "database at {s} was created by a pre-release build whose schema has since changed; delete it (and its -wal/-shm files) or point --db elsewhere",
+            .{path},
+        ),
+        else => fail("cannot open database at {s}", .{path}),
+    };
 }
 
 fn dbPath(ctx: *Ctx, override: ?[]const u8) ![:0]u8 {

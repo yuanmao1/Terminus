@@ -385,14 +385,26 @@ test "gate: only settle can write a terminal" {
     const request_id: []const u8 = &rid;
     try seedOperation(&store, request_id);
 
-    // `append` refuses a terminal at runtime. A debug assertion would have
-    // vanished in ReleaseFast and let a caller settle without updating the
-    // operation status.
-    try t.expectError(error.TerminalRequiresSettle, Store.receipts.append(&store, .{
+    // `append` takes an ObservationKind, which has no `terminal` and no
+    // `reconcile` member, so forging either is a compile error rather than a
+    // runtime check. What it can still be handed is a reconcile *source*,
+    // which would make a forged resolution indistinguishable from a real one
+    // in the trail — that is refused at runtime.
+    try t.expectError(error.ReconcileRequiresResolve, Store.receipts.append(&store, .{
         .request_id = request_id,
-        .kind = .terminal,
+        .kind = .audit,
+        .source = .reconcile,
         .observed_at = 200,
     }));
+
+    // A plain observation cannot claim a verdict either: `status` is a
+    // LiveStatus, so `.completed` is not expressible here.
+    _ = try Store.receipts.append(&store, .{
+        .request_id = request_id,
+        .kind = .connect,
+        .status = .connecting,
+        .observed_at = 201,
+    });
 
     // `advance` cannot even name a terminal: LiveStatus has no such member,
     // so the bypass is a compile error rather than a runtime check.
@@ -457,17 +469,56 @@ test "gate: settle refuses evidence that contradicts itself" {
 
     var store = try Store.open(scratch.path);
     defer store.close();
+    try seedServer(&store);
     const rid = testId("evidence");
     const request_id: []const u8 = &rid;
-    try seedOperation(&store, request_id);
+    try Store.operations.create(&store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .exec,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, request_id, .connecting, 101);
 
-    // "Nothing reached the remote" cannot come with a remote process id.
+    // From `connecting`, "nothing reached the remote" is a legitimate claim —
+    // but not alongside a remote process id.
     try t.expectError(error.ContradictoryEvidence, Store.receipts.settle(
         &store,
         request_id,
         .{ .never_submitted = .{ .transport_error = "refused" } },
         .{ .remote_pid = 4242 },
         200,
+    ));
+
+    // And once the work has been handed over, that claim is not available at
+    // all: the evidence no longer fits the state we are in.
+    try Store.operations.advance(&store, request_id, .submitted, 210);
+    try t.expectError(error.EvidenceDoesNotFit, Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .never_submitted = .{ .transport_error = "refused" } },
+        .{},
+        220,
+    ));
+
+    // Symmetrically, an exit status cannot come from an attempt that never
+    // reached a connection.
+    const rid2 = testId("neverran");
+    const other: []const u8 = &rid2;
+    try Store.operations.create(&store, .{
+        .request_id = other,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .exec,
+        .now = 300,
+    });
+    try t.expectError(error.EvidenceDoesNotFit, Store.receipts.settle(
+        &store,
+        other,
+        .{ .exited = .{ .exit_code = 1 } },
+        .{},
+        310,
     ));
 }
 
@@ -488,7 +539,7 @@ test "gate: indeterminate evidence is persisted, not just mapped" {
     _ = try Store.receipts.settle(
         &store,
         request_id,
-        Store.op_state.terminalForTransportLoss(.remote_started, "channel eof"),
+        Store.op_state.terminalForTransportLoss(.submitted, "channel eof"),
         .{},
         300,
     );
@@ -501,7 +552,7 @@ test "gate: indeterminate evidence is persisted, not just mapped" {
     defer stmt.deinit();
     try stmt.bindText(1, request_id);
     try t.expect(try stmt.step());
-    try t.expectEqualStrings("remote_started", stmt.columnText(0));
+    try t.expectEqualStrings("submitted", stmt.columnText(0));
     try t.expectEqualStrings("channel eof", stmt.columnText(1));
     try t.expectEqualStrings("INDETERMINATE", stmt.columnText(2));
 
@@ -554,7 +605,7 @@ test "gate: transport loss after submission records indeterminate, never failed"
     try t.expectEqual(@as(usize, 1), (try Store.operations.unsettled(&store, arena, 1)).len);
 
     // Reconciliation proves the truth without erasing the observation.
-    try t.expect((try Store.receipts.resolve(&store, request_id, .completed, "found exit 0 in job log", 400)) == .resolved);
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{ .job_sentinel = .{ .sentinel = "__TERMINUS_JOB_1__", .exit_code = 0 } }, 400)) == .resolved);
     const after = (try Store.operations.get(&store, arena, request_id)).?;
     try t.expectEqual(op_state.Status.indeterminate, after.status); // preserved
     try t.expectEqual(op_state.Status.completed, after.effectiveStatus());
@@ -584,7 +635,7 @@ test "gate: resolution cannot lift the barrier on a running operation" {
     // A `submitted` attempt is not unknown, it is in progress. Resolving it
     // would drop it out of `unsettled()` and let a peer start a conflicting
     // mutation while the remote command is still alive.
-    const refused = try Store.receipts.resolve(&store, request_id, .completed, "wishful thinking", 300);
+    const refused = try Store.receipts.resolve(&store, arena, request_id, .completed, .{ .operator_override = .{ .reason = "wishful thinking", .by = "tester" } }, 300);
     try t.expectEqual(op_state.Status.submitted, refused.not_indeterminate);
 
     // The barrier is still up and nothing was recorded.
@@ -606,7 +657,7 @@ test "gate: resolution cannot lift the barrier on a running operation" {
     try Store.operations.advance(&store, other, .connecting, 401);
     try Store.operations.advance(&store, other, .submitted, 402);
     _ = try Store.receipts.settle(&store, other, .{ .exited = .{ .exit_code = 0 } }, .{}, 410);
-    const refused_done = try Store.receipts.resolve(&store, other, .failed, "rewrite history", 420);
+    const refused_done = try Store.receipts.resolve(&store, arena, other, .failed, .{ .operator_override = .{ .reason = "rewrite history", .by = "tester" } }, 420);
     try t.expectEqual(op_state.Status.completed, refused_done.not_indeterminate);
 }
 
@@ -631,17 +682,17 @@ test "gate: resolution is write-once" {
         300,
     );
 
-    try t.expect((try Store.receipts.resolve(&store, request_id, .completed, "log shows exit 0", 400)) == .resolved);
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{ .job_sentinel = .{ .sentinel = "__S__", .exit_code = 0 } }, 400)) == .resolved);
 
     // A second reconciler must not overwrite the first one's evidence.
-    const second = try Store.receipts.resolve(&store, request_id, .failed, "disagrees", 500);
+    const second = try Store.receipts.resolve(&store, arena, request_id, .failed, .{ .supervisor_report = .{ .detail = "disagrees" } }, 500);
     try t.expectEqual(op_state.ResolvedStatus.completed, second.already_resolved);
 
     const op = (try Store.operations.get(&store, arena, request_id)).?;
     try t.expectEqual(op_state.ResolvedStatus.completed, op.resolved_status.?);
-    try t.expectEqualStrings("log shows exit 0", op.resolution_evidence.?);
+    try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "job_sentinel") != null);
 
-    try t.expect((try Store.receipts.resolve(&store, &testId("missing"), .completed, "x", 600)) == .unknown_operation);
+    try t.expect((try Store.receipts.resolve(&store, arena, &testId("missing"), .completed, .{ .supervisor_report = .{ .detail = "x" } }, 600)) == .unknown_operation);
 }
 
 test "gate: illegal transitions are rejected" {
@@ -910,6 +961,133 @@ test "gate: owner token is stable across store reopens" {
     defer store.close();
     const second = try Store.policy.ownerToken(&store, arena, scratch.io, 200);
     try t.expectEqualStrings(first_token, second);
+}
+
+test "gate: the operation guard and leases share one overlap rule" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_scope_unified");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    // An unsettled operation holding a narrow path.
+    const dist = testId("dist");
+    try Store.operations.create(&store, .{
+        .request_id = &dist,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .transfer_push,
+        .scope_kind = .path,
+        .scope_key = "/srv/app/dist",
+        .now = 100,
+    });
+    try Store.operations.advance(&store, &dist, .connecting, 101);
+    try Store.operations.advance(&store, &dist, .submitted, 102);
+
+    // SQL equality on (kind, key) missed all three of these.
+    const parent: Store.operations.Scope = .{ .kind = .path, .key = "/srv/app" };
+    try t.expectEqual(@as(usize, 1), (try Store.operations.unsettledInScope(&store, arena, 1, parent)).len);
+    const whole_host: Store.operations.Scope = .{ .kind = .server };
+    try t.expectEqual(@as(usize, 1), (try Store.operations.unsettledInScope(&store, arena, 1, whole_host)).len);
+    const sibling: Store.operations.Scope = .{ .kind = .path, .key = "/srv/applied" };
+    try t.expectEqual(@as(usize, 0), (try Store.operations.unsettledInScope(&store, arena, 1, sibling)).len);
+
+    // An unsettled operation that never declared a scope must block
+    // everything: we cannot bound what it is touching. `dist` still does not
+    // match this sibling path, so the undeclared one is the only hit.
+    const vague = testId("vague");
+    try Store.operations.create(&store, .{
+        .request_id = &vague,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .exec,
+        .now = 200,
+    });
+    try Store.operations.advance(&store, &vague, .connecting, 201);
+    try Store.operations.advance(&store, &vague, .submitted, 202);
+    try t.expectEqual(@as(usize, 1), (try Store.operations.unsettledInScope(&store, arena, 1, sibling)).len);
+
+    // Settling clears the barrier.
+    _ = try Store.receipts.settle(&store, &vague, .{ .exited = .{ .exit_code = 0 } }, .{}, 300);
+    try t.expectEqual(@as(usize, 0), (try Store.operations.unsettledInScope(&store, arena, 1, sibling)).len);
+    // ...but the narrow path operation is still in flight for its own scope.
+    try t.expectEqual(@as(usize, 1), (try Store.operations.unsettledInScope(&store, arena, 1, parent)).len);
+
+    // The lease layer answers identically, because it is the same rule.
+    try t.expect(Store.leases.Scope.overlaps(parent, .{ .kind = .path, .key = "/srv/app/dist" }));
+    try t.expect(!Store.leases.Scope.overlaps(sibling, .{ .kind = .path, .key = "/srv/app/dist" }));
+}
+
+test "gate: an operator override cannot pass for mechanical proof" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_override");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("override");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        300,
+    );
+
+    _ = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .operator_override = .{ .reason = "checked by hand", .by = "czykl" },
+    }, 400);
+
+    // A resolution lifts the mutation barrier, so the trail has to say
+    // whether it rested on proof or on a decision.
+    const rows = try Store.receipts.list(&store, arena, request_id);
+    const last = rows[rows.len - 1];
+    try t.expectEqualStrings("reconcile", last.kind);
+    try t.expectEqualStrings("OPERATOR_OVERRIDE", last.error_code.?);
+    try t.expect(std.mem.indexOf(u8, last.detail_json.?, "\"mechanical\":false") != null);
+    try t.expect(std.mem.indexOf(u8, last.detail_json.?, "\"schemaVersion\"") != null);
+
+    // Mechanical evidence is marked as such.
+    const probe: Store.receipts.ResolutionEvidence = .{
+        .process_probe = .{ .pid = 991, .alive = false },
+    };
+    try t.expect(probe.isMechanical());
+    const json = try probe.toJson(arena);
+    try t.expect(std.mem.indexOf(u8, json, "\"mechanical\":true") != null);
+}
+
+test "gate: a pre-release schema is detected instead of failing obscurely" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_drift");
+    defer scratch.deinit();
+
+    // Reproduce what the parent commit produced: v5+ reported, but the
+    // evidence columns added afterwards are missing.
+    {
+        var db = try Db.open(scratch.path);
+        defer db.close();
+        try migrate.applyUpTo(&db, 4);
+        try db.exec(
+            \\CREATE TABLE operations (request_id TEXT PRIMARY KEY, status TEXT NOT NULL);
+            \\CREATE TABLE operation_events (
+            \\  id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, seq INTEGER NOT NULL,
+            \\  is_terminal INTEGER NOT NULL DEFAULT 0, observed_at INTEGER NOT NULL,
+            \\  source TEXT NOT NULL
+            \\);
+            \\PRAGMA user_version = 8;
+        );
+    }
+    try t.expectError(error.PreReleaseSchemaDrift, Store.open(scratch.path));
 }
 
 test "gate: host key mismatch is reported, never auto-updated" {

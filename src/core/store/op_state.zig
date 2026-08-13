@@ -230,6 +230,88 @@ pub fn terminalForTransportLoss(last_observed: Status, detail: []const u8) Termi
     };
 }
 
+/// Whether this evidence can legitimately settle an attempt in state `from`.
+///
+/// `canTransition` alone is not enough, because several evidence variants map
+/// onto the same status and a status check cannot tell them apart. Without
+/// this, the ledger would accept:
+///
+/// * `submitted` + `never_submitted` → `failed` — a receipt that claims both
+///   that we handed the work over and that nothing left this machine;
+/// * `created` + `exited(1)` → `failed` — an exit status, with
+///   `connected = true`, for an attempt that never reached a connection.
+///
+/// Both are `failed`, so only the evidence distinguishes them.
+pub fn canSettle(from: Status, terminal: Terminal) bool {
+    // Terminals are frozen; reconciliation annotates them instead.
+    if (from.isTerminal()) return false;
+    return switch (terminal) {
+        // Only credible while nothing has been handed over.
+        .never_submitted => switch (from) {
+            .created, .connecting => true,
+            else => false,
+        },
+        // A real exit status requires something that actually ran.
+        .exited, .remote_deadline => switch (from) {
+            .submitted, .remote_started => true,
+            else => false,
+        },
+        // Cancellation is legitimate at any live stage. Before submission it
+        // is a local abandonment (nothing ran); after, the caller must have
+        // verified the remote process is gone. The receipt records which,
+        // via `connected`/`remote_started`.
+        .cancelled_confirmed => true,
+        // Only work that was in flight can become unknown, and the recorded
+        // `last_observed` has to be the state we were actually in — otherwise
+        // the field a reconciler navigates by would be fiction.
+        .indeterminate => |i| switch (from) {
+            .connecting, .submitted, .remote_started => i.last_observed == from,
+            else => false,
+        },
+    };
+}
+
+test canSettle {
+    const t = std.testing;
+
+    // The two combinations a status-only check lets through.
+    try t.expect(!canSettle(.submitted, .{ .never_submitted = .{ .transport_error = "eof" } }));
+    try t.expect(!canSettle(.created, .{ .exited = .{ .exit_code = 1 } }));
+
+    // ...and their legitimate counterparts.
+    try t.expect(canSettle(.connecting, .{ .never_submitted = .{ .transport_error = "refused" } }));
+    try t.expect(canSettle(.created, .{ .never_submitted = .{ .transport_error = "no route" } }));
+    try t.expect(canSettle(.submitted, .{ .exited = .{ .exit_code = 1 } }));
+    try t.expect(canSettle(.remote_started, .{ .exited = .{ .exit_code = 0 } }));
+
+    // A remote deadline needs a remote that accepted the work.
+    try t.expect(!canSettle(.connecting, .{ .remote_deadline = .{ .after_ms = 10 } }));
+    try t.expect(canSettle(.remote_started, .{ .remote_deadline = .{ .after_ms = 10 } }));
+
+    // Cancellation is allowed at every live stage.
+    try t.expect(canSettle(.created, .{ .cancelled_confirmed = .{ .method = "local abort" } }));
+    try t.expect(canSettle(.remote_started, .{ .cancelled_confirmed = .{ .method = "TERM" } }));
+
+    // last_observed must match reality, so the field can be trusted.
+    try t.expect(canSettle(.submitted, .{ .indeterminate = .{ .reason = "eof", .last_observed = .submitted } }));
+    try t.expect(!canSettle(.submitted, .{ .indeterminate = .{ .reason = "eof", .last_observed = .remote_started } }));
+    try t.expect(!canSettle(.created, .{ .indeterminate = .{ .reason = "eof", .last_observed = .created } }));
+
+    // Nothing settles an already-settled attempt.
+    try t.expect(!canSettle(.completed, .{ .exited = .{ .exit_code = 0 } }));
+    try t.expect(!canSettle(.indeterminate, .{ .exited = .{ .exit_code = 0 } }));
+}
+
+test "terminalForTransportLoss always produces settleable evidence" {
+    const t = std.testing;
+    // The single decision point must never hand back something `settle`
+    // would then reject.
+    for ([_]Status{ .created, .connecting, .submitted, .remote_started }) |from| {
+        const terminal = terminalForTransportLoss(from, "dropped");
+        try t.expect(canSettle(from, terminal));
+    }
+}
+
 test "advance cannot express a terminal" {
     const t = std.testing;
     // Exhaustive: every LiveStatus maps to a non-terminal Status, so

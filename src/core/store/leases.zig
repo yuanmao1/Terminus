@@ -23,9 +23,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Store = @import("Store.zig");
 const Db = @import("Db.zig");
-const operations = @import("operations.zig");
+const scope_mod = @import("scope.zig");
 
-pub const ScopeKind = operations.ScopeKind;
+/// Leases and the unsettled-operation guard share one definition of overlap;
+/// see `scope.zig`. Two barriers with different rules is how a hole appears.
+pub const ScopeKind = scope_mod.Kind;
+pub const Scope = scope_mod.Scope;
 
 pub const ReleaseReason = enum {
     /// Owner gave it up.
@@ -41,40 +44,6 @@ pub const ReleaseReason = enum {
         return @tagName(r);
     }
 };
-
-pub const Scope = struct {
-    kind: ScopeKind,
-    /// Empty for a whole-server lease; job name or path otherwise.
-    key: []const u8 = "",
-
-    /// The conflict matrix.
-    ///
-    /// * A `server` lease covers everything on that host, so it overlaps any
-    ///   other scope.
-    /// * `job` scopes overlap only on the same name.
-    /// * `path` scopes overlap when one contains the other — holding
-    ///   `/srv/app` must block `/srv/app/dist`, otherwise "do not let two
-    ///   sessions modify the same directory" would not hold.
-    pub fn overlaps(a: Scope, b: Scope) bool {
-        if (a.kind == .server or b.kind == .server) return true;
-        if (a.kind != b.kind) return false;
-        return switch (a.kind) {
-            .server => true,
-            .job => std.mem.eql(u8, a.key, b.key),
-            .path => pathContains(a.key, b.key) or pathContains(b.key, a.key),
-        };
-    }
-};
-
-/// True when `parent` contains `child` (or they are the same path). Compares
-/// at separator boundaries so `/srv/app` does not "contain" `/srv/applied`.
-fn pathContains(parent: []const u8, child: []const u8) bool {
-    const p = std.mem.trimEnd(u8, parent, "/");
-    const c = std.mem.trimEnd(u8, child, "/");
-    if (p.len == 0) return true; // "/" contains everything
-    if (!std.mem.startsWith(u8, c, p)) return false;
-    return c.len == p.len or c[p.len] == '/';
-}
 
 pub const Lease = struct {
     id: i64,
@@ -373,41 +342,4 @@ pub fn takeover(store: *Store, arena: Allocator, opts: AcquireOptions) Error!Tak
     const fresh = try insertLocked(store, arena, opts, null);
     try store.db.exec("COMMIT");
     return .{ .acquired = fresh };
-}
-
-test "scope overlap matrix" {
-    const t = std.testing;
-    const server: Scope = .{ .kind = .server };
-    const job_a: Scope = .{ .kind = .job, .key = "build" };
-    const job_b: Scope = .{ .kind = .job, .key = "deploy" };
-    const path_app: Scope = .{ .kind = .path, .key = "/srv/app" };
-    const path_dist: Scope = .{ .kind = .path, .key = "/srv/app/dist" };
-    const path_other: Scope = .{ .kind = .path, .key = "/srv/applied" };
-
-    // A server lease covers the whole host.
-    try t.expect(server.overlaps(job_a));
-    try t.expect(job_a.overlaps(server));
-    try t.expect(server.overlaps(path_app));
-
-    // Different jobs are independent; different kinds do not collide.
-    try t.expect(job_a.overlaps(job_a));
-    try t.expect(!job_a.overlaps(job_b));
-    try t.expect(!job_a.overlaps(path_app));
-
-    // Holding a directory blocks anything inside it, in both directions.
-    try t.expect(path_app.overlaps(path_dist));
-    try t.expect(path_dist.overlaps(path_app));
-    // ...but not a sibling that merely shares a prefix string.
-    try t.expect(!path_app.overlaps(path_other));
-}
-
-test pathContains {
-    const t = std.testing;
-    try t.expect(pathContains("/srv/app", "/srv/app"));
-    try t.expect(pathContains("/srv/app", "/srv/app/dist"));
-    try t.expect(pathContains("/srv/app/", "/srv/app/dist"));
-    try t.expect(!pathContains("/srv/app", "/srv/applied"));
-    try t.expect(!pathContains("/srv/app/dist", "/srv/app"));
-    // Root contains everything.
-    try t.expect(pathContains("/", "/anything"));
 }
