@@ -32,10 +32,11 @@ const usage =
     \\reconcile establishes what an attempt actually did, so the scope it
     \\holds can be released.
     \\
-    \\  --from-log   re-reads the job's own log. On an attempt still in
-    \\               flight (a job whose caller walked away) this settles the
-    \\               real outcome from the exit sentinel; if the session is
-    \\               alive it reports that and settles nothing.
+    \\  --from-log   re-reads what the job left behind: its result record
+    \\               first, then its log. On an attempt still in flight (a job
+    \\               whose caller walked away) this settles the real outcome
+    \\               from the recorded exit status; if the session is alive it
+    \\               reports that and settles nothing.
     \\  --override   for an `indeterminate` attempt a human has checked by
     \\               hand. Recorded as a decision, never as proof.
     \\
@@ -300,18 +301,26 @@ const Outcome = struct {
     exit: enum { ok, failure, indeterminate },
 };
 
-/// What the job's own log says, and whether its session is still there.
+/// What the job's own durable evidence says, and whether its session is
+/// still there.
 const LogEvidence = struct {
     alias: []const u8,
     sentinel: []const u8,
     exit_code: ?i32,
+    /// Which record answered. Carried through so the receipt names the
+    /// evidence it actually had rather than the one this command is called
+    /// after.
+    source: Tmux.JobProbe.ExitSource,
+    finished_at: ?i64,
     session_alive: bool,
     output_bytes: usize,
 };
 
-/// Goes and reads the job's own log. The sentinel is written by the remote
-/// shell after the command returns, so it is the one durable record of how
-/// the job ended — available long after the process that launched it is gone.
+/// Goes and reads what the job left behind: its result sidecar first, then
+/// its log. Both are written by the remote shell after the command returns,
+/// so either is available long after the process that launched the job is
+/// gone — but only the sidecar stays findable once the job's own output has
+/// buried the sentinel.
 fn readLog(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -331,21 +340,79 @@ fn readLog(
     var conn = Cli.connect(ctx, parsed, resolved_server.server, resolved_server.auth);
     defer conn.deinit();
 
-    // Tail read: the sentinel is the last line, so one round trip finds it
-    // however much output came before.
-    const probe = Tmux.probeTail(conn.executor(), ctx.arena, session, sentinel, 256 * 1024) catch |err|
+    // One round trip: the sidecar at its fixed address, plus a tail of the
+    // log for the sentinel fallback and the output-size figure.
+    const probe = Tmux.probeTail(conn.executor(), ctx.arena, session, sentinel, op.request_id, 256 * 1024) catch |err|
         fatal("cannot read the job log for '{s}': {s}", .{ alias, @errorName(err) });
 
     return .{
         .alias = alias,
         .sentinel = sentinel,
         .exit_code = probe.exit_code,
+        .source = probe.exit_source,
+        .finished_at = probe.finished_at,
         .session_alive = probe.session_alive,
         .output_bytes = probe.output.len,
     };
 }
 
-/// Annotates an already-`indeterminate` attempt with what the log proves.
+/// The evidence value matching whichever record answered, and the sentence
+/// that describes it. Never says "sentinel" when it read a sidecar.
+fn evidenceOf(op_request_id: []const u8, e: LogEvidence, code: i32) struct {
+    evidence: Store.receipts.ResolutionEvidence,
+    detail: []const u8,
+} {
+    return switch (e.source) {
+        .result_file => .{
+            .evidence = .{ .job_result = .{
+                .request_id = op_request_id,
+                .exit_code = code,
+                .finished_at = e.finished_at orelse 0,
+            } },
+            .detail = "the job's result record carried its exit status",
+        },
+        // `.none` cannot reach here: the caller only calls this once it has an
+        // exit code, and an exit code without a source is not producible.
+        .log_sentinel, .none => .{
+            .evidence = .{ .job_sentinel = .{ .sentinel = e.sentinel, .exit_code = code } },
+            .detail = "exit sentinel found in the job log",
+        },
+    };
+}
+
+test "M2e gate: reconcile names the record it actually read" {
+    const t = std.testing;
+    const base: LogEvidence = .{
+        .alias = "deploy",
+        .sentinel = "__TERMINUS_JOB_5__",
+        .exit_code = 3,
+        .source = .result_file,
+        .finished_at = 1750000000,
+        .session_alive = false,
+        .output_bytes = 12,
+    };
+    const rid = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+
+    // The receipt has to carry the evidence that answered. Reporting a
+    // sentinel for a result file — or the reverse — would make the audit
+    // trail describe a lookup that never happened.
+    const from_file = evidenceOf(rid, base, 3);
+    try t.expectEqualStrings("job_result", from_file.evidence.kindName());
+    try t.expectEqual(@as(i64, 3), from_file.evidence.job_result.exit_code);
+    try t.expectEqual(@as(i64, 1750000000), from_file.evidence.job_result.finished_at);
+    try t.expectEqualStrings(rid, from_file.evidence.job_result.request_id);
+    try t.expect(std.mem.indexOf(u8, from_file.detail, "sentinel") == null);
+
+    var legacy = base;
+    legacy.source = .log_sentinel;
+    legacy.finished_at = null;
+    const from_log = evidenceOf(rid, legacy, 3);
+    try t.expectEqualStrings("job_sentinel", from_log.evidence.kindName());
+    try t.expectEqualStrings("__TERMINUS_JOB_5__", from_log.evidence.job_sentinel.sentinel);
+    try t.expect(std.mem.indexOf(u8, from_log.detail, "sentinel") != null);
+}
+
+/// Annotates an already-`indeterminate` attempt with what the job proves.
 fn resolveFromLog(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -360,29 +427,29 @@ fn resolveFromLog(
         .mechanical = true,
         .status = op.status.text(),
         .detail = if (evidence.session_alive)
-            "the job session is still alive and its log carries no exit sentinel; its outcome is not established yet"
+            "the job session is still alive and it has recorded no exit status; its outcome is not established yet"
         else
-            "the job log carries no exit sentinel; its outcome is still unknown (the log may have been rotated, or the job never finished)",
+            "the job left no exit status behind — no result record and no sentinel in its log; its outcome is still unknown (the evidence may have been discarded, or the job never finished)",
         .exit = .indeterminate,
     };
 
     const resolved: Store.op_state.ResolvedStatus = if (code == 0) .completed else .failed;
-    const result = Store.receipts.resolve(store, ctx.arena, op.request_id, resolved, .{
-        .job_sentinel = .{ .sentinel = evidence.sentinel, .exit_code = code },
-    }, ctx.now) catch |err| Cli.receiptFatal(op.request_id, err, "reconcile");
+    const chosen = evidenceOf(op.request_id, evidence, code);
+    const result = Store.receipts.resolve(store, ctx.arena, op.request_id, resolved, chosen.evidence, ctx.now) catch |err|
+        Cli.receiptFatal(op.request_id, err, "reconcile");
 
-    return interpret(result, resolved, true, "exit sentinel found in the job log");
+    return interpret(result, resolved, true, chosen.detail);
 }
 
 /// Settles an attempt that was never settled at all.
 ///
 /// Three answers, kept strictly apart:
 ///
-///   * sentinel present — the job ended and the log says how. Settled for
-///     real, and the scope is released.
-///   * no sentinel, session alive — the job is running. Nothing is settled;
-///     the scope stays held because it *should* be held.
-///   * no sentinel, session gone — something happened and the evidence is
+///   * an exit status is recorded — the job ended and we can say how. Settled
+///     for real, and the scope is released.
+///   * no exit status, session alive — the job is running. Nothing is
+///     settled; the scope stays held because it *should* be held.
+///   * no exit status, session gone — something happened and the evidence is
 ///     gone with it. Settled `indeterminate`, which still blocks the scope.
 ///     An operator override can then release it, as an override.
 fn settleFromLog(
@@ -417,7 +484,7 @@ fn settleFromLog(
             .resolved = status.text(),
             .mechanical = true,
             .status = status.text(),
-            .detail = "exit sentinel found in the job log",
+            .detail = evidenceOf(op.request_id, evidence, code).detail,
             .exit = .ok,
         };
     }
@@ -438,13 +505,13 @@ fn settleFromLog(
             .mechanical = true,
             .status = op.status.text(),
             .still_running = true,
-            .detail = "still running: the job session is alive and has written no exit sentinel. Nothing to reconcile — poll it with 'job status'",
+            .detail = "still running: the job session is alive and has recorded no exit status. Nothing to reconcile — poll it with 'job status'",
             .exit = .ok,
         };
     }
 
     _ = execution.settleAttached(.{ .indeterminate = .{
-        .reason = "job session is gone and its log carries no exit sentinel",
+        .reason = "job session is gone and it recorded no exit status, in neither its result record nor its log",
         .last_observed = execution.status,
     } }, .{ .source = .reconcile }) catch |err| Cli.receiptFatal(op.request_id, err, op.status.text());
 
@@ -453,7 +520,7 @@ fn settleFromLog(
         .resolved = null,
         .mechanical = true,
         .status = Store.op_state.Status.indeterminate.text(),
-        .detail = "the job session is gone and left no exit sentinel; recorded as indeterminate, which keeps holding the scope. Release it with --override once you have checked the host by hand",
+        .detail = "the job session is gone and left no exit status behind; recorded as indeterminate, which keeps holding the scope. Release it with --override once you have checked the host by hand",
         .exit = .indeterminate,
     };
 }
@@ -464,7 +531,7 @@ fn probeJson(arena: std.mem.Allocator, session_alive: bool) ![]u8 {
         .schemaVersion = Store.receipts.schema_version,
         .event = "reconcile_probe",
         .sessionAlive = session_alive,
-        .sentinelFound = false,
+        .exitStatusFound = false,
     }, .{}, &writer.writer) catch return error.OutOfMemory;
     return writer.toOwnedSlice();
 }

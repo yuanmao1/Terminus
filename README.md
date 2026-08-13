@@ -22,7 +22,7 @@ structured output  > terminal scraping
 recalled memory    > re-discovery
 ```
 
-- **Jobs** — long tasks run in dedicated remote tmux sessions with a sentinel capturing the exit code. Nothing is lost if the CLI, agent process, or SSH connection dies; the job stays queryable from any process.
+- **Jobs** — long tasks run in dedicated remote tmux sessions, each writing its exit status to a durable per-request result file on the host. Nothing is lost if the CLI, agent process, or SSH connection dies; the job stays queryable from any process.
 - **Sessions** — a Terminus session maps to a remote tmux session. cwd/env persist between calls; disconnects don't destroy state.
 - **Memory & facts** — agents store what they learned about a server (deploy paths, service layout, gotchas) and recall it next conversation. Every `exec --json` response carries the server's memory keys.
 - **Stable JSON contract** — every command supports `--json`; every failure is `{"ok":false,"error":"..."}` with exit 1; remote exit codes pass through.
@@ -115,7 +115,7 @@ agent / human
 │  store/    SQLite: servers keys sessions      │
 │            memories jobs facts history        │
 │  ssh/      libssh2: exec, SCP, auth           │
-│  session/  remote tmux + sentinel + cursors   │
+│  session/  remote tmux + results + cursors    │
 │  daemon/   local unix-socket connection pool  │
 └───┬───────────────────────────┬──────────────┘
     │ ssh (direct)              │ unix socket

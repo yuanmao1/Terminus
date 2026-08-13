@@ -199,9 +199,11 @@ the connection daemon was skipped — mention it if you see repeated fallbacks.
 
 ## Jobs: the reliable way to run long tasks
 
-`run` starts the command in a dedicated remote tmux session with a sentinel
-that captures the exit code. Nothing is lost if your process, the CLI, or
-the SSH connection dies — the job keeps running and stays queryable:
+`run` starts the command in a dedicated remote tmux session. When it ends,
+its exit status is written to `~/.terminus/results/<request-id>.json` on the
+host, and also echoed into the session log. Nothing is lost if your process,
+the CLI, or the SSH connection dies — the job keeps running and stays
+queryable:
 
 ```bash
 terminus run prod --name migrate --cwd /srv/app -- ./migrate.sh

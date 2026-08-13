@@ -1,8 +1,11 @@
 //! `terminus run` / `terminus job` — tracked long-running remote tasks.
 //!
-//! A job runs inside a dedicated remote tmux session named `job-<name>` with
-//! a sentinel appended (`cmd; echo <sentinel>:$?`), so its exit code is
-//! recoverable from the output log at any later time, by any process.
+//! A job runs inside a dedicated remote tmux session named `job-<name>`. When
+//! the command returns, its shell records the exit status twice: into
+//! `~/.terminus/results/<request-id>.json`, and as a sentinel line in the
+//! output log. Either one makes the outcome recoverable later by any process,
+//! but only the first stays findable once the job's own output has scrolled
+//! the sentinel out of reach — see `Tmux.jobLaunchLine`.
 //!
 //! Jobs run under the execution boundary, with one twist: the launching
 //! command exits while the work continues. `run` therefore *detaches* rather
@@ -11,10 +14,10 @@
 //! Whoever next observes the job settles it.
 //!
 //! What this file no longer does is guess. A job session that has vanished
-//! without leaving a sentinel used to be recorded as `killed`; but a pane can
-//! disappear because the command finished and the shell exited, because
-//! somebody killed it, or because the host rebooted mid-write. Those are not
-//! the same outcome, and none of them is evidence for the others.
+//! without recording an exit status used to be recorded as `killed`; but a
+//! pane can disappear because the command finished and the shell exited,
+//! because somebody killed it, or because the host rebooted mid-write. Those
+//! are not the same outcome, and none of them is evidence for the others.
 const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
@@ -221,10 +224,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 
     const cwd = parsed.flag("cwd") orelse resolved.server.cwd;
-    const full = if (cwd) |dir|
-        try std.fmt.allocPrint(ctx.arena, "cd {s} && ({s}); echo {s}:$?", .{ dir, command, sentinel })
-    else
-        try std.fmt.allocPrint(ctx.arena, "({s}); echo {s}:$?", .{ command, sentinel });
+    const full = try Tmux.jobLaunchLine(ctx.arena, command, cwd, sentinel, execution.id());
 
     // The immutable record of what was launched. Survives `job rm` and a
     // same-name rerun, which the mutable `jobs` row does not.
@@ -380,8 +380,15 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         else
             1 << 20;
         const from = if (parsed.boolean("from-cursor")) job.read_cursor else 0;
-        const probe = Tmux.probeJob(executor, ctx.arena, session, job.sentinel, from, limit) catch |err|
-            fatalTmux(err, executor, session);
+        const probe = Tmux.probeJob(
+            executor,
+            ctx.arena,
+            session,
+            job.sentinel,
+            if (attempt) |a| a.request_id else null,
+            from,
+            limit,
+        ) catch |err| fatalTmux(err, executor, session);
         if (parsed.boolean("from-cursor")) {
             Store.jobs.setCursor(&store, job.id, probe.next_cursor) catch |err| Cli.storeFatal(&store, err);
         }
@@ -442,8 +449,14 @@ fn refresh(
     job: Store.jobs.Job,
     attempt: ?Store.job_attempts.Attempt,
 ) State {
-    const probe = Tmux.probeTail(executor, ctx.arena, session, job.sentinel, probe_tail_bytes) catch |err|
-        fatalTmux(err, executor, session);
+    const probe = Tmux.probeTail(
+        executor,
+        ctx.arena,
+        session,
+        job.sentinel,
+        if (attempt) |a| a.request_id else null,
+        probe_tail_bytes,
+    ) catch |err| fatalTmux(err, executor, session);
     if (attempt) |a| {
         Store.job_attempts.recordProbe(store, a.request_id, .{
             .probe_cursor = probe.next_cursor,
@@ -481,11 +494,15 @@ fn applyProbe(
                 .stdout = .{ .bytes = @intCast(probe.output.len) },
             }) catch |err| Cli.storeFatal(store, err);
         }
-        Store.jobs.markFinished(store, job.id, .exited, code, ctx.now) catch |err| Cli.storeFatal(store, err);
+        // The remote's own clock when it could report one — the sidecar
+        // records it. Falling back to `now` is an observation time, not a
+        // finish time, and is only used when nothing better exists.
+        const finished_at = if (probe.finished_at) |ts| (if (ts > 0) ts else ctx.now) else ctx.now;
+        Store.jobs.markFinished(store, job.id, .exited, code, finished_at) catch |err| Cli.storeFatal(store, err);
         return .{
             .status = if (code == 0) .completed else .failed,
             .exit_code = code,
-            .finished_at = ctx.now,
+            .finished_at = finished_at,
             .business_result = probe.business_result,
         };
     }
@@ -502,7 +519,10 @@ fn applyProbe(
         return .{
             .status = .indeterminate,
             .exit_code = null,
-            .finished_at = ctx.now,
+            // Not `now`. We cannot say when this job finished, and we cannot
+            // say that it finished — that is what `indeterminate` means. A
+            // timestamp here would read as a finish we never witnessed.
+            .finished_at = null,
             .business_result = probe.business_result,
         };
     }
@@ -727,14 +747,25 @@ fn removeJob(
     try requireNoForeignLease(ctx, store, server_id, job.name, parsed);
     const discard = parsed.boolean("discard-evidence");
 
-    // Look before destroying: if the sentinel is there, this job's outcome is
-    // provable right now and need never become an override.
-    const probe = Tmux.probeTail(executor, ctx.arena, session, job.sentinel, probe_tail_bytes) catch |err|
-        fatalTmux(err, executor, session);
+    // Look before destroying: if the outcome is provable right now, it need
+    // never become an override.
+    const probe = Tmux.probeTail(
+        executor,
+        ctx.arena,
+        session,
+        job.sentinel,
+        if (attempt) |a| a.request_id else null,
+        probe_tail_bytes,
+    ) catch |err| fatalTmux(err, executor, session);
 
     const cleared = if (discard) blk: {
         Tmux.kill(executor, ctx.arena, session) catch |err|
             fatal("cannot clean up job '{s}' on the remote: {s} ({s}); the local record is kept", .{ job.name, executor.errorMessage(), @errorName(err) });
+        // The sidecar is evidence too. Leaving it behind after being told to
+        // discard evidence would make the next `reconcile --from-log` settle
+        // from a file the caller believes is gone.
+        if (attempt) |a| Tmux.removeResult(executor, ctx.arena, a.request_id) catch |err|
+            fatal("removed job '{s}' but could not delete its result record on the remote: {s} ({s}); delete {s}.json under ~/.terminus/results by hand", .{ job.name, executor.errorMessage(), @errorName(err), a.request_id });
         break :blk true;
     } else Tmux.killKeepLog(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);

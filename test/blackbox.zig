@@ -263,6 +263,76 @@ test "blackbox: a bare `exit` cannot swallow the wrapper's exit marker" {
     }
 }
 
+test "blackbox: a job records its exit status where later output cannot bury it" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "sidecar");
+    defer f.deinit();
+
+    // Same reasoning as the wrapper gate above: the launch line is a single
+    // line of shell holding a capture of `$?`, a printf format, a redirect and
+    // a rename, and reading it is not the same as knowing it runs. Run it
+    // through a real POSIX shell and look at what lands on disk.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const request_id = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+    const sentinel = "__TERMINUS_JOB_555__";
+
+    const cases = [_]struct { command: []const u8, code: []const u8 }{
+        .{ .command = "true", .code = "0" },
+        .{ .command = "exit 3", .code = "3" },
+        // The case the sidecar is for: a command that keeps the pane busy
+        // long after it has answered. Its own output would push the sentinel
+        // out of any tail window; the result file is unaffected.
+        .{ .command = "(exit 7); i=0; while [ $i -lt 200 ]; do echo noise; i=$((i+1)); done; exit 7", .code = "7" },
+    };
+
+    for (cases, 0..) |case, i| {
+        // `HOME=.` keeps `$HOME/.terminus/results` inside the scratch
+        // directory: a test must never write into the real home.
+        const line = try Terminus.Core.Tmux.jobLaunchLine(arena, case.command, null, sentinel, request_id);
+        const script = try std.fmt.allocPrint(arena, "HOME=.\nexport HOME\n{s}\n", .{line});
+
+        const path = try std.fmt.allocPrint(arena, "{s}/launch_{d}.sh", .{ f.dir, i });
+        try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = path, .data = script });
+        defer std.Io.Dir.cwd().deleteFile(f.io, path) catch {};
+
+        const result = try std.process.run(arena, f.io, .{
+            .argv = &.{ "sh", try std.fmt.allocPrint(arena, "launch_{d}.sh", .{i}) },
+            .cwd = .{ .path = f.dir },
+            .stdout_limit = .limited(1 << 16),
+            .stderr_limit = .limited(1 << 16),
+        });
+
+        const doc_path = try std.fmt.allocPrint(arena, "{s}/.terminus/results/{s}.json", .{ f.dir, request_id });
+        const doc = std.Io.Dir.cwd().readFileAlloc(f.io, doc_path, arena, .limited(4096)) catch |err| {
+            std.debug.print("command '{s}' left no result document: {s}\nstdout:\n{s}\nstderr:\n{s}\n", .{ case.command, @errorName(err), result.stdout, result.stderr });
+            return err;
+        };
+
+        const wanted_code = try std.fmt.allocPrint(arena, "\"exitCode\":{s}", .{case.code});
+        std.testing.expect(std.mem.indexOf(u8, doc, wanted_code) != null) catch |err| {
+            std.debug.print("command '{s}' recorded {s}, wanted {s}\n", .{ case.command, doc, wanted_code });
+            return err;
+        };
+        try t.expect(std.mem.indexOf(u8, doc, request_id) != null);
+        try t.expect(std.mem.indexOf(u8, doc, "\"v\":1") != null);
+
+        // The document is published by rename, so a reader never sees the
+        // partial write, and nothing is left behind pretending to be one.
+        const part = try std.fmt.allocPrint(arena, "{s}.part", .{doc_path});
+        try t.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(f.io, part, .{}));
+
+        // The sentinel is still written: jobs whose result file is discarded
+        // fall back to it, so it has to keep working.
+        const marker = try std.fmt.allocPrint(arena, "{s}:{s}", .{ sentinel, case.code });
+        try t.expect(std.mem.indexOf(u8, result.stdout, marker) != null);
+
+        try std.Io.Dir.cwd().deleteFile(f.io, doc_path);
+    }
+}
+
 /// A job-name reservation left behind by a launcher that did not finish,
 /// with its owning attempt parked at `status`.
 fn seedReservation(f: *Fixture, request_id: []const u8, name: []const u8, status: []const u8) !void {

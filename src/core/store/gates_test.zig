@@ -1311,6 +1311,59 @@ test "gate: evidence must entail the result it is used to justify" {
     try t.expectEqual(op_state.ResolvedStatus.failed, op.resolved_status.?);
 }
 
+test "M2e gate: a result record is read like a sentinel, and named unlike one" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_job_result_evidence");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("jobresult");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .indeterminate = .{ .reason = "caller walked away", .last_observed = .submitted } },
+        .{},
+        200,
+    );
+
+    // An exit status is an exit status wherever it was recorded: it says how
+    // the command ended and cannot speak to a deadline or a cancellation.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_result = .{ .request_id = request_id, .exit_code = 4, .finished_at = 900 },
+    }, 300)) == .evidence_does_not_support);
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .timed_out, .{
+        .job_result = .{ .request_id = request_id, .exit_code = 0, .finished_at = 900 },
+    }, 301)) == .evidence_does_not_support);
+
+    // Nothing was recorded by the refusals.
+    try t.expectEqual(
+        @as(?op_state.ResolvedStatus, null),
+        (try Store.operations.get(&store, arena, request_id)).?.resolved_status,
+    );
+
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .failed, .{
+        .job_result = .{ .request_id = request_id, .exit_code = 4, .finished_at = 900 },
+    }, 310)) == .resolved);
+
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(op_state.ResolvedStatus.failed, op.resolved_status.?);
+    // The trail has to distinguish "a document at this operation's own
+    // address said so" from "a line turned up in a shared log". Recording
+    // both as `job_sentinel` would erase the difference in strength.
+    try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "job_result") != null);
+    try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "job_sentinel") == null);
+    try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, request_id) != null);
+    // Mechanical, unlike an operator override — it must not need a human's
+    // name attached to release the scope.
+    try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "\"mechanical\":true") != null);
+}
+
 test "gate: a supervisor report cannot be repointed at another result" {
     const t = std.testing;
     var scratch = try Scratch.init(t.allocator, "gate_supervisor_report");

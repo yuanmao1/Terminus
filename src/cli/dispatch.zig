@@ -93,3 +93,27 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .daemon => try @import("cmd_daemon.zig").run(ctx, args[1..]),
     }
 }
+
+test {
+    // Every command module is imported inside a switch arm, and Zig only
+    // compiles tests in files it actually analyzes — so without this, a test
+    // written next to the code it covers silently never runs. That is worse
+    // than having no test: the count goes up and nothing is checked.
+    _ = @import("cmd_daemon.zig");
+    _ = @import("cmd_doctor.zig");
+    _ = @import("cmd_exec.zig");
+    _ = @import("cmd_export_import.zig");
+    _ = @import("cmd_fact.zig");
+    _ = @import("cmd_history.zig");
+    _ = @import("cmd_job.zig");
+    _ = @import("cmd_key.zig");
+    _ = @import("cmd_memory.zig");
+    _ = @import("cmd_read_write.zig");
+    _ = @import("cmd_request.zig");
+    _ = @import("cmd_server.zig");
+    _ = @import("cmd_session.zig");
+    _ = @import("cmd_setup.zig");
+    _ = @import("cmd_sync.zig");
+    _ = @import("cmd_transfer.zig");
+    _ = @import("cmd_workspace.zig");
+}

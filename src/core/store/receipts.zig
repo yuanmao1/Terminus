@@ -579,6 +579,23 @@ pub const ResolutionEvidence = union(enum) {
         sentinel: []const u8,
         exit_code: i64,
     },
+    /// The job's result sidecar — the document the remote wrapper wrote to
+    /// `~/.terminus/results/<request-id>.json` when the command returned.
+    ///
+    /// Kept distinct from `job_sentinel` even though both carry an exit code,
+    /// because they are not the same claim. A sentinel is a line found by
+    /// scanning a window of an append-only log that anything on the host can
+    /// write to; a sidecar is a document at an address derived from this
+    /// operation's own id, holding one fact. Collapsing them would make a
+    /// receipt unable to say which one it had.
+    job_result: struct {
+        /// Echoed back from the document, so the receipt records the identity
+        /// the evidence claimed rather than the one we went looking for.
+        request_id: []const u8,
+        exit_code: i64,
+        /// Remote unix seconds, 0 when the host could not report a clock.
+        finished_at: i64 = 0,
+    },
     /// A verified side effect on the filesystem (published artifact hash).
     /// Only meaningful for transfers: a hash matching proves the bytes
     /// landed, which says nothing about an arbitrary command.
@@ -616,6 +633,13 @@ pub const ResolutionEvidence = union(enum) {
                 .failed => s.exit_code != 0,
                 // A sentinel records how the command ended, which cannot
                 // establish a timeout or a cancellation.
+                .timed_out, .cancelled => false,
+            },
+            // Same reading rules as a sentinel: an exit status says how the
+            // command ended, and nothing about a deadline or a cancellation.
+            .job_result => |r| switch (resolved) {
+                .completed => r.exit_code == 0,
+                .failed => r.exit_code != 0,
                 .timed_out, .cancelled => false,
             },
             // A live process proves nothing at all. A dead one proves only
@@ -662,6 +686,7 @@ pub const ResolutionEvidence = union(enum) {
                 .by = try redact(arena, o.by),
             } },
             .process_probe => e, // numeric and opaque; nothing to redact
+            .job_result => e, // a request id and numbers; nothing to redact
         };
 
         var writer: std.Io.Writer.Allocating = .init(arena);
