@@ -176,9 +176,29 @@ pub const Terminal = union(enum) {
     remote_deadline: struct {
         after_ms: i64,
     },
-    /// Cancellation was carried out and verified (process confirmed gone).
-    cancelled_confirmed: struct {
-        method: []const u8,
+    /// Nothing had been handed over, so there is nothing to stop. Only
+    /// legitimate before submission.
+    local_abandon: struct {
+        reason: []const u8,
+    },
+    /// A remote process was signalled *and its absence verified*.
+    ///
+    /// Every field is required on purpose. "We sent TERM" is not evidence
+    /// that anything stopped; a free-text method string would let a caller
+    /// mark an operation `cancelled` — releasing the scope barrier — while
+    /// the process tree is still alive. If absence could not be established,
+    /// the honest terminal is `indeterminate`, and this variant cannot be
+    /// constructed to say otherwise.
+    remote_cancel_confirmed: struct {
+        pid: i64,
+        /// Process start time, so a recycled pid cannot masquerade as ours.
+        start_token: ?[]const u8 = null,
+        term_sent: bool,
+        kill_sent: bool,
+        /// When the process was observed to be gone.
+        absence_verified_at: i64,
+        /// How absence was established (e.g. "kill -0 -pgid => ESRCH").
+        verification_method: []const u8,
     },
     /// We cannot establish the remote outcome. Carries why, plus the last
     /// state we did observe, so reconcile knows where to look.
@@ -194,7 +214,7 @@ pub const Terminal = union(enum) {
             .exited => |e| if (e.exit_code == 0 and e.term_signal == null) .completed else .failed,
             .never_submitted => .failed,
             .remote_deadline => .timed_out,
-            .cancelled_confirmed => .cancelled,
+            .local_abandon, .remote_cancel_confirmed => .cancelled,
             .indeterminate => .indeterminate,
         };
     }
@@ -204,7 +224,7 @@ pub const Terminal = union(enum) {
             .exited => |e| if (e.exit_code == 0 and e.term_signal == null) null else "REMOTE_NONZERO_EXIT",
             .never_submitted => |n| n.error_code,
             .remote_deadline => "REMOTE_DEADLINE",
-            .cancelled_confirmed => null,
+            .local_abandon, .remote_cancel_confirmed => null,
             .indeterminate => |i| i.error_code,
         };
     }
@@ -256,11 +276,18 @@ pub fn canSettle(from: Status, terminal: Terminal) bool {
             .submitted, .remote_started => true,
             else => false,
         },
-        // Cancellation is legitimate at any live stage. Before submission it
-        // is a local abandonment (nothing ran); after, the caller must have
-        // verified the remote process is gone. The receipt records which,
-        // via `connected`/`remote_started`.
-        .cancelled_confirmed => true,
+        // Abandoning is only meaningful while nothing has been handed over.
+        .local_abandon => switch (from) {
+            .created, .connecting => true,
+            else => false,
+        },
+        // Once work is out there, `cancelled` requires verified absence.
+        // Sending a signal is not the same as the process being gone; if
+        // absence could not be established the terminal is `indeterminate`.
+        .remote_cancel_confirmed => switch (from) {
+            .submitted, .remote_started => true,
+            else => false,
+        },
         // Only work that was in flight can become unknown, and the recorded
         // `last_observed` has to be the state we were actually in — otherwise
         // the field a reconciler navigates by would be fiction.
@@ -288,9 +315,22 @@ test canSettle {
     try t.expect(!canSettle(.connecting, .{ .remote_deadline = .{ .after_ms = 10 } }));
     try t.expect(canSettle(.remote_started, .{ .remote_deadline = .{ .after_ms = 10 } }));
 
-    // Cancellation is allowed at every live stage.
-    try t.expect(canSettle(.created, .{ .cancelled_confirmed = .{ .method = "local abort" } }));
-    try t.expect(canSettle(.remote_started, .{ .cancelled_confirmed = .{ .method = "TERM" } }));
+    // Cancellation before submission is a local abandonment; after, it needs
+    // verified absence. Neither is expressible in the other's stage.
+    try t.expect(canSettle(.created, .{ .local_abandon = .{ .reason = "user aborted" } }));
+    try t.expect(!canSettle(.remote_started, .{ .local_abandon = .{ .reason = "user aborted" } }));
+    const verified: Terminal = .{ .remote_cancel_confirmed = .{
+        .pid = 42,
+        .term_sent = true,
+        .kill_sent = false,
+        .absence_verified_at = 1000,
+        .verification_method = "kill -0 => ESRCH",
+    } };
+    try t.expect(canSettle(.remote_started, verified));
+    try t.expect(canSettle(.submitted, verified));
+    // Nothing was ever started, so there is no absence to verify.
+    try t.expect(!canSettle(.created, verified));
+    try t.expect(!canSettle(.connecting, verified));
 
     // last_observed must match reality, so the field can be trusted.
     try t.expect(canSettle(.submitted, .{ .indeterminate = .{ .reason = "eof", .last_observed = .submitted } }));
@@ -353,7 +393,14 @@ test "terminal evidence maps to status" {
     // Killed by a signal is a failure even though exit_code reads 0.
     try t.expectEqual(Status.failed, (Terminal{ .exited = .{ .exit_code = 0, .term_signal = 9 } }).status());
     try t.expectEqual(Status.timed_out, (Terminal{ .remote_deadline = .{ .after_ms = 1000 } }).status());
-    try t.expectEqual(Status.cancelled, (Terminal{ .cancelled_confirmed = .{ .method = "TERM" } }).status());
+    try t.expectEqual(Status.cancelled, (Terminal{ .local_abandon = .{ .reason = "aborted" } }).status());
+    try t.expectEqual(Status.cancelled, (Terminal{ .remote_cancel_confirmed = .{
+        .pid = 1,
+        .term_sent = true,
+        .kill_sent = true,
+        .absence_verified_at = 5,
+        .verification_method = "ps",
+    } }).status());
 }
 
 test canTransition {

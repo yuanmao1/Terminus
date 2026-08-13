@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const Store = @import("Store.zig");
 const Db = @import("Db.zig");
 const op_state = @import("op_state.zig");
+const history = @import("history.zig");
 
 pub const schema_version: i64 = 1;
 
@@ -114,6 +115,11 @@ pub const TerminalExtra = struct {
     started_at: ?i64 = null,
     finished_at: ?i64 = null,
     duration_ms: ?i64 = null,
+    /// What the transport actually observed, when it knows more than the
+    /// state does — it can distinguish a refused TCP connect from a rejected
+    /// key, both of which live in `connecting`. May not contradict work that
+    /// was demonstrably handed over.
+    connected: ?bool = null,
     remote_pid: ?i64 = null,
     remote_pgid: ?i64 = null,
     remote_start_token: ?[]const u8 = null,
@@ -359,6 +365,22 @@ pub const SettleOutcome = union(enum) {
     already_settled: TerminalRecord,
 };
 
+/// What the operation's state tells us about the connection, as a three-state
+/// observation.
+///
+/// `connecting` covers both dialing and authenticating, so it proves nothing:
+/// an authentication failure would be reported with `connected = true` if we
+/// derived it from the state alone. Unknown is recorded as unknown; the
+/// transport layer can override with what it actually saw.
+fn connectedAt(from: op_state.Status) ?bool {
+    return switch (from) {
+        .created => false, // nothing was dialed
+        .connecting => null, // dialing or authenticating: not established
+        .submitted, .remote_started => true, // work was handed over
+        else => null,
+    };
+}
+
 /// Builds the terminal event from evidence plus the state we were actually
 /// in. Every field the evidence implies is set here, so a caller cannot
 /// supply a contradictory combination, and `connected`/`remote_started`
@@ -370,7 +392,15 @@ fn terminalEvent(
     extra: TerminalExtra,
     now: i64,
 ) Error!Event {
-    const reached_remote = from == .submitted or from == .remote_started;
+    // The transport layer may know more than the state does (it can tell a
+    // refused TCP connect from a rejected key), but it may not contradict
+    // work that was demonstrably handed over.
+    const derived = connectedAt(from);
+    if (extra.connected) |observed| {
+        if (derived == true and observed == false) return error.ContradictoryEvidence;
+    }
+    const connected = extra.connected orelse derived;
+
     var event: Event = .{
         .request_id = request_id,
         .kind = .terminal,
@@ -391,14 +421,14 @@ fn terminalEvent(
         .detail_json = extra.detail_json,
         .error_code = terminal.errorCode(),
         .last_observed = from.text(),
+        .connected = connected,
+        .remote_started = from == .remote_started,
     };
 
     switch (terminal) {
         .exited => |e| {
             event.exit_code = e.exit_code;
             event.term_signal = if (e.term_signal) |s| @as(i64, s) else null;
-            event.connected = true;
-            event.remote_started = from == .remote_started;
             event.timed_out = false;
         },
         .never_submitted => |n| {
@@ -407,28 +437,27 @@ fn terminalEvent(
             if (extra.remote_pid != null or extra.remote_pgid != null or extra.remote_start_token != null)
                 return error.ContradictoryEvidence;
             event.transport_error = n.transport_error;
-            event.connected = from == .connecting;
             event.remote_started = false;
             event.timed_out = false;
         },
         .remote_deadline => |d| {
             event.timed_out = true;
-            event.connected = true;
-            event.remote_started = from == .remote_started;
             event.duration_ms = extra.duration_ms orelse d.after_ms;
         },
-        .cancelled_confirmed => |c| {
-            event.cancel_method = c.method;
-            // Before submission this is a local abandonment: recording it as
-            // having reached the remote would overstate what happened.
-            event.connected = reached_remote or from == .connecting;
-            event.remote_started = from == .remote_started;
+        .local_abandon => |a| {
+            event.cancel_method = a.reason;
+            event.remote_started = false;
+            event.timed_out = false;
+        },
+        .remote_cancel_confirmed => |c| {
+            event.cancel_method = c.verification_method;
+            event.remote_pid = extra.remote_pid orelse c.pid;
+            event.remote_start_token = extra.remote_start_token orelse c.start_token;
+            event.finished_at = c.absence_verified_at;
             event.timed_out = false;
         },
         .indeterminate => |i| {
             event.transport_error = i.reason;
-            event.connected = from != .created;
-            event.remote_started = from == .remote_started;
             event.timed_out = null;
         },
     }
@@ -518,16 +547,39 @@ pub fn settle(
 /// audit trail — and an operator override has to be legible *as* an
 /// override, never dressed up as a mechanical proof.
 pub const ResolutionEvidence = union(enum) {
-    /// The remote supervisor reported the final status.
-    supervisor_report: struct { detail: []const u8 },
+    /// The remote supervisor reported the final status. It carries the
+    /// status it reported, so the claim and the conclusion are one fact
+    /// rather than two independently-chosen ones.
+    supervisor_report: struct {
+        reported: op_state.ResolvedStatus,
+        detail: []const u8,
+    },
     /// A pid + start-token probe established whether the process survived.
-    process_probe: struct { pid: i64, start_token: ?[]const u8 = null, alive: bool },
-    /// A durable job sentinel or log line carried the exit code.
-    job_sentinel: struct { sentinel: []const u8, exit_code: ?i64 = null },
+    /// On its own this can only prove that something is *gone*, which is
+    /// cancellation — never how it ended, and never that it succeeded.
+    process_probe: struct {
+        pid: i64,
+        start_token: ?[]const u8 = null,
+        alive: bool,
+    },
+    /// A durable job sentinel carried the exit code. The exit code is
+    /// required: a sentinel without one proves the job ended, not how.
+    job_sentinel: struct {
+        sentinel: []const u8,
+        exit_code: i64,
+    },
     /// A verified side effect on the filesystem (published artifact hash).
-    filesystem_effect: struct { path: []const u8, sha256: ?[]const u8 = null },
+    /// Only meaningful for transfers: a hash matching proves the bytes
+    /// landed, which says nothing about an arbitrary command.
+    filesystem_effect: struct {
+        path: []const u8,
+        sha256: ?[]const u8 = null,
+    },
     /// A human decided, without mechanical proof.
-    operator_override: struct { reason: []const u8, by: []const u8 },
+    operator_override: struct {
+        reason: []const u8,
+        by: []const u8,
+    },
 
     pub fn kindName(e: ResolutionEvidence) []const u8 {
         return @tagName(e);
@@ -539,21 +591,97 @@ pub const ResolutionEvidence = union(enum) {
         return e != .operator_override;
     }
 
+    /// Whether this evidence actually entails `resolved`.
+    ///
+    /// Without this the two arguments of `resolve` are independent, so
+    /// `failed` could be justified by a zero exit code, or — worse —
+    /// `completed` by a probe showing the process still *running*, which
+    /// would release the scope barrier on live work.
+    pub fn supports(e: ResolutionEvidence, resolved: op_state.ResolvedStatus) bool {
+        return switch (e) {
+            .supervisor_report => |s| s.reported == resolved,
+            .job_sentinel => |s| switch (resolved) {
+                .completed => s.exit_code == 0,
+                .failed => s.exit_code != 0,
+                // A sentinel records how the command ended, which cannot
+                // establish a timeout or a cancellation.
+                .timed_out, .cancelled => false,
+            },
+            // A live process proves nothing at all. A dead one proves only
+            // that it is no longer running; pairing that with an outcome
+            // needs the exit status, which this evidence does not carry.
+            .process_probe => |p| !p.alive and resolved == .cancelled,
+            .filesystem_effect => resolved == .completed,
+            .operator_override => true,
+        };
+    }
+
+    /// Kinds of operation this evidence can speak about.
+    pub fn appliesToKind(e: ResolutionEvidence, kind: []const u8) bool {
+        return switch (e) {
+            .filesystem_effect => std.mem.eql(u8, kind, "transfer_push") or
+                std.mem.eql(u8, kind, "transfer_pull") or
+                std.mem.eql(u8, kind, "fetch"),
+            else => true,
+        };
+    }
+
     /// Versioned JSON, matching the documented contract of `detail_json`.
+    ///
+    /// Free-text fields pass through the same redaction as the audit trail:
+    /// `detail_json` promises already-redacted content, and a reconciler
+    /// pasting a command line into `detail` must not be how a token reaches
+    /// the ledger.
     pub fn toJson(e: ResolutionEvidence, arena: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        const redacted: ResolutionEvidence = switch (e) {
+            .supervisor_report => |s| .{ .supervisor_report = .{
+                .reported = s.reported,
+                .detail = try redact(arena, s.detail),
+            } },
+            .job_sentinel => |s| .{ .job_sentinel = .{
+                .sentinel = try redact(arena, s.sentinel),
+                .exit_code = s.exit_code,
+            } },
+            .filesystem_effect => |f| .{ .filesystem_effect = .{
+                .path = try redact(arena, f.path),
+                .sha256 = f.sha256,
+            } },
+            .operator_override => |o| .{ .operator_override = .{
+                .reason = try redact(arena, o.reason),
+                .by = try redact(arena, o.by),
+            } },
+            .process_probe => e, // numeric and opaque; nothing to redact
+        };
+
         var writer: std.Io.Writer.Allocating = .init(arena);
         std.json.Stringify.value(.{
             .schemaVersion = schema_version,
             .kind = e.kindName(),
             .mechanical = e.isMechanical(),
-            .evidence = e,
+            .evidence = redacted,
         }, .{}, &writer.writer) catch return error.OutOfMemory;
         return writer.toOwnedSlice();
     }
 };
 
+fn redact(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
+    return history.redactSecrets(arena, text);
+}
+
 pub const ResolveOutcome = union(enum) {
     resolved,
+    /// The evidence does not entail the claimed result (a zero exit code
+    /// cannot prove `failed`; a live process cannot prove anything).
+    evidence_does_not_support: struct {
+        resolved: op_state.ResolvedStatus,
+        evidence_kind: []const u8,
+    },
+    /// The evidence cannot speak about this kind of operation (a published
+    /// file hash says nothing about an arbitrary command).
+    evidence_wrong_kind: struct {
+        operation_kind: []const u8,
+        evidence_kind: []const u8,
+    },
     /// Only an `indeterminate` attempt can be resolved. Carries what the
     /// status actually is, so the caller can say why it refused.
     not_indeterminate: op_state.Status,
@@ -596,9 +724,11 @@ pub fn resolve(
     var found = false;
     var current_status: op_state.Status = undefined;
     var current_resolution: ?op_state.ResolvedStatus = null;
+    var kind_buf: [64]u8 = undefined;
+    var kind: []const u8 = "";
     {
         var stmt = try store.db.prepare(
-            "SELECT status, resolved_status FROM operations WHERE request_id = ?1",
+            "SELECT status, resolved_status, kind FROM operations WHERE request_id = ?1",
         );
         defer stmt.deinit();
         try stmt.bindText(1, request_id);
@@ -606,12 +736,33 @@ pub fn resolve(
             found = true;
             current_status = try op_state.Status.parse(stmt.columnText(0));
             current_resolution = if (stmt.columnOptText(1)) |v| try op_state.ResolvedStatus.parse(v) else null;
+            const raw_kind = stmt.columnText(2);
+            const n = @min(raw_kind.len, kind_buf.len);
+            @memcpy(kind_buf[0..n], raw_kind[0..n]);
+            kind = kind_buf[0..n];
         }
     }
 
     if (!found) {
         try rollback(store);
         return .unknown_operation;
+    }
+    // Check what the evidence can actually establish before anything else:
+    // a resolution lifts the mutation barrier, so an unsupported one must
+    // never reach the ledger at all.
+    if (!evidence.supports(resolved)) {
+        try rollback(store);
+        return .{ .evidence_does_not_support = .{
+            .resolved = resolved,
+            .evidence_kind = evidence.kindName(),
+        } };
+    }
+    if (!evidence.appliesToKind(kind)) {
+        try rollback(store);
+        return .{ .evidence_wrong_kind = .{
+            .operation_kind = evidence.kindName(),
+            .evidence_kind = evidence.kindName(),
+        } };
     }
     if (current_resolution) |existing| {
         try rollback(store);

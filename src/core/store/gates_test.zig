@@ -571,7 +571,14 @@ test "gate: indeterminate evidence is persisted, not just mapped" {
     _ = try Store.receipts.settle(
         &store,
         other,
-        .{ .cancelled_confirmed = .{ .method = "TERM then KILL, absence verified" } },
+        .{ .remote_cancel_confirmed = .{
+            .pid = 8123,
+            .start_token = "boot+41213",
+            .term_sent = true,
+            .kill_sent = true,
+            .absence_verified_at = 409,
+            .verification_method = "kill -0 -8123 => ESRCH",
+        } },
         .{},
         410,
     );
@@ -685,14 +692,14 @@ test "gate: resolution is write-once" {
     try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{ .job_sentinel = .{ .sentinel = "__S__", .exit_code = 0 } }, 400)) == .resolved);
 
     // A second reconciler must not overwrite the first one's evidence.
-    const second = try Store.receipts.resolve(&store, arena, request_id, .failed, .{ .supervisor_report = .{ .detail = "disagrees" } }, 500);
+    const second = try Store.receipts.resolve(&store, arena, request_id, .failed, .{ .supervisor_report = .{ .reported = .failed, .detail = "disagrees" } }, 500);
     try t.expectEqual(op_state.ResolvedStatus.completed, second.already_resolved);
 
     const op = (try Store.operations.get(&store, arena, request_id)).?;
     try t.expectEqual(op_state.ResolvedStatus.completed, op.resolved_status.?);
     try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "job_sentinel") != null);
 
-    try t.expect((try Store.receipts.resolve(&store, arena, &testId("missing"), .completed, .{ .supervisor_report = .{ .detail = "x" } }, 600)) == .unknown_operation);
+    try t.expect((try Store.receipts.resolve(&store, arena, &testId("missing"), .completed, .{ .supervisor_report = .{ .reported = .completed, .detail = "x" } }, 600)) == .unknown_operation);
 }
 
 test "gate: illegal transitions are rejected" {
@@ -1088,6 +1095,245 @@ test "gate: a pre-release schema is detected instead of failing obscurely" {
         );
     }
     try t.expectError(error.PreReleaseSchemaDrift, Store.open(scratch.path));
+}
+
+test "gate: evidence must entail the result it is used to justify" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_evidence_supports");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("supports");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        300,
+    );
+
+    // A zero exit code cannot justify `failed`.
+    const mismatch = try Store.receipts.resolve(&store, arena, request_id, .failed, .{
+        .job_sentinel = .{ .sentinel = "__S__", .exit_code = 0 },
+    }, 400);
+    try t.expectEqualStrings("job_sentinel", mismatch.evidence_does_not_support.evidence_kind);
+
+    // The dangerous one: a process still *running* proves nothing, and must
+    // not be able to release the mutation barrier by claiming completion.
+    const alive = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .process_probe = .{ .pid = 77, .alive = true },
+    }, 401);
+    try t.expect(alive == .evidence_does_not_support);
+
+    // A dead process establishes absence, i.e. cancellation — not success.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .process_probe = .{ .pid = 77, .alive = false },
+    }, 402)) == .evidence_does_not_support);
+
+    // A published file hash says nothing about an arbitrary command.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "abc" },
+    }, 403)) == .evidence_wrong_kind);
+
+    // Nothing was recorded by any of the refusals.
+    const op_before = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(@as(?op_state.ResolvedStatus, null), op_before.resolved_status);
+
+    // A non-zero exit code does justify `failed`.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .failed, .{
+        .job_sentinel = .{ .sentinel = "__S__", .exit_code = 3 },
+    }, 410)) == .resolved);
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(op_state.ResolvedStatus.failed, op.resolved_status.?);
+}
+
+test "gate: a supervisor report cannot be repointed at another result" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_supervisor_report");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("report");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        300,
+    );
+
+    // The reported status is part of the evidence, so claim and conclusion
+    // cannot be chosen independently.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .supervisor_report = .{ .reported = .timed_out, .detail = "deadline hit" },
+    }, 400)) == .evidence_does_not_support);
+
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .timed_out, .{
+        .supervisor_report = .{ .reported = .timed_out, .detail = "deadline hit" },
+    }, 401)) == .resolved);
+}
+
+test "gate: connecting is not recorded as an established connection" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_connected_tristate");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    // `connecting` spans dialing *and* authenticating, so it cannot prove a
+    // connection was established. Unknown must be recorded as unknown.
+    const rid = testId("authfail");
+    try Store.operations.create(&store, .{
+        .request_id = &rid,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .exec,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, &rid, .connecting, 101);
+    _ = try Store.receipts.settle(&store, &rid, .{
+        .never_submitted = .{ .transport_error = "authentication failed" },
+    }, .{}, 110);
+
+    var rows = try Store.receipts.list(&store, arena, &rid);
+    try t.expectEqual(@as(?bool, null), rows[rows.len - 1].connected);
+    try t.expectEqual(@as(?bool, false), rows[rows.len - 1].remote_started);
+
+    // The transport may state what it actually saw — here: TCP connected,
+    // key rejected.
+    const rid2 = testId("authfail2");
+    try Store.operations.create(&store, .{
+        .request_id = &rid2,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .exec,
+        .now = 200,
+    });
+    try Store.operations.advance(&store, &rid2, .connecting, 201);
+    _ = try Store.receipts.settle(&store, &rid2, .{
+        .never_submitted = .{ .transport_error = "publickey rejected" },
+    }, .{ .connected = true }, 210);
+    rows = try Store.receipts.list(&store, arena, &rid2);
+    try t.expectEqual(@as(?bool, true), rows[rows.len - 1].connected);
+
+    // But it may not deny a connection for work that was handed over.
+    const rid3 = testId("handedover");
+    try Store.operations.create(&store, .{
+        .request_id = &rid3,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .exec,
+        .now = 300,
+    });
+    try Store.operations.advance(&store, &rid3, .connecting, 301);
+    try Store.operations.advance(&store, &rid3, .submitted, 302);
+    try t.expectError(error.ContradictoryEvidence, Store.receipts.settle(
+        &store,
+        &rid3,
+        .{ .exited = .{ .exit_code = 0 } },
+        .{ .connected = false },
+        310,
+    ));
+}
+
+test "gate: cancelling live work needs verified absence, not a signal" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_cancel_proof");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("cancelproof");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id); // submitted
+
+    // `local_abandon` is not available once work is out there: there is
+    // something running that abandoning does not stop.
+    try t.expectError(error.EvidenceDoesNotFit, Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .local_abandon = .{ .reason = "changed my mind" } },
+        .{},
+        400,
+    ));
+
+    // Sending TERM without confirming the process is gone has no expressible
+    // form here — the only cancellation variant for live work requires
+    // absence_verified_at and a verification_method. When absence cannot be
+    // established the honest terminal is indeterminate.
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .indeterminate = .{
+            .reason = "TERM sent, process still visible after grace period",
+            .last_observed = .submitted,
+        } },
+        .{},
+        410,
+    );
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(op_state.Status.indeterminate, op.status);
+    // ...and it keeps blocking the scope, which `cancelled` would not.
+    try t.expect(op.status.blocksScope());
+}
+
+test "gate: secrets in resolution evidence do not reach the receipt" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_evidence_redaction");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("redact");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        300,
+    );
+
+    // A reconciler pasting a command line into the note must not be how a
+    // token lands in an append-only ledger.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .operator_override = .{
+            .reason = "verified by hand with PGPASSWORD=hunter2 psql -h db",
+            .by = "czykl",
+        },
+    }, 400)) == .resolved);
+
+    const rows = try Store.receipts.list(&store, arena, request_id);
+    const detail = rows[rows.len - 1].detail_json.?;
+    try t.expect(std.mem.indexOf(u8, detail, "hunter2") == null);
+    try t.expect(std.mem.indexOf(u8, detail, "[REDACTED]") != null);
+
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "hunter2") == null);
 }
 
 test "gate: host key mismatch is reported, never auto-updated" {
