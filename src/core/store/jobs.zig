@@ -7,7 +7,34 @@ const Allocator = std.mem.Allocator;
 const Store = @import("Store.zig");
 const Db = @import("Db.zig");
 
-pub const Status = enum { running, exited, killed };
+/// `pending` is the launch window: the row exists, but nothing has been typed
+/// into the remote shell yet.
+///
+/// It is a distinct state rather than an early `running` because the row is
+/// written before the launcher touches the remote host at all — that is what
+/// makes `UNIQUE(server_id, name)` able to pick a winner between two
+/// simultaneous launches — and a reservation that never got that far is not
+/// work in progress. Calling it `running` would put a job in `job ls` that
+/// provably never started.
+pub const Status = enum {
+    pending,
+    running,
+    exited,
+    killed,
+
+    /// Names a row that may correspond to something on the remote host, and
+    /// so must not be silently reused or overwritten.
+    pub fn live(self: Status) bool {
+        return switch (self) {
+            .pending, .running => true,
+            .exited, .killed => false,
+        };
+    }
+
+    pub fn parse(text: []const u8) error{UnknownStatus}!Status {
+        return std.meta.stringToEnum(Status, text) orelse error.UnknownStatus;
+    }
+};
 
 pub const Job = struct {
     id: i64,
@@ -21,12 +48,21 @@ pub const Job = struct {
     finished_at: ?i64,
 };
 
+/// An unreadable status is an error, never a default. Guessing `running` here
+/// would be the safe direction by luck rather than by design, and the same
+/// helper is used to decide whether a name may be reused.
+pub const ReadError = Db.Error || Allocator.Error || error{UnknownStatus};
 pub const CreateError = Db.Error || error{NameTaken};
 
+/// Reserves the job name. The row starts `pending`: it says "this name is
+/// claimed and the remote is being prepared", not "this job is running".
+///
+/// `error.NameTaken` is the serialisation point of the whole launch path —
+/// whoever loses here has not touched the remote host yet.
 pub fn create(store: *Store, server_id: i64, name: []const u8, command: []const u8, sentinel: []const u8, now: i64) CreateError!i64 {
     var stmt = try store.db.prepare(
         \\INSERT INTO jobs (server_id, name, command, sentinel, status, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, 'running', ?5)
+        \\VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
     );
     defer stmt.deinit();
     try stmt.bindInt(1, server_id);
@@ -41,13 +77,25 @@ pub fn create(store: *Store, server_id: i64, name: []const u8, command: []const 
     return store.db.lastInsertRowId();
 }
 
-fn rowToJob(arena: Allocator, stmt: *Db.Stmt) Allocator.Error!Job {
+/// Promotes a reservation once the command has actually reached the remote
+/// shell. Scoped to `pending` so a concurrent observer that already settled
+/// this job cannot be walked backwards into `running`.
+pub fn markStarted(store: *Store, job_id: i64) Db.Error!void {
+    var stmt = try store.db.prepare(
+        "UPDATE jobs SET status = 'running' WHERE id = ?1 AND status = 'pending'",
+    );
+    defer stmt.deinit();
+    try stmt.bindInt(1, job_id);
+    _ = try stmt.step();
+}
+
+fn rowToJob(arena: Allocator, stmt: *Db.Stmt) (Allocator.Error || error{UnknownStatus})!Job {
     return .{
         .id = stmt.columnInt(0),
         .name = try arena.dupe(u8, stmt.columnText(1)),
         .command = try arena.dupe(u8, stmt.columnText(2)),
         .sentinel = try arena.dupe(u8, stmt.columnText(3)),
-        .status = std.meta.stringToEnum(Status, stmt.columnText(4)) orelse .running,
+        .status = try Status.parse(stmt.columnText(4)),
         .exit_code = stmt.columnOptInt(5),
         .read_cursor = stmt.columnInt(6),
         .created_at = stmt.columnInt(7),
@@ -60,7 +108,7 @@ const select_columns =
     \\FROM jobs
 ;
 
-pub fn getByName(store: *Store, arena: Allocator, server_id: i64, name: []const u8) (Db.Error || Allocator.Error)!?Job {
+pub fn getByName(store: *Store, arena: Allocator, server_id: i64, name: []const u8) ReadError!?Job {
     var stmt = try store.db.prepare(select_columns ++ " WHERE server_id = ?1 AND name = ?2");
     defer stmt.deinit();
     try stmt.bindInt(1, server_id);
@@ -69,7 +117,7 @@ pub fn getByName(store: *Store, arena: Allocator, server_id: i64, name: []const 
     return try rowToJob(arena, &stmt);
 }
 
-pub fn list(store: *Store, arena: Allocator, server_id: i64) (Db.Error || Allocator.Error)![]Job {
+pub fn list(store: *Store, arena: Allocator, server_id: i64) ReadError![]Job {
     var out: std.ArrayList(Job) = .empty;
     var stmt = try store.db.prepare(select_columns ++ " WHERE server_id = ?1 ORDER BY created_at DESC");
     defer stmt.deinit();

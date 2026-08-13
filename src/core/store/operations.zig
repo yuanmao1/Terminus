@@ -200,12 +200,26 @@ pub fn advance(
 ) (Error || error{ IllegalTransition, UnknownOperation })!void {
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
+    try advanceLocked(store, request_id, to, now);
+    try store.db.exec("COMMIT");
+}
 
+/// The transition itself, for a caller that needs it to land atomically with
+/// other writes.
+///
+/// `submitted` is the case that matters: the check for a conflicting attempt
+/// and the write that makes *this* attempt visible as a conflict have to be
+/// one indivisible step, or two callers each see a clear scope and both send.
+/// Caller must hold the write transaction.
+pub fn advanceLocked(
+    store: *Store,
+    request_id: []const u8,
+    to: op_state.LiveStatus,
+    now: i64,
+) (Error || error{ IllegalTransition, UnknownOperation })!void {
     const current = try statusOfLocked(store, request_id);
-    if (!op_state.canTransition(current, to.toStatus())) {
-        store.db.exec("ROLLBACK") catch {};
-        return error.IllegalTransition;
-    }
+    if (!op_state.canTransition(current, to.toStatus())) return error.IllegalTransition;
+
     var stmt = try store.db.prepare(
         "UPDATE operations SET status = ?1, updated_at = ?2 WHERE request_id = ?3",
     );
@@ -214,8 +228,6 @@ pub fn advance(
     try stmt.bindInt(2, now);
     try stmt.bindText(3, request_id);
     _ = try stmt.step();
-
-    try store.db.exec("COMMIT");
 }
 
 /// Caller must hold the write transaction.

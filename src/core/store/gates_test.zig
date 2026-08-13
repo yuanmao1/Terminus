@@ -493,8 +493,8 @@ test "gate: settle refuses evidence that contradicts itself" {
     });
     try Store.operations.advance(&store, request_id, .connecting, 101);
 
-    // From `connecting`, "nothing reached the remote" is a legitimate claim —
-    // but not alongside a remote process id.
+    // From `connecting`, "the command was never handed over" is a legitimate
+    // claim — but not alongside a remote process id.
     try t.expectError(error.ContradictoryEvidence, Store.receipts.settle(
         &store,
         request_id,
@@ -957,6 +957,104 @@ test "gate: job attempts survive a same-name rerun and job rm" {
     try t.expectEqual(@as(i64, 8192), probe.probe_cursor);
     try t.expectEqualStrings("{\"phase\":\"download\"}", probe.latest_progress_json.?);
     try t.expectEqual(@as(i64, 2100), probe.last_probed_at.?);
+}
+
+/// One thread racing to claim a job name, the way `run --name deploy` does.
+const ReserveCtx = struct {
+    path: [:0]const u8,
+    gate: *std.atomic.Value(bool),
+    reserved: bool = false,
+    taken: bool = false,
+    err: ?anyerror = null,
+};
+
+fn reserveInThread(ctx: *ReserveCtx) void {
+    while (!ctx.gate.load(.acquire)) std.atomic.spinLoopHint();
+    var store = Store.open(ctx.path) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    defer store.close();
+    _ = Store.jobs.create(&store, 1, "deploy", "make deploy", "__TERMINUS_JOB_1__", 1000) catch |err| {
+        switch (err) {
+            error.NameTaken => ctx.taken = true,
+            else => ctx.err = err,
+        }
+        return;
+    };
+    ctx.reserved = true;
+}
+
+test "M2 gate: only one launcher may reserve a job name" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_job_reservation");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var store = try Store.open(scratch.path);
+        defer store.close();
+        try seedServer(&store);
+    }
+
+    const thread_count = 4;
+    var gate: std.atomic.Value(bool) = .init(false);
+    var ctxs: [thread_count]ReserveCtx = undefined;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&ctxs, 0..) |*c, i| {
+        c.* = .{ .path = scratch.path, .gate = &gate };
+        threads[i] = try std.Thread.spawn(.{}, reserveInThread, .{c});
+    }
+    gate.store(true, .release);
+    for (threads) |th| th.join();
+
+    var reserved: usize = 0;
+    var taken: usize = 0;
+    for (ctxs) |c| {
+        try t.expectEqual(@as(?anyerror, null), c.err);
+        if (c.reserved) reserved += 1;
+        if (c.taken) taken += 1;
+    }
+    // Exactly one launcher owns the name, and the losers learned it from a
+    // single indivisible insert rather than from a read that another thread
+    // could invalidate a moment later.
+    //
+    // This is the gate behind an ordering rule in `cmd_job.runCmd`: the
+    // reservation happens *before* the job's tmux session is torn down and
+    // rebuilt. A loser that got as far as that teardown would be killing the
+    // session the winner had already filled with real work.
+    try t.expectEqual(@as(usize, 1), reserved);
+    try t.expectEqual(@as(usize, thread_count - 1), taken);
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // The winner holds a *pending* row, not a running one. Nothing has been
+    // typed into the remote shell yet, so claiming `running` would put a job
+    // in `job ls` that provably never started — while still blocking the
+    // name, which is what the reservation is for.
+    const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    try t.expectEqual(Store.jobs.Status.pending, row.status);
+    try t.expect(row.status.live());
+
+    // Only reaching the remote promotes it.
+    try Store.jobs.markStarted(&store, row.id);
+    try t.expectEqual(Store.jobs.Status.running, (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.status);
+
+    // A promotion arriving after somebody observed the job's end must not
+    // walk it back: the settlement is the newer truth.
+    try Store.jobs.markFinished(&store, row.id, .exited, 0, 2000);
+    try Store.jobs.markStarted(&store, row.id);
+    try t.expectEqual(Store.jobs.Status.exited, (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.status);
+
+    // An unreadable status is an error, not a guess. This row is the shape a
+    // future version writing a state this binary does not know would leave
+    // behind; the old `orelse .running` renamed it to a state it had no
+    // evidence for and reported that in `job ls`.
+    try store.db.exec("UPDATE jobs SET status = 'quantum' WHERE name = 'deploy'");
+    try t.expectError(error.UnknownStatus, Store.jobs.getByName(&store, arena, 1, "deploy"));
 }
 
 test "gate: owner token is stable across store reopens" {

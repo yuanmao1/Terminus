@@ -143,7 +143,33 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Black-box gates: drive the real binary as a subprocess and read its
+    // stdout and exit code, because that is the contract an agent depends on.
+    // The in-process gates prove the ledger's rules; only this proves that a
+    // command actually surfaces them — `75` for an unknown outcome, `76` for
+    // a ledger it could not write.
+    const blackbox_options = b.addOptions();
+    blackbox_options.addOptionPath("terminus_exe", exe.getEmittedBin());
+
+    const blackbox_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/blackbox.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                // The states worth gating (`submitted`, `indeterminate`) are
+                // only reachable by talking to a remote, so the harness seeds
+                // them through the library and then judges the binary.
+                .{ .name = "Terminus", .module = mod },
+            },
+        }),
+    });
+    blackbox_tests.root_module.addOptions("build_options", blackbox_options);
+    const run_blackbox_tests = b.addRunArtifact(blackbox_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_blackbox_tests.step);
 }

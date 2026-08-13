@@ -134,7 +134,7 @@ pub fn canTransition(from: Status, to: Status) bool {
             else => false,
         },
         // Connect failures are the ONE place a transport error means failed,
-        // because they prove nothing reached the remote.
+        // because they prove the command was never handed over.
         .connecting => switch (to) {
             .submitted, .failed, .cancelled, .indeterminate => true,
             else => false,
@@ -165,8 +165,16 @@ pub const Terminal = union(enum) {
         exit_code: i32,
         term_signal: ?i32 = null,
     },
-    /// The connection layer proved the request never left this machine
-    /// (refused, DNS failure, auth rejected — all before submission).
+    /// The user's command was never submitted: the connection layer proved
+    /// it did not leave this machine (refused, DNS failure, auth rejected —
+    /// all before submission).
+    ///
+    /// This is deliberately narrower than "the remote was not touched".
+    /// Setup before submission — staging a script into a temp file, `tmux
+    /// new-session` — really does reach the host, and can leave artefacts
+    /// behind when the attempt then dies. What this variant claims, and all
+    /// it claims, is that the *command the caller asked for* did not run. A
+    /// wider reading would be a lie a leftover `/tmp` file could disprove.
     never_submitted: struct {
         transport_error: []const u8,
         error_code: []const u8 = "NEVER_SUBMITTED",
@@ -241,7 +249,9 @@ pub const Terminal = union(enum) {
 /// of deciding for itself.
 pub fn terminalForTransportLoss(last_observed: Status, detail: []const u8) Terminal {
     return switch (last_observed) {
-        // Nothing was sent, so the remote is untouched: a real failure.
+        // The command was never handed over, so it provably did not run: a
+        // real failure. (Setup may already have touched the host — see
+        // `never_submitted` — but the caller's command did not.)
         .created, .connecting => .{ .never_submitted = .{ .transport_error = detail } },
         // Bytes may already be executing. We do not know. Say so.
         .submitted, .remote_started => .{ .indeterminate = .{
@@ -263,7 +273,7 @@ pub fn terminalForTransportLoss(last_observed: Status, detail: []const u8) Termi
 /// this, the ledger would accept:
 ///
 /// * `submitted` + `never_submitted` → `failed` — a receipt that claims both
-///   that we handed the work over and that nothing left this machine;
+///   that we handed the work over and that we never did;
 /// * `created` + `exited(1)` → `failed` — an exit status, with
 ///   `connected = true`, for an attempt that never reached a connection.
 ///

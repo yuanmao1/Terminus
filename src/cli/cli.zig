@@ -36,6 +36,7 @@ pub fn setActiveCtx(ctx: *Ctx) void {
 /// (agents parse one stream); in human mode writes stderr. Always exit 1.
 pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     settleActiveExecution("command failed before recording an outcome");
+    releaseReservation();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
@@ -69,6 +70,54 @@ fn settleActiveExecution(reason: []const u8) void {
         std.debug.print(
             "terminus: RECEIPT_PERSIST_FAILED for {s}: {s} (remote state unknown)\n",
             .{ execution.id(), @errorName(err) },
+        );
+    };
+}
+
+/// A job-name reservation held by the command currently running.
+///
+/// The `jobs` row has to be written *before* the launch path tears down and
+/// rebuilds the job's remote tmux session, because its `UNIQUE(server_id,
+/// name)` index is the only thing that makes two simultaneous launches pick a
+/// winner atomically. Without it a second `run --name deploy` could still be
+/// connecting when the first one starts sending keys, and would then kill the
+/// session it had just filled with real work.
+///
+/// Reserving that early means every fatal exit in between would strand a row
+/// for a job that never started — and `fail` exits with `std.process.exit`,
+/// which skips defers. Hence this hook, the same shape as the execution one.
+const Reservation = struct {
+    store: *Store,
+    server_id: i64,
+    name: []const u8,
+};
+var active_reservation: ?Reservation = null;
+
+pub fn registerReservation(store: *Store, server_id: i64, name: []const u8) void {
+    active_reservation = .{ .store = store, .server_id = server_id, .name = name };
+}
+
+/// Keeps the reservation: the command is in the remote's hands now, so the
+/// row describes something that may be running and must not be dropped.
+pub fn commitReservation() void {
+    active_reservation = null;
+}
+
+/// Gives the name back, if it is still held.
+///
+/// Called from `fail` (which skips defers) and from the launch path's own
+/// `defer` — the latter both covers a plain error return and guarantees the
+/// borrowed `*Store` never outlives the frame that owns it.
+pub fn releaseReservation() void {
+    const held = active_reservation orelse return;
+    active_reservation = null; // never re-enter
+    _ = Store.jobs.remove(held.store, held.server_id, held.name) catch |err| {
+        // Reported, not swallowed: what is left behind is a name that will
+        // refuse the next launch until it is removed by hand.
+        std.debug.print(
+            "terminus: could not release the name reservation for job '{s}': {s}; " ++
+                "clear it with 'terminus job rm' before relaunching\n",
+            .{ held.name, @errorName(err) },
         );
     };
 }

@@ -105,12 +105,41 @@ pub fn list(executor: Executor, arena: Allocator) Error![]RemoteSession {
 }
 
 /// Kills the remote tmux session and removes its log file.
+///
+/// Destroys evidence: the log is the only durable record of how a job ended,
+/// so anything that may still need reconciling should use `killKeepLog`.
 pub fn kill(executor: Executor, arena: Allocator, name: []const u8) Error!void {
+    _ = try killSession(executor, arena, name, true);
+}
+
+/// Kills the session but preserves the output log.
+///
+/// Returns whether the session is actually gone afterwards. The old
+/// formulation (`tmux kill-session; rm -f log`) took its exit status from the
+/// `rm`, so a failed kill reported success — and a surviving session is not a
+/// cosmetic problem: `ensure` treats an existing session as ready, so the
+/// next command would be typed into the previous job's shell.
+pub fn killKeepLog(executor: Executor, arena: Allocator, name: []const u8) Error!bool {
+    return killSession(executor, arena, name, false);
+}
+
+fn killSession(executor: Executor, arena: Allocator, name: []const u8, drop_log: bool) Error!bool {
     const tname = try tmuxName(arena, name);
-    const script = try std.fmt.allocPrint(arena,
-        \\tmux kill-session -t ={s} 2>/dev/null; rm -f {s}/{s}.log
-    , .{ tname, log_dir, name });
-    _ = try run(executor, arena, script);
+    const script = if (drop_log)
+        try std.fmt.allocPrint(arena,
+            \\tmux kill-session -t ={s} 2>/dev/null
+            \\rm -f {s}/{s}.log
+            \\tmux has-session -t ={s} 2>/dev/null && exit 1
+            \\exit 0
+        , .{ tname, log_dir, name, tname })
+    else
+        try std.fmt.allocPrint(arena,
+            \\tmux kill-session -t ={s} 2>/dev/null
+            \\tmux has-session -t ={s} 2>/dev/null && exit 1
+            \\exit 0
+        , .{ tname, tname });
+    const result = try run(executor, arena, script);
+    return result.exit_code == 0;
 }
 
 /// Types `input` into the session as if at the keyboard, plus Enter unless

@@ -18,7 +18,27 @@ const op_state = @import("store/op_state.zig");
 const scope_mod = @import("store/scope.zig");
 const execution = @import("execution.zig");
 const supervisor = @import("supervisor.zig");
+const Executor = @import("exec.zig").Executor;
 const Scripted = @import("exec.zig").Scripted;
+
+/// Submits, insisting the scope guard let it through.
+///
+/// Most gates here are about what happens *after* submission, so a refusal
+/// would make them pass for the wrong reason — the attempt would have ended
+/// before the thing under test ever happened.
+fn mustSubmit(e: *execution.Execution) !void {
+    switch (try e.submitted()) {
+        .submitted => {},
+        .refused => return error.UnexpectedlyRefused,
+    }
+}
+
+fn mustRun(e: *execution.Execution, executor: Executor, command: []const u8) !execution.RunOutcome {
+    return switch (try execution.runCommand(e, executor, command)) {
+        .ran => |outcome| outcome,
+        .refused => error.UnexpectedlyRefused,
+    };
+}
 
 const Harness = struct {
     io: std.Io,
@@ -141,9 +161,9 @@ test "M2 gate: disconnect before submission is a proven failure" {
     var exec = start.ready;
     defer exec.deinit();
 
-    // Dialing failed. Nothing left this machine, so the remote is untouched
-    // and `failed` is the honest verdict — this is the *only* disconnect
-    // that may be reported as a failure.
+    // Dialing failed. The command was never handed over, so `failed` is the
+    // honest verdict — this is the *only* disconnect that may be reported as
+    // a failure.
     try exec.connecting();
     _ = try exec.transportLoss("connection refused");
 
@@ -172,7 +192,7 @@ test "M2 gate: disconnect after submission is indeterminate, not failed" {
     // The command was handed over and then the channel broke. It may have
     // run. It may have run and finished. We cannot tell.
     var scripted = Scripted.init(h.arena, &.{.{ .transport_error = error.ExecFailed }});
-    const outcome = try execution.runCommand(&exec, scripted.executor(), "systemctl restart api");
+    const outcome = try mustRun(&exec, scripted.executor(), "systemctl restart api");
 
     try t.expectEqual(op_state.Status.indeterminate, outcome.status);
     try t.expectEqual(@as(?i32, null), outcome.exit_code);
@@ -209,7 +229,7 @@ test "M2 gate: disconnect after the process started is indeterminate" {
     var scripted = Scripted.init(h.arena, &.{
         .{ .reply = .{ .exit_code = 0, .stdout = truncated, .stderr = "" } },
     });
-    const outcome = try execution.runCommand(&exec, scripted.executor(), "./migrate.sh");
+    const outcome = try mustRun(&exec, scripted.executor(), "./migrate.sh");
 
     // The channel's own exit code was 0. Reporting that as the command's
     // result is precisely the bug: the command never told us how it ended.
@@ -246,7 +266,7 @@ test "M2 gate: a lost response is reconcilable, not guessable" {
     var scripted = Scripted.init(h.arena, &.{
         .{ .reply = .{ .exit_code = 0, .stdout = truncated, .stderr = "" } },
     });
-    _ = try execution.runCommand(&exec, scripted.executor(), "./migrate.sh");
+    _ = try mustRun(&exec, scripted.executor(), "./migrate.sh");
     try t.expectEqual(op_state.Status.indeterminate, (try h.operationOf(exec.id())).status);
 
     // Later, the durable job sentinel is found and settles the question.
@@ -283,7 +303,7 @@ test "M2 gate: no disconnect anywhere yields a failed verdict" {
         defer exec.deinit();
 
         if (stage != .created) try exec.connecting();
-        if (stage == .submitted or stage == .remote_started) try exec.submitted();
+        if (stage == .submitted or stage == .remote_started) try mustSubmit(&exec);
         if (stage == .remote_started) try exec.remoteStarted(.{ .pid = 7, .pgid = 7 });
 
         _ = try exec.transportLoss("channel eof");
@@ -305,7 +325,7 @@ test "M2 gate: a clean run records identity and the real exit code" {
     var scripted = Scripted.init(h.arena, &.{
         .{ .reply = .{ .exit_code = 3, .stdout = stdout, .stderr = "" } },
     });
-    const outcome = try execution.runCommand(&exec, scripted.executor(), "false");
+    const outcome = try mustRun(&exec, scripted.executor(), "false");
 
     try t.expectEqual(op_state.Status.failed, outcome.status);
     try t.expectEqual(@as(i32, 3), outcome.exit_code.?);
@@ -350,7 +370,7 @@ test "M2 gate: an unsettled peer blocks a mutation but only warns a read" {
         const start = try h.begin(.{ .kind = .job, .scope = job_scope, .alias = "deploy" });
         var exec = start.ready;
         try exec.connecting();
-        try exec.submitted();
+        try mustSubmit(&exec);
         _ = try exec.transportLoss("eof"); // -> indeterminate
     }
 
@@ -390,7 +410,7 @@ test "M2 gate: a dropped execution still records why nothing was decided" {
         const start = try h.begin(.{});
         var exec = start.ready;
         try exec.connecting();
-        try exec.submitted();
+        try mustSubmit(&exec);
         @memcpy(&request_id_buf, exec.id());
         // Falls out of scope without settling — a bug, but one that must not
         // leave an attempt that reached the remote silently unexplained.
@@ -434,7 +454,7 @@ test "M2b gate: a detached job stays in flight instead of inventing a verdict" {
         const start = try h.begin(.{ .kind = .job, .alias = "build", .mutating = true });
         var exec = start.ready;
         try exec.connecting();
-        try exec.submitted();
+        try mustSubmit(&exec);
         try exec.remoteStarted(.{ .pid = 900 });
         @memcpy(&request_id_buf, exec.id());
         // `run` exits here: the work continues in its tmux session.
@@ -458,7 +478,7 @@ test "M2b gate: attaching to a running job cannot settle it by accident" {
     const start = try h.begin(.{ .kind = .job, .alias = "build", .mutating = true });
     var launcher = start.ready;
     try launcher.connecting();
-    try launcher.submitted();
+    try mustSubmit(&launcher);
     try launcher.detach("running");
 
     // A later `job status` attaches. Merely looking must not produce a
@@ -488,7 +508,7 @@ test "M2b gate: a vanished job session is unknown, not killed" {
     const start = try h.begin(.{ .kind = .job, .alias = "migrate", .mutating = true });
     var launcher = start.ready;
     try launcher.connecting();
-    try launcher.submitted();
+    try mustSubmit(&launcher);
     try launcher.remoteStarted(.{ .pid = 4242 });
     try launcher.detach("running");
 
@@ -524,7 +544,7 @@ test "M2b gate: cancellation counts only when absence was verified" {
         const start = try h.begin(.{ .kind = .job, .alias = "a", .mutating = true });
         var e = start.ready;
         try e.connecting();
-        try e.submitted();
+        try mustSubmit(&e);
         try e.detach("running");
         var attached = (try execution.attach(&h.store, h.arena, h.io, e.id())).?;
         _ = try attached.settleAttached(.{ .remote_cancel_confirmed = .{
@@ -545,7 +565,7 @@ test "M2b gate: cancellation counts only when absence was verified" {
         const start = try h.begin(.{ .kind = .job, .alias = "b", .mutating = true });
         var e = start.ready;
         try e.connecting();
-        try e.submitted();
+        try mustSubmit(&e);
         try e.detach("running");
         var attached = (try execution.attach(&h.store, h.arena, h.io, e.id())).?;
         _ = try attached.settleAttached(.{ .indeterminate = .{
@@ -567,7 +587,7 @@ test "M2b gate: relaunching a job whose fate is unknown is refused" {
     const start = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
     var first = start.ready;
     try first.connecting();
-    try first.submitted();
+    try mustSubmit(&first);
     _ = try first.transportLoss("eof"); // indeterminate
 
     // The deploy may or may not have happened. Running it again could apply
@@ -588,12 +608,21 @@ test "M2b gate: relaunching a job whose fate is unknown is refused" {
 const ConcurrentStart = struct {
     path: [:0]const u8,
     gate: *std.atomic.Value(bool),
-    won: bool = false,
-    blocked: bool = false,
+    submitted: bool = false,
+    refused: bool = false,
     err: ?anyerror = null,
 };
 
-fn beginInThread(ctx: *ConcurrentStart) void {
+/// One thread's worth of `terminus job run --name deploy`.
+///
+/// It runs the whole launch sequence, not just `begin`, because `begin` is not
+/// where the race is decided. `begin` writes the row as `created`, which the
+/// unsettled predicate deliberately does not count, so several threads can and
+/// should get past it — a `created` row abandoned by a killed process must not
+/// hold a scope forever. The single winner is picked at `submitted`, where the
+/// conflict check and the write that makes this attempt visible to the next
+/// caller happen in one transaction.
+fn launchInThread(ctx: *ConcurrentStart) void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
@@ -619,20 +648,41 @@ fn beginInThread(ctx: *ConcurrentStart) void {
         ctx.err = err;
         return;
     };
-    switch (start) {
-        .ready => |e| {
-            var owned = e;
-            ctx.won = true;
-            // The winner leaves it in flight, as `run` does.
-            owned.connecting() catch {};
-            owned.submitted() catch {};
-            owned.detach("running") catch {};
+
+    var owned = switch (start) {
+        .ready => |e| e,
+        // Refused before dialing: a peer had already submitted.
+        .blocked => {
+            ctx.refused = true;
+            return;
         },
-        .blocked => ctx.blocked = true,
+    };
+    // Whatever happens below, this attempt gets a terminal. A loser is settled
+    // as a proven failure at `connecting` — nothing was sent — so it does not
+    // become a blocker of its own.
+    defer owned.deinit();
+
+    owned.connecting() catch |err| {
+        ctx.err = err;
+        return;
+    };
+    const submit = owned.submitted() catch |err| {
+        ctx.err = err;
+        return;
+    };
+    switch (submit) {
+        .submitted => {
+            ctx.submitted = true;
+            // The winner leaves it in flight, as `run` does.
+            owned.detach("running") catch |err| {
+                ctx.err = err;
+            };
+        },
+        .refused => ctx.refused = true,
     }
 }
 
-test "M2 gate: concurrent starts on one scope produce exactly one winner" {
+test "M2 gate: concurrent launches on one scope produce exactly one submitter" {
     const t = std.testing;
     const thread_count = 4;
 
@@ -642,33 +692,71 @@ test "M2 gate: concurrent starts on one scope produce exactly one winner" {
         var h = try Harness.init(t.allocator, name);
         defer h.deinit();
 
-        // The guard checks for a conflict and inserts the operation. Unless
-        // both happen inside one write transaction, every thread sees an
-        // empty scope and every thread submits — the exact double-application
-        // the guard exists to stop.
+        // Unless the conflict check and the transition to `submitted` land in
+        // one write transaction, every thread sees an empty scope and every
+        // thread sends — the exact double-application the guard exists to stop.
         var gate: std.atomic.Value(bool) = .init(false);
         var ctxs: [thread_count]ConcurrentStart = undefined;
         var threads: [thread_count]std.Thread = undefined;
         for (&ctxs, 0..) |*ctx, i| {
             ctx.* = .{ .path = h.path, .gate = &gate };
-            threads[i] = try std.Thread.spawn(.{}, beginInThread, .{ctx});
+            threads[i] = try std.Thread.spawn(.{}, launchInThread, .{ctx});
         }
         gate.store(true, .release);
         for (threads) |thread| thread.join();
 
-        var winners: usize = 0;
-        var blocked: usize = 0;
+        var submitted: usize = 0;
+        var refused: usize = 0;
         for (&ctxs) |*ctx| {
             if (ctx.err) |err| {
                 std.debug.print("round {d}: {s}\n", .{ round, @errorName(err) });
                 return err;
             }
-            if (ctx.won) winners += 1;
-            if (ctx.blocked) blocked += 1;
+            if (ctx.submitted) submitted += 1;
+            if (ctx.refused) refused += 1;
         }
-        try t.expectEqual(@as(usize, 1), winners);
-        try t.expectEqual(@as(usize, thread_count - 1), blocked);
+        try t.expectEqual(@as(usize, 1), submitted);
+        try t.expectEqual(@as(usize, thread_count - 1), refused);
+
+        // And the ledger agrees: exactly one attempt is holding the scope.
+        try t.expectEqual(@as(usize, 1), (try operations.unsettled(&h.store, h.arena, 1)).len);
     }
+}
+
+test "M2 gate: an attempt that never dialed holds no scope" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2_created_no_trap");
+    defer h.deinit();
+
+    const scope: scope_mod.Scope = .{ .kind = .job, .key = "deploy" };
+
+    // A process killed between `begin` and `submitted` leaves rows behind in
+    // `created` and `connecting`. Neither may block the scope: nothing was
+    // sent, so there is nothing to reconcile, and a permanent blocker with no
+    // escape hatch is worse than no guard at all.
+    var stranded = (try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true })).ready;
+    try t.expectEqual(op_state.Status.created, (try h.operationOf(stranded.id())).status);
+    try t.expectEqual(@as(usize, 0), (try operations.unsettled(&h.store, h.arena, 1)).len);
+
+    try stranded.connecting();
+    try t.expectEqual(@as(usize, 0), (try operations.unsettled(&h.store, h.arena, 1)).len);
+
+    // So the next launch goes through, all the way to the point of no return.
+    var next = (try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true })).ready;
+    defer next.deinit();
+    try next.connecting();
+    try mustSubmit(&next);
+
+    // Now that one really did send, and it does hold the scope.
+    try t.expectEqual(@as(usize, 1), (try operations.unsettled(&h.store, h.arena, 1)).len);
+    switch (try stranded.submitted()) {
+        .submitted => return error.GuardLetASecondAttemptThrough,
+        .refused => |blocker| try t.expectEqualStrings(next.id(), blocker.unsettled.request_id),
+    }
+    // Refused means nothing was sent, so the stranded attempt is still at
+    // `connecting` and settles as a proven failure.
+    stranded.deinit();
+    try t.expectEqual(op_state.Status.failed, (try h.operationOf(stranded.id())).status);
 }
 
 test "M2 gate: a weak supervisor cannot claim a verified cancellation" {
@@ -694,7 +782,7 @@ test "M2 gate: a weak supervisor cannot claim a verified cancellation" {
     const start = try h.begin(.{ .kind = .job, .alias = "svc", .mutating = true });
     var exec = start.ready;
     try exec.connecting();
-    try exec.submitted();
+    try mustSubmit(&exec);
     try exec.detach("running");
 
     var attached = (try execution.attach(&h.store, h.arena, h.io, exec.id())).?;
@@ -716,7 +804,7 @@ test "M2 gate: a submitted attempt is findable even if the next local write fail
     const start = try h.begin(.{ .kind = .job, .alias = "deploy", .mutating = true });
     var exec = start.ready;
     try exec.connecting();
-    try exec.submitted();
+    try mustSubmit(&exec);
 
     // Whatever happens locally after this point, the attempt exists and is
     // reachable by request id and by alias — which is what `status`, `kill`
@@ -736,7 +824,7 @@ test "M2 gate: reconciliation releases a scope only with evidence" {
     const start = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
     var exec = start.ready;
     try exec.connecting();
-    try exec.submitted();
+    try mustSubmit(&exec);
     _ = try exec.transportLoss("eof");
 
     // An override needs a named owner and is marked as a decision, but it is

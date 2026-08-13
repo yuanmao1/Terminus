@@ -147,7 +147,7 @@ pub const Error = Db.Error || error{
     EvidenceDoesNotFit,
     UnknownOperation,
     /// Supplementary fields contradict the evidence (e.g. a remote pid on a
-    /// request that provably never left this machine).
+    /// request whose command was provably never handed over).
     ContradictoryEvidence,
     OutOfMemory,
 };
@@ -234,7 +234,7 @@ fn insert(store: *Store, event: Event, is_terminal: bool, seq: i64) Db.Error!i64
     return store.db.lastInsertRowId();
 }
 
-fn nextSeqLocked(store: *Store, request_id: []const u8) Db.Error!i64 {
+pub fn nextSeqLocked(store: *Store, request_id: []const u8) Db.Error!i64 {
     var stmt = try store.db.prepare(
         "SELECT IFNULL(MAX(seq), 0) + 1 FROM operation_events WHERE request_id = ?1",
     );
@@ -329,6 +329,16 @@ pub const Observation = struct {
         };
     }
 };
+
+/// Appends an observation from inside a transaction the caller already holds.
+///
+/// Same restrictions as `append`; exists so a caller can make an event and
+/// another write atomic (an override audit must land with the operation it
+/// justifies, or not at all).
+pub fn insertLocked(store: *Store, observation: Observation, seq: i64) Error!i64 {
+    if (observation.source == .reconcile) return error.ReconcileRequiresResolve;
+    return insert(store, observation.toEvent(), false, seq);
+}
 
 /// Appends a non-authoritative observation.
 ///
@@ -432,8 +442,9 @@ fn terminalEvent(
             event.timed_out = false;
         },
         .never_submitted => |n| {
-            // The whole claim is "nothing reached the remote", so any remote
-            // process detail would contradict it.
+            // The claim is "the caller's command did not run", so any remote
+            // process detail would contradict it. (Pre-submission setup may
+            // still have reached the host; that is not a remote process.)
             if (extra.remote_pid != null or extra.remote_pgid != null or extra.remote_start_token != null)
                 return error.ContradictoryEvidence;
             event.transport_error = n.transport_error;
@@ -471,7 +482,7 @@ fn terminalEvent(
 /// Four things make this the only way an operation can end:
 ///
 /// * `terminal` is an evidence variant, so `failed` needs either a real
-///   remote exit status or proof the request never left this machine. A
+///   remote exit status or proof the command was never handed over. A
 ///   transport error after submission can only produce `indeterminate`.
 /// * `canSettle` checks the evidence against the *source* state, not just the
 ///   target status. Several variants map onto `failed`, so a status-only

@@ -74,8 +74,55 @@ pub const Start = union(enum) {
     blocked: Blocker,
 };
 
+/// The result of asking to submit.
+///
+/// `submitted` is the point of no return, so it is also the point the scope
+/// guard has to be enforced at — see `Execution.submitted`.
+pub const Submit = union(enum) {
+    /// The attempt is now `submitted`. From here a transport failure proves
+    /// nothing about the remote.
+    submitted,
+    /// Someone else holds the scope. Nothing was sent.
+    refused: Blocker,
+};
+
 pub const Error = Store.Db.Error || receipts.Error || operations.Error ||
     Allocator.Error || error{ IllegalTransition, UnknownOperation, UnknownScopeKind };
+
+/// Whether anything else is laying claim to `target`, as one definition.
+///
+/// Caller must hold the write transaction. A guard evaluated outside the
+/// transaction that acts on it is not a guard: whatever it checked can become
+/// false before the write lands.
+fn blockerLocked(
+    store: *Store,
+    arena: Allocator,
+    server_id: i64,
+    target: Scope,
+    owner_token: []const u8,
+    exclude_request_id: ?[]const u8,
+    now: i64,
+) Error!?Blocker {
+    var found: ?Blocker = null;
+
+    const unsettled = try operations.unsettledInScope(store, arena, server_id, target);
+    for (unsettled) |op| {
+        if (exclude_request_id) |self_id| {
+            if (std.mem.eql(u8, op.request_id, self_id)) continue;
+        }
+        found = .{ .unsettled = op };
+        break;
+    }
+
+    // Run the lease check even when we already have a reason to refuse: it
+    // expires stale leases on the way past, and that housekeeping should not
+    // depend on the order the two checks happen to be in.
+    if (try leases.conflictForLocked(store, arena, server_id, target, owner_token, now)) |lease| {
+        if (found == null) found = .{ .lease = lease };
+    }
+
+    return found;
+}
 
 pub const Execution = struct {
     request_id: [ids.len]u8,
@@ -86,6 +133,15 @@ pub const Execution = struct {
     io: std.Io,
     scope: Scope,
     capability: Capability,
+    /// Whether this attempt changes remote state. Decides whether a claim on
+    /// the same scope refuses it or merely warns.
+    mutating: bool = false,
+    /// The caller chose to proceed past a blocker. Carried through to
+    /// `submitted`, where the guard is actually binding.
+    force: bool = false,
+    /// Identifies who we are for lease purposes, so our own lease is not
+    /// mistaken for someone else's.
+    owner_token: []const u8 = "",
     /// Mirror of the persisted status, so transport failures can be
     /// classified without another read.
     status: op_state.Status = .created,
@@ -117,19 +173,61 @@ pub const Execution = struct {
         });
     }
 
-    /// Moves to `submitted`. Call once the command has been handed to the
-    /// remote — from here on, a transport failure is no longer a proof of
-    /// anything.
-    pub fn submitted(self: *Execution) Error!void {
-        try operations.advance(self.store, self.id(), .submitted, self.now());
-        self.status = .submitted;
-        _ = try receipts.append(self.store, .{
+    /// Moves to `submitted`, enforcing the scope guard as it does so.
+    ///
+    /// This is where the guard actually binds, and it has to be here rather
+    /// than at `begin`. `begin` commits the operation as `created`, which the
+    /// unsettled predicate deliberately does not count — a `created` row left
+    /// behind by a process that died before dialing provably never sent
+    /// anything, and blocking a scope on it forever would be a trap with no
+    /// escape. But that leaves a window: between `begin`'s COMMIT and this
+    /// call the row is invisible to the guard, so two concurrent
+    /// `run --name deploy` could each see a clear scope and each send. The
+    /// check at `begin` is a courtesy that fails fast before we dial; this
+    /// one is the real thing, because the check and the write that makes this
+    /// attempt visible to the next caller land in a single transaction.
+    ///
+    /// Nothing has been sent when this returns `.refused`.
+    pub fn submitted(self: *Execution) Error!Submit {
+        const at = self.now();
+
+        try self.store.db.exec("BEGIN IMMEDIATE");
+        errdefer self.store.db.exec("ROLLBACK") catch {};
+
+        if (self.server_id) |server_id| {
+            if (try blockerLocked(self.store, self.arena, server_id, self.scope, self.owner_token, self.id(), at)) |blocker| {
+                if (self.mutating and !self.force) {
+                    // Nothing of ours was written, so committing only keeps
+                    // the lease expiry pass that the check performed.
+                    try self.store.db.exec("COMMIT");
+                    return .{ .refused = blocker };
+                }
+                if (self.advisory == null) self.advisory = blocker;
+                if (self.force) {
+                    const audit_seq = try receipts.nextSeqLocked(self.store, self.id());
+                    _ = try receipts.insertLocked(self.store, .{
+                        .request_id = self.id(),
+                        .kind = .audit,
+                        .observed_at = at,
+                        .detail_json = try forcedJson(self.arena, blocker),
+                    }, audit_seq);
+                }
+            }
+        }
+
+        try operations.advanceLocked(self.store, self.id(), .submitted, at);
+        const seq = try receipts.nextSeqLocked(self.store, self.id());
+        _ = try receipts.insertLocked(self.store, .{
             .request_id = self.id(),
             .kind = .submit,
             .status = .submitted,
             .connected = true,
-            .observed_at = self.now(),
-        });
+            .observed_at = at,
+        }, seq);
+        try self.store.db.exec("COMMIT");
+
+        self.status = .submitted;
+        return .submitted;
     }
 
     /// Records a confirmed remote process.
@@ -239,11 +337,11 @@ fn reportLostReceipt(self: *Execution, err: anyerror) void {
 
 /// Opens an execution, applying the scope guard and lease check first.
 ///
-/// The check and the insert happen inside one `BEGIN IMMEDIATE`. Splitting
-/// them — even by a few microseconds — lets two concurrent `run --name
-/// deploy` both observe an empty scope and both submit, which is exactly the
-/// double-application this guard exists to prevent. The write lock serializes
-/// them, so the loser sees the winner's operation and is refused.
+/// This check is the fast path, not the binding one: it refuses before we
+/// waste a connection on work that is already claimed. The operation it
+/// creates is `created`, which the guard deliberately does not count, so the
+/// authoritative check happens again in `Execution.submitted` — see there for
+/// why the two cannot be collapsed into one.
 pub fn begin(
     store: *Store,
     arena: Allocator,
@@ -258,21 +356,14 @@ pub fn begin(
 
     var advisory: ?Blocker = null;
     if (opts.server_id) |server_id| {
-        const unsettled = try operations.unsettledInScope(store, arena, server_id, opts.scope);
-        if (unsettled.len > 0) {
+        if (try blockerLocked(store, arena, server_id, opts.scope, opts.owner_token, null, opts.now)) |blocker| {
             if (opts.mutating and !opts.force) {
-                try store.db.exec("ROLLBACK");
-                return .{ .blocked = .{ .unsettled = unsettled[0] } };
-            }
-            advisory = .{ .unsettled = unsettled[0] };
-        }
-        if (try leases.conflictForLocked(store, arena, server_id, opts.scope, opts.owner_token, opts.now)) |lease| {
-            if (opts.mutating and !opts.force) {
-                // The expiry pass is worth keeping even when we refuse.
+                // Nothing was inserted; the commit only keeps the lease
+                // expiry pass the check performed on its way through.
                 try store.db.exec("COMMIT");
-                return .{ .blocked = .{ .lease = lease } };
+                return .{ .blocked = blocker };
             }
-            if (advisory == null) advisory = .{ .lease = lease };
+            advisory = blocker;
         }
     }
 
@@ -293,9 +384,23 @@ pub fn begin(
         .now = opts.now,
     });
 
+    // The override audit belongs to the same transaction as the operation.
+    // Appending it afterwards meant a failure there left a `created`
+    // operation behind with no Execution handed back — a blocker nobody
+    // could settle, because reconcile only accepts `indeterminate`.
+    if (opts.force and advisory != null) {
+        const seq = try receipts.nextSeqLocked(store, &request_id);
+        _ = try receipts.insertLocked(store, .{
+            .request_id = &request_id,
+            .kind = .audit,
+            .observed_at = opts.now,
+            .detail_json = try forcedJson(arena, advisory.?),
+        }, seq);
+    }
+
     try store.db.exec("COMMIT");
 
-    var execution: Execution = .{
+    const execution: Execution = .{
         .request_id = request_id,
         .server_id = opts.server_id,
         .store = store,
@@ -303,20 +408,12 @@ pub fn begin(
         .io = io,
         .scope = opts.scope,
         .capability = opts.capability,
+        .mutating = opts.mutating,
+        .force = opts.force,
+        .owner_token = opts.owner_token,
         .advisory = advisory,
         .nonce = nonceFrom(request_id),
     };
-
-    // An override is an event in its own right: proceeding past a blocker
-    // has to be visible to whoever reads the trail later.
-    if (opts.force and advisory != null) {
-        _ = try receipts.append(store, .{
-            .request_id = execution.id(),
-            .kind = .audit,
-            .observed_at = opts.now,
-            .detail_json = try forcedJson(arena, advisory.?),
-        });
-    }
 
     return .{ .ready = execution };
 }
@@ -408,25 +505,36 @@ pub const RunOutcome = struct {
     identity: ?supervisor.Identity,
 };
 
+/// Either the command ran (however it ended), or the guard refused to let it
+/// be sent. These are not the same thing and must not share a shape: a
+/// refusal has no exit code, no output, and — crucially — no remote effect.
+pub const RunResult = union(enum) {
+    ran: RunOutcome,
+    refused: Blocker,
+};
+
 pub fn runCommand(
     execution: *Execution,
     executor: Executor,
     command: []const u8,
-) Error!RunOutcome {
+) Error!RunResult {
     const wrapped = try supervisor.wrapShell(execution.arena, command, execution.nonce);
 
-    try execution.submitted();
+    switch (try execution.submitted()) {
+        .submitted => {},
+        .refused => |blocker| return .{ .refused = blocker },
+    }
 
     const result = executor.exec(execution.arena, wrapped) catch |err| {
         // We do not know whether the remote ran it. Say so.
         _ = try execution.transportLoss(describe(executor, err));
-        return .{
+        return .{ .ran = .{
             .status = execution.status,
             .exit_code = null,
             .stdout = "",
             .stderr = "",
             .identity = null,
-        };
+        } };
     };
 
     const observed = try supervisor.parseShell(
@@ -448,13 +556,13 @@ pub fn runCommand(
 
     if (observed.exit_code) |code| {
         _ = try execution.settle(.{ .exited = .{ .exit_code = code } }, stream_extra);
-        return .{
+        return .{ .ran = .{
             .status = execution.status,
             .exit_code = code,
             .stdout = observed.stdout,
             .stderr = observed.stderr,
             .identity = observed.identity,
-        };
+        } };
     }
 
     // The channel closed cleanly but the exit marker never arrived: the
@@ -465,13 +573,13 @@ pub fn runCommand(
         .reason = "remote closed the channel before reporting an exit status",
         .last_observed = execution.status,
     } }, stream_extra);
-    return .{
+    return .{ .ran = .{
         .status = execution.status,
         .exit_code = null,
         .stdout = observed.stdout,
         .stderr = observed.stderr,
         .identity = observed.identity,
-    };
+    } };
 }
 
 fn describe(executor: Executor, err: anyerror) []const u8 {

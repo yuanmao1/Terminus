@@ -83,7 +83,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             .{ .kind = .server },
         .alias = target.session,
         .mutating = !parsed.boolean("read-only"),
-        .argv_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch raw_command,
+        .argv_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch
+            // Falling back to the raw text would write the very secrets the
+            // redaction exists to keep out of an append-only ledger.
+            fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
         .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
         .shell = if (parsed.boolean("login")) "bash-login" else "bash",
         .owner_token = owner_token,
@@ -93,7 +96,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
 
     var execution = switch (start) {
         .ready => |e| e,
-        .blocked => |blocker| return reportBlocked(ctx, blocker),
+        .blocked => |blocker| reportBlocked(blocker),
     };
     Cli.registerExecution(&execution);
     defer {
@@ -102,7 +105,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 
     const started = std.Io.Timestamp.now(ctx.io, .awake);
-    execution.connecting() catch |err| Cli.storeFatal(&store, err);
+    execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
 
     var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
     defer conn.deinit();
@@ -111,7 +114,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const outcome = if (target.session) |session_name|
         try runInSession(ctx, &store, &execution, executor, &parsed, session_name, raw_command, timeout_ms)
     else
-        try runOneShot(ctx, &store, &execution, executor, &parsed, raw_command, resolved.server.cwd);
+        try runOneShot(ctx, &execution, executor, &parsed, raw_command, resolved.server.cwd);
 
     const duration_ms: i64 = @intCast(@divTrunc(
         started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds,
@@ -168,7 +171,6 @@ const Outcome = Core.execution.RunOutcome;
 /// One-shot exec on a plain server target.
 fn runOneShot(
     ctx: *Cli.Ctx,
-    store: *Store,
     execution: *Core.execution.Execution,
     executor: Core.Executor,
     parsed: *const Cli.Args.Parsed,
@@ -207,8 +209,14 @@ fn runOneShot(
     else
         command;
 
-    const outcome = Core.execution.runCommand(execution, executor, effective) catch |err|
-        Cli.storeFatal(store, err);
+    const result = Core.execution.runCommand(execution, executor, effective) catch |err|
+        // The command may well have run; what failed is our record of it.
+        Cli.receiptFatal(execution.id(), err, execution.status.text());
+
+    const outcome = switch (result) {
+        .ran => |o| o,
+        .refused => |blocker| reportBlocked(blocker),
+    };
 
     return .{
         .status = outcome.status,
@@ -260,8 +268,12 @@ fn runInSession(
     const cursor = Store.sessions.cursor(store, session_id) catch |err| Cli.storeFatal(store, err);
 
     // Keys are about to be typed into a live shell: from here the remote may
-    // act, so the attempt is submitted.
-    execution.submitted() catch |err| Cli.storeFatal(store, err);
+    // act, so the attempt is submitted — and the scope guard gets its binding
+    // say, because this is the last moment at which nothing has happened yet.
+    switch (execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "about to submit")) {
+        .submitted => {},
+        .refused => |blocker| reportBlocked(blocker),
+    }
 
     const result = Tmux.execIn(executor, ctx.arena, ctx.io, session_name, command, cursor, timeout_ms) catch |err| {
         const settled = switch (err) {
@@ -277,7 +289,7 @@ fn runInSession(
                 .last_observed = execution.status,
             } }, .{}),
             else => execution.transportLoss(executor.errorMessage()),
-        } catch |settle_err| Cli.storeFatal(store, settle_err);
+        } catch |settle_err| Cli.receiptFatal(execution.id(), settle_err, execution.status.text());
         _ = settled;
         return .{
             .status = execution.status,
@@ -292,7 +304,7 @@ fn runInSession(
         Cli.storeFatal(store, err);
     _ = execution.settle(.{ .exited = .{ .exit_code = result.exit_code } }, .{
         .stdout = .{ .bytes = @intCast(result.output.len) },
-    }) catch |err| Cli.storeFatal(store, err);
+    }) catch |err| Cli.receiptFatal(execution.id(), err, "remote reported an exit status");
 
     return .{
         .status = execution.status,
@@ -319,18 +331,22 @@ fn advisoryText(ctx: *Cli.Ctx, advisory: ?Core.execution.Blocker) ?[]const u8 {
     };
 }
 
-fn reportBlocked(ctx: *Cli.Ctx, blocker: Core.execution.Blocker) !void {
+/// Refuses an attempt that another claim on the same scope makes unsafe.
+///
+/// Reachable from two places — `begin` (before we dial) and `submitted` (the
+/// point of no return). Both mean the same thing to the caller: nothing was
+/// sent, so retrying after reconciling is safe.
+fn reportBlocked(blocker: Core.execution.Blocker) noreturn {
     switch (blocker) {
         .unsettled => |op| fatal(
-            "refused: request {s} is {s} on an overlapping scope, so this change could be applied twice; reconcile it ('terminus request reconcile {s}') or pass --force",
+            "refused: request {s} is {s} on an overlapping scope, so this change could be applied twice; nothing was sent. Reconcile it ('terminus request reconcile {s}') or pass --force",
             .{ op.request_id, op.status.text(), op.request_id },
         ),
         .lease => |lease| fatal(
-            "refused: {s} holds a lease on an overlapping scope until {d}; wait, take it over, or pass --force",
+            "refused: {s} holds a lease on an overlapping scope until {d}; nothing was sent. Wait, take it over, or pass --force",
             .{ lease.owner_token, lease.expires_at },
         ),
     }
-    _ = ctx;
 }
 
 pub fn fatalTmux(err: anyerror, executor: Core.Executor, session_name: []const u8) noreturn {

@@ -106,28 +106,63 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     Cli.registerExecution(&execution);
     defer {
         Cli.clearExecution();
+        // Covers the paths `fail`'s hook cannot: a plain error return unwinds
+        // through here, and `store` dies with this frame.
+        Cli.releaseReservation();
         execution.deinit();
     }
 
     if (Store.jobs.getByName(&store, ctx.arena, resolved.server.id, job_name) catch |err|
         Cli.storeFatal(&store, err)) |existing|
     {
-        if (existing.status == .running and !parsed.boolean("force"))
-            fatal("job '{s}' is already running (started {d}); pick another --name, 'job rm' it, or pass --force", .{ job_name, existing.created_at });
+        if (existing.status.live() and !parsed.boolean("force"))
+            fatal("job '{s}' is {t} (started {d}); pick another --name, 'job rm' it, or pass --force", .{ job_name, existing.status, existing.created_at });
         _ = Store.jobs.remove(&store, resolved.server.id, job_name) catch |err| Cli.storeFatal(&store, err);
     }
 
-    execution.connecting() catch |err| Cli.storeFatal(&store, err);
+    execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
     var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
     defer conn.deinit();
     const executor = conn.executor();
 
     const session = try jobSessionName(ctx.arena, job_name);
-    Tmux.kill(executor, ctx.arena, session) catch {}; // stale session from a forgotten job
-    Tmux.ensure(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session);
-
     const nonce: u64 = @intCast(@mod(std.Io.Timestamp.now(ctx.io, .real).nanoseconds, 1_000_000_007));
     const sentinel = try std.fmt.allocPrint(ctx.arena, "__TERMINUS_JOB_{d}__", .{nonce});
+
+    // Claim the name before touching the remote host, and keep the claim for
+    // the whole setup.
+    //
+    // The check above is a courtesy: it produces a good message, but two
+    // launches racing on one name can both pass it. This insert cannot — the
+    // `UNIQUE(server_id, name)` index picks exactly one winner, and the loser
+    // is still holding an untouched remote when it finds out. That ordering is
+    // the point. The next thing this function does is kill the job's tmux
+    // session, and a loser that got that far would be killing the session the
+    // winner had just filled with real work.
+    //
+    // The row also has to exist before `sendKeys` for a second reason: if the
+    // database failed afterwards, the command would be running on the server
+    // with nothing locally able to find it — `status`, `kill` and `reconcile`
+    // all key off this row and the attempt.
+    const job_id = Store.jobs.create(&store, resolved.server.id, job_name, raw_command, sentinel, ctx.now) catch |err| switch (err) {
+        error.NameTaken => fatal("job '{s}' was claimed by another launch just now; nothing was sent", .{job_name}),
+        else => Cli.storeFatal(&store, err),
+    };
+    // `fail` exits without running defers, so the release is a hook rather
+    // than a `defer`. It stays registered until the keys are gone.
+    Cli.registerReservation(&store, resolved.server.id, job_name);
+
+    // A leftover session from a forgotten job must be *confirmed* gone before
+    // we reuse the name. `ensure` treats an existing session as ready, so a
+    // kill that quietly failed would type this command into the previous
+    // job's shell — with its cwd, its environment and its half-finished work.
+    const cleared = Tmux.killKeepLog(executor, ctx.arena, session) catch |err|
+        fatalTmux(err, executor, session);
+    if (!cleared) fatal(
+        "a tmux session for job '{s}' still exists and could not be killed; refusing to reuse it (inspect it with 'tmux attach -t job-{s}' on the host)",
+        .{ job_name, job_name },
+    );
+    Tmux.ensure(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session);
 
     var command = raw_command;
     var staged_path: ?[]const u8 = null;
@@ -156,19 +191,6 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     else
         try std.fmt.allocPrint(ctx.arena, "({s}); echo {s}:$?", .{ command, sentinel });
 
-    // Persist *before* handing anything to the remote.
-    //
-    // The sentinel and session name are already fixed, so the record can be
-    // written first — and it must be. If these writes happened after
-    // `sendKeys` and the local database then failed, the command would be
-    // running on the server with nothing locally able to find it: `status`,
-    // `kill` and `reconcile` all key off the job row and the attempt.
-    const job_id = Store.jobs.create(&store, resolved.server.id, job_name, raw_command, sentinel, ctx.now) catch |err| switch (err) {
-        error.NameTaken => fatal("job '{s}' already exists", .{job_name}),
-        else => Cli.storeFatal(&store, err),
-    };
-    _ = job_id;
-
     // The immutable record of what was launched. Survives `job rm` and a
     // same-name rerun, which the mutable `jobs` row does not.
     const attempt_no = Store.job_attempts.nextAttemptNo(&store, resolved.server.id, job_name) catch |err|
@@ -193,11 +215,32 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }) catch |err| Cli.storeFatal(&store, err);
 
     // Keys are about to enter a live shell: from here the remote may act.
-    execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "about to submit");
-    Tmux.sendKeys(executor, ctx.arena, session, full, false) catch |err| {
-        _ = execution.transportLoss(executor.errorMessage()) catch {};
-        fatalTmux(err, executor, session);
+    // This is also where the scope guard binds — the check at `begin` was a
+    // fast fail, this one is atomic with becoming visible to the next caller.
+    switch (execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "about to submit")) {
+        .submitted => {},
+        // `fail` releases the name reservation on the way out: we prepared
+        // this launch and are not going to use it, and leaving the row behind
+        // would make the next run report a job that never started. The
+        // immutable attempt row stays — it is the record that this happened.
+        .refused => |blocker| reportBlocked(blocker),
+    }
+    Tmux.sendKeys(executor, ctx.arena, session, full, false) catch {
+        // The keys may have landed before the channel broke, so the job may
+        // be running. Recording that and then exiting 1 would tell an agent
+        // "failed, safe to retry" — the one conclusion that is not available.
+        //
+        // The reservation is kept, and deliberately left `pending`: it may
+        // name something running on the host, so it must neither be reused
+        // nor claimed as started.
+        Cli.commitReservation();
+        _ = execution.transportLoss(executor.errorMessage()) catch |receipt_err|
+            Cli.receiptFatal(execution.id(), receipt_err, "submitted");
+        Cli.failIndeterminateAfterOutput(execution.id());
     };
+    // The command is in the remote shell. The reservation is now a job.
+    Cli.commitReservation();
+    Store.jobs.markStarted(&store, job_id) catch |err| Cli.storeFatal(&store, err);
 
     if (Tmux.panePid(executor, ctx.arena, session) catch null) |pid| {
         execution.remoteStarted(.{ .pid = pid }) catch |err|
@@ -207,7 +250,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // The work outlives this process. Detaching says so explicitly, and the
     // attempt keeps holding its scope until somebody establishes how it ended.
     execution.detach("job continues in its remote tmux session") catch |err|
-        Cli.storeFatal(&store, err);
+        Cli.receiptFatal(execution.id(), err, "remote_started");
 
     switch (ctx.out.format) {
         .json => try ctx.out.json(.{
@@ -561,7 +604,7 @@ fn killJob(
         }
     }
 
-    if (job.status == .running) {
+    if (job.status.live()) {
         Store.jobs.markFinished(store, job.id, .killed, null, ctx.now) catch |err|
             Cli.storeFatal(store, err);
     }
@@ -594,11 +637,17 @@ fn killJob(
     }
 }
 
-/// Forgets a job, but only once the remote side is actually clean.
+/// Forgets a job's name while preserving what can still be proven.
 ///
-/// This used to delete the local row and report success even when the remote
-/// kill had failed, which turned a half-finished cleanup into a confident
-/// "removed" and left a live session nobody was tracking.
+/// The old version killed the session — which also deleted the remote log —
+/// then settled `indeterminate` and reported `{ok:true, "removed"}`. That
+/// destroyed the only mechanical evidence of how the job ended and left a
+/// human override as the sole way to ever settle it, while telling the caller
+/// everything went fine.
+///
+/// Now it probes for an outcome first, keeps the log, and only discards
+/// evidence when explicitly told to — in which case it says so rather than
+/// reporting success.
 fn removeJob(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -610,41 +659,86 @@ fn removeJob(
     parsed: *const Cli.Args.Parsed,
 ) !void {
     try requireNoForeignLease(ctx, store, server_id, job.name, parsed);
+    const discard = parsed.boolean("discard-evidence");
 
-    Tmux.kill(executor, ctx.arena, session) catch |err|
-        fatal("cannot clean up job '{s}' on the remote: {s} ({s}); the local record is kept", .{ job.name, executor.errorMessage(), @errorName(err) });
-    const gone = !(Tmux.isAlive(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session));
-    if (!gone) {
-        fatal("job '{s}' session is still present after cleanup; refusing to forget a job that may still be running (use 'job kill' and check, or --force)", .{job.name});
-    }
+    // Look before destroying: if the sentinel is there, this job's outcome is
+    // provable right now and need never become an override.
+    const probe = Tmux.probeTail(executor, ctx.arena, session, job.sentinel, probe_tail_bytes) catch |err|
+        fatalTmux(err, executor, session);
 
+    const cleared = if (discard) blk: {
+        Tmux.kill(executor, ctx.arena, session) catch |err|
+            fatal("cannot clean up job '{s}' on the remote: {s} ({s}); the local record is kept", .{ job.name, executor.errorMessage(), @errorName(err) });
+        break :blk true;
+    } else Tmux.killKeepLog(executor, ctx.arena, session) catch |err|
+        fatalTmux(err, executor, session);
+
+    if (!cleared) fatal(
+        "job '{s}' session is still present after cleanup; refusing to forget a job that may still be running",
+        .{job.name},
+    );
+
+    var settled_status: []const u8 = "unchanged";
+    var proven = false;
     if (attempt) |a| {
         if (Core.execution.attach(store, ctx.arena, ctx.io, a.request_id) catch |err|
             Cli.storeFatal(store, err)) |loaded|
         {
             var execution = loaded;
-            // Same proof limit as `job kill`: the session being gone does not
-            // establish that the work stopped.
-            _ = execution.settleAttached(.{ .indeterminate = .{
-                .reason = "job removed; session absent, but this supervisor cannot prove the process tree stopped",
+            const outcome = if (probe.exit_code) |code| out: {
+                proven = true;
+                break :out execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{});
+            } else execution.settleAttached(.{ .indeterminate = .{
+                .reason = if (discard)
+                    "job removed with --discard-evidence; the log was deleted, so its outcome can no longer be established mechanically"
+                else
+                    "job removed before its outcome was established; the log is retained for 'request reconcile --from-log'",
                 .last_observed = execution.status,
-            } }, .{}) catch |err| Cli.receiptFatal(a.request_id, err, "job removed");
+            } }, .{});
+            const settled = outcome catch |err| Cli.receiptFatal(a.request_id, err, "job removed");
+            settled_status = switch (settled) {
+                .recorded => |r| r.status.text(),
+                .already_settled => |r| r.status.text(),
+            };
+        } else {
+            settled_status = "already settled";
+            proven = true;
         }
     }
 
     _ = Store.jobs.remove(store, server_id, job.name) catch |err| Cli.storeFatal(store, err);
 
+    // Discarding evidence is not a success: it converts something that could
+    // have been proven into an override the caller now owes.
+    const ok = proven or !discard;
     switch (ctx.out.format) {
-        // The attempt row survives on purpose: `job inspect` still answers
-        // what ran, after the job itself is forgotten.
         .json => try ctx.out.json(.{
-            .ok = true,
+            .ok = ok,
             .action = "removed",
             .job = job.name,
+            .status = settled_status,
+            .outcomeProven = proven,
+            .evidenceRetained = !discard,
             .attemptRetained = attempt != null,
             .requestId = if (attempt) |a| a.request_id else null,
+            .hint = if (proven or discard)
+                @as(?[]const u8, null)
+            else
+                "outcome still unknown; settle it with 'terminus request reconcile <request-id> --from-log'",
         }),
-        .human => try ctx.out.print("removed job '{s}' (attempt history retained)\n", .{job.name}),
+        .human => {
+            if (proven) {
+                try ctx.out.print("removed job '{s}' (outcome recorded from its log)\n", .{job.name});
+            } else if (discard) {
+                try ctx.out.print("removed job '{s}' and deleted its log; its outcome can no longer be proven\n", .{job.name});
+            } else {
+                try ctx.out.print("removed job '{s}'; outcome unknown, log retained for reconcile\n", .{job.name});
+            }
+        },
+    }
+    if (!ok) {
+        try ctx.out.flush();
+        Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
     }
 }
 
@@ -665,7 +759,7 @@ fn listJobs(
 
     var filtered: std.ArrayList(Store.jobs.Job) = .empty;
     for (all) |j| {
-        if (only_active and j.status != .running) continue;
+        if (only_active and !j.status.live()) continue;
         if (name_filter) |nf| if (std.mem.indexOf(u8, j.name, nf) == null) continue;
         try filtered.append(ctx.arena, j);
     }
@@ -758,14 +852,19 @@ fn requireNoForeignLease(
     );
 }
 
+/// Refuses an attempt that another claim on the same scope makes unsafe.
+///
+/// Reachable from `begin` (before we dial) and from `submitted` (the point of
+/// no return). Both mean the same thing to the caller: the job was not
+/// started, so retrying after reconciling is safe.
 fn reportBlocked(blocker: Core.execution.Blocker) noreturn {
     switch (blocker) {
         .unsettled => |op| fatal(
-            "refused: request {s} is {s} on an overlapping scope, so this could be applied twice; reconcile it ('terminus request reconcile {s}') or pass --force",
+            "refused: request {s} is {s} on an overlapping scope, so this could be applied twice; the job was not started. Reconcile it ('terminus request reconcile {s}') or pass --force",
             .{ op.request_id, op.status.text(), op.request_id },
         ),
         .lease => |lease| fatal(
-            "refused: {s} holds a lease on an overlapping scope until {d}; wait, take it over, or pass --force",
+            "refused: {s} holds a lease on an overlapping scope until {d}; the job was not started. Wait, take it over, or pass --force",
             .{ lease.owner_token, lease.expires_at },
         ),
     }
