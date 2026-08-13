@@ -42,6 +42,7 @@ const usage =
     \\  exec       run a remote command, wait for it (sync; <server> or <server>:<sess>)
     \\  run        start a tracked background job    (--name; needs tmux)
     \\  job        manage jobs                       (ls/status/read/kill/rm)
+    \\  request    inspect and settle operations     (ls/show/receipt/reconcile)
     \\  read       read session output by cursor
     \\  write      write input into a session
     \\  push       upload a file over SCP
