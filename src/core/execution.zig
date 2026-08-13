@@ -164,6 +164,20 @@ pub const Execution = struct {
         return outcome;
     }
 
+    /// Settles an attempt re-opened by `attach`.
+    ///
+    /// `attach` starts out marked as settled so that merely *looking* at a
+    /// running job cannot invent a verdict for it. Recording a real outcome
+    /// lifts that guard explicitly.
+    pub fn settleAttached(
+        self: *Execution,
+        terminal: op_state.Terminal,
+        extra: receipts.TerminalExtra,
+    ) Error!receipts.SettleOutcome {
+        self.settled = false;
+        return self.settle(terminal, extra);
+    }
+
     /// Classifies a transport failure against how far we got.
     ///
     /// This is the only route from an SSH/daemon error to a terminal, which
@@ -172,6 +186,24 @@ pub const Execution = struct {
     pub fn transportLoss(self: *Execution, detail: []const u8) Error!receipts.SettleOutcome {
         const terminal = op_state.terminalForTransportLoss(self.status, detail);
         return self.settle(terminal, .{});
+    }
+
+    /// Deliberately leaves the attempt in flight.
+    ///
+    /// A job outlives the process that launched it, so `run` must be able to
+    /// exit without settling. That is *not* the same as losing track: it is
+    /// recorded as a detach, and the attempt keeps blocking its scope because
+    /// something really is still running there. Whoever next observes the
+    /// job — `job status`, `job watch`, a handoff — settles it via `attach`.
+    pub fn detach(self: *Execution, note: []const u8) Error!void {
+        _ = try receipts.append(self.store, .{
+            .request_id = self.id(),
+            .kind = .checkpoint,
+            .phase = "detached",
+            .observed_at = self.now(),
+            .detail_json = try detachJson(self.arena, note),
+        });
+        self.settled = true; // not "finished" — "not ours to finish here"
     }
 
     /// Settles an attempt we gave up on, classified by how far it got.
@@ -282,6 +314,52 @@ fn nonceFrom(request_id: [ids.len]u8) u64 {
     for (request_id[ids.len - 12 ..]) |ch| value = value *% 31 +% ch;
     return value;
 }
+
+fn detachJson(arena: Allocator, note: []const u8) Allocator.Error![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    std.json.Stringify.value(.{
+        .schemaVersion = receipts.schema_version,
+        .event = "detached",
+        .note = note,
+    }, .{}, &writer.writer) catch return error.OutOfMemory;
+    return writer.toOwnedSlice();
+}
+
+/// Re-opens an attempt that a previous process left in flight.
+///
+/// This is how a detached job gets settled: the launching command is long
+/// gone, so the truth is established by whoever next looks. Returns null when
+/// the attempt is already settled — the caller then reads the recorded
+/// terminal rather than producing a second opinion.
+pub fn attach(
+    store: *Store,
+    arena: Allocator,
+    io: std.Io,
+    request_id: []const u8,
+) Error!?Execution {
+    const op = (try operations.get(store, arena, request_id)) orelse return null;
+    if (op.status.isTerminal()) return null;
+
+    var buf: [ids.len]u8 = undefined;
+    if (op.request_id.len != ids.len) return null;
+    @memcpy(&buf, op.request_id);
+
+    return .{
+        .request_id = buf,
+        .server_id = op.server_id,
+        .store = store,
+        .arena = arena,
+        .io = io,
+        .scope = op.scopeOf(),
+        .capability = supervisor.shell_capability,
+        .status = op.status,
+        // Settling is the caller's job now; dropping this handle without
+        // deciding must not invent a verdict for work that is still running.
+        .settled = true,
+        .nonce = nonceFrom(buf),
+    };
+}
+
 
 fn forcedJson(arena: Allocator, blocker: Blocker) Allocator.Error![]u8 {
     var writer: std.Io.Writer.Allocating = .init(arena);

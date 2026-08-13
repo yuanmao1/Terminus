@@ -411,3 +411,164 @@ test "M2 gate: an execution abandoned before dialing touched nothing" {
     try t.expect(!op.status.blocksScope());
     try t.expectEqual(@as(usize, 0), (try operations.unsettled(&h.store, h.arena, 1)).len);
 }
+
+test "M2b gate: a detached job stays in flight instead of inventing a verdict" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2b_detach");
+    defer h.deinit();
+
+    var request_id_buf: [26]u8 = undefined;
+    {
+        const start = try h.begin(.{ .kind = .job, .alias = "build", .mutating = true });
+        var exec = start.ready;
+        try exec.connecting();
+        try exec.submitted();
+        try exec.remoteStarted(.{ .pid = 900 });
+        @memcpy(&request_id_buf, exec.id());
+        // `run` exits here: the work continues in its tmux session.
+        try exec.detach("job continues in its remote tmux session");
+        exec.deinit(); // must not settle anything
+    }
+
+    const op = try h.operationOf(&request_id_buf);
+    try t.expectEqual(op_state.Status.remote_started, op.status);
+    // Detached is not finished: something really is running, so the scope
+    // stays held until somebody establishes how it ended.
+    try t.expect(op.status.blocksScope());
+    try t.expect((try receipts.terminalOf(&h.store, &request_id_buf)) == null);
+}
+
+test "M2b gate: attaching to a running job cannot settle it by accident" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2b_attach_readonly");
+    defer h.deinit();
+
+    const start = try h.begin(.{ .kind = .job, .alias = "build", .mutating = true });
+    var launcher = start.ready;
+    try launcher.connecting();
+    try launcher.submitted();
+    try launcher.detach("running");
+
+    // A later `job status` attaches. Merely looking must not produce a
+    // terminal, even if the handle is dropped without deciding.
+    {
+        var attached = (try execution.attach(&h.store, h.arena, h.io, launcher.id())).?;
+        attached.deinit();
+    }
+    try t.expect((try receipts.terminalOf(&h.store, launcher.id())) == null);
+    try t.expectEqual(op_state.Status.submitted, (try h.operationOf(launcher.id())).status);
+
+    // Recording a real outcome is explicit.
+    var attached = (try execution.attach(&h.store, h.arena, h.io, launcher.id())).?;
+    _ = try attached.settleAttached(.{ .exited = .{ .exit_code = 0 } }, .{});
+    try t.expectEqual(op_state.Status.completed, (try h.operationOf(launcher.id())).status);
+
+    // Once settled, a second observer gets the recorded terminal rather than
+    // an opportunity to overwrite it.
+    try t.expect((try execution.attach(&h.store, h.arena, h.io, launcher.id())) == null);
+}
+
+test "M2b gate: a vanished job session is unknown, not killed" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2b_vanished");
+    defer h.deinit();
+
+    const start = try h.begin(.{ .kind = .job, .alias = "migrate", .mutating = true });
+    var launcher = start.ready;
+    try launcher.connecting();
+    try launcher.submitted();
+    try launcher.remoteStarted(.{ .pid = 4242 });
+    try launcher.detach("running");
+
+    // The pane is gone and no sentinel was ever written. That happens when a
+    // command finishes and the shell exits, when somebody kills it, and when
+    // the host reboots mid-write — three different outcomes, none of which is
+    // evidence for the others.
+    var attached = (try execution.attach(&h.store, h.arena, h.io, launcher.id())).?;
+    _ = try attached.settleAttached(.{ .indeterminate = .{
+        .reason = "job session disappeared without reporting an exit status",
+        .last_observed = attached.status,
+    } }, .{});
+
+    const op = try h.operationOf(launcher.id());
+    try t.expectEqual(op_state.Status.indeterminate, op.status);
+    try t.expect(op.status.blocksScope());
+
+    // It can be resolved later by the durable log, which is the only thing
+    // that actually knows.
+    try t.expect((try receipts.resolve(&h.store, h.arena, launcher.id(), .completed, .{
+        .job_sentinel = .{ .sentinel = "__TERMINUS_JOB_1__", .exit_code = 0 },
+    }, 5000)) == .resolved);
+    try t.expectEqual(op_state.Status.completed, (try h.operationOf(launcher.id())).effectiveStatus());
+}
+
+test "M2b gate: cancellation counts only when absence was verified" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2b_cancel");
+    defer h.deinit();
+
+    // Session confirmed gone -> a real cancellation.
+    {
+        const start = try h.begin(.{ .kind = .job, .alias = "a", .mutating = true });
+        var e = start.ready;
+        try e.connecting();
+        try e.submitted();
+        try e.detach("running");
+        var attached = (try execution.attach(&h.store, h.arena, h.io, e.id())).?;
+        _ = try attached.settleAttached(.{ .remote_cancel_confirmed = .{
+            .term_sent = true,
+            .kill_sent = true,
+            .absence_verified_at = 4000,
+            .verification_method = "tmux has-session reports the job session absent",
+        } }, .{});
+        const op = try h.operationOf(e.id());
+        try t.expectEqual(op_state.Status.cancelled, op.status);
+        try t.expect(!op.status.blocksScope());
+    }
+
+    // Kill issued but the session is still there -> unknown, and it keeps
+    // holding the scope. Claiming `cancelled` here would release the barrier
+    // on something still running.
+    {
+        const start = try h.begin(.{ .kind = .job, .alias = "b", .mutating = true });
+        var e = start.ready;
+        try e.connecting();
+        try e.submitted();
+        try e.detach("running");
+        var attached = (try execution.attach(&h.store, h.arena, h.io, e.id())).?;
+        _ = try attached.settleAttached(.{ .indeterminate = .{
+            .reason = "kill issued but the job session is still present",
+            .last_observed = attached.status,
+        } }, .{});
+        const op = try h.operationOf(e.id());
+        try t.expectEqual(op_state.Status.indeterminate, op.status);
+        try t.expect(op.status.blocksScope());
+    }
+}
+
+test "M2b gate: relaunching a job whose fate is unknown is refused" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m2b_relaunch");
+    defer h.deinit();
+
+    const scope: scope_mod.Scope = .{ .kind = .job, .key = "deploy" };
+    const start = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
+    var first = start.ready;
+    try first.connecting();
+    try first.submitted();
+    _ = try first.transportLoss("eof"); // indeterminate
+
+    // The deploy may or may not have happened. Running it again could apply
+    // it twice, so the launch is refused rather than left to judgement.
+    const blocked = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
+    try t.expectEqual(op_state.Status.indeterminate, blocked.blocked.unsettled.status);
+
+    // Resolving the question unblocks it.
+    _ = try receipts.resolve(&h.store, h.arena, first.id(), .failed, .{
+        .job_sentinel = .{ .sentinel = "__S__", .exit_code = 1 },
+    }, 6000);
+    const allowed = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
+    var second = allowed.ready;
+    defer second.deinit();
+    try t.expect(allowed == .ready);
+}

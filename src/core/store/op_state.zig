@@ -183,14 +183,20 @@ pub const Terminal = union(enum) {
     },
     /// A remote process was signalled *and its absence verified*.
     ///
-    /// Every field is required on purpose. "We sent TERM" is not evidence
-    /// that anything stopped; a free-text method string would let a caller
-    /// mark an operation `cancelled` — releasing the scope barrier — while
-    /// the process tree is still alive. If absence could not be established,
-    /// the honest terminal is `indeterminate`, and this variant cannot be
-    /// constructed to say otherwise.
+    /// `absence_verified_at` and `verification_method` are required on
+    /// purpose. "We sent TERM" is not evidence that anything stopped; a
+    /// free-text method string alone would let a caller mark an operation
+    /// `cancelled` — releasing the scope barrier — while the process tree is
+    /// still alive. If absence could not be established, the honest terminal
+    /// is `indeterminate`, and this variant cannot be constructed to say
+    /// otherwise.
+    ///
+    /// `pid` is optional because proof comes at different granularities: a
+    /// helper verifies a specific process, while tmux verifies that the
+    /// session (and with it the process group) is gone. How strong the proof
+    /// is belongs in the operation's recorded capability, not here.
     remote_cancel_confirmed: struct {
-        pid: i64,
+        pid: ?i64 = null,
         /// Process start time, so a recycled pid cannot masquerade as ours.
         start_token: ?[]const u8 = null,
         term_sent: bool,

@@ -234,6 +234,25 @@ pub fn execIn(
     }
 }
 
+/// The pid of the session's pane process — the shell the job runs under, and
+/// the head of its process group.
+///
+/// This is what identity a tmux-supervised job can offer. It is a real pid,
+/// but nothing here proves a process later found under it is still ours,
+/// which is why the recorded capability says `pidProof = weak`.
+pub fn panePid(executor: Executor, arena: Allocator, name: []const u8) Error!?i64 {
+    const tname = try tmuxName(arena, name);
+    const script = try std.fmt.allocPrint(
+        arena,
+        "tmux list-panes -t ={s} -F '#{{pane_pid}}' 2>/dev/null | head -1",
+        .{tname},
+    );
+    const result = try run(executor, arena, script);
+    const text = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (text.len == 0) return null;
+    return std.fmt.parseInt(i64, text, 10) catch null;
+}
+
 pub fn isAlive(executor: Executor, arena: Allocator, name: []const u8) Error!bool {
     const tname = try tmuxName(arena, name);
     const script = try std.fmt.allocPrint(arena, "tmux has-session -t ={s} 2>/dev/null", .{tname});
