@@ -10,7 +10,21 @@ pub const memories = @import("memories.zig");
 pub const jobs = @import("jobs.zig");
 pub const facts = @import("facts.zig");
 pub const history = @import("history.zig");
+/// Operation ledger (0.2.0): immutable identity + append-only receipts.
+/// `history` stays readable but is no longer an authoritative record.
+pub const ids = @import("ids.zig");
+pub const op_state = @import("op_state.zig");
+pub const operations = @import("operations.zig");
+pub const receipts = @import("receipts.zig");
+pub const transfers = @import("transfers.zig");
+pub const job_attempts = @import("job_attempts.zig");
+pub const leases = @import("leases.zig");
+pub const plans = @import("plans.zig");
+pub const host_pins = @import("host_pins.zig");
+pub const policy = @import("policy.zig");
 const migrate = @import("migrate.zig");
+
+pub const schema_version = migrate.latest_version;
 
 db: Db,
 
@@ -27,5 +41,6 @@ pub fn close(store: *Store) void {
 }
 
 test {
+    _ = @import("gates_test.zig");
     @import("std").testing.refAllDecls(Store);
 }

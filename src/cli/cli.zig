@@ -46,6 +46,83 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.fatal(fmt, args);
 }
 
+/// Process exit codes with a defined meaning to callers.
+pub const exit_code = struct {
+    pub const ok: u8 = 0;
+    pub const failure: u8 = 1;
+    /// The remote outcome could not be established. Distinct from `failure`
+    /// on purpose (B6): an agent must be able to tell "it did not work" from
+    /// "we do not know whether it worked", because the second one forbids a
+    /// blind retry.
+    pub const indeterminate: u8 = 75;
+    /// The audit ledger could not be written. The remote effect may well have
+    /// happened; what failed is our ability to record it.
+    pub const receipt_persist_failed: u8 = 76;
+};
+
+/// The only exit for "the remote state is unknown".
+///
+/// Never collapses into `fail`: reporting an indeterminate result as a plain
+/// error would invite exactly the blind retry that can double-apply a remote
+/// side effect.
+pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observed: []const u8) noreturn {
+    if (active_ctx) |ctx| {
+        if (ctx.out.format == .json) {
+            ctx.out.json(.{
+                .ok = false,
+                .status = "indeterminate",
+                .@"error" = reason,
+                .errorCode = "INDETERMINATE",
+                .requestId = request_id,
+                .lastObserved = last_observed,
+                .hint = "the remote outcome is unknown; reconcile with 'terminus request reconcile <request-id>' before retrying",
+            }) catch {};
+            ctx.out.flush() catch {};
+            std.process.exit(exit_code.indeterminate);
+        }
+        ctx.out.print(
+            "indeterminate: {s}\n  request: {s}\n  last observed: {s}\n  reconcile before retrying: terminus request reconcile {s}\n",
+            .{ reason, request_id, last_observed, request_id },
+        ) catch {};
+        ctx.out.flush() catch {};
+    }
+    std.process.exit(exit_code.indeterminate);
+}
+
+/// A write to the operation ledger failed.
+///
+/// This must never be swallowed the way `history.add(...) catch {}` was: if
+/// we cannot record what we did, we do not get to claim we did it cleanly.
+/// The remote effect is reported as far as we know it, alongside an explicit
+/// signal that the audit trail is incomplete.
+pub fn receiptFatal(
+    request_id: []const u8,
+    err: anyerror,
+    known_remote_status: ?[]const u8,
+) noreturn {
+    if (active_ctx) |ctx| {
+        if (ctx.out.format == .json) {
+            ctx.out.json(.{
+                .ok = false,
+                .@"error" = "could not persist the operation receipt",
+                .errorCode = "RECEIPT_PERSIST_FAILED",
+                .requestId = request_id,
+                .cause = @errorName(err),
+                .remoteStatus = known_remote_status,
+                .hint = "the remote action may have taken effect; the local ledger is incomplete",
+            }) catch {};
+            ctx.out.flush() catch {};
+            std.process.exit(exit_code.receipt_persist_failed);
+        }
+        ctx.out.print(
+            "RECEIPT_PERSIST_FAILED: {s}\n  request: {s}\n  remote status: {s}\n  the remote action may have taken effect; the local ledger is incomplete\n",
+            .{ @errorName(err), request_id, known_remote_status orelse "unknown" },
+        ) catch {};
+        ctx.out.flush() catch {};
+    }
+    std.process.exit(exit_code.receipt_persist_failed);
+}
+
 /// `<server>` or `<server>:<session>` — the target syntax shared by exec,
 /// memory, read, write, and session commands.
 pub const Target = struct {

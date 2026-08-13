@@ -36,9 +36,51 @@ pub fn open(path: [:0]const u8) Error!Db {
     }
     var db: Db = .{ .handle = handle.? };
     _ = c.sqlite3_busy_timeout(db.handle, 5000);
-    try db.exec("PRAGMA journal_mode=WAL");
+    try db.ensureWal();
     try db.exec("PRAGMA foreign_keys=ON");
     return db;
+}
+
+/// Switches the database to WAL, tolerating a concurrent first open.
+///
+/// WAL is what lets a reader and a writer coexist, which the CLI and daemon
+/// both depend on. Setting it needs a brief exclusive lock, and SQLite does
+/// **not** route that wait through the busy handler — so `busy_timeout` does
+/// nothing here. Several processes starting in the same instant on a brand
+/// new database therefore see "database is locked" (an agent firing parallel
+/// commands hits this readily).
+///
+/// The lock is held only for the duration of the peer's own pragma, so
+/// retrying closes the window. A peer winning the race is success: the mode
+/// lives in the file header, so what matters is that the database *is* in WAL
+/// when we return, not who put it there. Once set, later opens read `wal` and
+/// never contend again.
+///
+/// Waiting spins briefly (the common case is a peer finishing a header write,
+/// i.e. microseconds) and then yields, so a *preempted* peer can actually run.
+/// A pure spin here is not enough: under scheduling pressure it exhausts its
+/// budget while the lock holder never gets scheduled, which showed up as an
+/// intermittent ReleaseSafe failure.
+fn ensureWal(db: *Db) Error!void {
+    var round: usize = 0;
+    while (round < 4096) : (round += 1) {
+        if (db.exec("PRAGMA journal_mode=WAL")) |_| return else |_| {}
+        if (try db.inWalMode()) return;
+        var spin: usize = 0;
+        while (spin < 64) : (spin += 1) std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
+    }
+    // Never report success in a different journal mode: the concurrency
+    // guarantees the rest of the code assumes would not hold.
+    if (try db.inWalMode()) return;
+    return error.Sqlite;
+}
+
+fn inWalMode(db: *Db) Error!bool {
+    var stmt = try db.prepare("PRAGMA journal_mode");
+    defer stmt.deinit();
+    if (!try stmt.step()) return false;
+    return std.ascii.eqlIgnoreCase(stmt.columnText(0), "wal");
 }
 
 pub fn close(db: *Db) void {
