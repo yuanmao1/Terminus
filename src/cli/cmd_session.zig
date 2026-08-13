@@ -76,7 +76,23 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         }
     } else if (std.mem.eql(u8, verb, "rm")) {
         const name = parsed.positional(1) orelse fatal("{s}", .{usage});
-        Tmux.kill(executor, ctx.arena, name) catch |err| fatalTmux(err, executor, name);
+        // The kill has to be *proven* before anything else happens. Deleting
+        // the local row for a session that is still on the host leaves it
+        // orphaned — invisible to `session ls`'s local half, and `ensure`
+        // treats an existing session as ready, so the next command under this
+        // name would land in the shell we just claimed to have removed.
+        const gone = Tmux.killSession(executor, ctx.arena, name) catch |err| fatalTmux(err, executor, name);
+        if (!gone) fatal(
+            "session '{s}:{s}' is still present after the kill; nothing was removed. Inspect it with 'tmux attach -t t-{s}' on the host",
+            .{ server_name, name, name },
+        );
+        // Only now: a live pane recreates its log through `pipe-pane`, so a
+        // log deleted under a surviving session quietly comes back holding a
+        // partial history that starts mid-stream.
+        Tmux.removeLog(executor, ctx.arena, name) catch |err| fatal(
+            "session '{s}:{s}' was stopped but its log could not be deleted: {s} ({s}); the local record is kept",
+            .{ server_name, name, executor.errorMessage(), @errorName(err) },
+        );
         _ = Store.sessions.remove(&store, resolved.server.id, name) catch |err|
             Cli.storeFatal(&store, err);
         switch (ctx.out.format) {

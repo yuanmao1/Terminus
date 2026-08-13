@@ -42,7 +42,9 @@ const job_usage =
     \\  job status  <server> <name> [--json]     probe: running? exit code? businessResult?
     \\  job read    <server> <name> [--from-cursor] [--limit BYTES] [--json]
     \\  job watch   <server> <name> [--interval 15s] [--max N] [--json]
-    \\  job kill    <server> <name>              terminate and verify it is gone
+    \\  job kill    <server> <name>              settle it from its recorded
+    \\                                           outcome if it already ended,
+    \\                                           else terminate and verify
     \\  job rm      <server> <name>              forget the job (kills if running)
     \\  job inspect <server> <name> [--json]     what was launched, byte for byte
     \\
@@ -105,7 +107,10 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // or a foreign lease refuses it. That is the whole point: starting a
     // second `deploy` while the first one's fate is unknown is how work gets
     // applied twice.
-    const start = Core.execution.begin(&store, ctx.arena, ctx.io, .{
+    //
+    // Held in a named value because a blocked launch asks a second time,
+    // after trying to settle the blocker from evidence on the host.
+    const begin_opts: Core.execution.BeginOptions = .{
         .server_id = resolved.server.id,
         .server_name = resolved.server.name,
         .kind = .job,
@@ -122,11 +127,38 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         .owner_token = owner_token,
         .force = parsed.boolean("force"),
         .now = ctx.now,
-    }) catch |err| Cli.storeFatal(&store, err);
+    };
+    const start = Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
+        Cli.storeFatal(&store, err);
+
+    // One connection for the whole command, opened wherever it is first
+    // needed. The blocked path needs it before the execution exists, the
+    // normal path after — and opening a second one would mean two SSH
+    // handshakes for one launch.
+    var conn_slot: ?Cli.Connection = null;
+    defer if (conn_slot) |*c| c.deinit();
 
     var execution = switch (start) {
         .ready => |e| e,
-        .blocked => |blocker| return reportBlocked(blocker),
+        // A blocker that might already have finished is worth one connection
+        // before we refuse. `begin` inserts nothing on this path, so settling
+        // the blocker and asking again costs a round trip and leaks nothing —
+        // and the second answer is the one that decides. Anything unprovable
+        // (a lease, a non-job) still refuses without dialling at all, and an
+        // unreachable host falls back to the refusal rather than reporting a
+        // connection error in its place.
+        .blocked => |blocker| retry: {
+            if (!Cli.blockerMayBeProvable(blocker)) return reportBlocked(blocker);
+            conn_slot = Cli.tryConnect(ctx, &parsed, resolved.server, resolved.auth) orelse
+                return reportBlocked(blocker);
+            Cli.settleProvableBlocker(ctx, &store, conn_slot.?.executor(), blocker);
+            const second = Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
+                Cli.storeFatal(&store, err);
+            break :retry switch (second) {
+                .ready => |e| e,
+                .blocked => |still| return reportBlocked(still),
+            };
+        },
     };
     Cli.registerExecution(&execution);
     defer {
@@ -157,9 +189,22 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 
     execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
-    var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
-    defer conn.deinit();
+    if (conn_slot == null) conn_slot = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
+    var conn = &conn_slot.?;
     const executor = conn.executor();
+
+    // The guard waved this launch through while something else still holds an
+    // overlapping scope (`--force`). If that something is a job which already
+    // finished, read its exit status before anything is torn down —
+    // opportunistic and one-way, and `submitted()` below re-runs the
+    // authoritative guard either way. It has to happen here, ahead of the
+    // session teardown, because the blocker on a same-name rerun is the
+    // previous attempt in this very session.
+    //
+    // The blocked path above has already done this for its own blocker; this
+    // call covers the launches `begin` let through while still reporting one
+    // (`--force`), where `advisory` is the only place the blocker appears.
+    Cli.settleProvableBlocker(ctx, &store, executor, execution.advisory);
 
     const session = try jobSessionName(ctx.arena, job_name);
     const nonce: u64 = @intCast(@mod(std.Io.Timestamp.now(ctx.io, .real).nanoseconds, 1_000_000_007));
@@ -194,11 +239,11 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // we reuse the name. `ensure` treats an existing session as ready, so a
     // kill that quietly failed would type this command into the previous
     // job's shell — with its cwd, its environment and its half-finished work.
-    const cleared = Tmux.killKeepLog(executor, ctx.arena, session) catch |err|
+    const cleared = Tmux.killSession(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);
     if (!cleared) fatal(
-        "a tmux session for job '{s}' still exists and could not be killed; refusing to reuse it (inspect it with 'tmux attach -t job-{s}' on the host)",
-        .{ job_name, job_name },
+        "a tmux session for job '{s}' still exists and could not be killed; refusing to reuse it (inspect it with 'tmux attach -t {s}' on the host)",
+        .{ job_name, try Tmux.targetName(ctx.arena, session) },
     );
     Tmux.ensure(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session);
 
@@ -401,6 +446,9 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 .status = state.status.text(),
                 .exitCode = state.exit_code,
                 .businessResult = state.business_result,
+                .finishedAt = state.finished_at,
+                .observedAt = state.observed_at,
+                .conflict = ConflictJson.from(state.conflict),
                 .from = from,
                 .to = probe.next_cursor,
                 .data = probe.output,
@@ -425,14 +473,36 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
 const State = struct {
     status: Core.Store.op_state.Status,
     exit_code: ?i64,
+    /// A remote finish time we can prove, and nothing else. Null whenever the
+    /// only record that answered was the log sentinel, which carries no
+    /// timestamp — see `observed_at` for what we can always say.
     finished_at: ?i64,
+    /// Our own clock, at the moment we looked. Never presented as a finish
+    /// time: it is when *we saw* the evidence, on a different machine.
+    observed_at: i64,
+    /// Set when the two durable records disagree. Carried all the way out to
+    /// the caller: without it a contradiction reads as a plain `indeterminate`
+    /// with no exit code, which is indistinguishable from "the job left
+    /// nothing behind" and sends the operator to a reconcile that will refuse.
+    conflict: ?Tmux.JobProbe.Conflict = null,
     business_result: ?[]const u8 = null,
 };
 
-/// How much of the log's end a state probe reads. The sentinel is one short
-/// line at the very end, so this only has to be large enough to survive a
-/// burst of trailing output.
-const probe_tail_bytes: i64 = 256 * 1024;
+/// The JSON shape of a `JobProbe.Conflict`. One definition so every command
+/// that can hit a contradiction names its two halves the same way.
+const ConflictJson = struct {
+    resultExitCode: i32,
+    sentinelExitCode: i32,
+
+    fn from(clash: ?Tmux.JobProbe.Conflict) ?ConflictJson {
+        const c = clash orelse return null;
+        return .{ .resultExitCode = c.result_exit_code, .sentinelExitCode = c.sentinel_exit_code };
+    }
+};
+
+/// How much of the log's end a state probe reads. Shared with the launch
+/// paths' lazy settlement, so both windows are the same by construction.
+const probe_tail_bytes = Cli.probe_tail_bytes;
 
 /// One SSH probe of the log's *end*; settles the operation if it establishes
 /// an outcome.
@@ -470,11 +540,14 @@ fn refresh(
 
 /// Turns an observation into a settlement — or into nothing at all.
 ///
-/// Three cases, and only two of them are conclusions:
-///   * the sentinel carried an exit code — the job ended, and how;
-///   * the session is gone with no sentinel — something happened and we
-///     cannot say what. Not `killed`: a pane also disappears when the command
-///     finishes and the shell exits, or when the host reboots mid-write;
+/// Four cases; three of them settle the ledger and the fourth records nothing:
+///   * the two durable records disagree — the one case where more evidence
+///     leaves us less certain. Settled `indeterminate`, naming both codes;
+///   * a record carried an exit code — the job ended, and how. Settled;
+///   * the session is gone with no exit code — something happened and we
+///     cannot say what. Settled `indeterminate`, which keeps holding the
+///     scope. Not `killed`: a pane also disappears when the command finishes
+///     and the shell exits, or when the host reboots mid-write;
 ///   * otherwise it is still running, and there is nothing to record.
 fn applyProbe(
     ctx: *Cli.Ctx,
@@ -488,21 +561,51 @@ fn applyProbe(
     else
         null;
 
+    // Checked before the exit code, not after. `probe.exit_code` is already
+    // null on a conflict, but reading it first would make the ordering the
+    // thing that keeps a contradiction from settling — and the reason string
+    // below is the only place the two codes ever reach a human.
+    if (probe.conflict) |clash| {
+        if (execution) |*e| {
+            _ = e.settleAttached(.{ .indeterminate = .{
+                .reason = std.fmt.allocPrint(
+                    ctx.arena,
+                    "the job's two durable records disagree: its result file says exit {d}, the sentinel in its log says exit {d}. One of them is wrong and nothing here can say which",
+                    .{ clash.result_exit_code, clash.sentinel_exit_code },
+                ) catch "the job's result file and its log sentinel report different exit codes",
+                .last_observed = e.status,
+            } }, .{}) catch |err| Cli.storeFatal(store, err);
+        }
+        // The row is left as it stands. Writing a status here would have to
+        // pick one of the two codes, which is precisely what we refuse to do.
+        return .{
+            .status = .indeterminate,
+            .exit_code = null,
+            .finished_at = null,
+            .observed_at = ctx.now,
+            .conflict = clash,
+            .business_result = probe.business_result,
+        };
+    }
+
     if (probe.exit_code) |code| {
         if (execution) |*e| {
             _ = e.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
                 .stdout = .{ .bytes = @intCast(probe.output.len) },
             }) catch |err| Cli.storeFatal(store, err);
         }
-        // The remote's own clock when it could report one — the sidecar
-        // records it. Falling back to `now` is an observation time, not a
-        // finish time, and is only used when nothing better exists.
-        const finished_at = if (probe.finished_at) |ts| (if (ts > 0) ts else ctx.now) else ctx.now;
-        Store.jobs.markFinished(store, job.id, .exited, code, finished_at) catch |err| Cli.storeFatal(store, err);
+        // `jobs.finished_at` takes the remote clock when the sidecar reported
+        // one and ours otherwise, so the column mixes two machines' clocks and
+        // cannot be read as a finish time on its own. That is tolerable only
+        // because it is a cache: the ledger is the record. What must not mix
+        // is what we *report* — see `State.finished_at` and `State.observed_at`.
+        const row_stamp = probe.finished_at orelse ctx.now;
+        Store.jobs.markFinished(store, job.id, .exited, code, row_stamp) catch |err| Cli.storeFatal(store, err);
         return .{
             .status = if (code == 0) .completed else .failed,
             .exit_code = code,
-            .finished_at = finished_at,
+            .finished_at = probe.finished_at,
+            .observed_at = ctx.now,
             .business_result = probe.business_result,
         };
     }
@@ -523,6 +626,7 @@ fn applyProbe(
             // say that it finished — that is what `indeterminate` means. A
             // timestamp here would read as a finish we never witnessed.
             .finished_at = null,
+            .observed_at = ctx.now,
             .business_result = probe.business_result,
         };
     }
@@ -531,6 +635,7 @@ fn applyProbe(
         .status = if (execution) |e| e.status else .remote_started,
         .exit_code = null,
         .finished_at = null,
+        .observed_at = ctx.now,
         .business_result = probe.business_result,
     };
 }
@@ -555,7 +660,15 @@ fn reportStatus(
             .businessResult = state.business_result,
             .command = job.command,
             .createdAt = job.created_at,
+            // Two clocks, never merged. `finishedAt` is the remote's own
+            // report and is null unless the result sidecar carried one — a
+            // sentinel-only outcome has no timestamp, and filling it with our
+            // clock would put this machine's time under a key that claims to
+            // describe when work ended on another one. `observedAt` is that
+            // local clock, labelled as what it is.
             .finishedAt = state.finished_at,
+            .observedAt = state.observed_at,
+            .conflict = ConflictJson.from(state.conflict),
             .transport = transport,
             .daemonError = daemon_error,
         }),
@@ -563,6 +676,10 @@ fn reportStatus(
             try ctx.out.print("job '{s}': {s} (exit={?d})", .{ job.name, state.status.text(), state.exit_code });
             if (state.business_result) |br| try ctx.out.print(" result={s}", .{br});
             try ctx.out.print("\n", .{});
+            if (state.conflict) |clash| try ctx.out.print(
+                "  its result file says exit {d}, its log sentinel says exit {d}; one of them is wrong and nothing mechanical can say which\n",
+                .{ clash.result_exit_code, clash.sentinel_exit_code },
+            );
         },
     }
 }
@@ -606,6 +723,7 @@ fn watchJob(
             .exitCode = state.exit_code,
             .businessResult = state.business_result,
             .stillRunning = still_running,
+            .conflict = ConflictJson.from(state.conflict),
             .polls = polls,
             .transport = conn.transport,
         }),
@@ -615,6 +733,10 @@ fn watchJob(
             try ctx.out.print("job '{s}' {s} (exit={?d})", .{ job.name, state.status.text(), state.exit_code });
             if (state.business_result) |br| try ctx.out.print(" result={s}", .{br});
             try ctx.out.print("\n", .{});
+            if (state.conflict) |clash| try ctx.out.print(
+                "  its result file says exit {d}, its log sentinel says exit {d}; one of them is wrong and nothing mechanical can say which\n",
+                .{ clash.result_exit_code, clash.sentinel_exit_code },
+            );
         },
     }
 
@@ -630,18 +752,76 @@ fn watchJob(
     }
 }
 
-/// Kills a job's session and records what that actually established.
+/// What the ledger already holds for an attempt, without producing a second
+/// opinion.
+///
+/// `attach` returns null once an attempt is terminal, and terminal includes
+/// `indeterminate` — the case where nothing was ever established. Treating
+/// "already settled" as "settled successfully" would turn an unknown into a
+/// success in the caller's eyes, so the ledger is asked directly.
+///
+/// Null when the attempt names a request the ledger does not have: that is not
+/// a status, and must not be flattened into one.
+fn recordedEffective(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) ?Core.Store.op_state.Status {
+    const op = (Store.operations.get(store, ctx.arena, request_id) catch |err|
+        Cli.storeFatal(store, err)) orelse return null;
+    return op.effectiveStatus();
+}
+
+/// `recordedEffective` for callers that only need to print it.
+fn recordedStatus(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) []const u8 {
+    const status = recordedEffective(ctx, store, request_id) orelse return "unknown";
+    return status.text();
+}
+
+fn settledText(outcome: Core.Store.receipts.SettleOutcome) []const u8 {
+    return switch (outcome) {
+        .recorded => |r| r.status.text(),
+        .already_settled => |r| r.status.text(),
+    };
+}
+
+fn settledStatus(outcome: Core.Store.receipts.SettleOutcome) Core.Store.op_state.Status {
+    return switch (outcome) {
+        .recorded => |r| r.status,
+        .already_settled => |r| r.status,
+    };
+}
+
+/// Stops a job and records what that actually established.
 ///
 /// Not a new operation: a kill settles the attempt already in flight, so the
 /// receipt shows the launch and its cancellation on one trail.
 ///
-/// The hard part is what counts as proof. `tmux has-session` reporting the
-/// session gone is *not* evidence that the work stopped: a command that
-/// daemonized, called `disown`, or ran under `setsid` outlives the pane that
-/// launched it. Under a supervisor whose capability says it cannot prove a
-/// process is gone, this therefore settles `indeterminate` — which keeps the
-/// scope held — rather than `cancelled`, which would release it and invite a
-/// relaunch alongside a process that is still running.
+/// Three rules, each of them a bug that was here.
+///
+/// *Look before you kill.* This used to kill first and ask questions after,
+/// which turned a job that had already finished — exit status sitting in its
+/// result sidecar — into `indeterminate`, because once the session is gone
+/// "gone" proves nothing. The answer had been there the whole time and the
+/// kill is what stopped us reading it. So the probe comes first; when it finds
+/// a real outcome that is what gets recorded, and the kill becomes cleanup.
+/// What is *reported* is then what the ledger holds, which is not always what
+/// we set out to write: an attempt a peer already settled `indeterminate`
+/// cannot be re-settled, and claiming the outcome anyway would turn an unknown
+/// into a success.
+///
+/// *A contradiction is not a settlement.* When the two durable records report
+/// different exit codes, killing the session and calling it `cancelled` would
+/// paper over the one case where the evidence is actively untrustworthy.
+///
+/// *A kill is not proof.* `tmux has-session` reporting the session gone is not
+/// evidence that the work stopped: a command that daemonized, called `disown`,
+/// or ran under `setsid` outlives the pane that launched it. Under a
+/// supervisor whose capability says it cannot prove a process is gone, this
+/// settles `indeterminate` — which keeps the scope held — rather than
+/// `cancelled`, which would release it and invite a relaunch alongside a
+/// process that is still running.
+///
+/// The log is never deleted here. An `indeterminate` kill points the operator
+/// at `request reconcile --from-log`, so this is exactly the caller that must
+/// keep the evidence — which is why it uses `killSession` and never
+/// `removeLog`.
 fn killJob(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -654,8 +834,182 @@ fn killJob(
 ) !void {
     try requireNoForeignLease(ctx, store, server_id, job.name, parsed);
 
-    Tmux.kill(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session);
-    const session_gone = !(Tmux.isAlive(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session));
+    const probe = Tmux.probeTail(
+        executor,
+        ctx.arena,
+        session,
+        job.sentinel,
+        if (attempt) |a| a.request_id else null,
+        probe_tail_bytes,
+    ) catch |err| fatalTmux(err, executor, session);
+
+    if (probe.conflict) |clash| {
+        const reason = std.fmt.allocPrint(
+            ctx.arena,
+            "kill requested, but the job's two durable records already disagree: its result file says exit {d}, the sentinel in its log says exit {d}. One of them is wrong and nothing here can say which",
+            .{ clash.result_exit_code, clash.sentinel_exit_code },
+        ) catch "kill requested, but the job's result file and its log sentinel report different exit codes";
+
+        var settled_status: []const u8 = "unknown";
+        if (attempt) |a| {
+            if (Core.execution.attach(store, ctx.arena, ctx.io, a.request_id) catch |err|
+                Cli.storeFatal(store, err)) |loaded|
+            {
+                var execution = loaded;
+                settled_status = settledText(execution.settleAttached(.{ .indeterminate = .{
+                    .reason = reason,
+                    .last_observed = execution.status,
+                } }, .{}) catch |err| Cli.receiptFatal(a.request_id, err, "kill requested"));
+            } else settled_status = recordedStatus(ctx, store, a.request_id);
+        }
+
+        // Still killed: the caller asked for the session to stop, and both
+        // records claim the command already returned. What is refused is
+        // reporting the kill as if it had established an outcome.
+        const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
+            fatalTmux(err, executor, session);
+        if (job.status.live()) {
+            Store.jobs.markFinished(store, job.id, .killed, null, ctx.now) catch |err|
+                Cli.storeFatal(store, err);
+        }
+
+        switch (ctx.out.format) {
+            .json => try ctx.out.json(.{
+                .ok = false,
+                .action = "killed",
+                .job = job.name,
+                .status = settled_status,
+                .sessionGone = session_gone,
+                .cancellationProven = false,
+                .conflict = ConflictJson.from(clash),
+                .requestId = if (attempt) |a| a.request_id else null,
+                .hint = "the two records disagree; settle it by hand with 'terminus request reconcile <request-id> --override'",
+            }),
+            .human => try ctx.out.print(
+                "job '{s}': session killed, but its result file says exit {d} while its log sentinel says exit {d}; the outcome is unknown\n",
+                .{ job.name, clash.result_exit_code, clash.sentinel_exit_code },
+            ),
+        }
+        try ctx.out.flush();
+        Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
+    }
+
+    if (probe.exit_code) |code| {
+        var settled_status: []const u8 = "unknown";
+        // Whether the *ledger* now holds a real outcome for this attempt.
+        // Reading an exit code off the host is not the same as recording it:
+        // `attach` returns null for an attempt that is already terminal, and
+        // terminal includes `indeterminate`, which settles nothing and goes on
+        // blocking the scope. With no attempt at all there is no operation to
+        // settle and nothing holding a scope, so the exit status we just read
+        // is the whole answer.
+        var proven = attempt == null;
+        if (attempt) |a| {
+            if (Core.execution.attach(store, ctx.arena, ctx.io, a.request_id) catch |err|
+                Cli.storeFatal(store, err)) |loaded|
+            {
+                var execution = loaded;
+                // `already_settled` hands back the terminal that is actually
+                // recorded, which need not be the one we just proved: a peer
+                // may have settled this attempt `indeterminate` between our
+                // `attach` and this call. Report the ledger, not the intent.
+                const status = settledStatus(execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
+                    .stdout = .{ .bytes = @intCast(probe.output.len) },
+                }) catch |err| Cli.receiptFatal(a.request_id, err, "kill requested"));
+                settled_status = status.text();
+                proven = status != .indeterminate;
+            } else if (recordedEffective(ctx, store, a.request_id)) |effective| {
+                settled_status = effective.text();
+                proven = effective != .indeterminate;
+            } else {
+                // The attempt names a request the ledger does not have.
+                settled_status = "unknown";
+                proven = false;
+            }
+        }
+        // Remote clock when the sidecar reported one, ours otherwise; see the
+        // note in `applyProbe` on why this column mixes them.
+        //
+        // Guarded like its two sibling branches: a row already marked `killed`
+        // records a decision somebody took, and overwriting it with `exited`
+        // because we later read the exit status the job happened to leave
+        // behind rewrites that history.
+        if (job.status.live()) {
+            Store.jobs.markFinished(store, job.id, .exited, code, probe.finished_at orelse ctx.now) catch |err|
+                Cli.storeFatal(store, err);
+        }
+
+        const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
+            fatalTmux(err, executor, session);
+
+        // A surviving session is a real failure even though the outcome is
+        // known: `ensure` treats one as ready, so the next launch under this
+        // name would type into the dead job's shell.
+        const ok = proven and session_gone;
+        const hint: ?[]const u8 = if (!proven) unproven: {
+            // The evidence is sitting on the host and `reconcile --from-log`
+            // accepts exactly it, so name the command that would take it.
+            const a = attempt orelse break :unproven
+                "the host holds this job's exit status, but there is no recorded attempt to settle it against";
+            break :unproven std.fmt.allocPrint(
+                ctx.arena,
+                "the host holds this job's exit status but the ledger records the attempt as {s}; settle it with 'terminus request reconcile {s} --from-log'",
+                .{ settled_status, a.request_id },
+            ) catch "the host holds this job's exit status but the ledger does not; settle it with 'terminus request reconcile <request-id> --from-log'";
+        } else if (!session_gone)
+            "the job's outcome is recorded, but its tmux session is still present; remove it on the host before relaunching under this name"
+        else
+            null;
+
+        switch (ctx.out.format) {
+            .json => try ctx.out.json(.{
+                .ok = ok,
+                .action = "already_finished",
+                .job = job.name,
+                .status = settled_status,
+                .exitCode = code,
+                .outcomeProven = proven,
+                .finishedAt = probe.finished_at,
+                .observedAt = ctx.now,
+                .sessionCleanedUp = session_gone,
+                // Nothing was cancelled: the job had already ended on its own.
+                .cancellationProven = false,
+                .requestId = if (attempt) |a| a.request_id else null,
+                .hint = hint,
+            }),
+            .human => if (!proven)
+                try ctx.out.print(
+                    "job '{s}' had already finished (exit {d}) on the host, but its attempt is recorded as {s}; nothing here settled it\n",
+                    .{ job.name, code, settled_status },
+                )
+            else if (session_gone)
+                try ctx.out.print(
+                    "job '{s}' had already finished (exit {d}); recorded its outcome and cleaned up the session\n",
+                    .{ job.name, code },
+                )
+            else
+                try ctx.out.print(
+                    "job '{s}' had already finished (exit {d}); its outcome is recorded, but the session could not be cleaned up\n",
+                    .{ job.name, code },
+                ),
+        }
+        // Unproven outranks a surviving session: "we do not know what the
+        // ledger holds for this work" is the conclusion that forbids a retry,
+        // and the two sibling branches already exit 75 in this situation.
+        if (!proven) {
+            try ctx.out.flush();
+            Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
+        }
+        if (!session_gone) {
+            try ctx.out.flush();
+            std.process.exit(Cli.exit_code.failure);
+        }
+        return;
+    }
+
+    // No outcome to preserve, so this is a cancellation in the real sense.
+    const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
+        fatalTmux(err, executor, session);
 
     const capability = Core.supervisor.shell_capability;
     const can_prove = Core.supervisor.Requirement.verified_cancellation.satisfiedBy(capability);
@@ -682,12 +1036,8 @@ fn killJob(
                         "kill issued but the job session is still present",
                     .last_observed = execution.status,
                 } }, .{});
-            const settled = outcome catch |err| Cli.receiptFatal(a.request_id, err, "kill issued");
-            settled_status = switch (settled) {
-                .recorded => |r| r.status.text(),
-                .already_settled => |r| r.status.text(),
-            };
-        }
+            settled_status = settledText(outcome catch |err| Cli.receiptFatal(a.request_id, err, "kill issued"));
+        } else settled_status = recordedStatus(ctx, store, a.request_id);
     }
 
     if (job.status.live()) {
@@ -725,15 +1075,23 @@ fn killJob(
 
 /// Forgets a job's name while preserving what can still be proven.
 ///
-/// The old version killed the session — which also deleted the remote log —
-/// then settled `indeterminate` and reported `{ok:true, "removed"}`. That
-/// destroyed the only mechanical evidence of how the job ended and left a
-/// human override as the sole way to ever settle it, while telling the caller
+/// The original version killed the session — which also deleted the remote log
+/// — then settled `indeterminate` and reported `{ok:true, "removed"}`. That
+/// destroyed the only mechanical evidence of how the job ended and left a human
+/// override as the sole way to ever settle it, while telling the caller
 /// everything went fine.
 ///
-/// Now it probes for an outcome first, keeps the log, and only discards
-/// evidence when explicitly told to — in which case it says so rather than
-/// reporting success.
+/// The version after that kept the log but faked the safety check: on the
+/// `--discard-evidence` branch `cleared` was the literal `true`, so the guard
+/// reading "refusing to forget a job that may still be running" was dead code
+/// on precisely the branch that also deleted the evidence. A job whose session
+/// survived the kill could lose its log, its result record and its local row
+/// while the process kept running.
+///
+/// So the order below is the whole point, and it is the same for both
+/// branches: probe, kill, *prove the session is gone*, and only then destroy
+/// anything. Nothing is deleted on a session that is still there — not the
+/// log, not the sidecar, not the row.
 fn removeJob(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -758,22 +1116,29 @@ fn removeJob(
         probe_tail_bytes,
     ) catch |err| fatalTmux(err, executor, session);
 
-    const cleared = if (discard) blk: {
-        Tmux.kill(executor, ctx.arena, session) catch |err|
-            fatal("cannot clean up job '{s}' on the remote: {s} ({s}); the local record is kept", .{ job.name, executor.errorMessage(), @errorName(err) });
+    // The real boolean, on both branches. `killSession` never touches the log;
+    // destroying evidence is a separate act below, gated on this answer.
+    const cleared = Tmux.killSession(executor, ctx.arena, session) catch |err|
+        fatalTmux(err, executor, session);
+    if (!cleared) fatal(
+        "job '{s}' session is still present after cleanup; refusing to forget a job that may still be running. Nothing was deleted — no log, no result record, no local row. Inspect it with 'tmux attach -t {s}' on the host",
+        .{ job.name, try Tmux.targetName(ctx.arena, session) },
+    );
+
+    if (discard) {
+        // Only now, with the session proven gone. A live pane recreates the
+        // log through `pipe-pane`, so deleting it under a surviving session
+        // would leave a file that quietly comes back holding a partial
+        // history starting mid-job.
+        Tmux.removeLog(executor, ctx.arena, session) catch |err|
+            fatal("job '{s}': its session is stopped but its log could not be deleted: {s} ({s}); nothing was removed locally, so the job is still tracked", .{ job.name, executor.errorMessage(), @errorName(err) });
         // The sidecar is evidence too. Leaving it behind after being told to
         // discard evidence would make the next `reconcile --from-log` settle
-        // from a file the caller believes is gone.
+        // from a file the caller believes is gone. A half-discarded evidence
+        // set must not be reported as a clean removal, so this is fatal.
         if (attempt) |a| Tmux.removeResult(executor, ctx.arena, a.request_id) catch |err|
-            fatal("removed job '{s}' but could not delete its result record on the remote: {s} ({s}); delete {s}.json under ~/.terminus/results by hand", .{ job.name, executor.errorMessage(), @errorName(err), a.request_id });
-        break :blk true;
-    } else Tmux.killKeepLog(executor, ctx.arena, session) catch |err|
-        fatalTmux(err, executor, session);
-
-    if (!cleared) fatal(
-        "job '{s}' session is still present after cleanup; refusing to forget a job that may still be running",
-        .{job.name},
-    );
+            fatal("job '{s}': its log was deleted but its result record could not be: {s} ({s}); the evidence set is now half gone. Delete {s}.json under ~/.terminus/results by hand, then re-run this command", .{ job.name, executor.errorMessage(), @errorName(err), a.request_id });
+    }
 
     var settled_status: []const u8 = "unchanged";
     var proven = false;
@@ -782,7 +1147,19 @@ fn removeJob(
             Cli.storeFatal(store, err)) |loaded|
         {
             var execution = loaded;
-            const outcome = if (probe.exit_code) |code| out: {
+            const outcome = if (probe.conflict) |clash|
+                // Two mechanical records contradicting each other is not an
+                // outcome. `proven` stays false, so this exits 75 and the
+                // caller owes a reconcile.
+                execution.settleAttached(.{ .indeterminate = .{
+                    .reason = std.fmt.allocPrint(
+                        ctx.arena,
+                        "job removed while its two durable records disagreed: its result file says exit {d}, the sentinel in its log says exit {d}",
+                        .{ clash.result_exit_code, clash.sentinel_exit_code },
+                    ) catch "job removed while its result file and its log sentinel reported different exit codes",
+                    .last_observed = execution.status,
+                } }, .{})
+            else if (probe.exit_code) |code| out: {
                 proven = true;
                 break :out execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{});
             } else execution.settleAttached(.{ .indeterminate = .{
@@ -792,38 +1169,40 @@ fn removeJob(
                     "job removed before its outcome was established; the log is retained for 'request reconcile --from-log'",
                 .last_observed = execution.status,
             } }, .{});
-            const settled = outcome catch |err| Cli.receiptFatal(a.request_id, err, "job removed");
-            settled_status = switch (settled) {
-                .recorded => |r| r.status.text(),
-                .already_settled => |r| r.status.text(),
-            };
-        } else {
+            settled_status = settledText(outcome catch |err| Cli.receiptFatal(a.request_id, err, "job removed"));
+        } else if (recordedEffective(ctx, store, a.request_id)) |effective| {
             // `attach` returns null for an attempt that is already terminal.
             // That is not the same as proven: an attempt settled
             // `indeterminate` is exactly the case where nothing was ever
             // established, and reporting "outcome recorded from its log"
             // would turn the unknown into a success in the caller's eyes.
             // Ask the ledger what it actually holds.
-            const op = (Store.operations.get(store, ctx.arena, a.request_id) catch |err|
-                Cli.storeFatal(store, err));
-            if (op) |settled| {
-                const effective = settled.effectiveStatus();
-                settled_status = effective.text();
-                proven = effective != .indeterminate;
-            } else {
-                // The attempt row names a request the ledger does not have.
-                // Nothing here is established; say so rather than guess.
-                settled_status = "unknown";
-                proven = false;
-            }
+            settled_status = effective.text();
+            proven = effective != .indeterminate;
+        } else {
+            // The attempt row names a request the ledger does not have.
+            // Nothing here is established; say so rather than guess.
+            settled_status = "unknown";
+            proven = false;
         }
     }
 
     _ = Store.jobs.remove(store, server_id, job.name) catch |err| Cli.storeFatal(store, err);
 
     // Discarding evidence is not a success: it converts something that could
-    // have been proven into an override the caller now owes.
-    const ok = proven or !discard;
+    // have been proven into an override the caller now owes. Neither is a
+    // contradiction — the log is still on the host, but `reconcile --from-log`
+    // will refuse two disagreeing records exactly as this did, so that case
+    // also ends in an override and must not report `ok`.
+    const ok = proven or (!discard and probe.conflict == null);
+    const hint: ?[]const u8 = if (proven)
+        null
+    else if (probe.conflict != null)
+        "the job's two durable records disagree; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'"
+    else if (discard)
+        null
+    else
+        "outcome still unknown; settle it with 'terminus request reconcile <request-id> --from-log'";
     switch (ctx.out.format) {
         .json => try ctx.out.json(.{
             .ok = ok,
@@ -833,20 +1212,30 @@ fn removeJob(
             .outcomeProven = proven,
             .evidenceRetained = !discard,
             .attemptRetained = attempt != null,
+            .conflict = ConflictJson.from(probe.conflict),
             .requestId = if (attempt) |a| a.request_id else null,
-            .hint = if (proven or discard)
-                @as(?[]const u8, null)
-            else
-                "outcome still unknown; settle it with 'terminus request reconcile <request-id> --from-log'",
+            .hint = hint,
         }),
         .human => {
             if (proven) {
                 try ctx.out.print("removed job '{s}' (outcome recorded from its log)\n", .{job.name});
+            } else if (probe.conflict) |clash| {
+                try ctx.out.print(
+                    "removed job '{s}'; its result file says exit {d} while its log sentinel says exit {d}, so its outcome is unknown\n",
+                    .{ job.name, clash.result_exit_code, clash.sentinel_exit_code },
+                );
             } else if (discard) {
                 try ctx.out.print("removed job '{s}' and deleted its log; its outcome can no longer be proven\n", .{job.name});
             } else {
                 try ctx.out.print("removed job '{s}'; outcome unknown, log retained for reconcile\n", .{job.name});
             }
+            // A proven or contradictory removal takes an earlier branch, so
+            // the deletion has to be stated on its own rather than folded into
+            // the discard branch — otherwise `--discard-evidence` on a job
+            // with two disagreeing records never tells the operator that the
+            // records it disagreed with are now gone.
+            if (discard and (proven or probe.conflict != null))
+                try ctx.out.print("  its log and result record were deleted; nothing can read them again\n", .{});
         },
     }
     if (!ok) {

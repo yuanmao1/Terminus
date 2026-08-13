@@ -226,6 +226,243 @@ pub fn receiptFatal(
     std.process.exit(exit_code.receipt_persist_failed);
 }
 
+/// How much of a job log's *end* a state probe reads. The sentinel is one
+/// short line at the very end, so this only has to be large enough to survive
+/// a burst of trailing output.
+pub const probe_tail_bytes: i64 = 256 * 1024;
+
+/// Whether a blocker could conceivably be settled by going and reading the
+/// host.
+///
+/// Two conditions, both deliberately narrow:
+///
+///   * it has to be an unsettled operation. A lease is somebody's live claim
+///     on the scope, not a stale outcome waiting to be read, and nothing on
+///     the remote host can settle one;
+///   * that operation has to be a job. A job writes its exit status to a known
+///     address when it ends; an `exec` that never settled left nothing behind
+///     to go and look at.
+///
+/// False means there is nothing to go and look for, so a caller that would
+/// otherwise open a connection for the probe should not open one. `pub` for
+/// that reason: it is the question a launch path has to answer before it can
+/// decide whether a refusal is worth a round trip.
+pub fn blockerMayBeProvable(blocker: Core.execution.Blocker) bool {
+    return switch (blocker) {
+        .lease => false,
+        .unsettled => |op| std.mem.eql(u8, op.kind, "job"),
+    };
+}
+
+test "only an unsettled job blocker is worth opening a connection for" {
+    const t = std.testing;
+
+    const op: Store.operations.Operation = .{
+        .request_id = "01JQXW8ZK4N0RS7T3VYB2MCDEF",
+        .schema_version = 1,
+        .server_id = 1,
+        .server_name = "prod",
+        .kind = "job",
+        .scope_kind = "job",
+        .scope_key = "deploy",
+        .alias = "deploy",
+        .status = .indeterminate,
+        .resolved_status = null,
+        .reconciled_at = null,
+        .resolution_evidence = null,
+        .argv_redacted = null,
+        .argv_sha256 = null,
+        .cwd = null,
+        .shell = null,
+        .capability_json = null,
+        .transport = null,
+        .mutating = true,
+        .created_at = 1750000000,
+        .updated_at = 1750000000,
+    };
+    try t.expect(blockerMayBeProvable(.{ .unsettled = op }));
+
+    // An exec leaves no durable record at a known address, so there is
+    // nothing on the host a probe could read.
+    var an_exec = op;
+    an_exec.kind = "exec";
+    try t.expect(!blockerMayBeProvable(.{ .unsettled = an_exec }));
+
+    // A lease is a live claim by somebody else. Reading the host cannot
+    // retire it, and a connection spent trying would be spent for nothing.
+    const lease: Store.leases.Lease = .{
+        .id = 1,
+        .server_id = 1,
+        .scope_kind = .job,
+        .scope_key = "deploy",
+        .owner_token = "somebody-else",
+        .owner_label = null,
+        .note = null,
+        .request_id = null,
+        .acquired_at = 1750000000,
+        .renewed_at = 1750000000,
+        .expires_at = 1750003600,
+    };
+    try t.expect(!blockerMayBeProvable(.{ .lease = lease }));
+}
+
+/// One opportunistic attempt to settle a blocker that has already finished.
+///
+/// A job settles only when somebody looks at it, and the scope guard blocks on
+/// any unsettled peer. So a job that ended hours ago but was never polled goes
+/// on refusing every same-scope mutation — including a rerun under the same
+/// name — while the host has been holding its exit code the whole time. That
+/// is a trap rather than a guard, and the escape hatch (`request reconcile`)
+/// is a second command the caller has to know to run.
+///
+/// This closes it in the one direction that is safe: it can turn "unsettled
+/// but provable" into "settled", and it can do nothing else. A blocker with no
+/// recorded attempt, no recorded tmux session, no exit status, two durable
+/// records that disagree, or a probe that errors all leave the blocker exactly
+/// where it was. Absence of evidence never releases a scope.
+///
+/// A *live* session is deliberately not on that list. A tmux session outlives
+/// the command that ran in it, so a live pane is the normal state of a
+/// finished job; what proves the command returned is the sidecar it wrote when
+/// it did, and the pane's liveness is unrelated to that.
+///
+/// It is also not the check. `submitted()` re-runs the authoritative guard
+/// straight afterwards and refuses exactly as it does today if the blocker
+/// survived — which is why every failure in here is opportunistic: it is
+/// reported on stderr and the launch carries on to the real gate. Making a
+/// probe failure fatal would mean an unreachable log could stop a launch the
+/// guard would have allowed.
+///
+/// Three call sites reach it, and they are not equivalent. `cmd_exec` and
+/// `cmd_job` call it twice each: once from the `.blocked` arm of `begin`,
+/// where the blocker is the thing standing between the caller and a launch —
+/// this is the case the doc opens with, a rerun refused by a job that finished
+/// hours ago — and once with `Execution.advisory`, which `begin` sets only on
+/// the branch where it let the launch through while still having something to
+/// report. The first needs a connection opened before the operation exists;
+/// that is why the launch paths hold their connection in an optional and fill
+/// it from whichever branch gets there first.
+pub fn settleProvableBlocker(
+    ctx: *Ctx,
+    store: *Store,
+    executor: Executor,
+    advisory: ?Core.execution.Blocker,
+) void {
+    const blocker = advisory orelse return;
+    // One definition of "worth going to look at", shared with the launch
+    // paths that use it to decide whether to open a connection at all.
+    if (!blockerMayBeProvable(blocker)) return;
+    const op = blocker.unsettled; // the only variant that predicate admits
+
+    const attempt = (Store.job_attempts.byRequest(store, ctx.arena, op.request_id) catch |err| {
+        std.debug.print(
+            "terminus: could not look up the attempt for blocking request {s}: {s}; leaving it blocked\n",
+            .{ op.request_id, @errorName(err) },
+        );
+        return;
+    }) orelse return;
+    const session = attempt.tmux_session orelse return;
+    const sentinel = attempt.sentinel orelse return;
+
+    // Probed with the *blocker's* own request id: the sidecar lives at an
+    // address derived from it, and reading it under ours would find nothing.
+    const probe = Core.Tmux.probeTail(executor, ctx.arena, session, sentinel, op.request_id, probe_tail_bytes) catch |err| {
+        std.debug.print(
+            "terminus: could not read the log of blocking job '{s}' ({s}): {s}; the scope guard will decide on what it already has\n",
+            .{ attempt.job_name, op.request_id, @errorName(err) },
+        );
+        return;
+    };
+    if (probe.conflict) |clash| {
+        // Two mechanical records of the same fact contradicting each other is
+        // the one case where more evidence makes us less certain. Settling
+        // from either would be picking a winner by implementation order.
+        std.debug.print(
+            "terminus: blocking job '{s}' ({s}) has contradictory records (result file says {d}, log sentinel says {d}); it stays blocked until reconciled\n",
+            .{ attempt.job_name, op.request_id, clash.result_exit_code, clash.sentinel_exit_code },
+        );
+        return;
+    }
+    const code = probe.exit_code orelse return;
+
+    var execution = (Core.execution.attach(store, ctx.arena, ctx.io, op.request_id) catch |err| {
+        std.debug.print(
+            "terminus: could not re-open blocking request {s} to settle it: {s}; leaving it blocked\n",
+            .{ op.request_id, @errorName(err) },
+        );
+        return;
+    }) orelse return; // already settled by somebody else in the meantime
+    const outcome = execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
+        .stdout = .{ .bytes = @intCast(probe.output.len) },
+        .source = .reconcile,
+    }) catch |err| {
+        std.debug.print(
+            "terminus: could not record the outcome of blocking request {s}: {s}; leaving it blocked\n",
+            .{ op.request_id, @errorName(err) },
+        );
+        return;
+    };
+    // The ledger now holds the truth; bring the local cache row along so the
+    // relaunch check ahead of the scope guard does not re-erect the same wall.
+    if (op.server_id) |sid| syncJobRow(ctx, store, sid, attempt.job_name, code, probe.finished_at);
+
+    if (ctx.out.format != .human) return;
+    // What gets announced is what the ledger now holds, not what we set out to
+    // write. A peer can settle the same attempt between our `attach` and our
+    // `settleAttached`, in which case `already_settled` hands back *their*
+    // terminal and our exit code was never applied — claiming otherwise would
+    // print a settlement that did not happen.
+    switch (outcome) {
+        .recorded => |record| std.debug.print(
+            "note: settled request {s} (job '{s}') as {s} from its recorded exit status {d}; it had finished but nobody had looked\n",
+            .{ op.request_id, attempt.job_name, record.status.text(), code },
+        ),
+        .already_settled => |record| std.debug.print(
+            "note: blocking request {s} (job '{s}') was settled as {s} by another process while we were reading its log; the exit status {d} we found was not applied\n",
+            .{ op.request_id, attempt.job_name, record.status.text(), code },
+        ),
+    }
+}
+
+/// Brings the local `jobs` row in line with an outcome we have just proved.
+///
+/// The ledger is the record, but it is not the only gate a relaunch has to
+/// pass: `run` refuses a name whose `jobs` row still says `running`, and that
+/// check happens before the scope guard. Settling the operation and leaving
+/// the row saying "running" would move the wall one step back rather than
+/// removing it — the caller would be told the job is still going by the very
+/// command that had just read its exit status.
+///
+/// Only ever called with an exit code we read off the host. A failure here is
+/// reported and swallowed on purpose: the authoritative record is already
+/// written, and a stale cache row must not turn a proved settlement into a
+/// failed command.
+fn syncJobRow(
+    ctx: *Ctx,
+    store: *Store,
+    server_id: i64,
+    job_name: []const u8,
+    code: i32,
+    remote_finished_at: ?i64,
+) void {
+    const row = (Store.jobs.getByName(store, ctx.arena, server_id, job_name) catch |err| {
+        std.debug.print(
+            "terminus: settled job '{s}' but could not read its local row: {s}\n",
+            .{ job_name, @errorName(err) },
+        );
+        return;
+    }) orelse return;
+    if (!row.status.live()) return;
+    // The remote's own clock when it reported one; otherwise the time we
+    // looked. That column mixes the two by nature — the ledger is where the
+    // distinction is kept.
+    Store.jobs.markFinished(store, row.id, .exited, code, remote_finished_at orelse ctx.now) catch |err|
+        std.debug.print(
+            "terminus: settled job '{s}' but could not update its local row: {s}; a same-name relaunch may still be refused until 'job status' is run\n",
+            .{ job_name, @errorName(err) },
+        );
+}
+
 /// `<server>` or `<server>:<session>` — the target syntax shared by exec,
 /// memory, read, write, and session commands.
 pub const Target = struct {
@@ -271,22 +508,58 @@ pub fn resolveServer(ctx: *Ctx, store: *Store, name: []const u8) struct {
     return .{ .server = server, .auth = auth };
 }
 
+/// What a connection this command could not open means to the caller.
+pub const OnConnectFailure = enum {
+    /// The command cannot do its job without the host: say why and exit.
+    fatal,
+    /// The connection was worth trying but is not required: say why on stderr,
+    /// return null, and let the caller carry on with what it already knows.
+    report_and_continue,
+};
+
 /// Connect + authenticate, with user-oriented fatal messages.
 pub fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh {
-    var client = Ssh.connect(server.host, server.port) catch |err|
-        fail("cannot connect to {s}:{d}: {s} ({s})", .{
-            server.host, server.port, @errorName(err), Ssh.lastConnectError(),
-        });
-    client.authenticate(server.username, auth) catch |err| switch (err) {
-        error.UnsupportedKeyFormat => {
-            const format = Ssh.KeyFormat.detect(auth.key.private);
-            fail("the key for '{s}' is in an unsupported format.\n{s}", .{
-                server.name, Ssh.KeyFormat.adviceFor(format),
+    return sshOpen(server, auth, .fatal).?;
+}
+
+fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFailure) ?Ssh {
+    var client = Ssh.connect(server.host, server.port) catch |err| switch (on_failure) {
+        // Reported rather than swallowed, and reported as its own kind of
+        // failure: "we never reached the host" and "the host turned us away"
+        // send the caller to different places, and an optional probe that
+        // returns a bare null tells them neither.
+        .report_and_continue => {
+            std.debug.print("terminus: could not reach {s}:{d} ({s}); continuing without it\n", .{
+                server.host, server.port, @errorName(err),
             });
+            return null;
         },
-        else => fail("authentication failed for {s}@{s}: {s}", .{
-            server.username, server.host, client.errorMessage(),
+        .fatal => fail("cannot connect to {s}:{d}: {s} ({s})", .{
+            server.host, server.port, @errorName(err), Ssh.lastConnectError(),
         }),
+    };
+    client.authenticate(server.username, auth) catch |err| {
+        if (on_failure == .report_and_continue) {
+            // Worth saying loudly even though this call was optional: the
+            // credentials for this server are broken, and every later command
+            // against it will fail the same way.
+            std.debug.print("terminus: authentication failed for {s}@{s} ({s}): {s}\n", .{
+                server.username, server.host, @errorName(err), client.errorMessage(),
+            });
+            client.deinit();
+            return null;
+        }
+        switch (err) {
+            error.UnsupportedKeyFormat => {
+                const format = Ssh.KeyFormat.detect(auth.key.private);
+                fail("the key for '{s}' is in an unsupported format.\n{s}", .{
+                    server.name, Ssh.KeyFormat.adviceFor(format),
+                });
+            },
+            else => fail("authentication failed for {s}@{s}: {s}", .{
+                server.username, server.host, client.errorMessage(),
+            }),
+        }
     };
     return client;
 }
@@ -329,6 +602,30 @@ pub fn connect(
     server: Store.servers.Server,
     auth: Ssh.Auth,
 ) Connection {
+    return openConnection(ctx, parsed, server, auth, .fatal).?;
+}
+
+/// `connect` for a caller that has something useful to say either way.
+///
+/// Used where a connection buys extra certainty rather than being the point
+/// of the command: an opportunistic probe must not turn "the host is down"
+/// into the command's answer, replacing the answer it already had.
+pub fn tryConnect(
+    ctx: *Ctx,
+    parsed: *const Args.Parsed,
+    server: Store.servers.Server,
+    auth: Ssh.Auth,
+) ?Connection {
+    return openConnection(ctx, parsed, server, auth, .report_and_continue);
+}
+
+fn openConnection(
+    ctx: *Ctx,
+    parsed: *const Args.Parsed,
+    server: Store.servers.Server,
+    auth: Ssh.Auth,
+    on_failure: OnConnectFailure,
+) ?Connection {
     const env_disabled = if (ctx.environ.get("TERMINUS_NO_DAEMON")) |v|
         !std.mem.eql(u8, v, "0")
     else
@@ -339,18 +636,24 @@ pub fn connect(
             .ok => |client| return .{ .inner = .{ .daemon = client }, .transport = "daemon" },
             .unavailable => |reason| {
                 // Fall back, loudly: human mode warns on stderr now; JSON
-                // mode carries transport+daemonError in the response.
+                // mode carries transport+daemonError in the response. Warned
+                // on the optional path too, because the connection it returns
+                // is not thrown away — the launch paths keep it and run the
+                // whole command over it.
                 if (ctx.out.format == .human)
                     std.debug.print("warning: daemon unavailable ({s}); using direct SSH\n", .{reason});
                 return .{
-                    .inner = .{ .direct = sshConnect(server, auth) },
+                    .inner = .{ .direct = sshOpen(server, auth, on_failure) orelse return null },
                     .transport = "direct",
                     .daemon_error = reason,
                 };
             },
         }
     }
-    return .{ .inner = .{ .direct = sshConnect(server, auth) }, .transport = "direct" };
+    return .{
+        .inner = .{ .direct = sshOpen(server, auth, on_failure) orelse return null },
+        .transport = "direct",
+    };
 }
 
 fn daemonRequest(server: Store.servers.Server, auth: Ssh.Auth) Core.daemon_protocol.Request {

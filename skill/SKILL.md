@@ -139,10 +139,11 @@ terminus exec <server> -- git status          # runs in /srv/app
 
 # Tracked background job (survives CLI exit; needs tmux)
 terminus run <server> --name build -- npm run build
-terminus job status <server> build --json     # running | exited | killed + exitCode
+# status: submitted | remote_started | completed | failed | indeterminate
+terminus job status <server> build --json     # + exitCode; exits 75 if indeterminate
 terminus job read <server> build --from-cursor --json
 terminus job watch <server> build --interval 30s --json  # block until it ends
-terminus job kill <server> build
+terminus job kill <server> build               # exits 75 unless the kill is provable
 terminus job ls <server> --active --limit 20 --json
 
 # Persistent interactive session (requires tmux on the server)
@@ -193,33 +194,118 @@ other terminus commands, which run concurrently on their own connections.
 Jobs are still preferred past ~60s: they survive your process dying and
 report status without holding anything open.
 
-All failures are `{"ok":false,"error":"..."}` with exit 1 in `--json` mode.
-Responses include `transport` ("daemon" or "direct") and `daemonError` when
-the connection daemon was skipped — mention it if you see repeated fallbacks.
+Every failure carries `"ok":false` in `--json` mode. Exit 1 is a refusal or a
+proven failure (`{"ok":false,"error":"..."}`); exit 75 means the remote outcome
+could not be established — **never retry that blindly**; exit 76 means the local
+receipt could not be written. Responses include `transport` ("daemon" or
+"direct") and `daemonError` when the connection daemon was skipped — mention it
+if you see repeated fallbacks.
 
 ## Jobs: the reliable way to run long tasks
 
-`run` starts the command in a dedicated remote tmux session. When it ends,
-its exit status is written to `~/.terminus/results/<request-id>.json` on the
-host, and also echoed into the session log. Nothing is lost if your process,
-the CLI, or the SSH connection dies — the job keeps running and stays
-queryable:
+`run` starts the command in a dedicated remote tmux session. When the command
+returns, its exit status is recorded on the host twice: authoritatively in
+`~/.terminus/results/<request-id>.json`, and as a fallback sentinel line in the
+pane log. The sidecar is what keeps a job answerable — a job that keeps printing
+after it finishes pushes the sentinel out of the readable tail window, the file
+never moves. Nothing is lost if your process, the CLI, or the SSH connection
+dies — the job keeps running and stays queryable:
 
 ```bash
 terminus run prod --name migrate --cwd /srv/app -- ./migrate.sh
 # ...later, from any process:
-terminus job status prod migrate --json   # {"status":"exited","exitCode":0,...}
+terminus job status prod migrate --json   # {"status":"completed","exitCode":0,...}
 terminus job read prod migrate --json     # full output
 terminus job rm prod migrate              # cleanup when done
 ```
 
 Job names are unique per server while running; finished names can be reused.
 
+### The `status` field: these values and no others
+
+`job status`, `job read` and `job watch` report the **operation's** status, not
+a process state. The complete set:
+
+| `status` | Meaning |
+|---|---|
+| `submitted`, `remote_started` | still running; no outcome yet |
+| `completed` | the command exited 0 |
+| `failed` | the command exited non-zero — `exitCode` says which |
+| `indeterminate` | the outcome could not be established; the command exits 75 |
+
+There is no `running`, `exited` or `killed` in this field — those are the cached
+row labels `job ls` prints from its local snapshot, and matching them against
+`job status` never fires. `ok` is exactly `status != "indeterminate"`.
+
+`indeterminate` means the session vanished without recording an exit status, or
+the two durable records disagree. **Do not relaunch the work**: the attempt goes
+on blocking same-scope commands until it is settled with
+`terminus request reconcile <request-id> [--from-log]`.
+
+A launch refused by such a blocker will first spend one connection asking the
+host whether that blocker has in fact already finished, and settle it from the
+evidence if so — which usually means the relaunch simply proceeds. If the host
+is unreachable the refusal stands and says so; it is never replaced by a
+connection error.
+
+### Fields on job status / read / watch
+
+- `exitCode` — the remote exit code, `null` while unknown.
+- `businessResult` — the last `__TERMINUS_RESULT__:<v>` line (see below).
+- `finishedAt` — a **remote** finish time in unix seconds, taken from the result
+  file. `null` unless the host reported its own clock (a sentinel-only outcome
+  has no timestamp). Never backfilled with local time.
+- `observedAt` — local unix seconds when we saw the evidence. Not a finish time.
+- `conflict` — normally `null`; `{"resultExitCode":N,"sentinelExitCode":M}` when
+  the result file and the log sentinel report different exit codes. Then
+  `status` is `indeterminate` and no mechanical reconcile can settle it — it
+  needs `terminus request reconcile <request-id> --override`.
+- Command-specific: `job status` adds `command`, `createdAt`, `server`,
+  `transport`, `daemonError`; `job read` adds `from`, `to`, `data`; `job watch`
+  adds `stillRunning` and `polls`.
+
+**`job ls` is a different shape and a different clock.** It prints the local
+cache row verbatim, so its keys are snake_case (`exit_code`, `finished_at`,
+`read_cursor`) and its `status` holds the cached labels `running`/`exited`/
+`killed` rather than an operation status. In particular `finished_at` there is
+**not** `finishedAt`: it falls back to local time when the host reported none.
+Use `job status` when the answer matters; `job ls` is for looking around.
+
+### Stopping and forgetting jobs
+
+- `job kill` probes before it kills. If the job had already finished it records
+  that outcome and reports `"action":"already_finished"` — the real exit code,
+  not a cancellation. Otherwise it kills the session and reports
+  `cancellationProven`, which is **false** with today's shell supervisor: a
+  disowned or `setsid` child outlives its pane, so the kill settles
+  `indeterminate` and exits 75 rather than claiming the work stopped. The log is
+  never deleted here, so `reconcile --from-log` stays possible.
+- Two `job kill` outcomes are neither success nor 75. A `conflict` between the
+  result file and the log sentinel reports `"action":"killed"` with `ok:false`
+  and the `conflict` object, and needs `reconcile --override`. And an outcome
+  that *was* proven but whose tmux session survived the kill exits **1**: the
+  next launch under that name would otherwise type into the dead job's shell.
+- `job rm` kills the session first and refuses to delete anything — log, result
+  file, or local row — if the session is still there afterwards. It settles from
+  the probe it took beforehand: with the outcome provable you get
+  `outcomeProven:true`; with the outcome still unknown it removes the job, keeps
+  the log, and returns `ok:true` with a hint to run
+  `reconcile <request-id> --from-log`. A `conflict` exits 75.
+- `job rm --discard-evidence` additionally deletes the pane log and the result
+  file, and only once the session is proven gone. Unless the outcome was already
+  provable from that first probe, discarding is not a success: it exits 75,
+  because it turned something that could have been proven into an override you
+  now owe.
+- If `tmux` is not runnable on the host, none of these report the session as
+  gone — they fail with "tmux is not installed" instead. Absence of the tool is
+  not evidence about the job, and nothing is deleted on it.
+
 ### Waiting on a job and reporting business state
 
 - **Don't poll in a busy loop.** `terminus job watch <server> <name>
   --interval 30s --json` blocks and returns the instant the job reaches a
-  terminal state (or after `--max` polls, reported as `timedOut:true`).
+  terminal state (or after `--max` polls, reported as `stillRunning:true`).
+  `watch` also exits with the job's own exit code when it ended non-zero.
 - **Exit code ≠ business success.** A job can exit 0 yet fail its actual
   purpose (0 rows migrated, health check red). Have the job print a
   marker line and Terminus surfaces it as `businessResult`, separate from

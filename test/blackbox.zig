@@ -22,6 +22,53 @@ const Store = Terminus.Core.Store;
 
 const exe_path = build_options.terminus_exe;
 
+/// The POSIX shell the two shell-execution gates below run their generated
+/// text through. Resolved by the build: `-Dposix-sh=<path>`, else PATH, else
+/// Git for Windows' own `sh.exe`.
+const posix_sh = build_options.posix_sh;
+
+/// Run a generated script through a real POSIX shell.
+///
+/// Reading generated shell text is not the same as knowing what it does, so
+/// two gates here execute it. That makes a POSIX shell a prerequisite of
+/// `zig build test` on Windows, and an absent one is reported as such.
+///
+/// It is not skipped. A skipped gate raises the pass count and checks
+/// nothing, which is worse than having no gate at all: the number says the
+/// wrapper's quoting rules were verified when they were not.
+///
+/// Only `FileNotFound` is translated, because only `FileNotFound` is
+/// ambiguous — the script was just written by a `try` above and the scratch
+/// directory exists, so at this point it means the shell. `IsDir`,
+/// `AccessDenied` and `InvalidExe` already name their own cause and are
+/// passed through untouched.
+fn runPosixShell(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    script_path: []const u8,
+    cwd: std.process.Child.Cwd,
+) !std.process.RunResult {
+    return std.process.run(arena, io, .{
+        .argv = &.{ posix_sh, script_path },
+        .cwd = cwd,
+        .stdout_limit = .limited(1 << 16),
+        .stderr_limit = .limited(1 << 16),
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print(
+                \\
+                \\this gate runs generated shell text through a real POSIX shell, and none
+                \\was found at '{s}'. Install Git for Windows, or pass
+                \\-Dposix-sh=<path-to-sh>.
+                \\
+                \\
+            , .{posix_sh});
+            return error.PosixShellNotFound;
+        },
+        else => return err,
+    };
+}
+
 /// A scratch database seeded directly, then handed to the binary via `--db`.
 ///
 /// Seeding through the library rather than through the CLI is deliberate: the
@@ -182,7 +229,16 @@ fn run(f: *Fixture, argv: []const []const u8) !Run {
 
 /// An attempt parked in a live state, exactly as `run --name <alias>` leaves
 /// one behind when the caller walks away.
-fn seedInFlightJob(f: *Fixture, request_id: []const u8, alias: []const u8) !void {
+///
+/// `kind` decides whether the resulting blocker is one a later launch will
+/// spend a connection on: only a `job` leaves durable evidence on the host
+/// (its result sidecar, its pane log), so only a `job` is worth going to read.
+fn seedInFlight(
+    f: *Fixture,
+    request_id: []const u8,
+    alias: []const u8,
+    kind: Store.operations.Kind,
+) !void {
     var store = try f.open();
     defer store.close();
 
@@ -190,7 +246,7 @@ fn seedInFlightJob(f: *Fixture, request_id: []const u8, alias: []const u8) !void
         .request_id = request_id,
         .server_id = 1,
         .server_name = "box",
-        .kind = .job,
+        .kind = kind,
         .scope_kind = .job,
         .scope_key = alias,
         .alias = alias,
@@ -198,6 +254,7 @@ fn seedInFlightJob(f: *Fixture, request_id: []const u8, alias: []const u8) !void
     });
     try Store.operations.advance(&store, request_id, .connecting, 1001);
     try Store.operations.advance(&store, request_id, .submitted, 1002);
+    if (kind != .job) return;
     _ = try Store.job_attempts.create(&store, .{
         .request_id = request_id,
         .server_id = 1,
@@ -208,6 +265,10 @@ fn seedInFlightJob(f: *Fixture, request_id: []const u8, alias: []const u8) !void
         .tmux_session = "job-deploy",
         .now = 1002,
     });
+}
+
+fn seedInFlightJob(f: *Fixture, request_id: []const u8, alias: []const u8) !void {
+    return seedInFlight(f, request_id, alias, .job);
 }
 
 const in_flight_id = "01AAAAAAAA0123456789ABCDEF";
@@ -249,11 +310,7 @@ test "blackbox: a bare `exit` cannot swallow the wrapper's exit marker" {
         try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = path, .data = script });
         defer std.Io.Dir.cwd().deleteFile(f.io, path) catch {};
 
-        const result = try std.process.run(arena, f.io, .{
-            .argv = &.{ "sh", path },
-            .stdout_limit = .limited(1 << 16),
-            .stderr_limit = .limited(1 << 16),
-        });
+        const result = try runPosixShell(arena, f.io, path, .inherit);
 
         const observed = try Terminus.Core.supervisor.parseShell(arena, nonce, result.stdout, result.stderr);
         std.testing.expectEqual(@as(?i32, 42), observed.exit_code) catch |err| {
@@ -298,12 +355,12 @@ test "blackbox: a job records its exit status where later output cannot bury it"
         try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = path, .data = script });
         defer std.Io.Dir.cwd().deleteFile(f.io, path) catch {};
 
-        const result = try std.process.run(arena, f.io, .{
-            .argv = &.{ "sh", try std.fmt.allocPrint(arena, "launch_{d}.sh", .{i}) },
-            .cwd = .{ .path = f.dir },
-            .stdout_limit = .limited(1 << 16),
-            .stderr_limit = .limited(1 << 16),
-        });
+        const result = try runPosixShell(
+            arena,
+            f.io,
+            try std.fmt.allocPrint(arena, "launch_{d}.sh", .{i}),
+            .{ .path = f.dir },
+        );
 
         const doc_path = try std.fmt.allocPrint(arena, "{s}/.terminus/results/{s}.json", .{ f.dir, request_id });
         const doc = std.Io.Dir.cwd().readFileAlloc(f.io, doc_path, arena, .limited(4096)) catch |err| {
@@ -521,9 +578,13 @@ test "blackbox: the scope guard refuses a second launch and says nothing was sen
     try f.seedServer();
     try seedInFlightJob(&f, in_flight_id, "deploy");
 
-    // Same job name, unknown predecessor. This has to be refused *before* the
-    // network, and the message has to be unambiguous about it: an agent that
-    // reads "refused" and retries is the failure mode the guard exists for.
+    // Same job name, unknown predecessor. The predecessor is a job, so the
+    // launch is entitled to spend one connection finding out whether it has
+    // already finished — the server here is a closed port, so it cannot. What
+    // this gate pins is that failing to reach the host does not become the
+    // command's answer: the refusal the guard already holds is the more useful
+    // one, and an agent that reads "refused" and retries is the failure mode
+    // the guard exists for.
     var again = try run(&f, &.{
         "run", "box", "--name", "deploy", "--cmd", "make deploy", "--db", f.db,
     });
@@ -532,9 +593,11 @@ test "blackbox: the scope guard refuses a second launch and says nothing was sen
     try again.expectSays("refused");
     try again.expectSays("the job was not started");
     try again.expectSays(in_flight_id);
-    // The port is closed, so if this had gone as far as dialling we would be
-    // looking at a connection error instead.
-    try again.expectSaysNot("connect");
+    // It really did try, and said so — the probe is not silent about giving
+    // up. Without this the gate would pass just as well with the probe
+    // removed, which is how the previous version of it stopped meaning
+    // anything when the probe was added.
+    try again.expectSays("could not reach");
 
     // A non-overlapping scope is not blocked by it. (It fails at the network,
     // which is proof enough that the guard let it through.)
@@ -543,6 +606,29 @@ test "blackbox: the scope guard refuses a second launch and says nothing was sen
     });
     defer other.deinit(f.allocator);
     try other.expectSaysNot("refused: request");
+}
+
+test "blackbox: a blocker with nothing to read is refused without dialling" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "guard_no_dial");
+    defer f.deinit();
+    try f.seedServer();
+    // An `exec` leaves no durable record on the host: no sidecar addressed by
+    // its request id, no pane log, nothing a probe could read. Connecting to
+    // ask about it would cost a round trip and learn nothing, so this blocker
+    // must be refused where it stands.
+    try seedInFlight(&f, in_flight_id, "deploy", .exec);
+
+    var blocked = try run(&f, &.{
+        "run", "box", "--name", "deploy", "--cmd", "make deploy", "--db", f.db,
+    });
+    defer blocked.deinit(f.allocator);
+    try blocked.expectCode(1);
+    try blocked.expectSays("refused");
+    try blocked.expectSays(in_flight_id);
+    // The whole point: no connection was attempted. The closed port would
+    // have produced this line, so its absence is the evidence.
+    try blocked.expectSaysNot("could not reach");
 }
 
 test "blackbox: a launch that never reached the host claims no job name" {

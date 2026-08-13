@@ -148,8 +148,34 @@ pub fn build(b: *std.Build) void {
     // The in-process gates prove the ledger's rules; only this proves that a
     // command actually surfaces them — `75` for an unknown outcome, `76` for
     // a ledger it could not write.
+    //
+    // Two of those gates additionally run generated shell text through a real
+    // POSIX shell. On Windows that shell is a prerequisite this build cannot
+    // vendor, so it is declared here instead of being assumed.
+    //
+    // Discovery order: `-Dposix-sh=<path>`, then PATH, then the two places Git
+    // for Windows installs `sh.exe`. The last step is what keeps the default
+    // machine honest: Git for Windows deliberately keeps `usr\bin` off PATH,
+    // so a plain `sh` lookup fails on a machine that has a perfectly good
+    // shell — and a gate that quietly stops running on the standard developer
+    // setup is a gate nobody runs. If none of the three finds one, the literal
+    // `sh` is kept so the gates fail with an explanation rather than the build
+    // failing here with a different one — see `runPosixShell` in
+    // test/blackbox.zig.
+    const posix_sh = b.option(
+        []const u8,
+        "posix-sh",
+        "Path to a POSIX shell for the black-box gates that execute generated shell text (default: `sh` from PATH, else Git for Windows)",
+    ) orelse b.findProgram(&.{"sh"}, &.{
+        "C:\\Program Files\\Git\\usr\\bin",
+        "C:\\Program Files\\Git\\bin",
+    }) catch "sh";
+
     const blackbox_options = b.addOptions();
     blackbox_options.addOptionPath("terminus_exe", exe.getEmittedBin());
+    // A plain string, not a path: `addOptionPath` would resolve it against the
+    // build root and defeat the PATH lookup the default relies on.
+    blackbox_options.addOption([]const u8, "posix_sh", posix_sh);
 
     const blackbox_tests = b.addTest(.{
         .root_module = b.createModule(.{

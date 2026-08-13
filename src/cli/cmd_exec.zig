@@ -73,7 +73,9 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // as a mutation costs a refusal the caller can override, while wrongly
     // treating a mutation as a read can apply a change twice. `--read-only`
     // declares the safe case explicitly.
-    const start = Core.execution.begin(&store, ctx.arena, ctx.io, .{
+    // Held in a named value because a blocked run asks a second time, after
+    // trying to settle the blocker from evidence on the host.
+    const begin_opts: Core.execution.BeginOptions = .{
         .server_id = resolved.server.id,
         .server_name = resolved.server.name,
         .kind = .exec,
@@ -92,11 +94,37 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         .owner_token = owner_token,
         .force = parsed.boolean("force"),
         .now = ctx.now,
-    }) catch |err| Cli.storeFatal(&store, err);
+    };
+    const start = Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
+        Cli.storeFatal(&store, err);
+
+    // One connection for the whole command. A blocked run needs it before the
+    // execution exists, so that a blocker which has already finished can be
+    // read rather than guessed at; every other path needs it just after.
+    var conn_slot: ?Cli.Connection = null;
+    defer if (conn_slot) |*c| c.deinit();
 
     var execution = switch (start) {
         .ready => |e| e,
-        .blocked => |blocker| reportBlocked(blocker),
+        // Worth one connection before refusing, but only when there is
+        // something to go and read. `begin` inserts nothing when it blocks, so
+        // asking again after settling the blocker leaks no operation row.
+        //
+        // An unreachable host is not an answer here: the refusal we already
+        // hold is the more useful one, and "cannot connect" in its place would
+        // hide the fact that nothing was sent.
+        .blocked => |blocker| retry: {
+            if (!Cli.blockerMayBeProvable(blocker)) reportBlocked(blocker);
+            conn_slot = Cli.tryConnect(ctx, &parsed, resolved.server, resolved.auth) orelse
+                reportBlocked(blocker);
+            Cli.settleProvableBlocker(ctx, &store, conn_slot.?.executor(), blocker);
+            const second = Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
+                Cli.storeFatal(&store, err);
+            break :retry switch (second) {
+                .ready => |e| e,
+                .blocked => |still| reportBlocked(still),
+            };
+        },
     };
     Cli.registerExecution(&execution);
     defer {
@@ -107,9 +135,20 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const started = std.Io.Timestamp.now(ctx.io, .awake);
     execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
 
-    var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
-    defer conn.deinit();
+    if (conn_slot == null) conn_slot = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
+    var conn = &conn_slot.?;
     const executor = conn.executor();
+
+    // The guard waved this launch through while something else still holds an
+    // overlapping scope (`--force`, or read-only work). If that something is a
+    // job which already finished, read its exit status now. Opportunistic and
+    // one-way: it can only settle a blocker whose evidence is sitting on the
+    // host, and the authoritative check inside `submitted()` runs regardless.
+    //
+    // The blocked path above already handled its own blocker; this covers the
+    // launches `begin` let through while still reporting one, where `advisory`
+    // is the only place that blocker surfaces.
+    Cli.settleProvableBlocker(ctx, &store, executor, execution.advisory);
 
     const outcome = if (target.session) |session_name|
         try runInSession(ctx, &store, &execution, executor, &parsed, session_name, raw_command, timeout_ms)

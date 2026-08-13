@@ -312,6 +312,21 @@ const LogEvidence = struct {
     /// after.
     source: Tmux.JobProbe.ExitSource,
     finished_at: ?i64,
+    /// The request id the sidecar document *itself* named. Non-null exactly
+    /// when `source == .result_file`.
+    ///
+    /// Carried rather than re-derived from the operation we are reconciling:
+    /// the Store re-checks that the evidence's id and the operation's agree,
+    /// and filling both sides of that check from the same place makes it
+    /// unfalsifiable.
+    result_request_id: ?[]const u8,
+    /// Set when the sidecar and the log sentinel both answered and disagreed.
+    ///
+    /// Carried, not dropped: without it `exit_code == null` means two very
+    /// different things — "the job left nothing behind" and "it left two
+    /// answers that cannot both be true" — and the message this command
+    /// prints for the first is a lie about the second.
+    conflict: ?Tmux.JobProbe.Conflict,
     session_alive: bool,
     output_bytes: usize,
 };
@@ -342,7 +357,7 @@ fn readLog(
 
     // One round trip: the sidecar at its fixed address, plus a tail of the
     // log for the sentinel fallback and the output-size figure.
-    const probe = Tmux.probeTail(conn.executor(), ctx.arena, session, sentinel, op.request_id, 256 * 1024) catch |err|
+    const probe = Tmux.probeTail(conn.executor(), ctx.arena, session, sentinel, op.request_id, Cli.probe_tail_bytes) catch |err|
         fatal("cannot read the job log for '{s}': {s}", .{ alias, @errorName(err) });
 
     return .{
@@ -351,6 +366,8 @@ fn readLog(
         .exit_code = probe.exit_code,
         .source = probe.exit_source,
         .finished_at = probe.finished_at,
+        .result_request_id = probe.result_request_id,
+        .conflict = probe.conflict,
         .session_alive = probe.session_alive,
         .output_bytes = probe.output.len,
     };
@@ -358,16 +375,26 @@ fn readLog(
 
 /// The evidence value matching whichever record answered, and the sentence
 /// that describes it. Never says "sentinel" when it read a sidecar.
-fn evidenceOf(op_request_id: []const u8, e: LogEvidence, code: i32) struct {
+fn evidenceOf(e: LogEvidence, code: i32) struct {
     evidence: Store.receipts.ResolutionEvidence,
     detail: []const u8,
 } {
     return switch (e.source) {
         .result_file => .{
             .evidence = .{ .job_result = .{
-                .request_id = op_request_id,
+                // The document's own claim, never the operation we are
+                // reconciling: `resolve` compares the two, and a receipt
+                // filled from the id we searched with would be comparing a
+                // value against itself. `readingOf` guarantees this is
+                // non-null on this arm, so the `orelse` is an invariant
+                // check and not a fallback — there is no honest value to
+                // substitute if it ever fires.
+                .request_id = e.result_request_id orelse fatal(
+                    "the job's result record answered for '{s}' but named no request; refusing to reconcile from it",
+                    .{e.alias},
+                ),
                 .exit_code = code,
-                .finished_at = e.finished_at orelse 0,
+                .finished_at = e.finished_at,
             } },
             .detail = "the job's result record carried its exit status",
         },
@@ -382,31 +409,46 @@ fn evidenceOf(op_request_id: []const u8, e: LogEvidence, code: i32) struct {
 
 test "M2e gate: reconcile names the record it actually read" {
     const t = std.testing;
+    // Deliberately different from `rid` below: the receipt has to carry what
+    // the *document* claimed, so a test that used one id for both sides would
+    // pass just as happily against the tautology this exists to prevent.
+    const doc_rid = "01JQXW8ZK4N0RS7T3VYB2MCXYZ";
     const base: LogEvidence = .{
         .alias = "deploy",
         .sentinel = "__TERMINUS_JOB_5__",
         .exit_code = 3,
         .source = .result_file,
         .finished_at = 1750000000,
+        .result_request_id = doc_rid,
+        .conflict = null,
         .session_alive = false,
         .output_bytes = 12,
     };
     const rid = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+    try t.expect(!std.mem.eql(u8, doc_rid, rid));
 
     // The receipt has to carry the evidence that answered. Reporting a
     // sentinel for a result file — or the reverse — would make the audit
     // trail describe a lookup that never happened.
-    const from_file = evidenceOf(rid, base, 3);
+    const from_file = evidenceOf(base, 3);
     try t.expectEqualStrings("job_result", from_file.evidence.kindName());
     try t.expectEqual(@as(i64, 3), from_file.evidence.job_result.exit_code);
-    try t.expectEqual(@as(i64, 1750000000), from_file.evidence.job_result.finished_at);
-    try t.expectEqualStrings(rid, from_file.evidence.job_result.request_id);
+    try t.expectEqual(@as(?i64, 1750000000), from_file.evidence.job_result.finished_at);
+    try t.expectEqualStrings(doc_rid, from_file.evidence.job_result.request_id);
     try t.expect(std.mem.indexOf(u8, from_file.detail, "sentinel") == null);
+
+    // A host with no usable clock writes no finish time. That absence has to
+    // survive into the receipt as absence — recording the epoch would publish
+    // 1970 as the moment the work ended.
+    var no_clock = base;
+    no_clock.finished_at = null;
+    try t.expectEqual(@as(?i64, null), evidenceOf(no_clock, 3).evidence.job_result.finished_at);
 
     var legacy = base;
     legacy.source = .log_sentinel;
     legacy.finished_at = null;
-    const from_log = evidenceOf(rid, legacy, 3);
+    legacy.result_request_id = null;
+    const from_log = evidenceOf(legacy, 3);
     try t.expectEqualStrings("job_sentinel", from_log.evidence.kindName());
     try t.expectEqualStrings("__TERMINUS_JOB_5__", from_log.evidence.job_sentinel.sentinel);
     try t.expect(std.mem.indexOf(u8, from_log.detail, "sentinel") != null);
@@ -421,6 +463,23 @@ fn resolveFromLog(
 ) !Outcome {
     const evidence = try readLog(ctx, store, op, parsed);
 
+    // A contradiction is checked before the exit code, because it is not a
+    // weaker form of "no evidence": both records answered, and they cannot
+    // both be right. Resolving from either would release the scope on a coin
+    // flip, and `resolve` is the only guard on that barrier.
+    if (evidence.conflict) |clash| return .{
+        .ok = false,
+        .resolved = null,
+        .mechanical = true,
+        .status = op.status.text(),
+        .detail = std.fmt.allocPrint(
+            ctx.arena,
+            "the job's two durable records disagree: its result file says exit {d}, the sentinel in its log says exit {d}. Nothing mechanical can settle this — check the host and use --override",
+            .{ clash.result_exit_code, clash.sentinel_exit_code },
+        ) catch "the job's result file and its log sentinel report different exit codes; check the host and use --override",
+        .exit = .indeterminate,
+    };
+
     const code = evidence.exit_code orelse return .{
         .ok = false,
         .resolved = null,
@@ -434,17 +493,21 @@ fn resolveFromLog(
     };
 
     const resolved: Store.op_state.ResolvedStatus = if (code == 0) .completed else .failed;
-    const chosen = evidenceOf(op.request_id, evidence, code);
+    const chosen = evidenceOf(evidence, code);
     const result = Store.receipts.resolve(store, ctx.arena, op.request_id, resolved, chosen.evidence, ctx.now) catch |err|
         Cli.receiptFatal(op.request_id, err, "reconcile");
 
-    return interpret(result, resolved, true, chosen.detail);
+    return interpret(result, resolved, true, chosen.detail, ctx.arena);
 }
 
 /// Settles an attempt that was never settled at all.
 ///
-/// Three answers, kept strictly apart:
+/// Four answers, kept strictly apart:
 ///
+///   * the two durable records disagree — settled `indeterminate`, naming both
+///     codes. This is *not* the "left nothing behind" case and must not borrow
+///     its message: the evidence is present and untrustworthy, so no later
+///     mechanical reconcile will do any better either;
 ///   * an exit status is recorded — the job ended and we can say how. Settled
 ///     for real, and the scope is released.
 ///   * no exit status, session alive — the job is running. Nothing is
@@ -470,6 +533,30 @@ fn settleFromLog(
         .exit = .failure,
     };
 
+    if (evidence.conflict) |clash| {
+        const reason = std.fmt.allocPrint(
+            ctx.arena,
+            "the job's two durable records disagree: its result file says exit {d}, the sentinel in its log says exit {d}. One of them is wrong and nothing here can say which",
+            .{ clash.result_exit_code, clash.sentinel_exit_code },
+        ) catch "the job's result file and its log sentinel report different exit codes";
+        _ = execution.settleAttached(.{ .indeterminate = .{
+            .reason = reason,
+            .last_observed = execution.status,
+        } }, .{ .source = .reconcile }) catch |err| Cli.receiptFatal(op.request_id, err, op.status.text());
+        return .{
+            .ok = false,
+            .resolved = null,
+            .mechanical = true,
+            .status = Store.op_state.Status.indeterminate.text(),
+            .detail = std.fmt.allocPrint(
+                ctx.arena,
+                "{s}. Recorded as indeterminate, which keeps holding the scope; re-reading the log will not help, so release it with --override once you have checked the host by hand",
+                .{reason},
+            ) catch reason,
+            .exit = .indeterminate,
+        };
+    }
+
     if (evidence.exit_code) |code| {
         const settled = execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
             .stdout = .{ .bytes = @intCast(evidence.output_bytes) },
@@ -484,7 +571,7 @@ fn settleFromLog(
             .resolved = status.text(),
             .mechanical = true,
             .status = status.text(),
-            .detail = evidenceOf(op.request_id, evidence, code).detail,
+            .detail = evidenceOf(evidence, code).detail,
             .exit = .ok,
         };
     }
@@ -553,7 +640,7 @@ fn reconcileByOverride(
         .operator_override = .{ .reason = reason, .by = by },
     }, ctx.now) catch |err| Cli.receiptFatal(op.request_id, err, "reconcile");
 
-    return interpret(result, resolved, false, "recorded as a human decision, not as proof");
+    return interpret(result, resolved, false, "recorded as a human decision, not as proof", ctx.arena);
 }
 
 fn interpret(
@@ -561,6 +648,7 @@ fn interpret(
     resolved: Store.op_state.ResolvedStatus,
     mechanical: bool,
     detail: []const u8,
+    arena: std.mem.Allocator,
 ) Outcome {
     return switch (result) {
         .resolved => .{
@@ -595,12 +683,36 @@ fn interpret(
             .detail = "the evidence does not establish that result",
             .exit = .failure,
         },
-        .evidence_wrong_kind => .{
+        .evidence_wrong_kind => |mismatch| .{
             .ok = false,
             .resolved = null,
             .mechanical = mechanical,
             .status = Store.op_state.Status.indeterminate.text(),
-            .detail = "that evidence cannot speak about this kind of operation",
+            // Both halves named. The refusal used to print one fixed sentence,
+            // which left an operator unable to see *which* pairing was
+            // rejected — and the payload it discarded is the only place that
+            // fact exists.
+            .detail = std.fmt.allocPrint(
+                arena,
+                "{s} evidence cannot speak about a {s} operation",
+                .{ mismatch.evidence_kind, mismatch.operation_kind },
+            ) catch "that evidence cannot speak about this kind of operation",
+            .exit = .failure,
+        },
+        // The evidence is about a different request. Not a category error —
+        // the document may be perfectly good, it just belongs to another
+        // operation, and settling this one from it would release a scope on
+        // the strength of somebody else's exit code.
+        .evidence_wrong_operation => |mismatch| .{
+            .ok = false,
+            .resolved = null,
+            .mechanical = mechanical,
+            .status = Store.op_state.Status.indeterminate.text(),
+            .detail = std.fmt.allocPrint(
+                arena,
+                "the evidence names request {s}, not {s}; it cannot settle this one",
+                .{ mismatch.evidence_request_id, mismatch.request_id },
+            ) catch "the evidence names a different request; it cannot settle this one",
             .exit = .failure,
         },
         .unknown_operation => .{
@@ -612,4 +724,35 @@ fn interpret(
             .exit = .failure,
         },
     };
+}
+
+test "M2d gate: a refusal says which pair it rejected" {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Evidence that belongs to another request must be refused, and the
+    // refusal must name both ids. Reporting it as a kind mismatch — the
+    // nearest existing variant — would be a truthful-sounding lie: the
+    // evidence's category is fine, its subject is not.
+    const wrong_op = interpret(.{ .evidence_wrong_operation = .{
+        .evidence_request_id = "01JQXW8ZK4N0RS7T3VYB2MCDEF",
+        .request_id = "01JQXW8ZK4N0RS7T3VYB2MCDAA",
+    } }, .completed, true, "unused", arena);
+    try t.expect(!wrong_op.ok);
+    try t.expectEqual(@as(?[]const u8, null), wrong_op.resolved);
+    try t.expect(std.mem.indexOf(u8, wrong_op.detail, "01JQXW8ZK4N0RS7T3VYB2MCDEF") != null);
+    try t.expect(std.mem.indexOf(u8, wrong_op.detail, "01JQXW8ZK4N0RS7T3VYB2MCDAA") != null);
+
+    // A kind mismatch has to name the operation's kind, not repeat the
+    // evidence's. The payload used to carry the evidence kind in both fields,
+    // and this command used to print neither.
+    const wrong_kind = interpret(.{ .evidence_wrong_kind = .{
+        .operation_kind = "transfer_push",
+        .evidence_kind = "job_result",
+    } }, .completed, true, "unused", arena);
+    try t.expect(!wrong_kind.ok);
+    try t.expect(std.mem.indexOf(u8, wrong_kind.detail, "transfer_push") != null);
+    try t.expect(std.mem.indexOf(u8, wrong_kind.detail, "job_result") != null);
 }

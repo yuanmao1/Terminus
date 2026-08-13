@@ -22,10 +22,10 @@ structured output  > terminal scraping
 recalled memory    > re-discovery
 ```
 
-- **Jobs** — long tasks run in dedicated remote tmux sessions, each writing its exit status to a durable per-request result file on the host. Nothing is lost if the CLI, agent process, or SSH connection dies; the job stays queryable from any process.
+- **Jobs** — long tasks run in dedicated remote tmux sessions. When the command returns, its exit status is recorded on the host twice: authoritatively in `~/.terminus/results/<request-id>.json`, and as a fallback sentinel line in the pane log. Nothing is lost if the CLI, agent process, or SSH connection dies; the job stays queryable from any process.
 - **Sessions** — a Terminus session maps to a remote tmux session. cwd/env persist between calls; disconnects don't destroy state.
 - **Memory & facts** — agents store what they learned about a server (deploy paths, service layout, gotchas) and recall it next conversation. Every `exec --json` response carries the server's memory keys.
-- **Stable JSON contract** — every command supports `--json`; every failure is `{"ok":false,"error":"..."}` with exit 1; remote exit codes pass through.
+- **Stable JSON contract** — every command supports `--json`; every failure carries `"ok":false`. Exit 1 is a refusal or a proven failure (`{"ok":false,"error":"..."}`), 75 means the remote outcome could not be established and a blind retry is unsafe, 76 means the receipt could not be persisted. Remote exit codes pass through.
 - **Connection daemon** — repeated calls reuse a pooled SSH connection (~0.6 s vs ~2.3 s cold). It exits itself after 5 idle minutes and never leaves processes or stale sockets behind; any daemon failure falls back to direct SSH, visibly (`transport` / `daemonError` fields).
 
 ## Quick start
@@ -52,9 +52,10 @@ terminus exec prod -- git status         # runs in /srv/app
 
 # Tracked background job
 terminus run prod --name build -- npm run build
-terminus job status prod build --json    # running | exited | killed + exitCode
+# status: submitted | remote_started | completed | failed | indeterminate (+ exitCode)
+terminus job status prod build --json    # exits 75 while the outcome is unknown
 terminus job read prod build --from-cursor --json
-terminus job kill prod build
+terminus job kill prod build             # 75 unless the process tree is proven gone
 
 # Persistent interactive session
 terminus session new prod dev
@@ -136,6 +137,8 @@ zig build              # debug
 zig build test         # unit tests
 zig build -Doptimize=ReleaseSafe
 ```
+
+`zig build test` additionally needs a POSIX shell on `PATH`: two black-box gates run generated shell text through a real `sh` instead of trusting a reading of it, and they fail rather than skip when none is found. Git for Windows supplies one; if yours lives elsewhere, point the build at it with `zig build test -Dposix-sh=<path-to-sh>`.
 
 ## Security status
 

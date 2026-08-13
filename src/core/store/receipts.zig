@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const Store = @import("Store.zig");
 const Db = @import("Db.zig");
 const op_state = @import("op_state.zig");
+const operations = @import("operations.zig");
 const history = @import("history.zig");
 
 pub const schema_version: i64 = 1;
@@ -146,6 +147,10 @@ pub const Error = Db.Error || error{
     /// to the remote).
     EvidenceDoesNotFit,
     UnknownOperation,
+    /// The `operations.kind` column holds something longer than any kind this
+    /// binary knows. Not a business outcome: it means the row is not one we
+    /// can reason about, so no admissibility decision may be made from it.
+    UnknownOperationKind,
     /// Supplementary fields contradict the evidence (e.g. a remote pid on a
     /// request whose command was provably never handed over).
     ContradictoryEvidence,
@@ -589,12 +594,23 @@ pub const ResolutionEvidence = union(enum) {
     /// operation's own id, holding one fact. Collapsing them would make a
     /// receipt unable to say which one it had.
     job_result: struct {
-        /// Echoed back from the document, so the receipt records the identity
-        /// the evidence claimed rather than the one we went looking for.
+        /// The request id the document itself names. Required to equal the
+        /// operation being resolved — that equality is what makes this
+        /// evidence *about* the operation rather than merely handed to it,
+        /// and `resolve` refuses the pair when it does not hold.
+        ///
+        /// Must be filled from the parsed document
+        /// (`Tmux.JobResult.claimed_request_id`), never from the operation
+        /// being reconciled: sourcing both sides of the check from the same
+        /// place makes it unfalsifiable.
         request_id: []const u8,
         exit_code: i64,
-        /// Remote unix seconds, 0 when the host could not report a clock.
-        finished_at: i64 = 0,
+        /// Remote unix seconds, or null when the host could not report a
+        /// clock. Optional rather than 0-means-absent so the ledger records
+        /// "the remote could not say" as absence instead of as the epoch —
+        /// the same reason `Tmux.JobResult.finished_at` is optional. Never
+        /// substituted with a local clock.
+        finished_at: ?i64 = null,
     },
     /// A verified side effect on the filesystem (published artifact hash).
     /// Only meaningful for transfers: a hash matching proves the bytes
@@ -652,11 +668,22 @@ pub const ResolutionEvidence = union(enum) {
     }
 
     /// Kinds of operation this evidence can speak about.
+    ///
+    /// Evidence produced by one mechanism can only settle the operations that
+    /// mechanism runs. Otherwise the strength of a record leaks across
+    /// domains: a job wrapper's exit status would be allowed to close a
+    /// transfer whose bytes nobody ever checked.
     pub fn appliesToKind(e: ResolutionEvidence, kind: []const u8) bool {
         return switch (e) {
             .filesystem_effect => std.mem.eql(u8, kind, "transfer_push") or
                 std.mem.eql(u8, kind, "transfer_pull") or
                 std.mem.eql(u8, kind, "fetch"),
+            // Both are exit statuses recorded by the job wrapper — the
+            // sidecar it writes and the sentinel it echoes. Neither exists
+            // for any other kind of operation, so one turning up against a
+            // transfer or a fetch means the evidence was misrouted, not that
+            // the operation is settled.
+            .job_result, .job_sentinel => std.mem.eql(u8, kind, "job"),
             else => true,
         };
     }
@@ -718,6 +745,16 @@ pub const ResolveOutcome = union(enum) {
         operation_kind: []const u8,
         evidence_kind: []const u8,
     },
+    /// The evidence is about a *different* operation: it carries a request id
+    /// of its own, and it is not this one. Distinct from `evidence_wrong_kind`
+    /// because the mismatch is identity, not category — the evidence could be
+    /// perfectly valid, just not here.
+    evidence_wrong_operation: struct {
+        /// The request id the evidence itself names.
+        evidence_request_id: []const u8,
+        /// The request id being resolved.
+        request_id: []const u8,
+    },
     /// Only an `indeterminate` attempt can be resolved. Carries what the
     /// status actually is, so the caller can say why it refused.
     not_indeterminate: op_state.Status,
@@ -725,6 +762,25 @@ pub const ResolveOutcome = union(enum) {
     /// overwrite the first one's evidence.
     already_resolved: op_state.ResolvedStatus,
     unknown_operation,
+};
+
+/// Length of the longest `operations.Kind` name.
+///
+/// Derived from the enum rather than guessed at, because the buffer it sizes
+/// carries the operation's kind out of a statement that is about to be
+/// finalized and into `appliesToKind`, which decides whether evidence is
+/// allowed to release the scope barrier. A hand-picked size can stop being
+/// big enough the day someone adds a longer kind, and the failure mode of the
+/// old `@min(raw_kind.len, kind_buf.len)` copy was silent: a kind longer than
+/// the buffer was compared as a truncated prefix. With the old 64-byte buffer
+/// that could only ever over-refuse — no 64-character prefix matches a kind
+/// name — so it was never an authorization hole, but it would have become one
+/// the moment the buffer was sized down to fit. Sized here it cannot be too
+/// small for a kind that exists, and anything longer is rejected, not trimmed.
+const max_kind_len = blk: {
+    var longest: usize = 0;
+    for (@typeInfo(operations.Kind).@"enum".fields) |field| longest = @max(longest, field.name.len);
+    break :blk longest;
 };
 
 /// Records the later-proven truth for an unsettled attempt.
@@ -739,6 +795,9 @@ pub const ResolveOutcome = union(enum) {
 ///   row count is checked;
 /// * evidence is typed, so an operator override stays legible as one instead
 ///   of passing for a mechanical proof;
+/// * evidence that names a request must name *this* one, and evidence must
+///   suit the kind of operation it is offered for — a barrier that trusts its
+///   callers to aim correctly is not a barrier;
 /// * the resolution and its append-only reconcile event commit together, so
 ///   a resolution can never exist without evidence explaining it.
 pub fn resolve(
@@ -760,7 +819,7 @@ pub fn resolve(
     var found = false;
     var current_status: op_state.Status = undefined;
     var current_resolution: ?op_state.ResolvedStatus = null;
-    var kind_buf: [64]u8 = undefined;
+    var kind_buf: [max_kind_len]u8 = undefined;
     var kind: []const u8 = "";
     {
         var stmt = try store.db.prepare(
@@ -773,15 +832,48 @@ pub fn resolve(
             current_status = try op_state.Status.parse(stmt.columnText(0));
             current_resolution = if (stmt.columnOptText(1)) |v| try op_state.ResolvedStatus.parse(v) else null;
             const raw_kind = stmt.columnText(2);
-            const n = @min(raw_kind.len, kind_buf.len);
-            @memcpy(kind_buf[0..n], raw_kind[0..n]);
-            kind = kind_buf[0..n];
+            // Longer than the longest kind that exists means it is not a kind
+            // this binary knows, so there is nothing here to authorize from.
+            // Copying a prefix instead — which is what `@min(raw_kind.len,
+            // kind_buf.len)` did — hands `appliesToKind` a string the
+            // operation never had, on the path that decides whether evidence
+            // may release the scope barrier. Fail instead of narrowing.
+            if (raw_kind.len > kind_buf.len) return error.UnknownOperationKind;
+            @memcpy(kind_buf[0..raw_kind.len], raw_kind);
+            kind = kind_buf[0..raw_kind.len];
         }
     }
 
     if (!found) {
         try rollback(store);
         return .unknown_operation;
+    }
+    // Identity before content: ask whether the evidence is about this
+    // operation at all before asking what it says. A sidecar is addressed by
+    // the request id it was written for and carries that id inside it, so a
+    // pair that disagrees is either a misrouted document or a caller that
+    // wired the wrong id in — and settling one operation from another's exit
+    // status is exactly what request-keyed results exist to prevent.
+    //
+    // `Tmux.parseJobResult` already refuses to hand back a document naming
+    // another request, and this check stays anyway. They are not the same
+    // check: the parser stops a foreign document from becoming a reading at
+    // all, this stops a genuine reading from being aimed at the wrong
+    // operation — which no parser can see, because by then the reading is
+    // just a value a caller is passing. Two independent checks on a
+    // scope-releasing path is the point. It only holds while the evidence's
+    // `request_id` comes from the document (see its doc comment); filled from
+    // the operation being resolved, this compares a value against itself and
+    // can never fire.
+    switch (evidence) {
+        .job_result => |r| if (!std.mem.eql(u8, r.request_id, request_id)) {
+            try rollback(store);
+            return .{ .evidence_wrong_operation = .{
+                .evidence_request_id = r.request_id,
+                .request_id = request_id,
+            } };
+        },
+        else => {},
     }
     // Check what the evidence can actually establish before anything else:
     // a resolution lifts the mutation barrier, so an unsupported one must
@@ -795,8 +887,12 @@ pub fn resolve(
     }
     if (!evidence.appliesToKind(kind)) {
         try rollback(store);
+        // `kind` is duped because it points into a buffer on this frame, and
+        // an outcome that outlives it has to carry the operation's real kind:
+        // reporting the evidence's kind in both fields told a caller nothing
+        // about what refused it.
         return .{ .evidence_wrong_kind = .{
-            .operation_kind = evidence.kindName(),
+            .operation_kind = try arena.dupe(u8, kind),
             .evidence_kind = evidence.kindName(),
         } };
     }

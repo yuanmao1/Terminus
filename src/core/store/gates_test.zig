@@ -272,6 +272,12 @@ test testId {
 
 /// Creates one operation ready to be settled.
 fn seedOperation(store: *Store, request_id: []const u8) !void {
+    return seedOperationOfKind(store, request_id, .exec);
+}
+
+/// Same, for tests that care which kind of work the operation represents —
+/// evidence is only admissible for the kind of operation that produces it.
+fn seedOperationOfKind(store: *Store, request_id: []const u8, kind: Store.operations.Kind) !void {
     try store.db.exec(
         \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
         \\VALUES (1, 'race', '10.0.0.1', 22, 'ubuntu', 100, 100);
@@ -280,7 +286,7 @@ fn seedOperation(store: *Store, request_id: []const u8) !void {
         .request_id = request_id,
         .server_id = 1,
         .server_name = "race",
-        .kind = .exec,
+        .kind = kind,
         .now = 100,
     });
     try Store.operations.advance(store, request_id, .connecting, 101);
@@ -606,7 +612,9 @@ test "gate: transport loss after submission records indeterminate, never failed"
     var store = try Store.open(scratch.path);
     defer store.close();
     const request_id = "01ZZZZZZZZ0123456789ABCDEF";
-    try seedOperation(&store, request_id);
+    // A job: the reconciliation below is a job's exit sentinel, and evidence
+    // is only admissible for the kind of operation that produces it.
+    try seedOperationOfKind(&store, request_id, .job);
 
     // The only decision point for a dropped connection.
     const terminal = op_state.terminalForTransportLoss(.submitted, "channel eof");
@@ -692,7 +700,7 @@ test "gate: resolution is write-once" {
     defer store.close();
     const rid = testId("once");
     const request_id: []const u8 = &rid;
-    try seedOperation(&store, request_id);
+    try seedOperationOfKind(&store, request_id, .job);
     _ = try Store.receipts.settle(
         &store,
         request_id,
@@ -1267,7 +1275,10 @@ test "gate: evidence must entail the result it is used to justify" {
     defer store.close();
     const rid = testId("supports");
     const request_id: []const u8 = &rid;
-    try seedOperation(&store, request_id);
+    // A job, because the evidence under test is a job's exit sentinel: the
+    // question here is whether the evidence entails the *result*, and it can
+    // only get asked of an operation the evidence is allowed to speak about.
+    try seedOperationOfKind(&store, request_id, .job);
     _ = try Store.receipts.settle(
         &store,
         request_id,
@@ -1323,7 +1334,7 @@ test "M2e gate: a result record is read like a sentinel, and named unlike one" {
     defer store.close();
     const rid = testId("jobresult");
     const request_id: []const u8 = &rid;
-    try seedOperation(&store, request_id);
+    try seedOperationOfKind(&store, request_id, .job);
     _ = try Store.receipts.settle(
         &store,
         request_id,
@@ -1362,6 +1373,223 @@ test "M2e gate: a result record is read like a sentinel, and named unlike one" {
     // Mechanical, unlike an operator override — it must not need a human's
     // name attached to release the scope.
     try t.expect(std.mem.indexOf(u8, op.resolution_evidence.?, "\"mechanical\":true") != null);
+}
+
+test "gate: a result document naming another request settles nothing here" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_job_result_identity");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("mine");
+    const request_id: []const u8 = &rid;
+    const other = testId("theirs");
+    try seedOperationOfKind(&store, request_id, .job);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .indeterminate = .{ .reason = "caller walked away", .last_observed = .submitted } },
+        .{},
+        200,
+    );
+
+    // The exit code is perfectly good evidence — for the operation the
+    // document names. Accepting it here would lift *this* operation's
+    // mutation barrier on the strength of another one's outcome, possibly
+    // from another host, with the contradiction persisted in the receipt
+    // where only a human reading the JSON would ever notice it.
+    //
+    // This is the Store's own check, exercised the only way it can be
+    // falsified: by handing it a pair whose two sides genuinely differ. The
+    // reader that produces such evidence in production has a second, separate
+    // check (`Tmux.parseJobResult` refuses a document naming another
+    // request), and neither stands in for the other — the parser cannot see
+    // where a caller later points a valid reading.
+    const refused = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_result = .{ .request_id = &other, .exit_code = 0, .finished_at = 900 },
+    }, 300);
+    try t.expectEqualStrings(&other, refused.evidence_wrong_operation.evidence_request_id);
+    try t.expectEqualStrings(request_id, refused.evidence_wrong_operation.request_id);
+    try t.expect(!std.mem.eql(
+        u8,
+        refused.evidence_wrong_operation.evidence_request_id,
+        refused.evidence_wrong_operation.request_id,
+    ));
+
+    // Identity is checked before anything else, so a mismatch is reported as
+    // a mismatch even when the evidence would have failed a later test too. A
+    // caller told "that exit code cannot prove completion" would go looking
+    // for the wrong bug.
+    const also_unsupported = try Store.receipts.resolve(&store, arena, request_id, .timed_out, .{
+        .job_result = .{ .request_id = &other, .exit_code = 0, .finished_at = 900 },
+    }, 301);
+    try t.expect(also_unsupported == .evidence_wrong_operation);
+
+    // Nothing was recorded: no resolution, and no reconcile event to imply
+    // one was attempted successfully.
+    const unresolved = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(@as(?op_state.ResolvedStatus, null), unresolved.resolved_status);
+    for (try Store.receipts.list(&store, arena, request_id)) |row| {
+        try t.expect(!std.mem.eql(u8, row.kind, "reconcile"));
+    }
+
+    // The same document, naming this operation, does settle it.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_result = .{ .request_id = request_id, .exit_code = 0, .finished_at = 900 },
+    }, 310)) == .resolved);
+    try t.expectEqual(
+        op_state.ResolvedStatus.completed,
+        (try Store.operations.get(&store, arena, request_id)).?.resolved_status.?,
+    );
+}
+
+test "gate: a result with no remote clock records absence, not the epoch" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_job_result_clockless");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("clockless");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .job);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        200,
+    );
+
+    // A host without a usable `date` produces a document with no finish time.
+    // The exit code in it is still evidence, so the resolution stands — but
+    // the receipt has to say the time is absent. Persisting 0 would publish
+    // midnight 1970 as the moment a job finished, and every later reader
+    // would have to know that one field's private convention to avoid
+    // repeating it.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_result = .{ .request_id = request_id, .exit_code = 0, .finished_at = null },
+    }, 300)) == .resolved);
+
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    const evidence = op.resolution_evidence.?;
+    try t.expect(std.mem.indexOf(u8, evidence, "\"finished_at\":null") != null);
+    try t.expect(std.mem.indexOf(u8, evidence, "\"finished_at\":0") == null);
+}
+
+test "gate: an operation kind too long to hold is refused, not truncated" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_kind_overlong");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("longkind");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .job);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        200,
+    );
+
+    // `kind` has no CHECK constraint, so a future version, a manual edit or a
+    // corrupted row can put anything here. Whatever it is, it is not a kind
+    // this binary knows, and `appliesToKind` — which decides whether evidence
+    // may release the scope barrier — must not be handed a prefix of it.
+    try store.db.exec(
+        "UPDATE operations SET kind = 'job_with_a_name_far_longer_than_any_kind_this_binary_knows_about_and_then_some_more'",
+    );
+    try t.expectError(error.UnknownOperationKind, Store.receipts.resolve(
+        &store,
+        arena,
+        request_id,
+        .completed,
+        .{ .job_result = .{ .request_id = request_id, .exit_code = 0 } },
+        300,
+    ));
+
+    // Nothing was written, and the refusal did not leave a transaction open —
+    // the next resolve would fail to BEGIN if it had.
+    try t.expectEqual(
+        @as(?op_state.ResolvedStatus, null),
+        (try Store.operations.get(&store, arena, request_id)).?.resolved_status,
+    );
+    try store.db.exec("UPDATE operations SET kind = 'job'");
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_result = .{ .request_id = request_id, .exit_code = 0 },
+    }, 310)) == .resolved);
+}
+
+test "gate: a job's exit status cannot settle a transfer" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_job_evidence_kind");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("push");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .transfer_push);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        200,
+    );
+
+    // Both records are written by the job wrapper and exist only for jobs.
+    // A transfer has no such wrapper, so an exit status offered for one was
+    // misrouted — and "the command returned 0" says nothing about whether
+    // the bytes landed, which is the only thing a transfer's outcome means.
+    const wrong_file = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_result = .{ .request_id = request_id, .exit_code = 0, .finished_at = 900 },
+    }, 300);
+    try t.expectEqualStrings("transfer_push", wrong_file.evidence_wrong_kind.operation_kind);
+    try t.expectEqualStrings("job_result", wrong_file.evidence_wrong_kind.evidence_kind);
+    // The two fields answer two different questions — "what refused" and
+    // "what was offered" — and both used to be filled from the evidence, so a
+    // refusal could not name the operation that issued it.
+    try t.expect(!std.mem.eql(
+        u8,
+        wrong_file.evidence_wrong_kind.operation_kind,
+        wrong_file.evidence_wrong_kind.evidence_kind,
+    ));
+
+    const wrong_sentinel = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_sentinel = .{ .sentinel = "__S__", .exit_code = 0 },
+    }, 301);
+    try t.expectEqualStrings("transfer_push", wrong_sentinel.evidence_wrong_kind.operation_kind);
+    try t.expectEqualStrings("job_sentinel", wrong_sentinel.evidence_wrong_kind.evidence_kind);
+
+    // Nothing was recorded by either refusal.
+    const unresolved = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(@as(?op_state.ResolvedStatus, null), unresolved.resolved_status);
+    for (try Store.receipts.list(&store, arena, request_id)) |row| {
+        try t.expect(!std.mem.eql(u8, row.kind, "reconcile"));
+    }
+
+    // The evidence a transfer actually produces still works, so the gate is
+    // about admissibility and not a blanket refusal.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "abc" },
+    }, 310)) == .resolved);
 }
 
 test "gate: a supervisor report cannot be repointed at another result" {

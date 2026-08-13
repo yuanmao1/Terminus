@@ -35,9 +35,14 @@ fn logPath(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
     return std.fmt.allocPrint(arena, "{s}/{s}.log", .{ log_dir, name });
 }
 
-/// tmux session names get a `t-` prefix to keep Terminus-managed sessions
-/// recognizable in `tmux ls` on the server.
-fn tmuxName(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
+/// The real tmux session name for a Terminus session: the `t-` prefixed form.
+///
+/// tmux session names get the prefix to keep Terminus-managed sessions
+/// recognizable in `tmux ls` on the server. It is also the only name that
+/// exists on the host, so it is the one an operator has to type — which is
+/// why this is public. A message telling somebody to run
+/// `tmux attach -t <terminus name>` names a session that is not there.
+pub fn targetName(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
     return std.fmt.allocPrint(arena, "t-{s}", .{name});
 }
 
@@ -62,11 +67,27 @@ fn run(executor: Executor, arena: Allocator, command: []const u8) Error!Ssh.Exec
 
 /// A job's durable terminal result, as the remote wrapper recorded it.
 pub const JobResult = struct {
+    /// The request id the *document itself* named, copied out of the parsed
+    /// JSON.
+    ///
+    /// Deliberately not called `request_id`: it is the identity the evidence
+    /// claimed, not the one we went looking for. They are equal only because
+    /// `parseJobResult` refused the document otherwise, and a receipt that
+    /// records this field records what the document said. Filling a receipt
+    /// from the id we searched with instead produces a claim that is true by
+    /// construction — it compares a value against itself — which is how the
+    /// Store's identity check came to be unfalsifiable.
+    claimed_request_id: []const u8,
     exit_code: i32,
-    /// Unix seconds as the *remote* clock saw them, or 0 if `date` was
-    /// unavailable. Never substituted with a local timestamp: a receipt that
-    /// says when something finished must not be quoting a different machine.
-    finished_at: i64,
+    /// Unix seconds as the *remote* clock saw them, or null when the remote
+    /// could not say. Optional rather than 0-means-absent: the wrapper writes
+    /// 0 on a host without a usable `date`, and a type that cannot express
+    /// "absent" forces every reader to re-derive that convention — one of them
+    /// will get it wrong and publish 1970 as a finish time.
+    ///
+    /// Never substituted with a local timestamp: a receipt that says when
+    /// something finished must not be quoting a different machine's clock.
+    finished_at: ?i64,
 };
 
 /// Schema version of the sidecar document. Bump when a reader has to
@@ -157,7 +178,17 @@ fn splitProbe(stdout: []const u8) ?ProbeHalves {
 /// point of keying results by request id is that a leftover file from an
 /// earlier attempt must not be read as this attempt's outcome, so a mismatch
 /// is treated as no evidence at all rather than as evidence.
-fn parseJobResult(arena: Allocator, text: []const u8, request_id: []const u8) ?JobResult {
+///
+/// The returned `claimed_request_id` is therefore always equal to
+/// `request_id` — and it is still carried, because the equality is a fact
+/// this parser established rather than one the receipt may assume. The Store
+/// checks the same thing again when the evidence is offered
+/// (`receipts.resolve`). Two independent checks on a scope-releasing path is
+/// the point, not redundancy to be collapsed: this one keeps a foreign
+/// document from ever being handed back as a reading, the other keeps a
+/// caller from aiming a perfectly good reading at the wrong operation. Delete
+/// either and the surviving one has to be trusted alone.
+fn parseJobResult(arena: Allocator, text: []const u8, request_id: []const u8) Allocator.Error!?JobResult {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
     const Doc = struct {
@@ -174,7 +205,18 @@ fn parseJobResult(arena: Allocator, text: []const u8, request_id: []const u8) ?J
     // Shell exit statuses are 0-255; anything else means the document was not
     // written by our wrapper, whatever it claims.
     if (doc.exitCode < 0 or doc.exitCode > 255) return null;
-    return .{ .exit_code = @intCast(doc.exitCode), .finished_at = doc.finishedAt };
+    return .{
+        // Duped: the parser may hand back a slice into the caller's input
+        // buffer, and this value outlives the probe that read it.
+        .claimed_request_id = try arena.dupe(u8, doc.requestId),
+        .exit_code = @intCast(doc.exitCode),
+        // 0 is the wrapper's own "the host had no usable `date`", and a
+        // negative stamp is nonsense from a host we should not be quoting
+        // either way. Both mean the remote could not say when this finished,
+        // which is not the same as it having finished at the epoch — and the
+        // answer to "the remote could not say" is never a local clock.
+        .finished_at = if (doc.finishedAt > 0) doc.finishedAt else null,
+    };
 }
 
 /// Deletes a job's result sidecar. Used only by `--discard-evidence`, which
@@ -199,12 +241,12 @@ pub fn readResult(executor: Executor, arena: Allocator, request_id: []const u8) 
     , .{ result_dir, request_id, max_result_bytes });
     const result = try run(executor, arena, script);
     if (result.exit_code != 0) return error.RemoteFailed;
-    return parseJobResult(arena, result.stdout, request_id);
+    return try parseJobResult(arena, result.stdout, request_id);
 }
 
 /// Creates the session if absent (idempotent) and starts output logging.
 pub fn ensure(executor: Executor, arena: Allocator, name: []const u8) Error!void {
-    const tname = try tmuxName(arena, name);
+    const tname = try targetName(arena, name);
     // new-session and pipe-pane must be one tmux command sequence (';'):
     // as separate invocations the second can race a freshly (re)started
     // server and fail with "can't find pane".
@@ -253,48 +295,97 @@ pub fn list(executor: Executor, arena: Allocator) Error![]RemoteSession {
     return out.toOwnedSlice(arena);
 }
 
-/// Kills the remote tmux session and removes its log file.
+/// Kills the session. Returns whether it is actually gone afterwards.
 ///
-/// Destroys evidence: the log is the only durable record of how a job ended,
-/// so anything that may still need reconciling should use `killKeepLog`.
-pub fn kill(executor: Executor, arena: Allocator, name: []const u8) Error!void {
-    _ = try killSession(executor, arena, name, true);
-}
-
-/// Kills the session but preserves the output log.
+/// Never touches the log. Destroying evidence is a separate, explicit act:
+/// doing it inside the same script meant a kill that failed still deleted the
+/// only durable record of how the job ended — the `rm` was its own statement,
+/// so it ran whether or not the kill worked, and it ran *before* the survival
+/// probe, so even a caller that checked the answer could only learn "still
+/// running" after the evidence was gone.
 ///
-/// Returns whether the session is actually gone afterwards. The old
-/// formulation (`tmux kill-session; rm -f log`) took its exit status from the
-/// `rm`, so a failed kill reported success — and a surviving session is not a
-/// cosmetic problem: `ensure` treats an existing session as ready, so the
-/// next command would be typed into the previous job's shell.
-pub fn killKeepLog(executor: Executor, arena: Allocator, name: []const u8) Error!bool {
-    return killSession(executor, arena, name, false);
-}
-
-fn killSession(executor: Executor, arena: Allocator, name: []const u8, drop_log: bool) Error!bool {
-    const tname = try tmuxName(arena, name);
-    const script = if (drop_log)
-        try std.fmt.allocPrint(arena,
-            \\tmux kill-session -t ={s} 2>/dev/null
-            \\rm -f {s}/{s}.log
-            \\tmux has-session -t ={s} 2>/dev/null && exit 1
-            \\exit 0
-        , .{ tname, log_dir, name, tname })
-    else
-        try std.fmt.allocPrint(arena,
-            \\tmux kill-session -t ={s} 2>/dev/null
-            \\tmux has-session -t ={s} 2>/dev/null && exit 1
-            \\exit 0
-        , .{ tname, tname });
+/// A surviving session is not a cosmetic problem: `ensure` treats an existing
+/// session as ready, so the next command would be typed into the previous
+/// job's shell — with its cwd, its environment and its half-finished work.
+/// That is why this reports the fact rather than returning `void`; the old
+/// `kill` bound it to `_` and no caller could ever learn it.
+///
+/// The `command -v` line is what makes that boolean mean anything. Without it,
+/// a host where `tmux` is not resolvable in this shell answers 127 to both
+/// invocations — so `has-session` "fails", the `&&` does not fire, the script
+/// reaches `exit 0`, and a session nobody even looked at is reported as proven
+/// gone. Callers act on that by deleting the pane log, the result sidecar and
+/// the local row, which is the exact destruction this split exists to prevent.
+pub fn killSession(executor: Executor, arena: Allocator, name: []const u8) Error!bool {
+    const tname = try targetName(arena, name);
+    const script = try std.fmt.allocPrint(arena,
+        \\command -v tmux >/dev/null || exit 41
+        \\tmux kill-session -t ={s} 2>/dev/null
+        \\tmux has-session -t ={s} 2>/dev/null && exit 1
+        \\exit 0
+    , .{ tname, tname });
     const result = try run(executor, arena, script);
+    if (result.exit_code == 41) return error.TmuxMissing;
     return result.exit_code == 0;
+}
+
+test "killSession answers gone / survived / cannot tell, and never confuses them" {
+    const t = std.testing;
+    const Scripted = @import("../exec.zig").Scripted;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+
+    // The script's own exits: 0 = killed and verified absent, 1 = still there.
+    var gone = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+    });
+    try t.expect(try killSession(gone.executor(), arena, "j"));
+
+    var survived = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 1, .stdout = empty, .stderr = empty } },
+    });
+    try t.expect(!try killSession(survived.executor(), arena, "j"));
+
+    // The one that matters. Without the `command -v tmux` guard both tmux
+    // invocations exit 127, the `&&` does not fire, the script falls through
+    // to `exit 0`, and a session nobody could even look at is reported as
+    // proven gone — on which `job rm --discard-evidence` deletes the pane log,
+    // the result sidecar and the local row for a job that is still running.
+    var no_tmux = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 41, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectError(error.TmuxMissing, killSession(no_tmux.executor(), arena, "j"));
+    // Two halves, and both are needed: the script has to ask the question,
+    // and the reader has to honour the answer. Asserting only the mapping
+    // would pass with the guard deleted from the script, which is where the
+    // bug actually was.
+    try t.expect(std.mem.indexOf(u8, no_tmux.seen.items[0], "command -v tmux") != null);
+
+    // Same trap on the read side: "no session" and "no tmux" are different
+    // answers, and only one of them is evidence about the job.
+    var alive_no_tmux = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 41, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectError(error.TmuxMissing, isAlive(alive_no_tmux.executor(), arena, "j"));
+    try t.expect(std.mem.indexOf(u8, alive_no_tmux.seen.items[0], "command -v tmux") != null);
+}
+
+/// Deletes the pane log. The caller must already have proven the session is
+/// gone — a live pane simply recreates the file through `pipe-pane`, so a
+/// "deleted" log quietly comes back holding a partial history that starts
+/// mid-job.
+pub fn removeLog(executor: Executor, arena: Allocator, name: []const u8) Error!void {
+    const script = try std.fmt.allocPrint(arena, "rm -f {s}/{s}.log", .{ log_dir, name });
+    const result = try run(executor, arena, script);
+    if (result.exit_code != 0) return error.RemoteFailed;
 }
 
 /// Types `input` into the session as if at the keyboard, plus Enter unless
 /// `no_enter`. Does not wait for any output.
 pub fn sendKeys(executor: Executor, arena: Allocator, name: []const u8, input: []const u8, no_enter: bool) Error!void {
-    const tname = try tmuxName(arena, name);
+    const tname = try targetName(arena, name);
     const quoted = try shellQuote(arena, input);
     // Pane targets need the trailing ':' (exact session, default window):
     // a bare '=name' is rejected as a pane target by some tmux versions.
@@ -376,41 +467,41 @@ fn interpretTail(
     request_id: ?[]const u8,
 ) Error!JobProbe {
     const split = splitProbe(stdout) orelse return error.RemoteFailed;
-    const sidecar = if (request_id) |id| parseJobResult(arena, split.result, id) else null;
+    const sidecar = if (request_id) |id| try parseJobResult(arena, split.result, id) else null;
 
-    // No size line: the log file does not exist yet. The sidecar can still
-    // have the answer — a job whose pane log was rotated away is exactly the
-    // case it is there for.
-    const newline = std.mem.indexOfScalar(u8, split.rest, '\n') orelse return .{
-        .output = "",
-        .next_cursor = 0,
-        .exit_code = if (sidecar) |r| r.exit_code else null,
-        .exit_source = if (sidecar != null) .result_file else .none,
-        .finished_at = if (sidecar) |r| r.finished_at else null,
-        .session_alive = false,
+    // No size line at all. The script emits `0` for a log that does not exist
+    // yet, so reaching here means the output was truncated or garbled rather
+    // than the log being absent. The sidecar can still have the answer — it is
+    // addressed by request id, not by the log — and with no log there is no
+    // second record to disagree with it. The same rule is applied anyway so
+    // this branch cannot drift away from the one below.
+    const newline = std.mem.indexOfScalar(u8, split.rest, '\n') orelse {
+        const only_sidecar = readingOf(sidecar, null);
+        return .{
+            .output = "",
+            .next_cursor = 0,
+            .exit_code = only_sidecar.exit_code,
+            .exit_source = only_sidecar.exit_source,
+            .finished_at = only_sidecar.finished_at,
+            .result_request_id = only_sidecar.claimed_request_id,
+            .conflict = only_sidecar.conflict,
+            .session_alive = false,
+        };
     };
     const size_text = std.mem.trim(u8, split.rest[0..newline], " \t\r");
     const log_size = std.fmt.parseInt(i64, size_text, 10) catch return error.RemoteFailed;
     const cleaned = try stripTerminalNoise(arena, split.rest[newline + 1 ..]);
 
-    var exit_code: ?i32 = null;
-    var exit_source: JobProbe.ExitSource = .none;
-    var finished_at: ?i64 = null;
-    if (sidecar) |r| {
-        exit_code = r.exit_code;
-        exit_source = .result_file;
-        finished_at = r.finished_at;
-    } else if (findSentinel(cleaned, sentinel)) |found| {
-        exit_code = found.exit_code;
-        exit_source = .log_sentinel;
-    }
+    const reading = readingOf(sidecar, findSentinel(cleaned, sentinel));
 
     return .{
         .output = cleaned,
         .next_cursor = log_size,
-        .exit_code = exit_code,
-        .exit_source = exit_source,
-        .finished_at = finished_at,
+        .exit_code = reading.exit_code,
+        .exit_source = reading.exit_source,
+        .finished_at = reading.finished_at,
+        .result_request_id = reading.claimed_request_id,
+        .conflict = reading.conflict,
         .session_alive = false,
         .business_result = try findBusinessResult(arena, cleaned),
     };
@@ -437,6 +528,9 @@ test "M2e gate: a buried sentinel does not cost a job its outcome" {
     try t.expectEqual(JobProbe.ExitSource.result_file, found.exit_source);
     try t.expectEqual(@as(?i64, 1750000000), found.finished_at);
     try t.expectEqual(@as(i64, 900000), found.next_cursor);
+    // The identity travels with the reading, so a receipt can record the id
+    // the document named rather than the one the caller was holding.
+    try t.expectEqualStrings(rid, found.result_request_id.?);
 
     // Same bytes, no sidecar: the honest answer is that we cannot say.
     const no_sidecar = try std.fmt.allocPrint(
@@ -458,6 +552,8 @@ test "M2e gate: a buried sentinel does not cost a job its outcome" {
     try t.expectEqual(@as(?i32, 7), from_log.exit_code);
     try t.expectEqual(JobProbe.ExitSource.log_sentinel, from_log.exit_source);
     try t.expectEqual(@as(?i64, null), from_log.finished_at);
+    // A log line names no request, so there is no identity to carry.
+    try t.expectEqual(@as(?[]const u8, null), from_log.result_request_id);
 }
 
 test "M2e gate: a result belonging to another request is not evidence" {
@@ -487,16 +583,106 @@ test "M2e gate: a result belonging to another request is not evidence" {
         "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2M",
         "",
     };
-    for (rejects) |doc| try t.expectEqual(@as(?JobResult, null), parseJobResult(arena, doc, mine));
+    for (rejects) |doc| try t.expectEqual(@as(?JobResult, null), try parseJobResult(arena, doc, mine));
 
     // And a good one is accepted, so the rejections above mean something.
-    const good = parseJobResult(
+    const good = try parseJobResult(
         arena,
         "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":255,\"finishedAt\":42}",
         mine,
     ) orelse return error.TestExpectedResult;
     try t.expectEqual(@as(i32, 255), good.exit_code);
-    try t.expectEqual(@as(i64, 42), good.finished_at);
+    try t.expectEqual(@as(?i64, 42), good.finished_at);
+    // The identity comes out of the document, not out of what we searched
+    // for. A receipt built from this can be checked against the operation it
+    // is offered for; one built from the search key checks itself.
+    try t.expectEqualStrings(mine, good.claimed_request_id);
+    try t.expect(good.claimed_request_id.ptr != mine.ptr);
+
+    // The wrapper writes finishedAt=0 when the host has no usable `date`, and
+    // a negative stamp is nonsense from a host we should not be quoting. Both
+    // mean "the remote could not say", which reads as absent — not as
+    // midnight 1970, and never as our own clock. The exit code in the same
+    // document is still perfectly good evidence, so the document stands.
+    for ([_][]const u8{
+        "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":3,\"finishedAt\":0}",
+        "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":3,\"finishedAt\":-5}",
+    }) |doc| {
+        const clockless = try parseJobResult(arena, doc, mine) orelse return error.TestExpectedResult;
+        try t.expectEqual(@as(i32, 3), clockless.exit_code);
+        try t.expectEqual(@as(?i64, null), clockless.finished_at);
+    }
+}
+
+test "gate: two mechanical records that disagree settle nothing" {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rid = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+
+    // The sidecar says the job succeeded; the sentinel in its log says it
+    // exited 7. One of the two records is wrong and nothing here can tell
+    // which, so this is not evidence of anything. Answering with either would
+    // be choosing by the order the reader happens to consult them in — which
+    // is exactly what the two readers used to do, in opposite directions.
+    const disagree = try std.fmt.allocPrint(arena, "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":0,\"finishedAt\":1750000000}}\n" ++
+        "{s}\n40\nwork done\n__TERMINUS_JOB_9__:7\n", .{ rid, probe_split_marker });
+    const clash = try interpretTail(arena, disagree, "__TERMINUS_JOB_9__", rid);
+    try t.expectEqual(@as(?i32, null), clash.exit_code);
+    try t.expectEqual(JobProbe.ExitSource.none, clash.exit_source);
+    try t.expectEqual(@as(i32, 0), clash.conflict.?.result_exit_code);
+    try t.expectEqual(@as(i32, 7), clash.conflict.?.sentinel_exit_code);
+    // A finish time taken from a record we are unwilling to settle from is
+    // not a fact either. Neither is the identity it named.
+    try t.expectEqual(@as(?i64, null), clash.finished_at);
+    try t.expectEqual(@as(?[]const u8, null), clash.result_request_id);
+
+    // Agreement is the ordinary case: one answer, attributed to the stronger
+    // record, and no conflict to report.
+    const agree = try std.fmt.allocPrint(arena, "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":7,\"finishedAt\":1750000000}}\n" ++
+        "{s}\n40\nwork done\n__TERMINUS_JOB_9__:7\n", .{ rid, probe_split_marker });
+    const settled = try interpretTail(arena, agree, "__TERMINUS_JOB_9__", rid);
+    try t.expectEqual(@as(?i32, 7), settled.exit_code);
+    try t.expectEqual(JobProbe.ExitSource.result_file, settled.exit_source);
+    try t.expectEqual(@as(?i64, 1750000000), settled.finished_at);
+    try t.expectEqualStrings(rid, settled.result_request_id.?);
+    try t.expect(settled.conflict == null);
+}
+
+test "gate: the streaming reader applies the same rule as the tail probe" {
+    const t = std.testing;
+    const Scripted = @import("../exec.zig").Scripted;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rid = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+    const empty = try arena.alloc(u8, 0);
+    // `job read` walks the log from the caller's cursor and fetches the
+    // sidecar separately, so it is the reader that holds both records at
+    // once. It used to compute the sentinel's answer and then overwrite it,
+    // discarding the contradiction it was holding.
+    const window = try std.fmt.allocPrint(arena, "40\nwork done\n__TERMINUS_JOB_9__:7\n", .{});
+    const doc = try std.fmt.allocPrint(
+        arena,
+        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":0,\"finishedAt\":1750000000}}",
+        .{rid},
+    );
+    var scripted = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = window, .stderr = empty } }, // readLog
+        .{ .reply = .{ .exit_code = 0, .stdout = doc, .stderr = empty } }, // readResult
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // isAlive
+    });
+    const probe = try probeJob(scripted.executor(), arena, "j", "__TERMINUS_JOB_9__", rid, 0, 1 << 20);
+    try t.expectEqual(@as(?i32, null), probe.exit_code);
+    try t.expectEqual(JobProbe.ExitSource.none, probe.exit_source);
+    try t.expectEqual(@as(i32, 0), probe.conflict.?.result_exit_code);
+    try t.expectEqual(@as(i32, 7), probe.conflict.?.sentinel_exit_code);
+    // The caller still gets its output window with the marker trimmed off:
+    // what to display is a separate question from what was established.
+    try t.expectEqualStrings("work done\n", probe.output);
 }
 
 pub const ReadResult = struct {
@@ -607,7 +793,7 @@ pub fn execIn(
 /// but nothing here proves a process later found under it is still ours,
 /// which is why the recorded capability says `pidProof = weak`.
 pub fn panePid(executor: Executor, arena: Allocator, name: []const u8) Error!?i64 {
-    const tname = try tmuxName(arena, name);
+    const tname = try targetName(arena, name);
     const script = try std.fmt.allocPrint(
         arena,
         "tmux list-panes -t ={s} -F '#{{pane_pid}}' 2>/dev/null | head -1",
@@ -619,10 +805,20 @@ pub fn panePid(executor: Executor, arena: Allocator, name: []const u8) Error!?i6
     return std.fmt.parseInt(i64, text, 10) catch null;
 }
 
+/// Whether the session exists right now.
+///
+/// `false` here is read as "the session is gone", which is half of every
+/// conclusion this module draws about a finished job — so it must not be what
+/// an unrunnable `tmux` looks like. Absence of the tool is a different answer
+/// from absence of the session, and only one of them is evidence.
 pub fn isAlive(executor: Executor, arena: Allocator, name: []const u8) Error!bool {
-    const tname = try tmuxName(arena, name);
-    const script = try std.fmt.allocPrint(arena, "tmux has-session -t ={s} 2>/dev/null", .{tname});
+    const tname = try targetName(arena, name);
+    const script = try std.fmt.allocPrint(arena,
+        \\command -v tmux >/dev/null || exit 41
+        \\tmux has-session -t ={s} 2>/dev/null
+    , .{tname});
     const result = try run(executor, arena, script);
+    if (result.exit_code == 41) return error.TmuxMissing;
     return result.exit_code == 0;
 }
 
@@ -640,11 +836,36 @@ pub const JobProbe = struct {
     /// Remote finish time, only ever from the sidecar. The log carries no
     /// timestamp, so a sentinel-only outcome has none.
     finished_at: ?i64 = null,
+    /// The request id the sidecar document itself named, when the sidecar is
+    /// what answered. Null for a sentinel-only outcome (a log line names no
+    /// request) and for a conflict (a record we refuse to settle from is not
+    /// one whose identity we may quote).
+    ///
+    /// A caller writing `job_result` evidence must fill the receipt's
+    /// `request_id` from *this*, not from the operation it is reconciling:
+    /// the Store re-checks that the two agree, and a check whose two sides
+    /// come from the same place can never fail.
+    result_request_id: ?[]const u8 = null,
+    /// Both durable records answered, and they disagree. Nothing may be
+    /// settled from this: two mechanical records of the same fact
+    /// contradicting each other means one of them is wrong and we cannot tell
+    /// which. Settling from either would be picking a winner by
+    /// implementation order.
+    ///
+    /// `exit_code` is null and `exit_source` is `.none` whenever this is set,
+    /// so a caller is structurally unable to settle from a conflict rather
+    /// than merely discouraged from it.
+    conflict: ?Conflict = null,
     session_alive: bool,
     /// Business-state marker: the value from the last `__TERMINUS_RESULT__:<v>`
     /// line the job printed, distinct from the process exit code (a job can
     /// exit 0 yet report a business failure). Null when the job printed none.
     business_result: ?[]const u8 = null,
+
+    pub const Conflict = struct {
+        result_exit_code: i32,
+        sentinel_exit_code: i32,
+    };
 
     pub const ExitSource = enum {
         none,
@@ -654,6 +875,45 @@ pub const JobProbe = struct {
         log_sentinel,
     };
 };
+
+/// What the two durable records, taken together, establish about how the job
+/// ended.
+///
+/// One function because there are two readers of the same two records
+/// (`interpretTail` and `probeJob`) and they had already drifted: one
+/// evaluated the sentinel only when there was no sidecar, the other computed
+/// both and then overwrote the sentinel's answer with the sidecar's. Neither
+/// could report a disagreement, and the second one had the contradiction in
+/// hand when it discarded it.
+fn readingOf(sidecar: ?JobResult, from_log: ?SentinelHit) struct {
+    exit_code: ?i32 = null,
+    exit_source: JobProbe.ExitSource = .none,
+    finished_at: ?i64 = null,
+    claimed_request_id: ?[]const u8 = null,
+    conflict: ?JobProbe.Conflict = null,
+} {
+    if (sidecar) |r| {
+        if (from_log) |found| {
+            if (found.exit_code != r.exit_code) return .{ .conflict = .{
+                .result_exit_code = r.exit_code,
+                .sentinel_exit_code = found.exit_code,
+            } };
+        }
+        // Agreement, or the sidecar alone. The sidecar is the stronger record
+        // — a document at an address derived from this operation's own id,
+        // versus a line in an append-only log anything on the host can write
+        // to — so it is what the receipt says it read, and it is the only one
+        // of the two that carries a finish time or an identity.
+        return .{
+            .exit_code = r.exit_code,
+            .exit_source = .result_file,
+            .finished_at = r.finished_at,
+            .claimed_request_id = r.claimed_request_id,
+        };
+    }
+    if (from_log) |found| return .{ .exit_code = found.exit_code, .exit_source = .log_sentinel };
+    return .{};
+}
 
 /// Jobs opt into business-state reporting by printing this marker; the
 /// value after the colon becomes `businessResult` in status/read output.
@@ -696,27 +956,22 @@ pub fn probeJob(
     const cleaned = try stripTerminalNoise(arena, chunk.data);
     const sidecar = if (request_id) |id| try readResult(executor, arena, id) else null;
 
-    var exit_code: ?i32 = null;
-    var exit_source: JobProbe.ExitSource = .none;
-    var output: []const u8 = cleaned;
-    if (findSentinel(cleaned, sentinel)) |found| {
-        exit_code = found.exit_code;
-        exit_source = .log_sentinel;
-        // Trim the marker out of what the caller shows the user; the window
-        // happened to contain it, which is a property of where their cursor
-        // was, not of how the job ended.
-        output = cleaned[found.output_start..found.output_end];
-    }
-    if (sidecar) |r| {
-        exit_code = r.exit_code;
-        exit_source = .result_file;
-    }
+    const from_log = findSentinel(cleaned, sentinel);
+    const reading = readingOf(sidecar, from_log);
+    // Trim the marker out of what the caller shows the user; the window
+    // happened to contain it, which is a property of where their cursor was,
+    // not of how the job ended. Independent of what the records established:
+    // this is presentation, not evidence.
+    const output = if (from_log) |found| cleaned[found.output_start..found.output_end] else cleaned;
+
     return .{
         .output = output,
         .next_cursor = chunk.next_cursor,
-        .exit_code = exit_code,
-        .exit_source = exit_source,
-        .finished_at = if (sidecar) |r| r.finished_at else null,
+        .exit_code = reading.exit_code,
+        .exit_source = reading.exit_source,
+        .finished_at = reading.finished_at,
+        .result_request_id = reading.claimed_request_id,
+        .conflict = reading.conflict,
         .session_alive = try isAlive(executor, arena, name),
         .business_result = try findBusinessResult(arena, cleaned),
     };
@@ -801,8 +1056,17 @@ fn findSentinel(data: []const u8, sentinel: []const u8) ?SentinelHit {
             if (after.len >= 2 and after[0] == ':') {
                 const code_text = std.mem.trim(u8, after[1..], " \r");
                 if (std.fmt.parseInt(i32, code_text, 10)) |code| {
-                    const start = echo_end orelse 0;
-                    return .{ .output_start = @min(start, line_start), .output_end = line_start, .exit_code = code };
+                    // A shell exit status is 0-255, so a line carrying
+                    // anything else was not written by `echo <sentinel>:$?`
+                    // — it is the job's own output that happens to start
+                    // with the marker. Treating it as the result line let a
+                    // job settle its own operation with a code the sidecar
+                    // reader rejects outright, so the scan continues past it
+                    // and reports nothing if no valid line ever turns up.
+                    if (code >= 0 and code <= 255) {
+                        const start = echo_end orelse 0;
+                        return .{ .output_start = @min(start, line_start), .output_end = line_start, .exit_code = code };
+                    }
                 } else |_| {}
             }
         } else {
@@ -821,4 +1085,19 @@ test findSentinel {
     try t.expectEqualStrings("file1\r\nfile2\r\n", data[hit.output_start..hit.output_end]);
     try t.expectEqual(0, hit.exit_code);
     try t.expectEqual(null, findSentinel("$ ls; echo __X__:$?\r\npartial", "__X__"));
+
+    // A shell exit status is 0-255. A line starting with the marker and
+    // carrying anything else was not written by `echo <sentinel>:$?`, so it
+    // is not a result line — the sidecar reader has always rejected such a
+    // document outright, and the log reader accepting one meant a job could
+    // settle its own operation with a code that could not have come from a
+    // shell.
+    try t.expectEqual(null, findSentinel("__X__:-1\n", "__X__"));
+    try t.expectEqual(null, findSentinel("__X__:256\n", "__X__"));
+    try t.expectEqual(null, findSentinel("__X__:99999999999999999999\n", "__X__"));
+
+    // Rejecting one is not the same as giving up: the scan continues, so a
+    // bogus line cannot hide the real one behind it.
+    const mixed = "__X__:900\nreal output\n__X__:3\n";
+    try t.expectEqual(3, findSentinel(mixed, "__X__").?.exit_code);
 }
