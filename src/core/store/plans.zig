@@ -61,6 +61,9 @@ pub const PhaseStatus = enum {
 
     /// Maps an operation's outcome onto the phase. Note the deliberate
     /// absence of any mapping that turns `indeterminate` into a failure.
+    /// A resolved operation is read through `Operation.effectiveStatus()`
+    /// before it gets here, so resolution is handled by the caller rather
+    /// than by a second status vocabulary.
     pub fn fromOperation(status: op_state.Status) PhaseStatus {
         return switch (status) {
             .created, .connecting => .pending,
@@ -69,7 +72,7 @@ pub const PhaseStatus = enum {
             .failed => .failed,
             .timed_out => .timed_out,
             .cancelled => .cancelled,
-            .indeterminate, .reconciled => .indeterminate,
+            .indeterminate => .indeterminate,
         };
     }
 };

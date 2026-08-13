@@ -114,7 +114,7 @@ const migrations = [_][:0]const u8{
     \\  status              TEXT NOT NULL CHECK (status IN (
     \\                        'created','connecting','submitted','remote_started',
     \\                        'completed','failed','timed_out','cancelled',
-    \\                        'indeterminate','reconciled')),
+    \\                        'indeterminate')),
     \\  resolved_status     TEXT CHECK (resolved_status IS NULL OR resolved_status IN (
     \\                        'completed','failed','timed_out','cancelled')),
     \\  reconciled_at       INTEGER,
@@ -154,6 +154,10 @@ const migrations = [_][:0]const u8{
     \\  timed_out          INTEGER,
     \\  transport_error    TEXT,
     \\  error_code         TEXT,
+    \\-- Evidence carried by specific Terminal variants, so a reconciler can
+    \\-- see where to look and an auditor can see how a cancel was performed.
+    \\  last_observed      TEXT,
+    \\  cancel_method      TEXT,
     \\  stdin_bytes        INTEGER,
     \\  stdin_sha256       TEXT,
     \\  stdout_bytes       INTEGER,

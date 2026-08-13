@@ -181,16 +181,24 @@ pub fn get(store: *Store, arena: Allocator, request_id: []const u8) (Error || Al
     return try rowToOperation(arena, &stmt);
 }
 
-/// Advances a non-terminal status. Rejects any transition the state machine
-/// does not allow, and refuses to move an already-terminal operation — a
-/// caller that tries is buggy, and silently permitting it would let the
-/// ledger record a state it cannot justify.
-pub fn advance(store: *Store, request_id: []const u8, to: Status, now: i64) (Error || error{ IllegalTransition, UnknownOperation })!void {
+/// Advances a live (non-terminal) status.
+///
+/// The parameter type is `LiveStatus`, which has no terminal members, so
+/// there is no way to reach `completed`/`failed`/`timed_out`/`cancelled`/
+/// `indeterminate` through this function. Terminals belong to
+/// `receipts.settle`, which demands evidence and writes the matching
+/// terminal receipt in the same transaction.
+pub fn advance(
+    store: *Store,
+    request_id: []const u8,
+    to: op_state.LiveStatus,
+    now: i64,
+) (Error || error{ IllegalTransition, UnknownOperation })!void {
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
 
     const current = try statusOfLocked(store, request_id);
-    if (!op_state.canTransition(current, to)) {
+    if (!op_state.canTransition(current, to.toStatus())) {
         store.db.exec("ROLLBACK") catch {};
         return error.IllegalTransition;
     }
@@ -198,7 +206,7 @@ pub fn advance(store: *Store, request_id: []const u8, to: Status, now: i64) (Err
         "UPDATE operations SET status = ?1, updated_at = ?2 WHERE request_id = ?3",
     );
     defer stmt.deinit();
-    try stmt.bindText(1, to.text());
+    try stmt.bindText(1, to.toStatus().text());
     try stmt.bindInt(2, now);
     try stmt.bindText(3, request_id);
     _ = try stmt.step();
@@ -215,39 +223,23 @@ pub fn statusOfLocked(store: *Store, request_id: []const u8) (Error || error{Unk
     return try Status.parse(stmt.columnText(0));
 }
 
-/// Records the later-proven truth for an unsettled attempt. `status` keeps
-/// the original observation; callers read `effectiveStatus()`.
-pub fn recordResolution(
-    store: *Store,
-    request_id: []const u8,
-    resolved: ResolvedStatus,
-    evidence: []const u8,
-    now: i64,
-) Error!void {
-    var stmt = try store.db.prepare(
-        \\UPDATE operations
-        \\   SET resolved_status = ?1, reconciled_at = ?2,
-        \\       resolution_evidence = ?3, updated_at = ?2
-        \\ WHERE request_id = ?4
-    );
-    defer stmt.deinit();
-    try stmt.bindText(1, resolved.text());
-    try stmt.bindInt(2, now);
-    try stmt.bindText(3, evidence);
-    try stmt.bindText(4, request_id);
-    _ = try stmt.step();
-}
-
 /// Attempts that may still be touching the remote host. Used to block a
 /// same-scope mutation (B7) and to fill the handoff package.
+///
+/// The predicate spells out "unsettled" directly rather than trusting that
+/// `resolved_status` is only ever set on an `indeterminate` row. That
+/// invariant is enforced in `receipts.resolve`, but a safety barrier should
+/// not depend on a rule held somewhere else: a resolution written against a
+/// still-running `submitted` attempt would otherwise silently lift the block.
+const unsettled_predicate =
+    \\ (status IN ('submitted','remote_started')
+    \\  OR (status = 'indeterminate' AND resolved_status IS NULL))
+;
+
 pub fn unsettled(store: *Store, arena: Allocator, server_id: i64) (Error || Allocator.Error)![]Operation {
     var out: std.ArrayList(Operation) = .empty;
     var stmt = try store.db.prepare(select_columns ++
-        \\ WHERE server_id = ?1
-        \\   AND resolved_status IS NULL
-        \\   AND status IN ('submitted','remote_started','indeterminate')
-        \\ ORDER BY created_at DESC
-    );
+        " WHERE server_id = ?1 AND " ++ unsettled_predicate ++ " ORDER BY created_at DESC");
     defer stmt.deinit();
     try stmt.bindInt(1, server_id);
     while (try stmt.step()) try out.append(arena, try rowToOperation(arena, &stmt));
@@ -264,9 +256,8 @@ pub fn unsettledInScope(
 ) (Error || Allocator.Error)![]Operation {
     var out: std.ArrayList(Operation) = .empty;
     var stmt = try store.db.prepare(select_columns ++
-        \\ WHERE server_id = ?1
-        \\   AND resolved_status IS NULL
-        \\   AND status IN ('submitted','remote_started','indeterminate')
+        \\ WHERE server_id = ?1 AND
+    ++ unsettled_predicate ++
         \\   AND (scope_kind = 'server'
         \\        OR (scope_kind = ?2 AND scope_key = ?3))
         \\ ORDER BY created_at DESC

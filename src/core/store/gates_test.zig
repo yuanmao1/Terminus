@@ -233,6 +233,31 @@ test "gate: concurrent first opens all succeed" {
     }
 }
 
+/// Builds a syntactically valid request id from a readable label.
+///
+/// Crockford base32 omits I, L, O and U, so hand-written test ids are easy
+/// to get wrong; this maps the confusable letters and pads to length.
+fn testId(label: []const u8) [ids.len]u8 {
+    var out: [ids.len]u8 = @splat('0');
+    for (label, 0..) |ch, i| {
+        if (i >= ids.len) break;
+        out[i] = switch (std.ascii.toUpper(ch)) {
+            'I', 'L' => '1',
+            'O' => '0',
+            'U' => 'V',
+            '0'...'9', 'A'...'H', 'J', 'K', 'M', 'N', 'P'...'T', 'V'...'Z' => std.ascii.toUpper(ch),
+            else => '0',
+        };
+    }
+    return out;
+}
+
+test testId {
+    const id = testId("guard");
+    try ids.validate(&id);
+    try std.testing.expectEqual(@as(usize, ids.len), id.len);
+}
+
 /// Creates one operation ready to be settled.
 fn seedOperation(store: *Store, request_id: []const u8) !void {
     try store.db.exec(
@@ -253,11 +278,15 @@ fn seedOperation(store: *Store, request_id: []const u8) !void {
 const SettleCtx = struct {
     path: [:0]const u8,
     request_id: []const u8,
+    /// Racing writers deliberately disagree in the conflict test.
+    exit_code: i32,
+    gate: *std.atomic.Value(bool),
     outcome: ?Store.receipts.SettleOutcome = null,
     err: ?anyerror = null,
 };
 
 fn settleInThread(ctx: *SettleCtx) void {
+    while (!ctx.gate.load(.acquire)) std.atomic.spinLoopHint();
     var store = Store.open(ctx.path) catch |err| {
         ctx.err = err;
         return;
@@ -266,8 +295,8 @@ fn settleInThread(ctx: *SettleCtx) void {
     ctx.outcome = Store.receipts.settle(
         &store,
         ctx.request_id,
-        .{ .exited = .{ .exit_code = 0 } },
-        .{ .request_id = ctx.request_id, .kind = .terminal, .observed_at = 200 },
+        .{ .exited = .{ .exit_code = ctx.exit_code } },
+        .{},
         200,
     ) catch |err| {
         ctx.err = err;
@@ -277,48 +306,226 @@ fn settleInThread(ctx: *SettleCtx) void {
 
 test "gate: a terminal receipt is recorded exactly once under contention" {
     const t = std.testing;
-    var scratch = try Scratch.init(t.allocator, "gate_terminal_once");
-    defer scratch.deinit();
 
-    const request_id = "01ABCDEFGH0123456789ABCDEF";
-    {
+    // Two writers that *disagree* — one says success, one says failure. The
+    // ledger must keep whichever landed first and hand the loser that same
+    // verdict, never let the later write redefine the outcome.
+    for ([_][2]i32{ .{ 0, 0 }, .{ 0, 1 } }, 0..) |codes, round| {
+        var name_buf: [40]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "gate_terminal_once_{d}", .{round});
+        var scratch = try Scratch.init(t.allocator, name);
+        defer scratch.deinit();
+
+        const request_id = "01ABCDEFGH0123456789ABCDEF";
+        {
+            var store = try Store.open(scratch.path);
+            defer store.close();
+            try seedOperation(&store, request_id);
+        }
+
+        var gate: std.atomic.Value(bool) = .init(false);
+        var a: SettleCtx = .{ .path = scratch.path, .request_id = request_id, .exit_code = codes[0], .gate = &gate };
+        var b: SettleCtx = .{ .path = scratch.path, .request_id = request_id, .exit_code = codes[1], .gate = &gate };
+        const ta = try std.Thread.spawn(.{}, settleInThread, .{&a});
+        const tb = try std.Thread.spawn(.{}, settleInThread, .{&b});
+        gate.store(true, .release);
+        ta.join();
+        tb.join();
+
+        try t.expectEqual(@as(?anyerror, null), a.err);
+        try t.expectEqual(@as(?anyerror, null), b.err);
+
+        var recorded: usize = 0;
+        var already: usize = 0;
+        var winner_status: ?Store.op_state.Status = null;
+        var loser_saw: ?Store.op_state.Status = null;
+        for ([_]?Store.receipts.SettleOutcome{ a.outcome, b.outcome }) |maybe| {
+            switch (maybe.?) {
+                .recorded => |rec| {
+                    recorded += 1;
+                    winner_status = rec.status;
+                },
+                .already_settled => |rec| {
+                    already += 1;
+                    loser_saw = rec.status;
+                },
+            }
+        }
+        try t.expectEqual(@as(usize, 1), recorded);
+        try t.expectEqual(@as(usize, 1), already);
+        // The loser is told the winner's verdict, not its own.
+        try t.expectEqual(winner_status.?, loser_saw.?);
+
         var store = try Store.open(scratch.path);
         defer store.close();
-        try seedOperation(&store, request_id);
+        var stmt = try store.db.prepare(
+            "SELECT COUNT(*) FROM operation_events WHERE request_id = ?1 AND is_terminal = 1",
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, request_id);
+        try t.expect(try stmt.step());
+        try t.expectEqual(@as(i64, 1), stmt.columnInt(0));
+
+        // And the operation status agrees with the single terminal receipt.
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const op = (try Store.operations.get(&store, arena_state.allocator(), request_id)).?;
+        try t.expectEqual(winner_status.?, op.status);
     }
+}
 
-    var a: SettleCtx = .{ .path = scratch.path, .request_id = request_id };
-    var b: SettleCtx = .{ .path = scratch.path, .request_id = request_id };
-    const ta = try std.Thread.spawn(.{}, settleInThread, .{&a});
-    const tb = try std.Thread.spawn(.{}, settleInThread, .{&b});
-    ta.join();
-    tb.join();
+test "gate: only settle can write a terminal" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_terminal_guard");
+    defer scratch.deinit();
 
-    try t.expectEqual(@as(?anyerror, null), a.err);
-    try t.expectEqual(@as(?anyerror, null), b.err);
-
-    // Exactly one writer recorded it; the other was handed the winner.
-    var recorded: usize = 0;
-    var already: usize = 0;
-    for ([_]?Store.receipts.SettleOutcome{ a.outcome, b.outcome }) |maybe| {
-        switch (maybe.?) {
-            .recorded => recorded += 1,
-            .already_settled => already += 1,
-        }
-    }
-    try t.expectEqual(@as(usize, 1), recorded);
-    try t.expectEqual(@as(usize, 1), already);
-
-    // And the ledger holds a single terminal row.
     var store = try Store.open(scratch.path);
     defer store.close();
+    const rid = testId("guard");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+
+    // `append` refuses a terminal at runtime. A debug assertion would have
+    // vanished in ReleaseFast and let a caller settle without updating the
+    // operation status.
+    try t.expectError(error.TerminalRequiresSettle, Store.receipts.append(&store, .{
+        .request_id = request_id,
+        .kind = .terminal,
+        .observed_at = 200,
+    }));
+
+    // `advance` cannot even name a terminal: LiveStatus has no such member,
+    // so the bypass is a compile error rather than a runtime check.
+    try Store.operations.advance(&store, request_id, .remote_started, 201);
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const op = (try Store.operations.get(&store, arena_state.allocator(), request_id)).?;
+    try t.expectEqual(Store.op_state.Status.remote_started, op.status);
+}
+
+test "gate: settle rejects a terminal the state machine cannot justify" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_settle_transition");
+    defer scratch.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+    const rid = testId("fresh");
+    const request_id: []const u8 = &rid;
+    try Store.operations.create(&store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .exec,
+        .now = 100,
+    });
+
+    // Nothing was ever sent, so a clean completion is not a story the ledger
+    // can tell. Without the in-transaction transition check this succeeded.
+    try t.expectError(error.IllegalTransition, Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .exited = .{ .exit_code = 0 } },
+        .{},
+        200,
+    ));
+
+    // The operation is untouched and no receipt was written.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const op = (try Store.operations.get(&store, arena_state.allocator(), request_id)).?;
+    try t.expectEqual(Store.op_state.Status.created, op.status);
+    try t.expect((try Store.receipts.terminalOf(&store, request_id)) == null);
+
+    // Proving we never submitted *is* justifiable from `created`.
+    const outcome = try Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .never_submitted = .{ .transport_error = "connection refused" } },
+        .{},
+        210,
+    );
+    try t.expectEqual(Store.op_state.Status.failed, outcome.recorded.status);
+}
+
+test "gate: settle refuses evidence that contradicts itself" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_evidence");
+    defer scratch.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("evidence");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+
+    // "Nothing reached the remote" cannot come with a remote process id.
+    try t.expectError(error.ContradictoryEvidence, Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .never_submitted = .{ .transport_error = "refused" } },
+        .{ .remote_pid = 4242 },
+        200,
+    ));
+}
+
+test "gate: indeterminate evidence is persisted, not just mapped" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_evidence_persist");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("persist");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        Store.op_state.terminalForTransportLoss(.remote_started, "channel eof"),
+        .{},
+        300,
+    );
+
+    // `last_observed` tells a reconciler where to look; keeping it only in
+    // memory would make the receipt unusable for that purpose.
     var stmt = try store.db.prepare(
-        "SELECT COUNT(*) FROM operation_events WHERE request_id = ?1 AND is_terminal = 1",
+        "SELECT last_observed, transport_error, error_code FROM operation_events WHERE request_id = ?1 AND is_terminal = 1",
     );
     defer stmt.deinit();
     try stmt.bindText(1, request_id);
     try t.expect(try stmt.step());
-    try t.expectEqual(@as(i64, 1), stmt.columnInt(0));
+    try t.expectEqualStrings("remote_started", stmt.columnText(0));
+    try t.expectEqualStrings("channel eof", stmt.columnText(1));
+    try t.expectEqualStrings("INDETERMINATE", stmt.columnText(2));
+
+    // A confirmed cancellation records how it was carried out.
+    const other_id = testId("cancel");
+    const other: []const u8 = &other_id;
+    try Store.operations.create(&store, .{
+        .request_id = other,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .exec,
+        .now = 400,
+    });
+    try Store.operations.advance(&store, other, .connecting, 401);
+    try Store.operations.advance(&store, other, .submitted, 402);
+    _ = try Store.receipts.settle(
+        &store,
+        other,
+        .{ .cancelled_confirmed = .{ .method = "TERM then KILL, absence verified" } },
+        .{},
+        410,
+    );
+    const rows = try Store.receipts.list(&store, arena, other);
+    try t.expectEqualStrings("cancelled", rows[rows.len - 1].status.?);
 }
 
 test "gate: transport loss after submission records indeterminate, never failed" {
@@ -333,13 +540,7 @@ test "gate: transport loss after submission records indeterminate, never failed"
 
     // The only decision point for a dropped connection.
     const terminal = op_state.terminalForTransportLoss(.submitted, "channel eof");
-    const outcome = try Store.receipts.settle(
-        &store,
-        request_id,
-        terminal,
-        .{ .request_id = request_id, .kind = .terminal, .observed_at = 300 },
-        300,
-    );
+    const outcome = try Store.receipts.settle(&store, request_id, terminal, .{}, 300);
     try t.expectEqual(op_state.Status.indeterminate, outcome.recorded.status);
 
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -350,12 +551,97 @@ test "gate: transport loss after submission records indeterminate, never failed"
     try t.expectEqual(op_state.Status.indeterminate, op.status);
     // Unsettled work must block a same-scope mutation until reconciled.
     try t.expect(op.status.blocksScope());
+    try t.expectEqual(@as(usize, 1), (try Store.operations.unsettled(&store, arena, 1)).len);
 
     // Reconciliation proves the truth without erasing the observation.
-    try Store.operations.recordResolution(&store, request_id, .completed, "found exit 0 in job log", 400);
+    try t.expect((try Store.receipts.resolve(&store, request_id, .completed, "found exit 0 in job log", 400)) == .resolved);
     const after = (try Store.operations.get(&store, arena, request_id)).?;
     try t.expectEqual(op_state.Status.indeterminate, after.status); // preserved
     try t.expectEqual(op_state.Status.completed, after.effectiveStatus());
+    // Once resolved it no longer blocks the scope.
+    try t.expectEqual(@as(usize, 0), (try Store.operations.unsettled(&store, arena, 1)).len);
+
+    // And the resolution left an append-only reconcile event behind it.
+    const rows = try Store.receipts.list(&store, arena, request_id);
+    try t.expectEqualStrings("reconcile", rows[rows.len - 1].kind);
+    try t.expectEqualStrings("reconcile", rows[rows.len - 1].source);
+}
+
+test "gate: resolution cannot lift the barrier on a running operation" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_resolve_guard");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("running");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id); // leaves it `submitted`
+
+    // A `submitted` attempt is not unknown, it is in progress. Resolving it
+    // would drop it out of `unsettled()` and let a peer start a conflicting
+    // mutation while the remote command is still alive.
+    const refused = try Store.receipts.resolve(&store, request_id, .completed, "wishful thinking", 300);
+    try t.expectEqual(op_state.Status.submitted, refused.not_indeterminate);
+
+    // The barrier is still up and nothing was recorded.
+    try t.expectEqual(@as(usize, 1), (try Store.operations.unsettled(&store, arena, 1)).len);
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(@as(?op_state.ResolvedStatus, null), op.resolved_status);
+    try t.expectEqual(@as(usize, 0), (try Store.receipts.list(&store, arena, request_id)).len);
+
+    // Same for a settled operation: a completed run has nothing to resolve.
+    const other_id = testId("done");
+    const other: []const u8 = &other_id;
+    try Store.operations.create(&store, .{
+        .request_id = other,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .exec,
+        .now = 400,
+    });
+    try Store.operations.advance(&store, other, .connecting, 401);
+    try Store.operations.advance(&store, other, .submitted, 402);
+    _ = try Store.receipts.settle(&store, other, .{ .exited = .{ .exit_code = 0 } }, .{}, 410);
+    const refused_done = try Store.receipts.resolve(&store, other, .failed, "rewrite history", 420);
+    try t.expectEqual(op_state.Status.completed, refused_done.not_indeterminate);
+}
+
+test "gate: resolution is write-once" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_resolve_once");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("once");
+    const request_id: []const u8 = &rid;
+    try seedOperation(&store, request_id);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        300,
+    );
+
+    try t.expect((try Store.receipts.resolve(&store, request_id, .completed, "log shows exit 0", 400)) == .resolved);
+
+    // A second reconciler must not overwrite the first one's evidence.
+    const second = try Store.receipts.resolve(&store, request_id, .failed, "disagrees", 500);
+    try t.expectEqual(op_state.ResolvedStatus.completed, second.already_resolved);
+
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqual(op_state.ResolvedStatus.completed, op.resolved_status.?);
+    try t.expectEqualStrings("log shows exit 0", op.resolution_evidence.?);
+
+    try t.expect((try Store.receipts.resolve(&store, &testId("missing"), .completed, "x", 600)) == .unknown_operation);
 }
 
 test "gate: illegal transitions are rejected" {
@@ -372,14 +658,8 @@ test "gate: illegal transitions are rejected" {
     try t.expectError(error.IllegalTransition, Store.operations.advance(&store, request_id, .connecting, 200));
 
     // Settling then advancing again must fail: terminals are frozen.
-    _ = try Store.receipts.settle(
-        &store,
-        request_id,
-        .{ .exited = .{ .exit_code = 3 } },
-        .{ .request_id = request_id, .kind = .terminal, .observed_at = 210 },
-        210,
-    );
-    try t.expectError(error.IllegalTransition, Store.operations.advance(&store, request_id, .completed, 220));
+    _ = try Store.receipts.settle(&store, request_id, .{ .exited = .{ .exit_code = 3 } }, .{}, 210);
+    try t.expectError(error.IllegalTransition, Store.operations.advance(&store, request_id, .remote_started, 220));
 }
 
 fn seedServer(store: *Store) !void {
