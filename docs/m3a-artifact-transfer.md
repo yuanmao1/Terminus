@@ -1,13 +1,70 @@
 # M3a: the ArtifactTransfer contract
 
-> Status: design, awaiting the decisions in §7. Nothing in §2–§6 may be
-> implemented until §7.1, §7.2 and §7.4 are answered — they change core types
-> and the schema.
+> Status: **decided; partially implemented.** All seven §7 questions are
+> answered — §7.3, §7.4 and §7.5 by the programmer directly, the rest by the
+> instruction to implement §2–§6 as written, which is written against the
+> recommendation in each. The answers are recorded in §7.0; the option text
+> is kept below unchanged, because what was weighed is part of the record.
 >
 > Synthesised from three competing designs and nine independent judgements.
 > Every fatal flaw those judgements found is closed here, in §2, by name; the
 > ones that could only be closed by touching a B-class surface are closed in
 > §2 *and* surfaced as a decision in §7 so the shape of the fix is yours.
+
+---
+
+## 7.0 What was decided, and what has landed
+
+| § | Question | Answer | State |
+|---|---|---|---|
+| 7.1 | closing the `filesystem_effect` laundering hole | **A**, tightened further | **implemented** (`212289e`) |
+| 7.2 | a terminal for a locally-published artifact | **A** — new `Terminal.local_effect` | not started |
+| 7.3 | HTTP fetch in M3a or M3b | **defer to M3b** | not started |
+| 7.4 | reshaping `transfer_checkpoints` | **A** — new migration, drop and recreate | not started; gated on the row-count audit below |
+| 7.5 | what happens to `terminus sync` | **port onto the artifact primitive** | not started |
+| 7.6 | the `history` table's last two writers | **B**, scheduled for **M4**, not M3 | not started |
+| 7.7 | where the streaming seam lives | **A** — on `Executor`, `daemon` refuses loudly | not started |
+
+**§7.1 as built differs from option A in three ways, all narrowing.** The
+comparison is not digest-only: evidence carries a `side` (`local`/`remote`)
+alongside the path and digest, and all three must equal what the transfer
+declared — a push that also wrote the same bytes to a scratch path, or a
+reading taken on the wrong machine, no longer settles it. The declaration is
+write-once and only legal while the operation is in `created`/`connecting`
+(`error.ExpectedHashLocked`), so "declared in advance" is enforced rather than
+commented. And a request carrying two declared digests is
+`error.AmbiguousCheckpoint` rather than the newest one by `ORDER BY id DESC` —
+picking between them would turn insertion order into a scope-releasing
+decision. §7.4's `UNIQUE(request_id)` is what makes that case unreachable
+rather than merely refused.
+
+**Still open before §7.4 can be implemented:** the claim that
+`transfer_checkpoints` is empty everywhere rests on "the current source has no
+writer", which does not establish anything about databases written by earlier
+builds or by hand. The real database must be enumerated read-only and its row
+count established before any drop-and-recreate DDL is written.
+
+### 7.0.1 The row-count audit (read-only, 2026-08-14)
+
+Every SQLite database on this machine that could be a Terminus store was
+opened with `mode=ro` and counted. Nothing was written.
+
+| Database | `user_version` | has `transfer_checkpoints` | rows |
+|---|---|---|---|
+| `%APPDATA%/terminus/terminus.db` (the real one, 362 MB) | **4** | **no — the table does not exist** | — |
+| `%TEMP%/m1test.db` (M1 dev store) | 7 | yes | 0 |
+| 14 × `.zig-cache/tmp/*.db` (gate scratch left by crashed runs) | 9–10 | yes | 2 total |
+
+The two rows are in `gate_job_evidence_kind_*.db`, written minutes earlier by
+the transfer gate in this repo's own test run. There is no non-test row
+anywhere.
+
+Two things follow. The drop-and-recreate is safe — this is now established
+rather than inferred. And the real store has never been opened by a 0.2.0
+build at all: it will run v5 → v11 in one go the first time one touches it,
+creating `transfer_checkpoints` at v6 and replacing it at v11 with nothing in
+it. The migration still has to be correct for a store that stopped anywhere in
+v6–v10, because the dev stores above are exactly that.
 
 ---
 
@@ -910,6 +967,10 @@ until §7.1, §7.2 and §7.4 are answered.
 
 Seven B-class calls. §2 is written against my recommendation in each case and
 marks where. None of these is settled anywhere else in this document.
+
+> All seven are now answered — see §7.0 for the answers and what has landed.
+> The option tables below are left exactly as they were written, before the
+> answers were known.
 
 ---
 
