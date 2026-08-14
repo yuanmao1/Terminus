@@ -519,8 +519,7 @@ test "M2e gate: a buried sentinel does not cost a job its outcome" {
     // own sentinel: the tail window we can afford to read holds only trailing
     // noise, so the sentinel scan finds nothing. This is the case the sidecar
     // exists for.
-    const buried = try std.fmt.allocPrint(arena,
-        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":3,\"finishedAt\":1750000000}}\n" ++
+    const buried = try std.fmt.allocPrint(arena, "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":3,\"finishedAt\":1750000000}}\n" ++
         "{s}\n900000\nstill chattering\nand chattering\n", .{ rid, probe_split_marker });
 
     const found = try interpretTail(arena, buried, "__TERMINUS_JOB_9__", rid);
@@ -568,9 +567,7 @@ test "M2e gate: a result belonging to another request is not evidence" {
     // A leftover document from a different attempt in the same directory.
     // Reading it as ours would settle this operation from someone else's exit
     // code — the exact confusion request-keyed results are meant to prevent.
-    const foreign = try std.fmt.allocPrint(arena,
-        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":0,\"finishedAt\":1750000000}}\n{s}\n5\nhi\n",
-        .{ theirs, probe_split_marker });
+    const foreign = try std.fmt.allocPrint(arena, "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":0,\"finishedAt\":1750000000}}\n{s}\n5\nhi\n", .{ theirs, probe_split_marker });
     const probe = try interpretTail(arena, foreign, "__S__", mine);
     try t.expectEqual(@as(?i32, null), probe.exit_code);
     try t.expectEqual(JobProbe.ExitSource.none, probe.exit_source);

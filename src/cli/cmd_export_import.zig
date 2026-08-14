@@ -319,7 +319,7 @@ pub fn importCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             for (plan.items) |item| {
                 if (item.state == .identical) continue;
                 try ctx.out.print("{t}  {s} {s}{s}{s}\n", .{
-                    item.state, item.kind, item.server,
+                    item.state,                       item.kind, item.server,
                     if (item.id.len > 0) ":" else "", item.id,
                 });
                 if (item.state == .conflict) {
@@ -332,7 +332,7 @@ pub fn importCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 });
             } else {
                 try ctx.out.print("applied {d} items; {d} conflicts {s}\n", .{
-                    applied, conflicts,
+                    applied,                                                                                                            conflicts,
                     if (std.mem.eql(u8, strategy, "theirs")) "taken from import" else "kept local (use --strategy theirs to override)",
                 });
             }

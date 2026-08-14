@@ -95,7 +95,10 @@ pub fn build(b: *std.Build) void {
         // ECDSA_WINCNG: enables ecdh kex + ECDSA host/user keys (needed by
         // modern servers). Note WinCNG cannot do ed25519 at all — switching
         // to an OpenSSL/wolfSSL backend for that is tracked in PLAN §8.
-        .flags = &.{ "-DLIBSSH2_WINCNG", "-DLIBSSH2_ECDSA_WINCNG", },
+        .flags = &.{
+            "-DLIBSSH2_WINCNG",
+            "-DLIBSSH2_ECDSA_WINCNG",
+        },
     });
     mod.linkSystemLibrary("ws2_32", .{});
     mod.linkSystemLibrary("bcrypt", .{});
@@ -104,7 +107,6 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("terminus_skill", .{
         .root_source_file = b.path("skill/SKILL.md"),
     });
-
 
     const exe = b.addExecutable(.{
         .name = "Terminus",

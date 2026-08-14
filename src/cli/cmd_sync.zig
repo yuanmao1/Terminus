@@ -86,7 +86,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 });
             } else {
                 try ctx.out.print("synced {d} files ({Bi}) {s} -> {s} in {d} ms{s}\n", .{
-                    summary.files, summary.bytes,          src, dst, duration_ms,
+                    summary.files,                                   summary.bytes, src, dst, duration_ms,
                     if (summary.verified) " [md5 verified]" else "",
                 });
             }
@@ -245,7 +245,7 @@ fn pull(
     const remote_tmp_z = try ctx.arena.dupeZ(u8, remote_tmp);
     const tar_bytes = client.scpRecvBytes(ctx.io, ctx.arena, remote_tmp_z) catch
         Core.transfer.pullBytes(client, ctx.arena, remote_tmp) catch |err|
-            fatal("download failed (scp and exec both): {s} ({s})", .{ client.errorMessage(), @errorName(err) });
+        fatal("download failed (scp and exec both): {s} ({s})", .{ client.errorMessage(), @errorName(err) });
     _ = client.exec(ctx.arena, try std.fmt.allocPrint(ctx.arena, "rm -f {s}", .{remote_tmp})) catch {};
 
     var md5: [16]u8 = undefined;

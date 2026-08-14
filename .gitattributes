@@ -1,0 +1,5 @@
+# zig fmt canonicalises to LF. Without this, a Windows checkout gets CRLF and
+# `zig fmt --check` reports every file in the repo as unformatted, which buries
+# the ones that genuinely are.
+*.zig text eol=lf
+*.zon text eol=lf

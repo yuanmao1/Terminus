@@ -122,7 +122,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 .previous = previous,
             }),
             .human => try ctx.out.print("{s} memory for '{s}'{s}\n", .{
-                action,             targetName(parsed),
+                action,                                                                                     targetName(parsed),
                 if (previous != null and !parsed.boolean("append")) " (previous content replaced)" else "",
             }),
         }
@@ -136,8 +136,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 if (list.len == 0) return ctx.out.print("no memories for '{s}'\n", .{targetName(parsed)});
                 for (list) |m| {
                     try ctx.out.print("[{d}] ({t}) {s}: {s}{s}{s}\n", .{
-                        m.id,               m.scope,           m.key orelse "-",
-                        m.content,          if (m.tags != null) "  #" else "", m.tags orelse "",
+                        m.id,      m.scope,                           m.key orelse "-",
+                        m.content, if (m.tags != null) "  #" else "", m.tags orelse "",
                     });
                 }
             },
