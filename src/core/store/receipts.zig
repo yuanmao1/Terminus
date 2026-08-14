@@ -18,6 +18,10 @@ const Store = @import("Store.zig");
 const Db = @import("Db.zig");
 const op_state = @import("op_state.zig");
 const operations = @import("operations.zig");
+// Read inside this module's own transaction, to bind a published-file hash to
+// the digest its transfer declared in advance. One-way: `transfers` knows
+// nothing about receipts.
+const transfers = @import("transfers.zig");
 const history = @import("history.zig");
 
 pub const schema_version: i64 = 1;
@@ -615,9 +619,17 @@ pub const ResolutionEvidence = union(enum) {
     /// A verified side effect on the filesystem (published artifact hash).
     /// Only meaningful for transfers: a hash matching proves the bytes
     /// landed, which says nothing about an arbitrary command.
+    ///
+    /// The hash is not optional, and `resolve` compares it against the digest
+    /// the transfer committed to *before* it submitted anything. Without both
+    /// halves this is the weakest evidence in the union pretending to be the
+    /// strongest: "a file exists at this path" would settle a transfer whose
+    /// bytes nobody checked, and a stale file left by an earlier run would do
+    /// it. A digest nobody declared in advance proves nothing either — it can
+    /// only be the hash of whatever happens to be there now.
     filesystem_effect: struct {
         path: []const u8,
-        sha256: ?[]const u8 = null,
+        sha256: []const u8,
     },
     /// A human decided, without mechanical proof.
     operator_override: struct {
@@ -754,6 +766,18 @@ pub const ResolveOutcome = union(enum) {
         evidence_request_id: []const u8,
         /// The request id being resolved.
         request_id: []const u8,
+    },
+    /// A published-file hash was offered for an operation that never declared
+    /// which hash would count, or declared a different one. Separate from
+    /// `evidence_does_not_support` because the evidence *kind* is right and
+    /// the claim is the right shape — what is missing is the advance
+    /// commitment that makes the digest mean anything.
+    effect_hash_unproven: struct {
+        path: []const u8,
+        /// The digest the caller observed.
+        observed_sha256: []const u8,
+        /// What the transfer committed to before submitting, if anything.
+        expected_sha256: ?[]const u8,
     },
     /// Only an `indeterminate` attempt can be resolved. Carries what the
     /// status actually is, so the caller can say why it refused.
@@ -895,6 +919,36 @@ pub fn resolve(
             .operation_kind = try arena.dupe(u8, kind),
             .evidence_kind = evidence.kindName(),
         } };
+    }
+    // The same idea as the `job_result` check above, one domain over, and it
+    // runs here because it is the *narrowest* of the three: by now we know the
+    // evidence supports the claim and may speak about this kind of operation,
+    // so what is left is whether it speaks about this particular one.
+    //
+    // A job's evidence is addressed by request id. A transfer's is addressed
+    // by content, so what binds it to this operation is the digest the
+    // transfer wrote down *before* it sent anything. A digest recorded
+    // afterwards would just be the hash of whatever is there now, and
+    // comparing that against itself is how a hash check becomes decoration.
+    //
+    // No declared digest means no proof is possible — not that any digest will
+    // do. Without this, `filesystem_effect` was the weakest evidence in the
+    // union behaving like the strongest: a stale file left at the right path
+    // by an earlier run would settle an indeterminate transfer `completed`.
+    switch (evidence) {
+        .filesystem_effect => |fx| {
+            const expected = try transfers.expectedHashLocked(store, arena, request_id);
+            const matches = if (expected) |want| std.mem.eql(u8, want, fx.sha256) else false;
+            if (!matches) {
+                try rollback(store);
+                return .{ .effect_hash_unproven = .{
+                    .path = fx.path,
+                    .observed_sha256 = fx.sha256,
+                    .expected_sha256 = expected,
+                } };
+            }
+        },
+        else => {},
     }
     if (current_resolution) |existing| {
         try rollback(store);

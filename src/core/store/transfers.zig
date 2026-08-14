@@ -134,7 +134,13 @@ pub const Checkpoint = struct {
     updated_at: i64,
 };
 
-pub const Error = Db.Error || error{ UnknownDirection, UnknownTransferState, OutOfMemory };
+pub const Error = Db.Error || error{
+    UnknownDirection,
+    UnknownTransferState,
+    OutOfMemory,
+    /// An UPDATE addressed by primary key matched no row. See `requireOneRow`.
+    CheckpointRowMissing,
+};
 
 pub const CreateOptions = struct {
     request_id: []const u8,
@@ -268,8 +274,20 @@ pub const RemotePartial = struct {
 };
 
 pub const ResumeVerdict = union(enum) {
-    /// Safe to continue from this offset.
+    /// Safe to continue from this offset, and the remote partial is already
+    /// exactly this long.
     resume_from: u64,
+    /// Safe to continue from `offset`, but the remote partial is longer than
+    /// that and must be truncated back to it first. The extra bytes were
+    /// written and never confirmed — normal after a cut mid-write — and they
+    /// are not evidence of anything, so they are discarded rather than
+    /// counted. Truncating before the prefix is proven would destroy the only
+    /// thing that could have proven it, hence the order: prove, then cut.
+    truncate_then_resume: struct {
+        offset: u64,
+        /// What the partial is now, for the message when the truncate fails.
+        remote_len: u64,
+    },
     /// Nothing usable on the remote; start over (not an error).
     start_over,
     /// The local file is not the one this checkpoint describes.
@@ -315,24 +333,47 @@ pub fn verifyResume(
         .partial_mismatch = "remote partial disappeared after bytes were confirmed",
     };
 
-    // A partial shorter than our confirmed offset means the remote lost data
-    // we had counted; longer means bytes we never confirmed (another writer,
-    // or a crash mid-append). Neither may be trusted as a prefix.
+    // Shorter than our confirmed offset means the remote lost bytes we had
+    // counted — nothing there can be trusted as a prefix of what we sent.
     if (remote.len < confirmed) return .{ .partial_mismatch = "remote partial is shorter than the confirmed offset" };
-    if (remote.len > confirmed) return .{ .partial_mismatch = "remote partial is longer than the confirmed offset" };
 
+    // Longer is the *normal* shape of an interruption, not a fault: the writer
+    // confirms an offset only after the remote acknowledges it, so a cut
+    // mid-write leaves bytes on the far side that were never confirmed.
+    // Rejecting this outright — as this function used to — made resume
+    // unreachable in exactly the case resume exists for.
+    //
+    // Those unconfirmed bytes still prove nothing: they may be a partial
+    // write, or another writer's. So they are not counted and not trusted;
+    // the prefix we *did* confirm is proven first, and only then are they cut
+    // away. Proving is what licenses the truncate, never the other way round.
     if (checkpoint.remote_partial_sha256) |recorded| {
         const observed = remote.prefix_sha256 orelse
             return .{ .partial_mismatch = "remote partial hash unavailable for comparison" };
         if (!std.mem.eql(u8, recorded, observed))
             return .{ .partial_mismatch = "remote partial content does not match the checkpoint" };
+    } else if (remote.len > confirmed) {
+        // No recorded prefix hash and unconfirmed bytes present: there is
+        // nothing to prove the head with, so the tail cannot be discarded
+        // safely and the head cannot be trusted either.
+        return .{ .partial_mismatch = "remote partial is longer than the confirmed offset and no prefix hash was recorded to check it against" };
     }
 
+    if (remote.len > confirmed) return .{ .truncate_then_resume = .{
+        .offset = confirmed,
+        .remote_len = remote.len,
+    } };
     return .{ .resume_from = confirmed };
 }
 
 /// Advances the confirmed offset. `offset` must be the end of the contiguous
 /// completed prefix, never the highest finished chunk.
+///
+/// The `?1 >= confirmed_offset` guard makes a regressing offset match no row,
+/// and `requireOneRow` turns that into a refusal instead of a shrug. Silently
+/// accepting it would let a late reply from an earlier chunk walk the durable
+/// offset backwards, and the next resume would re-send bytes it had already
+/// confirmed — or, worse, trust a prefix hash taken at the higher offset.
 pub fn confirmOffset(
     store: *Store,
     id: i64,
@@ -345,7 +386,7 @@ pub fn confirmOffset(
         \\UPDATE transfer_checkpoints
         \\   SET confirmed_offset = ?1, remote_partial_len = ?2,
         \\       remote_partial_sha256 = COALESCE(?3, remote_partial_sha256),
-        \\       state = 'transferring', updated_at = ?4
+        \\       updated_at = ?4
         \\ WHERE id = ?5 AND ?1 >= confirmed_offset
     );
     defer stmt.deinit();
@@ -355,6 +396,7 @@ pub fn confirmOffset(
     try stmt.bindInt(4, now);
     try stmt.bindInt(5, id);
     _ = try stmt.step();
+    try requireOneRow(store, "confirmOffset");
 }
 
 pub fn setState(store: *Store, id: i64, state: State, failure_reason: ?[]const u8, now: i64) Error!void {
@@ -369,6 +411,64 @@ pub fn setState(store: *Store, id: i64, state: State, failure_reason: ?[]const u
     try stmt.bindInt(3, now);
     try stmt.bindInt(4, id);
     _ = try stmt.step();
+    try requireOneRow(store, "setState");
+}
+
+/// The digest this transfer committed to before it sent anything.
+///
+/// Read by `receipts.resolve`, inside that module's transaction, to decide
+/// whether a published-file hash is allowed to settle this operation. Null
+/// means the transfer never declared one — in which case no observed digest
+/// can prove anything, because there is nothing it could have been checked
+/// against. See `recordExpectedHash`.
+pub fn expectedHashLocked(
+    store: *Store,
+    arena: Allocator,
+    request_id: []const u8,
+) (Db.Error || Allocator.Error)!?[]const u8 {
+    var stmt = try store.db.prepare(
+        \\SELECT expected_sha256 FROM transfer_checkpoints
+        \\ WHERE request_id = ?1 AND expected_sha256 IS NOT NULL
+        \\ ORDER BY id DESC LIMIT 1
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, request_id);
+    if (!try stmt.step()) return null;
+    const raw = stmt.columnOptText(0) orelse return null;
+    return try arena.dupe(u8, raw);
+}
+
+/// Declares, in advance, which digest would prove this transfer landed.
+///
+/// Must be written before the operation submits. Recording it afterwards
+/// would make the later comparison in `receipts.resolve` compare the file to
+/// itself, which is how a hash check becomes decoration.
+pub fn recordExpectedHash(store: *Store, id: i64, sha256: []const u8, now: i64) Error!void {
+    var stmt = try store.db.prepare(
+        "UPDATE transfer_checkpoints SET expected_sha256 = ?1, updated_at = ?2 WHERE id = ?3",
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, sha256);
+    try stmt.bindInt(2, now);
+    try stmt.bindInt(3, id);
+    _ = try stmt.step();
+    try requireOneRow(store, "recordExpectedHash");
+}
+
+/// Fails when an UPDATE matched nothing.
+///
+/// Every write here is addressed by a primary key the caller is holding, so a
+/// zero-row UPDATE means the row is gone, the id is wrong, or a guard in the
+/// WHERE clause rejected the write. All three are real failures, and all three
+/// used to return success: `_ = try stmt.step()` reports that the statement
+/// ran, not that it changed anything. On a durable checkpoint that silence is
+/// the difference between "the offset advanced" and "we believe the offset
+/// advanced" — and the second one resumes from the wrong place.
+fn requireOneRow(store: *Store, what: []const u8) Error!void {
+    if (store.db.changes() == 0) {
+        std.debug.print("terminus: checkpoint write '{s}' matched no row\n", .{what});
+        return error.CheckpointRowMissing;
+    }
 }
 
 pub fn recordVerifiedHash(store: *Store, id: i64, sha256: []const u8, now: i64) Error!void {
@@ -380,6 +480,7 @@ pub fn recordVerifiedHash(store: *Store, id: i64, sha256: []const u8, now: i64) 
     try stmt.bindInt(2, now);
     try stmt.bindInt(3, id);
     _ = try stmt.step();
+    try requireOneRow(store, "recordVerifiedHash");
 }
 
 /// End of the contiguous completed prefix, given which chunks finished.
@@ -487,12 +588,42 @@ test "verifyResume refuses a mismatched remote partial" {
 
     // Remote lost bytes we had counted.
     try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = true, .len = 300, .prefix_sha256 = "bbbb" }) == .partial_mismatch);
-    // Remote has bytes we never confirmed (another writer, or a torn append).
-    try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = true, .len = 500, .prefix_sha256 = "bbbb" }) == .partial_mismatch);
     // Right length, wrong content.
     try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = true, .len = 400, .prefix_sha256 = "cccc" }) == .partial_mismatch);
+    // Longer than confirmed AND the confirmed head does not check out: the
+    // tail cannot be discarded on the strength of a head we just disproved.
+    try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = true, .len = 500, .prefix_sha256 = "cccc" }) == .partial_mismatch);
+    // Longer than confirmed with nothing recorded to check the head against.
+    var no_hash = testCheckpoint();
+    no_hash.remote_partial_sha256 = null;
+    try t.expect(verifyResume(no_hash, local, .{ .exists = true, .len = 500, .prefix_sha256 = "bbbb" }) == .partial_mismatch);
     // Partial vanished after we had confirmed progress: not a clean restart.
     try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = false }) == .partial_mismatch);
+}
+
+test "verifyResume resumes past unconfirmed bytes, after proving the head" {
+    const t = std.testing;
+    const local: LocalIdentity = .{ .path = "./big.bin", .size = 1000, .mtime_ns = 42, .sha256 = "aaaa" };
+
+    // The ordinary shape of an interruption: the writer confirms an offset
+    // only once the remote acknowledges it, so a cut mid-write leaves more
+    // bytes on the far side than were ever confirmed. Refusing this outright
+    // — which this function used to do — made resume unreachable in the one
+    // case it exists for, and every real resume would have restarted at zero.
+    const verdict = verifyResume(testCheckpoint(), local, .{
+        .exists = true,
+        .len = 500,
+        .prefix_sha256 = "bbbb",
+    });
+    try t.expectEqual(@as(u64, 400), verdict.truncate_then_resume.offset);
+    try t.expectEqual(@as(u64, 500), verdict.truncate_then_resume.remote_len);
+
+    // Exactly as long as confirmed needs no truncation at all.
+    try t.expectEqual(@as(u64, 400), verifyResume(testCheckpoint(), local, .{
+        .exists = true,
+        .len = 400,
+        .prefix_sha256 = "bbbb",
+    }).resume_from);
 }
 
 test "verifyResume allows a clean start when nothing was confirmed yet" {

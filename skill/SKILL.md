@@ -265,11 +265,11 @@ connection error.
   adds `stillRunning` and `polls`.
 
 **`job ls` is a different shape and a different clock.** It prints the local
-cache row verbatim, so its keys are snake_case (`exit_code`, `finished_at`,
-`read_cursor`) and its `status` holds the cached labels `running`/`exited`/
-`killed` rather than an operation status. In particular `finished_at` there is
-**not** `finishedAt`: it falls back to local time when the host reported none.
-Use `job status` when the answer matters; `job ls` is for looking around.
+cache, so its `status` holds the cached labels `running`/`exited`/`killed`
+rather than an operation status, and its finish time is `cachedFinishedAt` —
+named apart from `finishedAt` on purpose, because it falls back to local time
+when the host reported none. Use `job status` when the answer matters;
+`job ls` is for looking around.
 
 ### Stopping and forgetting jobs
 

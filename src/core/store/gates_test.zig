@@ -1585,11 +1585,45 @@ test "gate: a job's exit status cannot settle a transfer" {
         try t.expect(!std.mem.eql(u8, row.kind, "reconcile"));
     }
 
-    // The evidence a transfer actually produces still works, so the gate is
-    // about admissibility and not a blanket refusal.
+    // The evidence a transfer actually produces still works — but only once
+    // the transfer has said, in advance, which digest would prove it. Offered
+    // against an operation that declared nothing, a hash is just the hash of
+    // whatever is at that path: a leftover file from an earlier run would
+    // settle this `completed` and release the scope.
+    const undeclared = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "abc" },
+    }, 310);
+    try t.expectEqual(@as(?[]const u8, null), undeclared.effect_hash_unproven.expected_sha256);
+    try t.expectEqualStrings("abc", undeclared.effect_hash_unproven.observed_sha256);
+
+    const checkpoint = try Store.transfers.create(&store, .{
+        .request_id = request_id,
+        .direction = .push,
+        .remote_path = "/srv/app/out.bin",
+        .remote_partial_path = "/srv/app/out.bin.terminus-part",
+        .chunk_size = 1 << 20,
+        .expected_sha256 = "abc",
+        .now = 200,
+    });
+    _ = checkpoint;
+
+    // Declared, but the bytes that landed are not the bytes it was sending.
+    const wrong_bytes = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "def" },
+    }, 311);
+    try t.expectEqualStrings("abc", wrong_bytes.effect_hash_unproven.expected_sha256.?);
+
+    // Still nothing recorded: two refusals in a row must not have leaked a
+    // resolution between them.
+    try t.expectEqual(
+        @as(?op_state.ResolvedStatus, null),
+        (try Store.operations.get(&store, arena, request_id)).?.resolved_status,
+    );
+
+    // Declared and matching. This is the only pairing that settles.
     try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
         .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "abc" },
-    }, 310)) == .resolved);
+    }, 312)) == .resolved);
 }
 
 test "gate: a supervisor report cannot be repointed at another result" {

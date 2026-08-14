@@ -1244,6 +1244,43 @@ fn removeJob(
     }
 }
 
+/// One row of `job ls --json`.
+///
+/// A projection rather than the `Store.jobs.Job` row itself, for one field.
+/// The row's `finished_at` falls back to local time when the host reported
+/// none, and serializing the row verbatim published it under a name one
+/// character away from `job status`'s `finishedAt` — which is documented as a
+/// remote clock reading that is *never* backfilled with local time. Two
+/// near-identical keys with opposite meanings, side by side in the same tool's
+/// output, is a trap; `cachedFinishedAt` says what it is.
+const ListedJob = struct {
+    name: []const u8,
+    command: []const u8,
+    sentinel: []const u8,
+    status: Store.jobs.Status,
+    exitCode: ?i64,
+    /// Local seconds when we last wrote this row, or the host's finish time
+    /// if it happened to report one. Not authoritative: ask `job status`.
+    cachedFinishedAt: ?i64,
+    createdAt: i64,
+    ownerRequestId: ?[]const u8,
+};
+
+fn listedJobs(ctx: *Cli.Ctx, rows: []const Store.jobs.Job) ![]ListedJob {
+    const out = try ctx.arena.alloc(ListedJob, rows.len);
+    for (rows, out) |row, *slot| slot.* = .{
+        .name = row.name,
+        .command = row.command,
+        .sentinel = row.sentinel,
+        .status = row.status,
+        .exitCode = row.exit_code,
+        .cachedFinishedAt = row.finished_at,
+        .createdAt = row.created_at,
+        .ownerRequestId = row.owner_request_id,
+    };
+    return out;
+}
+
 fn listJobs(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -1273,7 +1310,7 @@ fn listJobs(
         .json => try ctx.out.json(.{
             .ok = true,
             .server = server_name,
-            .jobs = shown,
+            .jobs = try listedJobs(ctx, shown),
             .total = total,
             .shown = shown.len,
             .source = "cache",

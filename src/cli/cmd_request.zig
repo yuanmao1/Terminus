@@ -683,6 +683,22 @@ fn interpret(
             .detail = "the evidence does not establish that result",
             .exit = .failure,
         },
+        .effect_hash_unproven => |fx| .{
+            .ok = false,
+            .resolved = null,
+            .mechanical = mechanical,
+            .status = Store.op_state.Status.indeterminate.text(),
+            .detail = if (fx.expected_sha256) |want| std.fmt.allocPrint(
+                arena,
+                "the file at {s} hashes to {s}, but this transfer committed to {s}; the bytes that landed are not the bytes it was sending",
+                .{ fx.path, fx.observed_sha256, want },
+            ) catch "the published file does not hash to what this transfer committed to" else std.fmt.allocPrint(
+                arena,
+                "this transfer never recorded which digest would prove it landed, so the hash of {s} proves nothing about it; settle it with --override if you have checked by hand",
+                .{fx.path},
+            ) catch "this transfer never recorded which digest would prove it landed",
+            .exit = .failure,
+        },
         .evidence_wrong_kind => |mismatch| .{
             .ok = false,
             .resolved = null,
