@@ -280,6 +280,13 @@ when the host reported none. Use `job status` when the answer matters;
   disowned or `setsid` child outlives its pane, so the kill settles
   `indeterminate` and exits 75 rather than claiming the work stopped. The log is
   never deleted here, so `reconcile --from-log` stays possible.
+- Once the session is confirmed gone, `kill` and `rm` look **once more**. A job
+  that ended by itself in the gap between the first probe and the kill has left
+  a real exit status, and settling it as an unprovable cancellation would throw
+  that away. `kill` reports that as `"action":"finished_during_kill"` with the
+  job's own exit code; `rm` uses it to settle before it removes anything. A
+  second look that errors, still finds nothing, or turns up a fresh
+  disagreement changes nothing — the cancellation path stands.
 - Two `job kill` outcomes are neither success nor 75. A `conflict` between the
   result file and the log sentinel reports `"action":"killed"` with `ok:false`
   and the `conflict` object, and needs `reconcile --override`. And an outcome

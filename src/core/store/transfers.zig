@@ -140,6 +140,10 @@ pub const Error = Db.Error || error{
     OutOfMemory,
     /// An UPDATE addressed by primary key matched no row. See `requireOneRow`.
     CheckpointRowMissing,
+    /// `recordExpectedHash` was called on a transfer that had already declared
+    /// a digest, or that had already started. Both mean the value it wants to
+    /// write can no longer be an *advance* commitment.
+    ExpectedHashLocked,
 };
 
 pub const CreateOptions = struct {
@@ -337,28 +341,31 @@ pub fn verifyResume(
     // counted — nothing there can be trusted as a prefix of what we sent.
     if (remote.len < confirmed) return .{ .partial_mismatch = "remote partial is shorter than the confirmed offset" };
 
+    // Length is not content. Any resume from a non-zero offset appends to
+    // bytes we are about to stop looking at, so those bytes must be proven,
+    // not counted: a partial of exactly the right length can be a different
+    // file, a half-written retry, or another writer's work. Both the recorded
+    // hash and the observed one must exist and agree — an equal length with
+    // no hash used to be enough, which meant the strictness below only ever
+    // applied to the interrupted case and never to the clean-looking one.
+    if (confirmed > 0) {
+        const recorded = checkpoint.remote_partial_sha256 orelse
+            return .{ .partial_mismatch = "no prefix hash was recorded for the bytes already confirmed, so they cannot be proven to be ours" };
+        const observed = remote.prefix_sha256 orelse
+            return .{ .partial_mismatch = "remote partial hash unavailable for comparison" };
+        if (!std.mem.eql(u8, recorded, observed))
+            return .{ .partial_mismatch = "remote partial content does not match the checkpoint" };
+    }
+
     // Longer is the *normal* shape of an interruption, not a fault: the writer
     // confirms an offset only after the remote acknowledges it, so a cut
     // mid-write leaves bytes on the far side that were never confirmed.
     // Rejecting this outright — as this function used to — made resume
     // unreachable in exactly the case resume exists for.
     //
-    // Those unconfirmed bytes still prove nothing: they may be a partial
-    // write, or another writer's. So they are not counted and not trusted;
-    // the prefix we *did* confirm is proven first, and only then are they cut
-    // away. Proving is what licenses the truncate, never the other way round.
-    if (checkpoint.remote_partial_sha256) |recorded| {
-        const observed = remote.prefix_sha256 orelse
-            return .{ .partial_mismatch = "remote partial hash unavailable for comparison" };
-        if (!std.mem.eql(u8, recorded, observed))
-            return .{ .partial_mismatch = "remote partial content does not match the checkpoint" };
-    } else if (remote.len > confirmed) {
-        // No recorded prefix hash and unconfirmed bytes present: there is
-        // nothing to prove the head with, so the tail cannot be discarded
-        // safely and the head cannot be trusted either.
-        return .{ .partial_mismatch = "remote partial is longer than the confirmed offset and no prefix hash was recorded to check it against" };
-    }
-
+    // Those unconfirmed bytes still prove nothing, so they are not counted and
+    // not trusted; the head was proven just above, and only that licenses
+    // cutting the tail away. Proving first is the whole ordering.
     if (remote.len > confirmed) return .{ .truncate_then_resume = .{
         .offset = confirmed,
         .remote_len = remote.len,
@@ -414,45 +421,97 @@ pub fn setState(store: *Store, id: i64, state: State, failure_reason: ?[]const u
     try requireOneRow(store, "setState");
 }
 
-/// The digest this transfer committed to before it sent anything.
+/// Which side of the connection a transfer's destination is on.
+///
+/// A push lands on the host; a pull and a fetch land here. The distinction
+/// matters to whoever verifies the result — reading `/srv/app/out.bin` locally
+/// to prove a push would prove nothing about the host — and it is why the
+/// destination is derived from the direction rather than assumed.
+pub const Side = enum { local, remote };
+
+/// What a published-file hash has to match to settle this transfer.
+pub const ExpectedEffect = struct {
+    side: Side,
+    path: []const u8,
+    sha256: []const u8,
+};
+
+/// The commitment this transfer made before it sent anything.
 ///
 /// Read by `receipts.resolve`, inside that module's transaction, to decide
-/// whether a published-file hash is allowed to settle this operation. Null
-/// means the transfer never declared one — in which case no observed digest
-/// can prove anything, because there is nothing it could have been checked
-/// against. See `recordExpectedHash`.
-pub fn expectedHashLocked(
+/// whether a published-file hash may settle this operation. Null means the
+/// transfer never declared one — in which case no observed digest can prove
+/// anything, because there is nothing it could have been checked against.
+///
+/// Refuses to choose when a request has more than one checkpoint carrying a
+/// digest. Taking the newest would mean a scope-releasing decision made by
+/// `ORDER BY id DESC` — silently answering a question about which artifact
+/// with "the most recent one we happened to insert". Until the schema makes
+/// that impossible, ambiguity is an error.
+pub fn expectedEffectLocked(
     store: *Store,
     arena: Allocator,
     request_id: []const u8,
-) (Db.Error || Allocator.Error)!?[]const u8 {
+) (Db.Error || Allocator.Error || error{AmbiguousCheckpoint})!?ExpectedEffect {
     var stmt = try store.db.prepare(
-        \\SELECT expected_sha256 FROM transfer_checkpoints
+        \\SELECT direction, remote_path, local_path, expected_sha256
+        \\  FROM transfer_checkpoints
         \\ WHERE request_id = ?1 AND expected_sha256 IS NOT NULL
-        \\ ORDER BY id DESC LIMIT 1
     );
     defer stmt.deinit();
     try stmt.bindText(1, request_id);
     if (!try stmt.step()) return null;
-    const raw = stmt.columnOptText(0) orelse return null;
-    return try arena.dupe(u8, raw);
+
+    const direction = Direction.parse(stmt.columnText(0)) catch return null;
+    const side: Side = switch (direction) {
+        .push => .remote,
+        .pull, .fetch => .local,
+    };
+    const raw_path = switch (side) {
+        .remote => stmt.columnText(1),
+        .local => stmt.columnOptText(2) orelse return null,
+    };
+    const found: ExpectedEffect = .{
+        .side = side,
+        .path = try arena.dupe(u8, raw_path),
+        .sha256 = try arena.dupe(u8, stmt.columnText(3)),
+    };
+    if (try stmt.step()) return error.AmbiguousCheckpoint;
+    return found;
 }
 
 /// Declares, in advance, which digest would prove this transfer landed.
 ///
-/// Must be written before the operation submits. Recording it afterwards
-/// would make the later comparison in `receipts.resolve` compare the file to
-/// itself, which is how a hash check becomes decoration.
+/// Write-once, and only before the operation submits — both enforced here, in
+/// one statement, rather than left to the caller's ordering. A comment saying
+/// "call this first" is not a guarantee: with a plain UPDATE this could be
+/// written after `submitted`, after `indeterminate`, or over an existing
+/// value, and each of those reopens the laundering hole it exists to close.
+/// The dangerous one is the last: read the destination file, write its hash in
+/// as the "advance commitment", then present that same hash as proof. The
+/// comparison would pass and mean nothing.
+///
+/// `created` and `connecting` are the two states in which nothing has been
+/// sent, so a digest recorded then cannot have been derived from the result.
+/// A caller that gets `error.ExpectedHashLocked` has either already declared
+/// one or has already started, and neither is retryable by trying harder.
 pub fn recordExpectedHash(store: *Store, id: i64, sha256: []const u8, now: i64) Error!void {
     var stmt = try store.db.prepare(
-        "UPDATE transfer_checkpoints SET expected_sha256 = ?1, updated_at = ?2 WHERE id = ?3",
+        \\UPDATE transfer_checkpoints
+        \\   SET expected_sha256 = ?1, updated_at = ?2
+        \\ WHERE id = ?3
+        \\   AND expected_sha256 IS NULL
+        \\   AND request_id IN (
+        \\         SELECT request_id FROM operations
+        \\          WHERE status IN ('created','connecting')
+        \\       )
     );
     defer stmt.deinit();
     try stmt.bindText(1, sha256);
     try stmt.bindInt(2, now);
     try stmt.bindInt(3, id);
     _ = try stmt.step();
-    try requireOneRow(store, "recordExpectedHash");
+    if (store.db.changes() == 0) return error.ExpectedHashLocked;
 }
 
 /// Fails when an UPDATE matched nothing.
@@ -593,10 +652,16 @@ test "verifyResume refuses a mismatched remote partial" {
     // Longer than confirmed AND the confirmed head does not check out: the
     // tail cannot be discarded on the strength of a head we just disproved.
     try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = true, .len = 500, .prefix_sha256 = "cccc" }) == .partial_mismatch);
-    // Longer than confirmed with nothing recorded to check the head against.
+    // Nothing recorded to check the head against, at either length. Length is
+    // not content: a partial of exactly the confirmed size can be a different
+    // file or a half-written retry, and appending to it would splice two
+    // sources together into something whose hash matches neither.
     var no_hash = testCheckpoint();
     no_hash.remote_partial_sha256 = null;
     try t.expect(verifyResume(no_hash, local, .{ .exists = true, .len = 500, .prefix_sha256 = "bbbb" }) == .partial_mismatch);
+    try t.expect(verifyResume(no_hash, local, .{ .exists = true, .len = 400, .prefix_sha256 = "bbbb" }) == .partial_mismatch);
+    // Recorded but not observed: we asked and the host did not tell us.
+    try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = true, .len = 400, .prefix_sha256 = null }) == .partial_mismatch);
     // Partial vanished after we had confirmed progress: not a clean restart.
     try t.expect(verifyResume(testCheckpoint(), local, .{ .exists = false }) == .partial_mismatch);
 }

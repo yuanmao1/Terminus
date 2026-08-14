@@ -591,6 +591,9 @@ fn applyProbe(
     if (probe.exit_code) |code| {
         if (execution) |*e| {
             _ = e.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
+                // The sidecar's own timestamp when it carried one. The ledger
+                // records a finish time only when the host stated it.
+                .finished_at = probe.finished_at,
                 .stdout = .{ .bytes = @intCast(probe.output.len) },
             }) catch |err| Cli.storeFatal(store, err);
         }
@@ -914,6 +917,7 @@ fn killJob(
                 // may have settled this attempt `indeterminate` between our
                 // `attach` and this call. Report the ledger, not the intent.
                 const status = settledStatus(execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
+                    .finished_at = probe.finished_at,
                     .stdout = .{ .bytes = @intCast(probe.output.len) },
                 }) catch |err| Cli.receiptFatal(a.request_id, err, "kill requested"));
                 settled_status = status.text();
@@ -1007,9 +1011,25 @@ fn killJob(
         return;
     }
 
-    // No outcome to preserve, so this is a cancellation in the real sense.
+    // No outcome to preserve *yet*. The kill can change that.
+    //
+    // A job can finish on its own in the window between the probe above and
+    // the kill below, and when it does the wrapper writes its result file.
+    // Killing the session does not remove that file. So settling
+    // `indeterminate` on the strength of the first probe would be recording
+    // "we do not know" while the proof sat on disk — and then charging the
+    // caller a reconcile for it. Worse on the `job rm --discard-evidence`
+    // path, which would delete the record it never read.
+    //
+    // Hence: kill, prove the session is gone, then look again.
     const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);
+
+    if (session_gone) {
+        if (finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)) |after| {
+            return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone);
+        }
+    }
 
     const capability = Core.supervisor.shell_capability;
     const can_prove = Core.supervisor.Requirement.verified_cancellation.satisfiedBy(capability);
@@ -1073,6 +1093,222 @@ fn killJob(
     }
 }
 
+/// One last look for an outcome, after the session is proven gone.
+///
+/// Returns a probe only when it establishes something the first one did not:
+/// an exit code, with no conflict between the two durable records. Everything
+/// else — a probe that errors, a still-unknown outcome, a fresh disagreement —
+/// returns null and lets the caller fall through to the path it was already
+/// on, which is the conservative one.
+///
+/// Not fatal on error. The kill has already happened; failing here costs only
+/// the chance to *upgrade* the answer, and turning that into a hard failure
+/// would make a flaky read worse than no read.
+fn finalProbe(
+    arena: std.mem.Allocator,
+    executor: Core.Executor,
+    session: []const u8,
+    job_name: []const u8,
+    sentinel: []const u8,
+    request_id: ?[]const u8,
+) ?Tmux.JobProbe {
+    const probe = Tmux.probeTail(
+        executor,
+        arena,
+        session,
+        sentinel,
+        request_id,
+        probe_tail_bytes,
+    ) catch |err| {
+        std.debug.print(
+            "terminus: could not re-read job '{s}' after killing its session: {s}; " ++
+                "reporting the cancellation without it\n",
+            .{ job_name, @errorName(err) },
+        );
+        return null;
+    };
+    // A disagreement between the two durable records carries no exit code —
+    // `Tmux.readingOf` refuses to pick a winner — so today the second line
+    // alone would reject this. It is written out anyway because the two say
+    // different things: one is "there is nothing here to upgrade to", the
+    // other is "there is something here and it must not be used". If the
+    // probe ever learns to report a preferred code alongside a conflict, the
+    // first line is what stops that from silently settling a killed job.
+    if (probe.conflict != null) return null;
+    if (probe.exit_code == null) return null;
+    return probe;
+}
+
+test finalProbe {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `probeTail`'s wire shape: the sidecar document, the split marker alone
+    // on its line, the log's byte count, then the tail window.
+    const marker = "__TERMINUS_PROBE_SPLIT__\n";
+    const finished =
+        "{\"v\":1,\"requestId\":\"01ABCDEFGHJKMNPQRSTVWXYZ00\",\"exitCode\":7,\"finishedAt\":1750}\n" ++
+        marker ++ "12\n" ++ "building...\n";
+    // The same job still running: no sidecar was written, and the sentinel is
+    // not in the window either.
+    const unfinished = "\n" ++ marker ++ "12\n" ++ "building...\n";
+    // Both durable records answered and they disagree. This is the dangerous
+    // one: it *looks* like an upgrade, and taking it would settle the job on
+    // whichever record the reader happened to prefer.
+    const conflicting =
+        "{\"v\":1,\"requestId\":\"01ABCDEFGHJKMNPQRSTVWXYZ00\",\"exitCode\":7,\"finishedAt\":1750}\n" ++
+        marker ++ "20\n" ++ "__TERMINUS_END_7__:3\n";
+
+    const empty = try arena.alloc(u8, 0);
+    const Case = struct {
+        what: []const u8,
+        step: Core.Scripted.Step,
+        upgrades: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .what = "a job that finished while we were killing it",
+            .step = .{ .reply = .{
+                .exit_code = 0,
+                .stdout = try arena.dupe(u8, finished),
+                .stderr = empty,
+            } },
+            .upgrades = true,
+        },
+        .{
+            // No outcome to upgrade to. Falling through leaves the caller on
+            // the cancellation path it was already taking.
+            .what = "a job whose end is still unrecorded",
+            .step = .{ .reply = .{
+                .exit_code = 0,
+                .stdout = try arena.dupe(u8, unfinished),
+                .stderr = empty,
+            } },
+            .upgrades = false,
+        },
+        .{
+            // The read failed mid-stream. A kill that already happened must
+            // not be reported *better* because we could not look again.
+            .what = "a probe that could not be read at all",
+            .step = .{ .transport_error = error.ReadFailed },
+            .upgrades = false,
+        },
+        .{
+            // Caught today by the missing exit code rather than by the
+            // conflict check itself; see `finalProbe`. What matters here is
+            // the observable: a disagreement never upgrades a cancellation.
+            .what = "two durable records that disagree",
+            .step = .{ .reply = .{
+                .exit_code = 0,
+                .stdout = try arena.dupe(u8, conflicting),
+                .stderr = empty,
+            } },
+            .upgrades = false,
+        },
+    };
+
+    for (cases) |case| {
+        // `probeTail` reads the tail, then asks whether the session is still
+        // there. Exit 1 = gone, which is where a post-kill probe starts.
+        var scripted = Core.Scripted.init(arena, &.{
+            case.step,
+            .{ .reply = .{ .exit_code = 1, .stdout = empty, .stderr = empty } },
+        });
+        const got = finalProbe(
+            arena,
+            scripted.executor(),
+            "terminus-job-build",
+            "build",
+            "__TERMINUS_END_7__",
+            "01ABCDEFGHJKMNPQRSTVWXYZ00",
+        );
+        if (case.upgrades) {
+            try t.expectEqual(@as(?i32, 7), got.?.exit_code);
+            // The remote clock reading has to survive: it is the only reason
+            // this second look beats settling as a cancellation.
+            try t.expectEqual(@as(?i64, 1750), got.?.finished_at);
+        } else {
+            try t.expect(got == null);
+        }
+    }
+}
+
+/// The job ended by itself while we were killing it, and left its receipt.
+///
+/// Reported as its own action rather than folded into `already_finished`,
+/// because the two are answers to different questions: one says the kill was
+/// unnecessary, this says the kill raced with the job and lost. The exit code
+/// is the real one either way, and it is the reason nothing here is
+/// `indeterminate`.
+fn reportFinishedDuringKill(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    job: Store.jobs.Job,
+    attempt: ?Store.job_attempts.Attempt,
+    probe: Tmux.JobProbe,
+    session_gone: bool,
+) !void {
+    const code = probe.exit_code.?;
+    var settled_status: []const u8 = "unknown";
+    var proven = attempt == null;
+    if (attempt) |a| {
+        if (Core.execution.attach(store, ctx.arena, ctx.io, a.request_id) catch |err|
+            Cli.storeFatal(store, err)) |loaded|
+        {
+            var execution = loaded;
+            const status = settledStatus(execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
+                // The host's own clock when it reported one. Null otherwise —
+                // the ledger's `finished_at` is a remote reading or nothing.
+                .finished_at = probe.finished_at,
+                .stdout = .{ .bytes = @intCast(probe.output.len) },
+            }) catch |err| Cli.receiptFatal(a.request_id, err, "killed, then found finished"));
+            settled_status = status.text();
+            proven = status != .indeterminate;
+        } else if (recordedEffective(ctx, store, a.request_id)) |effective| {
+            settled_status = effective.text();
+            proven = effective != .indeterminate;
+        } else {
+            settled_status = "unknown";
+            proven = false;
+        }
+    }
+    if (job.status.live()) {
+        Store.jobs.markFinished(store, job.id, .exited, code, probe.finished_at orelse ctx.now) catch |err|
+            Cli.storeFatal(store, err);
+    }
+
+    switch (ctx.out.format) {
+        .json => try ctx.out.json(.{
+            .ok = proven,
+            .action = "finished_during_kill",
+            .job = job.name,
+            .status = settled_status,
+            .exitCode = code,
+            .outcomeProven = proven,
+            .finishedAt = probe.finished_at,
+            .observedAt = ctx.now,
+            .sessionGone = session_gone,
+            // Nothing was cancelled: the job reached its own end first.
+            .cancellationProven = false,
+            .requestId = if (attempt) |a| a.request_id else null,
+            .hint = if (proven) null else @as(
+                ?[]const u8,
+                "the host holds this job's exit status but the ledger does not; settle it with 'terminus request reconcile <request-id> --from-log'",
+            ),
+        }),
+        .human => try ctx.out.print(
+            "job '{s}' finished on its own (exit {d}) while its session was being killed; recorded that, not a cancellation\n",
+            .{ job.name, code },
+        ),
+    }
+    if (!proven) {
+        try ctx.out.flush();
+        Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
+    }
+}
+
 /// Forgets a job's name while preserving what can still be proven.
 ///
 /// The original version killed the session — which also deleted the remote log
@@ -1106,8 +1342,9 @@ fn removeJob(
     const discard = parsed.boolean("discard-evidence");
 
     // Look before destroying: if the outcome is provable right now, it need
-    // never become an override.
-    const probe = Tmux.probeTail(
+    // never become an override. Re-read after the kill (below), because the
+    // window between the two is long enough for the job to finish in.
+    var probe = Tmux.probeTail(
         executor,
         ctx.arena,
         session,
@@ -1124,6 +1361,16 @@ fn removeJob(
         "job '{s}' session is still present after cleanup; refusing to forget a job that may still be running. Nothing was deleted — no log, no result record, no local row. Inspect it with 'tmux attach -t {s}' on the host",
         .{ job.name, try Tmux.targetName(ctx.arena, session) },
     );
+
+    // Look again before destroying anything.
+    //
+    // The probe above ran before the kill, and a job can reach its own end in
+    // between — the wrapper writes its result file when it does, and killing
+    // the session does not remove that file. Acting on the first probe alone
+    // meant `--discard-evidence` could delete a receipt written seconds
+    // earlier and then settle `indeterminate` for want of it: the command
+    // destroys the proof and bills the caller for its absence.
+    if (finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)) |after| probe = after;
 
     if (discard) {
         // Only now, with the session proven gone. A live pane recreates the
@@ -1161,7 +1408,9 @@ fn removeJob(
                 } }, .{})
             else if (probe.exit_code) |code| out: {
                 proven = true;
-                break :out execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{});
+                break :out execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
+                    .finished_at = probe.finished_at,
+                });
             } else execution.settleAttached(.{ .indeterminate = .{
                 .reason = if (discard)
                     "job removed with --discard-evidence; the log was deleted, so its outcome can no longer be established mechanically"

@@ -643,6 +643,13 @@ fn reconcileByOverride(
     return interpret(result, resolved, false, "recorded as a human decision, not as proof", ctx.arena);
 }
 
+fn sideName(side: Store.transfers.Side) []const u8 {
+    return switch (side) {
+        .local => "local",
+        .remote => "remote",
+    };
+}
+
 fn interpret(
     result: Store.receipts.ResolveOutcome,
     resolved: Store.op_state.ResolvedStatus,
@@ -683,20 +690,27 @@ fn interpret(
             .detail = "the evidence does not establish that result",
             .exit = .failure,
         },
+        // Names all three halves — side, path and digest — because any one of
+        // them can be the thing that does not line up, and an operator who is
+        // only told "hash mismatch" cannot tell a corrupted payload from a
+        // reading taken on the wrong machine or at the wrong path.
         .effect_hash_unproven => |fx| .{
             .ok = false,
             .resolved = null,
             .mechanical = mechanical,
             .status = Store.op_state.Status.indeterminate.text(),
-            .detail = if (fx.expected_sha256) |want| std.fmt.allocPrint(
+            .detail = if (fx.expected) |want| std.fmt.allocPrint(
                 arena,
-                "the file at {s} hashes to {s}, but this transfer committed to {s}; the bytes that landed are not the bytes it was sending",
-                .{ fx.path, fx.observed_sha256, want },
-            ) catch "the published file does not hash to what this transfer committed to" else std.fmt.allocPrint(
+                "this transfer committed to publishing {s} on the {s} side hashing to {s}; what was read was {s} on the {s} side hashing to {s}",
+                .{
+                    want.path,          sideName(want.side),         want.sha256,
+                    fx.observed.path,   sideName(fx.observed.side),  fx.observed.sha256,
+                },
+            ) catch "what was read is not the file this transfer committed to publishing" else std.fmt.allocPrint(
                 arena,
-                "this transfer never recorded which digest would prove it landed, so the hash of {s} proves nothing about it; settle it with --override if you have checked by hand",
-                .{fx.path},
-            ) catch "this transfer never recorded which digest would prove it landed",
+                "this transfer never recorded which file would prove it landed, so reading {s} proves nothing about it; settle it with --override if you have checked by hand",
+                .{fx.observed.path},
+            ) catch "this transfer never recorded which file would prove it landed",
             .exit = .failure,
         },
         .evidence_wrong_kind => |mismatch| .{

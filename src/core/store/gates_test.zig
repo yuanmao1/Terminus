@@ -1307,7 +1307,7 @@ test "gate: evidence must entail the result it is used to justify" {
 
     // A published file hash says nothing about an arbitrary command.
     try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
-        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "abc" },
+        .filesystem_effect = .{ .side = .remote, .path = "/srv/app/out.bin", .sha256 = "abc" },
     }, 403)) == .evidence_wrong_kind);
 
     // Nothing was recorded by any of the refusals.
@@ -1591,10 +1591,13 @@ test "gate: a job's exit status cannot settle a transfer" {
     // whatever is at that path: a leftover file from an earlier run would
     // settle this `completed` and release the scope.
     const undeclared = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
-        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "abc" },
+        .filesystem_effect = .{ .side = .remote, .path = "/srv/app/out.bin", .sha256 = "abc" },
     }, 310);
-    try t.expectEqual(@as(?[]const u8, null), undeclared.effect_hash_unproven.expected_sha256);
-    try t.expectEqualStrings("abc", undeclared.effect_hash_unproven.observed_sha256);
+    try t.expectEqual(
+        @as(?Store.transfers.ExpectedEffect, null),
+        undeclared.effect_hash_unproven.expected,
+    );
+    try t.expectEqualStrings("abc", undeclared.effect_hash_unproven.observed.sha256);
 
     const checkpoint = try Store.transfers.create(&store, .{
         .request_id = request_id,
@@ -1609,11 +1612,27 @@ test "gate: a job's exit status cannot settle a transfer" {
 
     // Declared, but the bytes that landed are not the bytes it was sending.
     const wrong_bytes = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
-        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "def" },
+        .filesystem_effect = .{ .side = .remote, .path = "/srv/app/out.bin", .sha256 = "def" },
     }, 311);
-    try t.expectEqualStrings("abc", wrong_bytes.effect_hash_unproven.expected_sha256.?);
+    try t.expectEqualStrings("abc", wrong_bytes.effect_hash_unproven.expected.?.sha256);
 
-    // Still nothing recorded: two refusals in a row must not have leaked a
+    // Right bytes, wrong destination. A digest is a statement about content,
+    // not about where the content ended up: a push that also wrote the same
+    // bytes to a scratch path would otherwise settle as if it had published.
+    const wrong_path = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .filesystem_effect = .{ .side = .remote, .path = "/tmp/scratch.bin", .sha256 = "abc" },
+    }, 312);
+    try t.expectEqualStrings("/srv/app/out.bin", wrong_path.effect_hash_unproven.expected.?.path);
+
+    // Right bytes at the right path, read on the wrong machine. A push
+    // publishes on the host; proving the local source still exists proves
+    // nothing about what landed there.
+    const wrong_side = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .filesystem_effect = .{ .side = .local, .path = "/srv/app/out.bin", .sha256 = "abc" },
+    }, 313);
+    try t.expectEqual(Store.transfers.Side.remote, wrong_side.effect_hash_unproven.expected.?.side);
+
+    // Still nothing recorded: four refusals in a row must not have leaked a
     // resolution between them.
     try t.expectEqual(
         @as(?op_state.ResolvedStatus, null),
@@ -1622,8 +1641,8 @@ test "gate: a job's exit status cannot settle a transfer" {
 
     // Declared and matching. This is the only pairing that settles.
     try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
-        .filesystem_effect = .{ .path = "/srv/app/out.bin", .sha256 = "abc" },
-    }, 312)) == .resolved);
+        .filesystem_effect = .{ .side = .remote, .path = "/srv/app/out.bin", .sha256 = "abc" },
+    }, 314)) == .resolved);
 }
 
 test "gate: a supervisor report cannot be repointed at another result" {
@@ -1851,4 +1870,228 @@ test "gate: host key mismatch is reported, never auto-updated" {
     }, "server rebuilt");
     try t.expect((try Store.host_pins.verify(&store, arena, "h", 22, "ssh-ed25519", "SHA256:bbb")) == .match);
     try t.expectEqual(@as(usize, 1), (try Store.host_pins.list(&store, arena)).len);
+}
+
+/// A transfer operation parked at `connecting`, i.e. before anything has been
+/// sent. `seedOperationOfKind` runs on to `submitted`, which is exactly the
+/// state the digest-declaration gate needs to be *outside* of.
+fn seedTransferBeforeSubmit(store: *Store, request_id: []const u8) !void {
+    store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'race', '10.0.0.1', 22, 'ubuntu', 100, 100);
+    ) catch |err| switch (err) {
+        // The second call in a test shares the first call's server.
+        error.Constraint => {},
+        else => return err,
+    };
+    try Store.operations.create(store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .transfer_push,
+        .now = 100,
+    });
+    try Store.operations.advance(store, request_id, .connecting, 101);
+}
+
+test "gate: the digest a transfer will be judged by is declared once, before it sends" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_digest_write_once");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    const early_id = testId("early");
+    const early: []const u8 = &early_id;
+    try seedTransferBeforeSubmit(&store, early);
+    const checkpoint = try Store.transfers.create(&store, .{
+        .request_id = early,
+        .direction = .push,
+        .remote_path = "/srv/app/out.bin",
+        .remote_partial_path = "/srv/app/out.bin.terminus-part",
+        .chunk_size = 1 << 20,
+        .now = 100,
+    });
+
+    // Declaring it before the first byte leaves is the whole point, so that
+    // one is allowed.
+    try Store.transfers.recordExpectedHash(&store, checkpoint, "abc", 110);
+
+    // A second declaration is refused even while the transfer is still early:
+    // a digest that can be rewritten is a digest that can be made to match
+    // whatever landed, which is the same as having none.
+    try t.expectError(
+        error.ExpectedHashLocked,
+        Store.transfers.recordExpectedHash(&store, checkpoint, "def", 111),
+    );
+    try t.expectEqualStrings(
+        "abc",
+        (try Store.transfers.get(&store, arena, checkpoint)).?.expected_sha256.?,
+    );
+
+    // And a first declaration made after submission is refused too. By then
+    // the bytes are already in flight, so "what I promised to publish" is
+    // indistinguishable from "what I found afterwards".
+    const late_id = testId("late");
+    const late: []const u8 = &late_id;
+    try seedTransferBeforeSubmit(&store, late);
+    const late_checkpoint = try Store.transfers.create(&store, .{
+        .request_id = late,
+        .direction = .push,
+        .remote_path = "/srv/app/late.bin",
+        .remote_partial_path = "/srv/app/late.bin.terminus-part",
+        .chunk_size = 1 << 20,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, late, .submitted, 102);
+    try t.expectError(
+        error.ExpectedHashLocked,
+        Store.transfers.recordExpectedHash(&store, late_checkpoint, "abc", 112),
+    );
+    try t.expectEqual(
+        @as(?[]const u8, null),
+        (try Store.transfers.get(&store, arena, late_checkpoint)).?.expected_sha256,
+    );
+}
+
+test "gate: a checkpoint write that lands on no row is an error, not a success" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_checkpoint_missing");
+    defer scratch.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // Every one of these used to return void on a zero-row UPDATE, which made
+    // "the checkpoint we are writing progress into does not exist" look
+    // exactly like "progress recorded".
+    try t.expectError(
+        error.CheckpointRowMissing,
+        Store.transfers.confirmOffset(&store, 999, 4096, 4096, null, 100),
+    );
+    try t.expectError(
+        error.CheckpointRowMissing,
+        Store.transfers.setState(&store, 999, .transferring, null, 100),
+    );
+    try t.expectError(
+        error.CheckpointRowMissing,
+        Store.transfers.recordVerifiedHash(&store, 999, "abc", 100),
+    );
+}
+
+test "gate: two declared digests for one request refuse to settle it" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_ambiguous_checkpoint");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    const rid = testId("ambig");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .transfer_push);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        300,
+    );
+
+    for ([_][]const u8{ "abc", "def" }) |digest| {
+        _ = try Store.transfers.create(&store, .{
+            .request_id = request_id,
+            .direction = .push,
+            .remote_path = "/srv/app/out.bin",
+            .remote_partial_path = "/srv/app/out.bin.terminus-part",
+            .chunk_size = 1 << 20,
+            .expected_sha256 = digest,
+            .now = 200,
+        });
+    }
+
+    // Two promises, both plausible. Picking one by `ORDER BY id DESC` would
+    // make a scope-releasing decision out of insertion order, so this refuses
+    // instead — and refuses as an error, because unlike a mismatch it is not
+    // a fact about the transfer, it is a fact about our own bookkeeping.
+    try t.expectError(error.AmbiguousCheckpoint, Store.receipts.resolve(
+        &store,
+        arena,
+        request_id,
+        .completed,
+        .{ .filesystem_effect = .{ .side = .remote, .path = "/srv/app/out.bin", .sha256 = "abc" } },
+        400,
+    ));
+
+    // The refusal left the ledger untouched — including the transaction it
+    // had already opened.
+    try t.expectEqual(
+        @as(?op_state.ResolvedStatus, null),
+        (try Store.operations.get(&store, arena, request_id)).?.resolved_status,
+    );
+}
+
+test "gate: the ledger records the time we looked, never a finish time we were not told" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_finished_at_honest");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // A sentinel-only outcome: the exit code survived in the pane log, but
+    // nothing on the host ever told us *when* the command ended.
+    const silent_id = testId("silent");
+    const silent: []const u8 = &silent_id;
+    try seedOperation(&store, silent);
+    _ = try Store.receipts.settle(&store, silent, .{ .exited = .{ .exit_code = 0 } }, .{}, 900);
+
+    const silent_terminal = try terminalRow(&store, arena, silent);
+    // `now` would have been a plausible-looking answer and a false one: it
+    // says when we read the log, which on a job polled hours later is hours
+    // wrong. A null here is what lets `job status` say "unknown" instead.
+    try t.expectEqual(@as(?i64, null), silent_terminal.finished_at);
+    try t.expectEqual(@as(i64, 900), silent_terminal.observed_at);
+
+    // With a real remote clock reading, it is kept exactly as given — the
+    // point is not to be shy about finish times, it is to only report ones
+    // the host actually reported.
+    const timed_id = testId("timed");
+    const timed: []const u8 = &timed_id;
+    try Store.operations.create(&store, .{
+        .request_id = timed,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .job,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, timed, .connecting, 101);
+    try Store.operations.advance(&store, timed, .submitted, 102);
+    _ = try Store.receipts.settle(
+        &store,
+        timed,
+        .{ .exited = .{ .exit_code = 0 } },
+        .{ .finished_at = 852 },
+        900,
+    );
+    const timed_terminal = try terminalRow(&store, arena, timed);
+    try t.expectEqual(@as(?i64, 852), timed_terminal.finished_at);
+    try t.expectEqual(@as(i64, 900), timed_terminal.observed_at);
+}
+
+fn terminalRow(store: *Store, arena: std.mem.Allocator, request_id: []const u8) !Store.receipts.Row {
+    for (try Store.receipts.list(store, arena, request_id)) |row| {
+        if (row.is_terminal) return row;
+    }
+    return error.NoTerminalEvent;
 }

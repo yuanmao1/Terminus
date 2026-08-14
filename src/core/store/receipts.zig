@@ -151,6 +151,10 @@ pub const Error = Db.Error || error{
     /// to the remote).
     EvidenceDoesNotFit,
     UnknownOperation,
+    /// More than one checkpoint carrying a declared digest exists for one
+    /// request. Choosing between them would make a scope-releasing decision
+    /// by `ORDER BY`; see `transfers.expectedEffectLocked`.
+    AmbiguousCheckpoint,
     /// The `operations.kind` column holds something longer than any kind this
     /// binary knows. Not a business outcome: it means the row is not one we
     /// can reason about, so no admissibility decision may be made from it.
@@ -428,7 +432,18 @@ fn terminalEvent(
         .status = terminal.status(),
         .phase = extra.phase,
         .started_at = extra.started_at,
-        .finished_at = extra.finished_at orelse now,
+        // Never `orelse now`. `finished_at` answers "when did the remote work
+        // end", and the only honest answer to that is one the remote gave us:
+        // a sidecar's timestamp, a supervisor's report, a verified absence.
+        // `now` answers "when did we look", which is `observed_at`, two lines
+        // up and always present. Substituting one for the other made every
+        // terminal receipt carry a finish time, most of them invented, and
+        // buried the difference between a job that ended at 14:02 and one we
+        // happened to notice at 14:02 after the connection came back.
+        //
+        // Null is the correct value for an outcome whose timing was never
+        // established, and it is what the CLI already reports.
+        .finished_at = extra.finished_at,
         .duration_ms = extra.duration_ms,
         .remote_pid = extra.remote_pid,
         .remote_pgid = extra.remote_pgid,
@@ -620,14 +635,21 @@ pub const ResolutionEvidence = union(enum) {
     /// Only meaningful for transfers: a hash matching proves the bytes
     /// landed, which says nothing about an arbitrary command.
     ///
-    /// The hash is not optional, and `resolve` compares it against the digest
-    /// the transfer committed to *before* it submitted anything. Without both
-    /// halves this is the weakest evidence in the union pretending to be the
-    /// strongest: "a file exists at this path" would settle a transfer whose
-    /// bytes nobody checked, and a stale file left by an earlier run would do
-    /// it. A digest nobody declared in advance proves nothing either — it can
-    /// only be the hash of whatever happens to be there now.
+    /// All three fields are compared in `resolve` against what the transfer
+    /// committed to *before* it submitted anything. Without every one of them
+    /// this is the weakest evidence in the union pretending to be the
+    /// strongest:
+    ///
+    /// * no hash, and "a file exists at this path" settles a transfer whose
+    ///   bytes nobody checked — a stale file from an earlier run will do it;
+    /// * no path, and the same content found *anywhere* settles it, so a copy
+    ///   of the source still sitting in /tmp proves the destination was
+    ///   written;
+    /// * no side, and reading the local copy proves the remote one landed.
     filesystem_effect: struct {
+        /// Which machine the file was read on. A push publishes on the host;
+        /// a pull and a fetch publish here.
+        side: transfers.Side,
         path: []const u8,
         sha256: []const u8,
     },
@@ -717,6 +739,7 @@ pub const ResolutionEvidence = union(enum) {
                 .exit_code = s.exit_code,
             } },
             .filesystem_effect => |f| .{ .filesystem_effect = .{
+                .side = f.side,
                 .path = try redact(arena, f.path),
                 .sha256 = f.sha256,
             } },
@@ -768,16 +791,21 @@ pub const ResolveOutcome = union(enum) {
         request_id: []const u8,
     },
     /// A published-file hash was offered for an operation that never declared
-    /// which hash would count, or declared a different one. Separate from
+    /// what would count, or whose declaration it does not match. Separate from
     /// `evidence_does_not_support` because the evidence *kind* is right and
     /// the claim is the right shape — what is missing is the advance
-    /// commitment that makes the digest mean anything.
+    /// commitment that makes the observation mean anything.
     effect_hash_unproven: struct {
-        path: []const u8,
-        /// The digest the caller observed.
-        observed_sha256: []const u8,
+        /// What the caller says it read, and where.
+        observed: Observed,
         /// What the transfer committed to before submitting, if anything.
-        expected_sha256: ?[]const u8,
+        expected: ?transfers.ExpectedEffect,
+
+        pub const Observed = struct {
+            side: transfers.Side,
+            path: []const u8,
+            sha256: []const u8,
+        };
     },
     /// Only an `indeterminate` attempt can be resolved. Carries what the
     /// status actually is, so the caller can say why it refused.
@@ -937,14 +965,18 @@ pub fn resolve(
     // by an earlier run would settle an indeterminate transfer `completed`.
     switch (evidence) {
         .filesystem_effect => |fx| {
-            const expected = try transfers.expectedHashLocked(store, arena, request_id);
-            const matches = if (expected) |want| std.mem.eql(u8, want, fx.sha256) else false;
+            const expected = try transfers.expectedEffectLocked(store, arena, request_id);
+            const matches = if (expected) |want|
+                want.side == fx.side and
+                    std.mem.eql(u8, want.path, fx.path) and
+                    std.mem.eql(u8, want.sha256, fx.sha256)
+            else
+                false;
             if (!matches) {
                 try rollback(store);
                 return .{ .effect_hash_unproven = .{
-                    .path = fx.path,
-                    .observed_sha256 = fx.sha256,
-                    .expected_sha256 = expected,
+                    .observed = .{ .side = fx.side, .path = fx.path, .sha256 = fx.sha256 },
+                    .expected = expected,
                 } };
             }
         },
