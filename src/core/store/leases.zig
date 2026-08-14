@@ -150,6 +150,7 @@ pub fn conflictForLocked(
     owner_token: []const u8,
     now: i64,
 ) Error!?Lease {
+    try store.db.requireTransaction();
     try expireLapsedLocked(store, server_id, now);
     for (try activeLocked(store, arena, server_id)) |lease| {
         if (lease.heldBy(owner_token)) continue;
@@ -166,6 +167,35 @@ pub fn active(store: *Store, arena: Allocator, server_id: i64, now: i64) Error![
     const list = try activeLocked(store, arena, server_id);
     try store.db.exec("COMMIT");
     return list;
+}
+
+/// How many leases on this server are still held, after the lazy expiry pass.
+///
+/// The barrier `servers.remove` refuses over. `leases.server_id` is
+/// `ON DELETE CASCADE`, so deleting the host does not merely un-scope the
+/// leases the way it un-scopes operations — it destroys them, together with the
+/// `superseded_by` chain that is the only record of who held what. A peer
+/// session mid-deploy would find its claim gone with nothing saying where it
+/// went.
+///
+/// The expiry pass runs first, and has to: without it a lease whose owner died
+/// hours ago would block the removal for as long as the row sat there
+/// un-swept, which is a trap with no way out rather than a barrier. After it,
+/// what is left is what is genuinely still claimed.
+///
+/// Caller must hold the write transaction — both because the expiry pass
+/// writes, and because a count taken outside it describes a moment that has
+/// already passed by the time the DELETE runs.
+pub fn activeCountLocked(store: *Store, server_id: i64, now: i64) Db.Error!i64 {
+    try store.db.requireTransaction();
+    try expireLapsedLocked(store, server_id, now);
+    var stmt = try store.db.prepare(
+        "SELECT COUNT(*) FROM leases WHERE server_id = ?1 AND released_at IS NULL",
+    );
+    defer stmt.deinit();
+    try stmt.bindInt(1, server_id);
+    if (!try stmt.step()) return error.Sqlite;
+    return stmt.columnInt(0);
 }
 
 /// The lease blocking `scope`, if a *different* owner holds an overlapping

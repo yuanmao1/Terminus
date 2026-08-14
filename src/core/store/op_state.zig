@@ -63,6 +63,32 @@ pub const Status = enum {
         };
     }
 
+    /// Whether the attempt has yet to hand its command to the remote.
+    ///
+    /// The window in which a commitment made *in advance* is still in advance
+    /// of anything. `transfers` guards three statements on it: a checkpoint may
+    /// only be minted, may only declare the digest it will be judged by, and
+    /// may only be taken over by an heir, while that heir has sent nothing. A
+    /// checkpoint minted after submission describes bytes already in flight,
+    /// and a digest declared then is indistinguishable from a reading of
+    /// whatever landed.
+    ///
+    /// No terminal is in the window, including the two that end without ever
+    /// submitting (`never_submitted` proves the command did not leave, and
+    /// `local_abandon` gives up before it does). A settled attempt has nothing
+    /// left to commit to, and letting one adopt a transfer would hand live work
+    /// to an operation that has already published its verdict.
+    ///
+    /// Exhaustive with no `else`, so a new status has to be classified rather
+    /// than defaulting into whichever answer the author happened to write last.
+    pub fn beforeSubmission(s: Status) bool {
+        return switch (s) {
+            .created, .connecting => true,
+            .submitted, .remote_started => false,
+            .completed, .failed, .timed_out, .cancelled, .indeterminate => false,
+        };
+    }
+
     /// Strict parse. Unknown text is an error, never a default: a status we
     /// cannot interpret must not silently become `running`-ish.
     pub fn parse(raw: []const u8) error{UnknownStatus}!Status {
@@ -73,6 +99,46 @@ pub const Status = enum {
         return @tagName(s);
     }
 };
+
+/// The statuses satisfying a role predicate, in enum declaration order.
+fn statusesWhere(comptime role: fn (Status) bool) []const Status {
+    comptime {
+        var out: []const Status = &[_]Status{};
+        for (@typeInfo(Status).@"enum".fields) |field| {
+            const s: Status = @enumFromInt(field.value);
+            if (role(s)) out = out ++ &[_]Status{s};
+        }
+        return out;
+    }
+}
+
+/// Renders the statuses satisfying `role` as a SQL `IN` list:
+/// `'created','connecting'`.
+///
+/// This module owns the status vocabulary, so it owns the lists too. Every
+/// statement in `transfers` that constrains `operations.status` used to spell
+/// its own out — three copies of `('created','connecting')`, none of which any
+/// predicate here could reach. That is the same shape of duplication that let
+/// the checkpoint states drift from the index enforcing them: the Zig predicate
+/// moves, the hand-typed SQL does not, and nothing fails until a row is stuck.
+///
+/// An empty predicate is a compile error rather than a list nothing matches.
+/// `transfers.State`'s renderer maps the empty set to `NULL` because "this
+/// target has no legal predecessor" is a real answer there; a status set with
+/// no members is only ever a predicate written by mistake.
+pub fn sqlList(comptime role: fn (Status) bool) []const u8 {
+    comptime {
+        const members = statusesWhere(role);
+        if (members.len == 0) @compileError(
+            "an empty status list matches no operation, which is never what a guard means",
+        );
+        var out: []const u8 = "";
+        for (members, 0..) |s, i| {
+            out = out ++ (if (i == 0) "" else ",") ++ "'" ++ @tagName(s) ++ "'";
+        }
+        return out;
+    }
+}
 
 /// The states an operation may be *advanced* into.
 ///
@@ -457,4 +523,42 @@ test "blocksScope covers exactly the unsettled states" {
     try t.expect(Status.indeterminate.blocksScope());
     try t.expect(!Status.completed.blocksScope());
     try t.expect(!Status.failed.blocksScope());
+}
+
+test "beforeSubmission is the advance-commitment window, and holds no terminal" {
+    const t = std.testing;
+
+    // The two states in which the caller's command has provably not left.
+    try t.expect(Status.created.beforeSubmission());
+    try t.expect(Status.connecting.beforeSubmission());
+    try t.expect(!Status.submitted.beforeSubmission());
+
+    // Disjoint from the terminals, and the two that end without submitting are
+    // the ones worth naming: `failed` via `never_submitted` and `cancelled` via
+    // `local_abandon` both leave from inside the window, and neither is still
+    // in it afterwards. A settled attempt has nothing left to commit to.
+    inline for (@typeInfo(Status).@"enum".fields) |field| {
+        const s: Status = @enumFromInt(field.value);
+        try t.expect(!(s.beforeSubmission() and s.isTerminal()));
+    }
+    try t.expect(!Status.failed.beforeSubmission());
+    try t.expect(!Status.cancelled.beforeSubmission());
+}
+
+test sqlList {
+    const t = std.testing;
+    // Declaration order, quoted, comma-separated — the shape a `status IN (...)`
+    // guard needs, and the reason no statement has to spell one out.
+    try t.expectEqualStrings("'created','connecting'", comptime sqlList(Status.beforeSubmission));
+    try t.expectEqualStrings(
+        "'completed','failed','timed_out','cancelled','indeterminate'",
+        comptime sqlList(Status.isTerminal),
+    );
+    // The two are complementary in the only sense a guard cares about: no
+    // status is in both, so a statement cannot be satisfied by both lists.
+    try t.expectEqualStrings("'submitted','remote_started'", comptime sqlList(struct {
+        fn f(s: Status) bool {
+            return !s.beforeSubmission() and !s.isTerminal();
+        }
+    }.f));
 }

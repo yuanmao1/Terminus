@@ -93,6 +93,14 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             "session '{s}:{s}' was stopped but its log could not be deleted: {s} ({s}); the local record is kept",
             .{ server_name, name, executor.errorMessage(), @errorName(err) },
         );
+        // The bool is discarded, and this is the one place in the CLI where
+        // that is not a swallowed refusal. `sessions.remove` has no owner, no
+        // expectation and no compare-and-swap: false means only that this
+        // machine had no metadata row for the session, which `mergedSessions`
+        // below documents as an ordinary state — a session started outside
+        // Terminus is alive remotely with nothing local naming it. What the
+        // success message claims is that the *session* is gone, and that was
+        // established above by `gone` before anything local was touched.
         _ = Store.sessions.remove(&store, resolved.server.id, name) catch |err|
             Cli.storeFatal(&store, err);
         switch (ctx.out.format) {

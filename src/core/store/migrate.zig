@@ -424,10 +424,19 @@ const migrations = [_][:0]const u8{
     //   to pick one — turning insertion order into a scope-releasing
     //   decision. `receipts.resolve` refuses that case; this makes it
     //   unreachable.
-    // * the partial unique index over live states. It is the *only* guard a
-    //   locally-published transfer gets: `unsettledInScope` filters by
-    //   `server_id`, so two pulls from different servers into one local path
-    //   both clear the scope guard, and a fetch has no server at all.
+    // * the partial unique index over the *destination-holding* states. It is
+    //   the only guard a locally-published transfer gets: `unsettledInScope`
+    //   filters by `server_id`, so two pulls from different servers into one
+    //   local path both clear the scope guard, and a fetch has no server at
+    //   all. A state holds the destination for as long as an operator has not
+    //   said what to do about it, which is every state except the two in which
+    //   the path stopped being a claim and became the artifact — `published`
+    //   and `completed_unverified`. That covers verifying and publishing, it
+    //   covers `indeterminate_publish` (the rename may already have landed, so
+    //   the path holds a result awaiting adjudication), and it covers every
+    //   `failed_*` state, whose partial stays on disk until something
+    //   explicitly supersedes it. See `transfers.State.holdsDestination`, from
+    //   which this list is copied and against which a gate compares it.
     \\DROP INDEX IF EXISTS idx_checkpoints_request;
     \\DROP INDEX IF EXISTS idx_checkpoints_resume;
     \\DROP TABLE IF EXISTS transfer_checkpoints;
@@ -478,16 +487,264 @@ const migrations = [_][:0]const u8{
     \\  -- ours, and the proof is the prefix hash. Zero needs none: there is
     \\  -- nothing to prove.
     \\  CHECK (confirmed_offset = 0 OR partial_sha256 IS NOT NULL),
-    \\  CHECK (confirmed_offset >= 0 AND partial_len >= 0)
+    \\  CHECK (confirmed_offset >= 0 AND partial_len >= 0),
+    \\  -- A non-zero offset is only worth keeping if the resume it licenses can
+    \\  -- be proven safe, and that proof is `verifyResume`'s source comparison:
+    \\  -- a content hash for a file, a strong validator for an HTTP object. A
+    \\  -- source known only by its path (or by size and mtime, which a rewrite
+    \\  -- can reproduce) gives that comparison nothing to fail on, so bytes
+    \\  -- appended to the partial would be spliced onto a head nobody can
+    \\  -- attribute. Named, because the drift probe looks for it by name.
+    \\  CONSTRAINT offset_needs_source_identity CHECK (
+    \\    confirmed_offset = 0
+    \\    OR (source_kind IN ('local_file','remote_file') AND source_sha256 IS NOT NULL)
+    \\    OR (source_kind = 'http' AND (source_etag IS NOT NULL OR source_last_modified IS NOT NULL))
+    \\  )
     \\);
     \\CREATE UNIQUE INDEX idx_checkpoints_live_dest
     \\  ON transfer_checkpoints(dest_side, dest_path)
-    \\  WHERE state IN ('planned','probing','transferring','paused');
+    \\  WHERE state IN ('planned','probing','transferring','paused',
+    \\                  'verifying','publishing',
+    \\                  'failed_source_changed','failed_remote_partial_mismatch',
+    \\                  'failed_hash_mismatch','failed_no_space',
+    \\                  'failed_clobber_conflict','failed_publish',
+    \\                  'indeterminate_publish');
     ,
 };
 
 /// Number of schema versions this binary knows about.
 pub const latest_version = migrations.len;
+
+/// The version at which `transfer_checkpoints` was dropped and recreated.
+///
+/// Named because two rules key on it — the drift probes for the re-cut table,
+/// and the refusal to destroy checkpoint rows written before it — and because
+/// it is a number in the frozen migration list rather than "the latest": it
+/// must not follow `latest_version` upwards.
+const checkpoints_recut_version = 11;
+
+/// The verbatim text of one frozen statement, sliced out of its migration.
+///
+/// sqlite stores a `CREATE` statement in `sqlite_master.sql` exactly as it was
+/// submitted — whitespace, line breaks and comments included — minus the
+/// terminating semicolon. So the text this binary would write is directly
+/// comparable to the text a database was actually built from, and that
+/// comparison is total: it needs no needle per amendment, and it cannot be
+/// satisfied by a statement that merely *contains* the right words.
+///
+/// Statements are terminated by `;` at the end of a line, and nothing in
+/// `migrations` contains that inside a statement body. The gate that compares
+/// each extracted statement against what sqlite stored is what enforces that: a
+/// future statement with an embedded `;\n` would be truncated here and the
+/// comparison would fail loudly at test time rather than silently probing a
+/// prefix.
+fn frozenStatement(comptime version: usize, comptime starts_with: []const u8) []const u8 {
+    comptime {
+        // The v11 text is several thousand characters and both searches walk it
+        // one byte at a time.
+        @setEvalBranchQuota(100_000);
+        const text = migrations[version - 1];
+        const start = std.mem.indexOf(u8, text, starts_with) orelse
+            @compileError("no frozen statement starts with: " ++ starts_with);
+        const rest = text[start..];
+        // The last statement of a migration has no trailing newline — a Zig
+        // multiline literal does not add one after its final line — so the
+        // terminator is `;\n` or the `;` the text ends on.
+        const end = std.mem.indexOf(u8, rest, ";\n") orelse
+            if (std.mem.endsWith(u8, rest, ";")) rest.len - 1 else @compileError(
+                "frozen statement is not terminated by a semicolon: " ++ starts_with,
+            );
+        return rest[0..end];
+    }
+}
+
+/// The two v11 objects an in-place amendment can change without moving
+/// `user_version`, as this binary writes them.
+///
+/// Both are exposed so the gate that holds the index predicate against
+/// `transfers.State.holdsDestination` reads the same text the runtime probe
+/// does, instead of a second transcription of it.
+pub const checkpoints_table_ddl = frozenStatement(
+    checkpoints_recut_version,
+    "CREATE TABLE transfer_checkpoints (",
+);
+pub const checkpoints_index_ddl = frozenStatement(
+    checkpoints_recut_version,
+    "CREATE UNIQUE INDEX idx_checkpoints_live_dest",
+);
+
+/// What a pre-write refusal knows, for a caller that can word a message.
+///
+/// Zig error values carry no payload, and the numbers here are the whole
+/// difference between "this database cannot be opened" and an operator knowing
+/// what to do next. `checkBeforeApply` fills one when it is given somewhere to
+/// put it, and **every** error it returns writes one first — `cli.openStore`
+/// reads the variant its error names without re-checking the tag.
+pub const Refusal = union(enum) {
+    /// The file was written by a newer binary. `found` is its `user_version`,
+    /// `known` is the highest this binary can produce.
+    future_version: struct { found: i64, known: i64 },
+    /// The file's contents do not match the version it claims, so it is not a
+    /// Terminus store — or not the one it says it is. `detail` is a static
+    /// string naming what was expected and missing, because "this is not our
+    /// database" and "our database is damaged" send an operator to different
+    /// places and only the payload can tell them apart.
+    foreign_database: struct { version: i64, detail: []const u8 },
+    /// A probe of the stored DDL failed. `probe` names which object did not
+    /// match, as a static string, so a report can say what drifted rather than
+    /// only that something did.
+    pre_release_drift: struct { probe: []const u8 },
+    /// The store predates the re-cut `transfer_checkpoints` and still holds
+    /// rows there. Migrating would destroy `rows` resumable transfers.
+    ///
+    /// The operator's options, none of which this code will take on its own:
+    /// finish or abandon those transfers with the binary that wrote them; or
+    /// move this database aside and let a fresh one be created; or keep it and
+    /// point `--db` elsewhere. A future build may carry the rows across — this
+    /// one refuses rather than guessing that they are disposable.
+    checkpoints_would_be_dropped: struct { rows: i64, version: i64 },
+};
+
+pub const PreApplyError = Db.Error || error{
+    /// `user_version` is higher than anything this binary can produce, so the
+    /// schema in front of it is one it does not understand. Every statement in
+    /// this program is written against a known version; running them against a
+    /// later one is not a read-only mistake, because the writes would land.
+    SchemaNewerThanBinary,
+    /// See `Refusal.foreign_database`.
+    NotATerminusStore,
+    /// See `checkPreReleaseDrift`.
+    PreReleaseSchemaDrift,
+    /// See `Refusal.checkpoints_would_be_dropped`.
+    CheckpointsWouldBeDropped,
+};
+
+/// Everything that must be true of a database *as found*, before any DDL runs.
+///
+/// The order is the point, and it is two orders at once.
+///
+/// Against `apply`: this used to run after it. v11 drops and recreates
+/// `transfer_checkpoints`, so on a v6–v10 store holding real rows `apply`
+/// destroyed them and the check that exists to stop exactly that then ran on
+/// the wreckage. A gate that reports damage it could have prevented is not a
+/// gate.
+///
+/// Within itself: the version is read before any table is, because what shape a
+/// table has — indeed whether it exists — is a function of the version, so a
+/// probe run against an unknown-version file is reading columns whose meaning
+/// it cannot vouch for.
+///
+/// Every branch here refuses. None of them deletes, repairs, or migrates
+/// anything: returning an error from `open` is the whole action, because a
+/// caller asked for a database and did not ask for its history to be rewritten.
+///
+/// The whole gate runs inside one read transaction, and that is not tidiness.
+/// The version and the contents are two reads, and `applyOne` moves both in one
+/// `BEGIN IMMEDIATE`, so a peer performing the very first migration under us
+/// would otherwise be caught halfway: version 0 read before its commit, tables
+/// counted after it, and a brand new store refused as a foreign database on a
+/// machine that merely started two commands at once. One snapshot makes the
+/// pair atomic — a reader sees the file either before that migration or after
+/// it, which are the only two states it is ever actually in.
+pub fn checkBeforeApply(db: *Db, refusal: ?*Refusal) PreApplyError!void {
+    try db.exec("BEGIN");
+    errdefer db.exec("ROLLBACK") catch {};
+    try checkBeforeApplyLocked(db, refusal);
+    try db.exec("COMMIT");
+}
+
+fn checkBeforeApplyLocked(db: *Db, refusal: ?*Refusal) PreApplyError!void {
+    const found = try userVersion(db);
+
+    // (a) A file from a newer binary. Opening it silently — which is what
+    //     happened until now — means running this binary's statements against
+    //     columns, constraints and indexes it has never heard of, and the
+    //     writes are not hypothetical: `apply`'s fast path returns immediately
+    //     at a version above its own, so every command after it proceeds as if
+    //     the schema were understood.
+    if (found > latest_version) {
+        if (refusal) |out| out.* = .{ .future_version = .{
+            .found = found,
+            .known = latest_version,
+        } };
+        return error.SchemaNewerThanBinary;
+    }
+
+    // (b) A file that is not ours at all.
+    try checkContentsMatchVersion(db, found, refusal);
+
+    // (c) The historical shape, at whatever version this file actually claims.
+    try checkPreReleaseDrift(db, refusal);
+
+    // (d) Checkpoint rows that v11 would destroy.
+    if (found < checkpoints_recut_version and try tableExists(db, "transfer_checkpoints")) {
+        const rows = try countCheckpoints(db);
+        if (rows > 0) {
+            if (refusal) |out| out.* = .{ .checkpoints_would_be_dropped = .{
+                .rows = rows,
+                .version = found,
+            } };
+            return error.CheckpointsWouldBeDropped;
+        }
+    }
+}
+
+/// Whether the file's contents are consistent with the version it reports.
+///
+/// The gate had an upper bound on `user_version` and no lower one, and
+/// `user_version` defaults to 0 — which is what essentially every SQLite file
+/// in the world reports. So `--db ~/some-other-app.db` ran the whole ladder
+/// into a stranger's database: nineteen tables grafted in and its
+/// `user_version` overwritten with 11, destroying the schema version of any
+/// application that uses that field the idiomatic way. At version 4 it was
+/// worse in a quieter way — `applyOne` skips v1–v4, so the `CREATE TABLE keys`
+/// collision that would have refused never happens, twelve tables land, v9's
+/// `ALTER TABLE jobs` fails, and the caller is told only "cannot open
+/// database" while the file has already been written to.
+///
+/// Two directions, because both are lies about the same file:
+///
+///  * version 0 with objects of its own. A brand new store is version 0 *and*
+///    empty; anything else claiming 0 is either a foreign database or one of
+///    ours whose header was zeroed, and neither is safe to run DDL into.
+///  * a version whose defining tables are absent. `keys` is created by v1 and
+///    `operations` by v5, and no migration drops either, so a file claiming to
+///    be at or past those versions must have them.
+///
+/// Deliberately not a full inventory. The question here is ownership — is this
+/// our database — and the shape *within* a version is `checkPreReleaseDrift`'s,
+/// which runs next.
+fn checkContentsMatchVersion(db: *Db, found: i64, refusal: ?*Refusal) PreApplyError!void {
+    const detail: []const u8 = blk: {
+        if (found == 0) {
+            if (try userObjectCount(db) > 0)
+                break :blk "the file reports user_version 0 but already contains objects of its own";
+            return;
+        }
+        if (!try tableExists(db, "keys"))
+            break :blk "no `keys` table, which every version from 1 onwards has";
+        if (found >= 5 and !try tableExists(db, "operations"))
+            break :blk "no `operations` table, which every version from 5 onwards has";
+        return;
+    };
+    if (refusal) |out| out.* = .{ .foreign_database = .{ .version = found, .detail = detail } };
+    return error.NotATerminusStore;
+}
+
+/// How many objects the file holds that are not sqlite's own bookkeeping.
+///
+/// `ESCAPE` because `_` is a LIKE wildcard: a bare `'sqlite_%'` also matches a
+/// table called `sqliteXfoo`, so a foreign database could hide a table from
+/// this count by naming it that way. The same wildcard is why the drift probes
+/// below compare whole statements rather than LIKE-matching needles.
+fn userObjectCount(db: *Db) Db.Error!i64 {
+    var stmt = try db.prepare(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+    );
+    defer stmt.deinit();
+    if (!try stmt.step()) return error.Sqlite;
+    return stmt.columnInt(0);
+}
 
 pub fn apply(db: *Db) Db.Error!void {
     // Fast path: an up-to-date database takes no write lock at all, so the
@@ -501,16 +758,62 @@ pub fn apply(db: *Db) Db.Error!void {
 /// Migrations are frozen once shipped, but before 0.2.0 exists the v5+ SQL is
 /// still being corrected in place. A database created by an earlier commit of
 /// this branch reports the right `user_version` while missing columns that
-/// were added afterwards, and the failures that follow are confusing SQL
-/// errors far from the cause. Detecting it here turns that into one clear
-/// message. Costs a single query on databases at v5 or above.
-pub fn checkPreReleaseDrift(db: *Db) (Db.Error || error{PreReleaseSchemaDrift})!void {
-    if (try userVersion(db) < 5) return;
+/// were added afterwards — or carrying an earlier revision's index predicate
+/// or constraint set — and the failures that follow are confusing SQL errors
+/// far from the cause. Detecting it here turns that into one clear message,
+/// and the only thing it does about it is refuse to open: repairing a schema
+/// under a caller who asked for a database, not a migration, would be a
+/// silent rewrite of state nobody agreed to. Costs one query per probe on
+/// databases at v5 or above.
+///
+/// Runs *before* `apply`, so what it inspects is the version the file claims
+/// for itself. A store below 11 skips the v11 probes and that is correct rather
+/// than vacuous: those objects do not exist in their v11 form yet, and `apply`
+/// is about to write them from this binary's own frozen text. What it no longer
+/// covers is the shape `apply` produces — that was never a property of somebody
+/// else's database, and it is asserted where it belongs, in the gate that opens
+/// a fresh store and runs these probes against the result.
+pub fn checkPreReleaseDrift(db: *Db, refusal: ?*Refusal) (Db.Error || error{PreReleaseSchemaDrift})!void {
+    const version = try userVersion(db);
+    if (version < 5) return;
     if (!try hasColumn(db, "operation_events", "last_observed"))
-        return error.PreReleaseSchemaDrift;
-    if (try userVersion(db) < 11) return;
-    if (!try hasColumn(db, "transfer_checkpoints", "dest_side"))
-        return error.PreReleaseSchemaDrift;
+        return drifted(refusal, "operation_events.last_observed");
+    if (version < checkpoints_recut_version) return;
+    // Column names are not the whole shape, and needles are not either. v11 has
+    // been amended three times since the first v11 databases existed: the
+    // destination-holding index gained states in its predicate twice, and the
+    // table gained a named CHECK. None of that is visible to
+    // `pragma_table_info`, and `user_version` cannot express a change *within* a
+    // version, so the stored DDL text is the only witness.
+    //
+    // It used to be read with three `LIKE '%needle%'` probes, and that was a
+    // gate that opened for the shape it was written to catch. A predicate
+    // missing `paused`, `failed_no_space`, `failed_clobber_conflict` and
+    // `failed_publish` still contains the words `verifying` and
+    // `failed_hash_mismatch`, so all three needles passed — and on that database
+    // a checkpoint parked in `paused` is not in the unique index at all, which
+    // is the *only* collision guard a locally-published transfer has
+    // (`transfers.create` has no pre-insert check; `find_live_dest_sql` runs
+    // after sqlite has already refused). Two drivers, one partial, one path.
+    // The constraint probe was weaker still: it matched the CHECK's *name*
+    // while the property lives in its body, so an intermediate revision with
+    // the right name and a wrong expression passed.
+    //
+    // Whole-statement equality against the text this binary would write says
+    // all of it at once, needs no needle per amendment, and cannot be satisfied
+    // by an object that merely mentions the right words. sqlite stores the
+    // statement verbatim, so the comparison is exact rather than approximate —
+    // including the comments, which are part of what a reviewer of a drifted
+    // database wants to see differ.
+    if (!try schemaTextEquals(db, "transfer_checkpoints", checkpoints_table_ddl))
+        return drifted(refusal, "transfer_checkpoints");
+    if (!try schemaTextEquals(db, "idx_checkpoints_live_dest", checkpoints_index_ddl))
+        return drifted(refusal, "idx_checkpoints_live_dest");
+}
+
+fn drifted(refusal: ?*Refusal, probe: []const u8) error{PreReleaseSchemaDrift} {
+    if (refusal) |out| out.* = .{ .pre_release_drift = .{ .probe = probe } };
+    return error.PreReleaseSchemaDrift;
 }
 
 fn hasColumn(db: *Db, table: [:0]const u8, column: []const u8) Db.Error!bool {
@@ -521,6 +824,53 @@ fn hasColumn(db: *Db, table: [:0]const u8, column: []const u8) Db.Error!bool {
     try stmt.bindText(1, table);
     try stmt.bindText(2, column);
     return try stmt.step();
+}
+
+/// Whether a table of this name exists.
+///
+/// Asked before counting rows in it, because `prepare` on a missing table is a
+/// bare `error.Sqlite` — indistinguishable from a real failure, and "the table
+/// is not there" is an ordinary answer for a store below the version that
+/// introduced it.
+fn tableExists(db: *Db, name: [:0]const u8) Db.Error!bool {
+    var stmt = try db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1");
+    defer stmt.deinit();
+    try stmt.bindText(1, name);
+    return try stmt.step();
+}
+
+/// How many rows the pre-v11 `transfer_checkpoints` holds.
+///
+/// A full count rather than a `LIMIT 1` existence probe: the number is the
+/// difference between a refusal an operator can act on and one they can only
+/// obey. Only reached on a store below v11, where the table is small by
+/// construction — nothing has ever shipped that writes it.
+fn countCheckpoints(db: *Db) Db.Error!i64 {
+    var stmt = try db.prepare("SELECT COUNT(*) FROM transfer_checkpoints");
+    defer stmt.deinit();
+    if (!try stmt.step()) return error.Sqlite;
+    return stmt.columnInt(0);
+}
+
+/// Whether the DDL sqlite stored for `name` is exactly the text this binary
+/// would have written.
+///
+/// `sqlite_master.sql` holds the `CREATE` statement as submitted — whitespace,
+/// line breaks and comments included — minus the terminating semicolon, so the
+/// comparison against `frozenStatement`'s slice is byte-for-byte. A missing
+/// object yields no row, which is a drift too.
+///
+/// Equality rather than containment on purpose. `LIKE '%needle%'` was what this
+/// replaced, and it had two independent weaknesses: `_` is a LIKE wildcard, so
+/// every needle was quietly a pattern, and a needle can only ever assert that
+/// something is *present* — never that a predicate has not lost four of its
+/// states, which is exactly how the index drifted.
+fn schemaTextEquals(db: *Db, name: [:0]const u8, want: []const u8) Db.Error!bool {
+    var stmt = try db.prepare("SELECT sql FROM sqlite_master WHERE name = ?1");
+    defer stmt.deinit();
+    try stmt.bindText(1, name);
+    if (!try stmt.step()) return false;
+    return std.mem.eql(u8, stmt.columnText(0), want);
 }
 
 /// Applies one migration, safe against a second process racing the same

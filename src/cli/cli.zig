@@ -48,6 +48,31 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.fatal(fmt, args);
 }
 
+/// `fail`, for a refusal a caller has to be able to branch on.
+///
+/// The prose says which barrier and how many rows; the code is what an agent
+/// matches, so it never has to pattern-match the sentence. Same stream, same
+/// exit status and the same `settleActiveExecution` / `releaseReservation`
+/// discipline as `fail` — the only difference is that the reason has a stable
+/// name as well as a wording.
+///
+/// The code is printed in human mode too. A refusal an operator can act on is
+/// one they will want to search for, and a code that only exists in `--json`
+/// is a code half the callers never see.
+pub fn failWithCode(code: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
+    settleActiveExecution("command failed before recording an outcome");
+    releaseReservation();
+    if (active_ctx) |ctx| {
+        if (ctx.out.format == .json) {
+            const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
+            ctx.out.json(.{ .ok = false, .@"error" = message, .errorCode = code }) catch {};
+            ctx.out.flush() catch {};
+            std.process.exit(1);
+        }
+    }
+    std.process.fatal(fmt ++ "\n  code: {s}", args ++ .{code});
+}
+
 /// The execution owning the current command, if any.
 ///
 /// `fail` ends the process with `std.process.exit`, which skips defers — so
@@ -392,19 +417,34 @@ pub fn settleProvableBlocker(
         );
         return;
     }) orelse return; // already settled by somebody else in the meantime
-    const outcome = execution.settleAttached(.{ .exited = .{ .exit_code = code } }, .{
+
+    // The cache row is read before the settlement and written inside the same
+    // transaction as it. Reading it first is what makes the write a
+    // compare-and-swap: `jobs` refuses it if the row moved, rather than
+    // stamping an outcome onto whatever ended up carrying that name.
+    //
+    // `syncJobRow` used to run afterwards, as a second transaction, and
+    // documented the divergence it left behind — the ledger settled while the
+    // row that `run --name X` checks first still said `running`. That gap is
+    // what this composition closes.
+    const sync = jobCacheSync(store, ctx.arena, op.request_id, code, probe.finished_at, ctx.now);
+    const settled = execution.settleAttachedAndSyncJob(.{ .exited = .{ .exit_code = code } }, .{
         .stdout = .{ .bytes = @intCast(probe.output.len) },
         .source = .reconcile,
-    }) catch |err| {
+    }, sync) catch |err| {
         std.debug.print(
             "terminus: could not record the outcome of blocking request {s}: {s}; leaving it blocked\n",
             .{ op.request_id, @errorName(err) },
         );
         return;
     };
-    // The ledger now holds the truth; bring the local cache row along so the
-    // relaunch check ahead of the scope guard does not re-erect the same wall.
-    if (op.server_id) |sid| syncJobRow(ctx, store, sid, attempt.job_name, code, probe.finished_at);
+    // Reported, not swallowed: the ledger is settled, but the row a relaunch
+    // consults before the scope guard still says the job is live, so the next
+    // `run --name X` will refuse with a message the ledger cannot explain.
+    if (settled.cache == .refused) std.debug.print(
+        "terminus: settled request {s} but its local row for job '{s}' is no longer the row we read; a same-name relaunch may still be refused until 'terminus job rm' clears it\n",
+        .{ op.request_id, attempt.job_name },
+    );
 
     if (ctx.out.format != .human) return;
     // What gets announced is what the ledger now holds, not what we set out to
@@ -412,7 +452,7 @@ pub fn settleProvableBlocker(
     // `settleAttached`, in which case `already_settled` hands back *their*
     // terminal and our exit code was never applied — claiming otherwise would
     // print a settlement that did not happen.
-    switch (outcome) {
+    switch (settled.outcome) {
         .recorded => |record| std.debug.print(
             "note: settled request {s} (job '{s}') as {s} from its recorded exit status {d}; it had finished but nobody had looked\n",
             .{ op.request_id, attempt.job_name, record.status.text(), code },
@@ -424,7 +464,7 @@ pub fn settleProvableBlocker(
     }
 }
 
-/// Brings the local `jobs` row in line with an outcome we have just proved.
+/// The cache write that belongs with a proved settlement, or `.none`.
 ///
 /// The ledger is the record, but it is not the only gate a relaunch has to
 /// pass: `run` refuses a name whose `jobs` row still says `running`, and that
@@ -433,34 +473,53 @@ pub fn settleProvableBlocker(
 /// removing it — the caller would be told the job is still going by the very
 /// command that had just read its exit status.
 ///
-/// Only ever called with an exit code we read off the host. A failure here is
-/// reported and swallowed on purpose: the authoritative record is already
-/// written, and a stale cache row must not turn a proved settlement into a
-/// failed command.
-fn syncJobRow(
-    ctx: *Ctx,
+/// **Addressed by the settled attempt's own request id, never by its name.**
+/// The name is an alias, and this function runs at the one moment it is most
+/// likely to have moved on: a blocker worth settling is a launch that finished
+/// or was displaced, and a displaced launch's name belongs to its successor.
+/// Looking the row up by name and handing the result to `finishExpectation`
+/// produced an expectation the successor's own row satisfies in every field —
+/// `Owner.of` reads the owner off the row that was just read — so the CAS could
+/// not refuse it. A live job's row was overwritten with a dead one's exit code
+/// and its `finished_at`, `applied` came back, and nothing was printed.
+///
+/// `.none` for a blocker that has no row of its own to bring along: it never
+/// reserved one (an exec, or an attempt in the local realm), somebody has
+/// already forgotten it, or a later launch took the name and this attempt's row
+/// went with it. None of those is a failure and none of them is a divergence —
+/// there is no row describing this attempt, so there is nothing for a relaunch
+/// to be misled by. What would be a divergence is writing to a row that
+/// describes somebody else.
+/// Public so the gate that pins the addressing rule can call it without an SSH
+/// round trip; `arena` and `now` are taken directly rather than off a `Ctx` for
+/// the same reason.
+pub fn jobCacheSync(
     store: *Store,
-    server_id: i64,
-    job_name: []const u8,
+    arena: std.mem.Allocator,
+    settled_request_id: []const u8,
     code: i32,
     remote_finished_at: ?i64,
-) void {
-    const row = (Store.jobs.getByName(store, ctx.arena, server_id, job_name) catch |err| {
+    now: i64,
+) Core.execution.JobCacheSync {
+    const row = (Store.jobs.byOwner(store, arena, settled_request_id) catch |err| {
         std.debug.print(
-            "terminus: settled job '{s}' but could not read its local row: {s}\n",
-            .{ job_name, @errorName(err) },
+            "terminus: settling request {s} but could not read its local job row: {s}\n",
+            .{ settled_request_id, @errorName(err) },
         );
-        return;
-    }) orelse return;
-    if (!row.status.live()) return;
-    // The remote's own clock when it reported one; otherwise the time we
-    // looked. That column mixes the two by nature — the ledger is where the
-    // distinction is kept.
-    Store.jobs.markFinished(store, row.id, .exited, code, remote_finished_at orelse ctx.now) catch |err|
-        std.debug.print(
-            "terminus: settled job '{s}' but could not update its local row: {s}; a same-name relaunch may still be refused until 'job status' is run\n",
-            .{ job_name, @errorName(err) },
-        );
+        return .none;
+    }) orelse return .none;
+    if (!row.status.live()) return .none;
+    return .{
+        .finish = .{
+            .expected = row.finishExpectation(),
+            .status = .exited,
+            .exit_code = code,
+            // The remote's own clock when it reported one; otherwise the time we
+            // looked. That column mixes the two by nature — the ledger is where
+            // the distinction is kept.
+            .at = remote_finished_at orelse now,
+        },
+    };
 }
 
 /// `<server>` or `<server>:<session>` — the target syntax shared by exec,
@@ -677,14 +736,37 @@ fn daemonRequest(server: Store.servers.Server, auth: Ssh.Auth) Core.daemon_proto
 /// Opens (and migrates) the metadata database. Honors `--db <path>` (both
 /// the global flag and per-command), defaulting to
 /// %APPDATA%\terminus\terminus.db (or ~/.terminus/terminus.db).
+///
+/// Every refusal `migrate.checkBeforeApply` can return writes the `Refusal`
+/// before returning, and each arm below reads the variant its own error names —
+/// see there. Without the numbers these all collapsed into "cannot open
+/// database at <path>", which was worst exactly where it mattered most: the
+/// refusal that exists to stop N resumable transfers from being destroyed
+/// arrived as an unexplained failure, standing next to the one other database
+/// message this binary can produce, which tells the operator to delete the file.
 pub fn openStore(ctx: *Ctx, parsed: *const Args.Parsed) !Store {
     const path = try dbPath(ctx, parsed.flag("db") orelse ctx.db_override);
-    return Store.open(path) catch |err| switch (err) {
+    var found: Store.migrate.Refusal = undefined;
+    return Store.openDiagnosed(path, &found) catch |err| switch (err) {
         // Only reachable on a machine that ran a pre-release build of the
         // 0.2.0 branch; say exactly that instead of leaking a SQL error.
         error.PreReleaseSchemaDrift => fail(
-            "database at {s} was created by a pre-release build whose schema has since changed; delete it (and its -wal/-shm files) or point --db elsewhere",
-            .{path},
+            "database at {s} was created by a pre-release build whose schema has since changed: {s} is not the shape this binary writes. Delete it (and its -wal/-shm files) or point --db elsewhere",
+            .{ path, found.pre_release_drift.probe },
+        ),
+        error.SchemaNewerThanBinary => fail(
+            "database at {s} is at schema version {d}; this binary understands up to {d}. Upgrade terminus, or point --db at a different file — running these statements against a schema they were not written for would write, not merely misread",
+            .{ path, found.future_version.found, found.future_version.known },
+        ),
+        // The one refusal whose whole purpose is to protect data, so it must
+        // not be the one that reads like an invitation to delete the file.
+        error.CheckpointsWouldBeDropped => fail(
+            "database at {s} is at schema version {d} and holds {d} resumable transfer checkpoint(s); the upgrade to version {d} recreates that table and would destroy them. Finish or abandon those transfers with the binary that wrote them, or move this file aside and let a new one be created — this command will not decide that for you",
+            .{ path, found.checkpoints_would_be_dropped.version, found.checkpoints_would_be_dropped.rows, Store.schema_version },
+        ),
+        error.NotATerminusStore => fail(
+            "the file at {s} is not a terminus database: {s}. Nothing was written to it; pass --db with a different path",
+            .{ path, found.foreign_database.detail },
         ),
         error.WalSetupExhausted => fail(
             "database at {s} could not be switched to WAL mode; another terminus process may be starting at the same instant under heavy load — retry",

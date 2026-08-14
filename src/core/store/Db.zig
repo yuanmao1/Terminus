@@ -18,11 +18,14 @@ pub const Error = error{
     /// The database could not be put into WAL mode within the retry budget.
     ///
     /// Distinct from `Sqlite` on purpose: this contention is invisible to
-    /// `busy_timeout` (see `ensureWal`) and the retry budget is measured in
+    /// `busy_timeout` (see `enableWal`) and the retry budget is measured in
     /// iterations rather than time, so a heavily loaded machine is the one
     /// place it could plausibly run out. Naming it means a future occurrence
     /// identifies itself instead of arriving as an unexplained failure.
     WalSetupExhausted,
+    /// A `…Locked` function was called with no explicit transaction open on
+    /// this connection. See `requireTransaction`.
+    NotInTransaction,
 };
 
 /// SQLITE_TRANSIENT: sqlite copies the buffer before returning from bind.
@@ -30,6 +33,21 @@ pub const Error = error{
 /// express as a constant, so it is reproduced here.
 const transient: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
+/// Opens a connection without changing anything the file records about itself.
+///
+/// `busy_timeout` and `foreign_keys` are connection settings and touch no
+/// bytes. WAL is *not* set here, and that ordering is the point:
+/// `PRAGMA journal_mode=WAL` rewrites the file header and leaves `-wal`/`-shm`
+/// sidecars, permanently, on whatever file it is pointed at. It used to run
+/// inside this function — before `migrate.checkBeforeApply` had looked at the
+/// file at all — so a database the gate was about to refuse as "not a Terminus
+/// store" had already been converted by the code refusing it. A caller that
+/// asked to open a database did not ask for that.
+///
+/// `Store.openDiagnosed` calls `enableWal` once the gate has accepted the file.
+/// A connection that never reaches it can still read: rollback-journal mode
+/// serves `PRAGMA user_version` and `sqlite_master` exactly as well, and those
+/// are all the gate reads.
 pub fn open(path: [:0]const u8) Error!Db {
     var handle: ?*c.sqlite3 = null;
     const rc = c.sqlite3_open_v2(
@@ -44,7 +62,6 @@ pub fn open(path: [:0]const u8) Error!Db {
     }
     var db: Db = .{ .handle = handle.? };
     _ = c.sqlite3_busy_timeout(db.handle, 5000);
-    try db.ensureWal();
     try db.exec("PRAGMA foreign_keys=ON");
     return db;
 }
@@ -69,7 +86,11 @@ pub fn open(path: [:0]const u8) Error!Db {
 /// A pure spin here is not enough: under scheduling pressure it exhausts its
 /// budget while the lock holder never gets scheduled, which showed up as an
 /// intermittent ReleaseSafe failure.
-fn ensureWal(db: *Db) Error!void {
+///
+/// Called by `Store.openDiagnosed` after the pre-apply gate has accepted the
+/// file, never by `open` — see there for why a gate must not have written to
+/// the file it is about to refuse.
+pub fn enableWal(db: *Db) Error!void {
     // Generous: the lock is held only for a peer's own header write, so the
     // only way to exhaust this is a machine so loaded that nothing runs.
     const max_rounds = 64 * 1024;
@@ -123,6 +144,38 @@ pub fn lastInsertRowId(db: *const Db) i64 {
 /// Rows changed by the most recent INSERT/UPDATE/DELETE.
 pub fn changes(db: *const Db) i64 {
     return c.sqlite3_changes64(db.handle);
+}
+
+/// Whether an explicit transaction is open on this connection.
+///
+/// sqlite reports the inverse: autocommit is on until `BEGIN` and comes back on
+/// at `COMMIT`/`ROLLBACK` — including a rollback sqlite performed itself, which
+/// is why this is read at the moment of use rather than tracked in Zig.
+pub fn inTransaction(db: *const Db) bool {
+    return c.sqlite3_get_autocommit(db.handle) == 0;
+}
+
+/// Refuses unless an explicit transaction is open.
+///
+/// Every `pub fn …Locked` in the store calls this first. The suffix is a
+/// promise that the caller holds the write transaction, and until this existed
+/// the promise was enforced by nothing at all: the whole atomicity story —
+/// check the scope and record the attempt in one step, move a checkpoint and
+/// write both sides' receipts in one step — rested on callers remembering. A
+/// forgotten `BEGIN` does not fail; it succeeds, one statement at a time, and
+/// leaves a half-written hand-over that reads as a fact.
+///
+/// An error rather than `std.debug.assert`, for two reasons. Assertions vanish
+/// in ReleaseFast, and this guards the same class of property `receipts.append`
+/// already refused to leave to one (see the note there). And a `@panic` — which
+/// would survive ReleaseFast — cannot be observed by an in-process gate, so the
+/// rule would go untested; the gate that calls a `…Locked` writer outside a
+/// transaction and watches it refuse is what makes this real.
+///
+/// The cost is one struct field read through the C API, next to a statement
+/// this function's callers are about to compile with `sqlite3_prepare`.
+pub fn requireTransaction(db: *const Db) Error!void {
+    if (!db.inTransaction()) return error.NotInTransaction;
 }
 
 fn failure(db: *const Db) Error {

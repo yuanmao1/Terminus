@@ -18,9 +18,14 @@ const Store = @import("Store.zig");
 const Db = @import("Db.zig");
 const op_state = @import("op_state.zig");
 const operations = @import("operations.zig");
-// Read inside this module's own transaction, to bind a published-file hash to
-// the digest its transfer declared in advance. One-way: `transfers` knows
-// nothing about receipts.
+// Read and written inside this module's own transaction: read to bind a
+// published-file hash to the digest its transfer declared in advance, written
+// to adjudicate a rename whose outcome the transfer never learned. Still
+// one-way — `transfers` knows nothing about receipts — which is why
+// `adjudicateLocked` is a bare statement and this module supplies the
+// transaction. Keeping `transfers` the sole writer of its own table is the
+// point: a second direct writer on one authoritative table is the entropy an
+// audit has already flagged elsewhere in this store.
 const transfers = @import("transfers.zig");
 const history = @import("history.zig");
 
@@ -136,7 +141,12 @@ pub const TerminalExtra = struct {
     source: Source = .live,
 };
 
-pub const Error = Db.Error || error{
+/// The ledger's own refusals, plus the ones `transfers.adjudicateLocked` can
+/// hand back: `resolve` writes to the checkpoint table now, so it can fail in
+/// that table's vocabulary. Only the adjudication subset is taken, not all of
+/// `transfers.Error` — see `transfers.TransitionError` for why the split
+/// exists.
+pub const Error = Db.Error || transfers.AdjudicateError || error{
     UnknownEventKind,
     UnknownSource,
     UnknownStatus,
@@ -159,13 +169,55 @@ pub const Error = Db.Error || error{
     /// `UnknownOperationKind`, it means the row is not one we can reason
     /// about, so no admissibility decision may be made from it.
     UnknownDestSide,
-    /// The `operations.kind` column holds something longer than any kind this
-    /// binary knows. Not a business outcome: it means the row is not one we
-    /// can reason about, so no admissibility decision may be made from it.
+    /// The `operations.kind` column holds something this binary cannot name.
+    /// Not a business outcome: it means the row is not one we can reason
+    /// about, so no admissibility decision may be made from it. Fires on any
+    /// unparseable value, not only one too long to be a kind — a short
+    /// unrecognised string used to slip past the text comparison this replaced
+    /// and inherit the widest permit in `appliesToKind`.
     UnknownOperationKind,
     /// Supplementary fields contradict the evidence (e.g. a remote pid on a
     /// request whose command was provably never handed over).
     ContradictoryEvidence,
+    /// The operation's transfer is parked in `indeterminate_publish` — its
+    /// rename may or may not have landed — and the evidence offered cannot say
+    /// which. The *whole* resolution is refused: resolving the operation and
+    /// leaving the artifact unjudged would lift the scope barrier while the
+    /// checkpoint goes on holding its destination against every later transfer.
+    /// See `publishAdjudication` for what each evidence variant can establish.
+    ///
+    /// The cost of refusing the pair together, stated because it is not
+    /// hypothetical: only a *reading of the destination* adjudicates. An
+    /// operation in this position cannot be settled by an operator override, by
+    /// a supervisor's report, or by a probe, so its scope barrier stays up until
+    /// somebody goes and looks. What that costs the operator is one look; there
+    /// is a reading for each of the four answers a look can produce —
+    /// `filesystem_effect` when the artifact is there and hashes to the digest
+    /// the transfer declared, `destination_present_contradicting` when it is
+    /// there and hashes to something else, `destination_present_unverified` when
+    /// it is there and no digest was ever declared, `destination_absent` when it
+    /// is not — so the refusal is a requirement to say what was seen rather than
+    /// a gap in the model.
+    ///
+    /// The fourth of those was the last hole, and it is worth recording that it
+    /// was one: an artifact present at the committed destination whose digest
+    /// *contradicts* the declaration used to be refused by every variant —
+    /// `filesystem_effect` with `effect_hash_unproven`,
+    /// `destination_present_unverified` because a digest was declared, and
+    /// `destination_absent` because the file is demonstrably there — and the row
+    /// stayed parked forever, holding its destination, with its operation
+    /// unresolvable beside it. It now adjudicates to `failed_hash_mismatch`,
+    /// whose literal meaning is what was proven. `effect_hash_unproven` is
+    /// unchanged and still fires on every contradicting hash offered as a
+    /// `filesystem_effect`: what closed the hole is a reading that says what it
+    /// saw, not a relaxation of the one that says the bytes matched.
+    ///
+    /// An error rather than a `ResolveOutcome` variant, which is where it
+    /// belongs: `interpret` in `cmd_request.zig` switches exhaustively on that
+    /// union. `UnknownOperationKind` above is refused the same way for the same
+    /// reason, and both are now classified by `cmd_request.semanticRefusal` so
+    /// they are no longer reported as `RECEIPT_PERSIST_FAILED`.
+    PublishAdjudicationUndetermined,
     OutOfMemory,
 };
 
@@ -252,6 +304,7 @@ fn insert(store: *Store, event: Event, is_terminal: bool, seq: i64) Db.Error!i64
 }
 
 pub fn nextSeqLocked(store: *Store, request_id: []const u8) Db.Error!i64 {
+    try store.db.requireTransaction();
     var stmt = try store.db.prepare(
         "SELECT IFNULL(MAX(seq), 0) + 1 FROM operation_events WHERE request_id = ?1",
     );
@@ -353,6 +406,7 @@ pub const Observation = struct {
 /// another write atomic (an override audit must land with the operation it
 /// justifies, or not at all).
 pub fn insertLocked(store: *Store, observation: Observation, seq: i64) Error!i64 {
+    try store.db.requireTransaction();
     if (observation.source == .reconcile) return error.ReconcileRequiresResolve;
     return insert(store, observation.toEvent(), false, seq);
 }
@@ -490,8 +544,26 @@ fn terminalEvent(
         },
         .remote_cancel_confirmed => |c| {
             event.cancel_method = c.verification_method;
-            event.remote_pid = extra.remote_pid orelse c.pid;
-            event.remote_start_token = extra.remote_start_token orelse c.start_token;
+            // Pid and token move together, from one source or the other, never
+            // one from each. They used to be filled by two independent
+            // `orelse`s, so a caller supplying only `extra.remote_pid` produced
+            // a row carrying that pid beside the *evidence's* token — a pair
+            // that never existed on any host, and one `recordedProcessLocked`
+            // would hand to a later probe as a `pid_and_start_token` identity.
+            // The effect runs both ways: the real process is refused because
+            // its token does not match, and a probe quoting the fabricated pair
+            // is admitted at the strongest binding grade there is.
+            //
+            // `remote_pid` is what decides, because the token is a property of
+            // a pid and means nothing apart from one. A caller that wants to
+            // correct the identity supplies both halves of the correction.
+            if (extra.remote_pid) |pid| {
+                event.remote_pid = pid;
+                event.remote_start_token = extra.remote_start_token;
+            } else {
+                event.remote_pid = c.pid;
+                event.remote_start_token = c.start_token;
+            }
             event.finished_at = c.absence_verified_at;
             event.timed_out = false;
         },
@@ -527,10 +599,42 @@ pub fn settle(
     extra: TerminalExtra,
     now: i64,
 ) Error!SettleOutcome {
-    const status = terminal.status();
-
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
+    const outcome = try settleLocked(store, request_id, terminal, extra, now);
+    try store.db.exec("COMMIT");
+    return outcome;
+}
+
+/// `settle`, for a caller that already holds the write transaction.
+///
+/// Split out so a settlement can be composed with the other writes that have
+/// to land with it. The job cache is the case that forced it: seven callers
+/// settled the ledger and then updated the `jobs` row in a second transaction,
+/// and between the two the ledger said the attempt was over while the row that
+/// gates the next `run --name X` still said `running`.
+///
+/// The three non-writing exits — already settled, illegal transition, evidence
+/// that does not fit — no longer roll back, because the transaction is not
+/// theirs to end. None of them has written anything by the time it is reached,
+/// so a caller that goes on to COMMIT commits nothing, and a caller that
+/// propagates the error rolls back through its own `errdefer`. Same for the
+/// `Constraint` path: sqlite rolls back the failed *statement*, and the read
+/// that follows it is a read.
+///
+/// Caller must hold the transaction. A settlement whose checks ran outside the
+/// lock that carries them is not the "one way an operation can end" the doc
+/// above claims it is — whatever `canSettle` looked at can change before the
+/// insert lands.
+pub fn settleLocked(
+    store: *Store,
+    request_id: []const u8,
+    terminal: op_state.Terminal,
+    extra: TerminalExtra,
+    now: i64,
+) Error!SettleOutcome {
+    try store.db.requireTransaction();
+    const status = terminal.status();
 
     const current = try currentStatusLocked(store, request_id);
 
@@ -538,18 +642,14 @@ pub fn settle(
     // a bogus programming error.
     if (current.isTerminal()) {
         if (try terminalOfLocked(store, request_id)) |winner| {
-            try rollback(store);
             return .{ .already_settled = winner };
         }
-        try rollback(store);
         return error.IllegalTransition;
     }
     if (!op_state.canTransition(current, status)) {
-        try rollback(store);
         return error.IllegalTransition;
     }
     if (!op_state.canSettle(current, terminal)) {
-        try rollback(store);
         return error.EvidenceDoesNotFit;
     }
 
@@ -559,7 +659,6 @@ pub fn settle(
         // The partial unique index fired: a peer settled first.
         error.Constraint => {
             const winner = try terminalOfLocked(store, request_id);
-            try rollback(store);
             return .{ .already_settled = winner orelse return error.Sqlite };
         },
         else => return err,
@@ -574,7 +673,6 @@ pub fn settle(
     try upd.bindText(3, request_id);
     _ = try upd.step();
 
-    try store.db.exec("COMMIT");
     return .{ .recorded = .{ .status = status, .observed_at = now, .seq = seq } };
 }
 
@@ -657,6 +755,160 @@ pub const ResolutionEvidence = union(enum) {
         path: []const u8,
         sha256: []const u8,
     },
+    /// The destination was inspected and does not carry the artifact.
+    ///
+    /// The negative counterpart of `filesystem_effect`, and the only evidence
+    /// that can adjudicate a parked publish to `failed_publish`. Without it
+    /// `publishAdjudication` mapped every variant but one to null, so a
+    /// transfer whose artifact is *not* at the destination could never be
+    /// judged at all: it stayed `indeterminate_publish` and went on holding its
+    /// path against every later transfer. An escape hatch that only opens for
+    /// one of the two possible answers is not an escape hatch.
+    ///
+    /// **What it proves and what it does not.** It records that at the moment
+    /// of this reconcile, the destination this transfer committed to did not
+    /// carry the artifact. It is *not* proof that the rename never ran —
+    /// somebody could have removed the file afterwards, and nothing here can
+    /// tell those two apart. So this is an observation with the reading
+    /// attached, not a history, and what it is allowed to conclude is bounded
+    /// accordingly: see `supports` for the operation's verdict and
+    /// `publishAdjudication` for the checkpoint's.
+    ///
+    /// `side` and `path` are compared in `resolve` against the destination the
+    /// transfer committed to at `create` — before it submitted anything — for
+    /// the reason `filesystem_effect`'s three fields are compared: a reading
+    /// taken somewhere else says nothing about this transfer, and without the
+    /// comparison a reconciler could nominate whichever empty path it liked and
+    /// call the transfer failed. There is no digest to compare because there is
+    /// nothing to hash, which is also why the comparison is against the
+    /// committed destination rather than against a declared digest — a transfer
+    /// that never declared one is still judgeable this way.
+    destination_absent: struct {
+        side: transfers.Side,
+        path: []const u8,
+        /// How absence was established, e.g. `stat => ENOENT`.
+        ///
+        /// Required, for the reason `op_state.Terminal.remote_cancel_confirmed`
+        /// requires one: "it is not there" is a conclusion, and a receipt
+        /// carrying the conclusion with no reading behind it cannot be argued
+        /// with afterwards by anyone who doubts it. `resolve` refuses an empty
+        /// one — "required" said only by the type is a field a caller satisfies
+        /// with `""`, which is the conclusion without the reading again.
+        verification_method: []const u8,
+    },
+    /// The destination carries an artifact, and this transfer committed to no
+    /// digest that could say whether it is the right one.
+    ///
+    /// The third reading of a destination, and the one that closes the last
+    /// crash-shaped hole in `indeterminate_publish`. `completed_unverified`
+    /// exists for a transfer where "no trustworthy hash or object validator was
+    /// available" — so it declares none and records none, and both halves are
+    /// conjuncts of the driver's own route out of `publishing` rather than
+    /// prose here (see `transfers.evidenceClause`). Kill that driver mid-rename
+    /// and the row normalises to `indeterminate_publish`, where every exit was
+    /// closed: `filesystem_effect` is refused because there is no advance
+    /// commitment to compare a hash against, `destination_absent` would be a lie
+    /// because the artifact *is* there, an override cannot adjudicate, and the
+    /// graph's `indeterminate_publish → completed_unverified` edge had no
+    /// evidence that could reach it. The row held its destination against every
+    /// later transfer, permanently, with no route but hand-editing sqlite.
+    ///
+    /// **Why it is not `filesystem_effect` with the digest check relaxed.**
+    /// Relaxing that check would let any presence reading settle any transfer
+    /// `completed`, which is the "weakest evidence in the union pretending to be
+    /// the strongest" this whole comparison exists to stop. A separate variant
+    /// keeps `filesystem_effect` exactly as strong as it is and makes the
+    /// receipt say, on its face, that nothing was checked — an auditor reading
+    /// the trail can tell a proven delivery from an unproven one without going
+    /// to look at whether a commitment existed.
+    ///
+    /// **What `resolve` demands of it**, because on its own it is weak:
+    ///
+    ///  * side and path must match the destination the transfer committed to at
+    ///    `create`, as for `destination_absent`;
+    ///  * the checkpoint's publish must still be an open question. Anywhere else
+    ///    this is a file at a path and says nothing about what this operation
+    ///    did;
+    ///  * the transfer must have declared **no** digest. If it declared one,
+    ///    there is a stronger reading available for the same act of looking —
+    ///    hash it and offer `filesystem_effect` — and admitting this would be a
+    ///    way of skipping a check that was there to be made.
+    ///
+    /// What is left is the same claim the driver itself would have recorded had
+    /// it survived: something is at the destination, and this transfer never had
+    /// anything to check it against. A stale file from an earlier run satisfies
+    /// it, and so would it have satisfied the driver.
+    destination_present_unverified: struct {
+        side: transfers.Side,
+        path: []const u8,
+        /// How presence was established, e.g. `stat => 4096 bytes`. Required
+        /// and non-empty, for the reason `destination_absent`'s is.
+        verification_method: []const u8,
+    },
+    /// The destination carries an artifact, and it is not the one this transfer
+    /// promised: it hashes to something other than the digest declared before a
+    /// byte moved.
+    ///
+    /// The fourth and last reading of a destination, and the only one whose
+    /// verdict is `failed` on a *present* artifact. Until it existed this was the
+    /// one `(crash point, state)` pair with no route at all: `filesystem_effect`
+    /// refuses a hash that does not match the declaration (`effect_hash_unproven`
+    /// — and it still does, everywhere, see below), `destination_present_unverified`
+    /// refuses a transfer that declared a digest, `destination_absent` would be a
+    /// lie about a file that is demonstrably there, and an override cannot
+    /// adjudicate. A parked publish in that position held its destination against
+    /// every later transfer for the life of the database, with its operation
+    /// unresolvable alongside it.
+    ///
+    /// **Why the verdict is a failure and why that is safe.** The checkpoint
+    /// lands on `failed_hash_mismatch`, whose literal meaning — the digest did
+    /// not match — is precisely what was proven, and the operation resolves
+    /// `failed`, because the artifact this transfer exists to deliver is not at
+    /// the destination; something else is. That reads oddly next to a reading
+    /// that says the file is *there*, so the reason it is not a hole is worth
+    /// stating: a failure keeps its hold on the destination
+    /// (`transfers.State.holdsDestination` covers every `failed_*`), so the wrong
+    /// artifact is not silently clobbered by the next transfer aimed at that
+    /// path — the rival `create` is refused `DestinationHeld`, and an operator
+    /// releases it with `supersede` once they have decided what to do about the
+    /// bytes that are actually there.
+    ///
+    /// **Why it is not `filesystem_effect` with the comparison inverted.** The
+    /// two make opposite claims and `supports` has to be able to tell them apart
+    /// before it has read anything: `filesystem_effect` proves `completed` and
+    /// nothing else, and widening it to prove `failed` as well would let a
+    /// *matching* digest justify `failed` on any path that never reaches the
+    /// comparison. A separate variant keeps `filesystem_effect` exactly as strong
+    /// as it is — `effect_hash_unproven` fires on a contradicting hash today in
+    /// exactly the circumstances it fired in before this variant existed — and
+    /// makes the receipt say on its face which of the two things was read.
+    ///
+    /// **What `resolve` demands of it**, all four things, because on its own an
+    /// unmatched digest is just a number:
+    ///
+    ///  * a verification method, as for the other two readings;
+    ///  * side and path matching the destination committed to at `create`;
+    ///  * the checkpoint's publish still an open question. Anywhere else this is
+    ///    a statement about a path and a hash, and re-deciding a settled publish
+    ///    from one is what `publish_not_in_question` exists to refuse;
+    ///  * a digest declared in advance that this reading actually *contradicts*.
+    ///    Neither half is redundant: with nothing declared there is nothing to
+    ///    contradict and the honest reading is `destination_present_unverified`,
+    ///    and with a digest the reading *agrees* with, the honest reading is
+    ///    `filesystem_effect` — admitting this one there would turn a delivered
+    ///    artifact into a failure on the caller's choice of variant.
+    destination_present_contradicting: struct {
+        side: transfers.Side,
+        path: []const u8,
+        /// What the artifact at the destination actually hashes to. Compared
+        /// against the transfer's advance commitment in `resolve`, and required
+        /// to differ from it — see `contradiction_not_established`.
+        sha256: []const u8,
+        /// How the artifact was read and hashed, e.g.
+        /// `sha256sum => 0000ffff`. Required and non-empty, for the reason
+        /// `destination_absent`'s is.
+        verification_method: []const u8,
+    },
     /// A human decided, without mechanical proof.
     operator_override: struct {
         reason: []const u8,
@@ -667,10 +919,37 @@ pub const ResolutionEvidence = union(enum) {
         return @tagName(e);
     }
 
-    /// False for `operator_override`: callers that need to distinguish
-    /// "proved" from "asserted" should ask this rather than parse the text.
+    /// Whether this rests on a reading rather than on somebody's say-so.
+    ///
+    /// Callers that need to distinguish "proved" from "asserted" ask this
+    /// rather than parse the text, and `resolve` stamps the reconcile event
+    /// `OPERATOR_OVERRIDE` when it is false.
+    ///
+    /// Exhaustive rather than `e != .operator_override`, so a new variant has to
+    /// be classified out loud instead of inheriting "mechanical" from a
+    /// negation nobody re-read. `destination_absent` is the one that makes that
+    /// worth doing, because it is the first variant where the honest answer is
+    /// arguable. It is mechanical: something looked at a path and reported what
+    /// it found, the method is on the receipt, and another reader at that
+    /// moment would have read the same thing. Its weakness is temporal — an
+    /// absence read now is not an absence then — and that is a limit on what it
+    /// may *conclude*, which is where it is enforced (`supports`,
+    /// `publishAdjudication`). Demoting it to an assertion instead would file a
+    /// reading alongside a human's opinion, and the trail would stop being able
+    /// to tell those apart at all.
     pub fn isMechanical(e: ResolutionEvidence) bool {
-        return e != .operator_override;
+        return switch (e) {
+            .supervisor_report,
+            .process_probe,
+            .job_sentinel,
+            .job_result,
+            .filesystem_effect,
+            .destination_absent,
+            .destination_present_unverified,
+            .destination_present_contradicting,
+            => true,
+            .operator_override => false,
+        };
     }
 
     /// Whether this evidence actually entails `resolved`.
@@ -701,6 +980,44 @@ pub const ResolutionEvidence = union(enum) {
             // needs the exit status, which this evidence does not carry.
             .process_probe => |p| !p.alive and resolved == .cancelled,
             .filesystem_effect => resolved == .completed,
+            // The destination does not hold what this transfer promised, so the
+            // transfer did not deliver it. Not `completed`, obviously; not
+            // `timed_out`, which is a remote deadline this says nothing about;
+            // not `cancelled`, which is a claim about a process rather than
+            // about a file.
+            //
+            // The verdict is about the *effect*, and that is the whole of what
+            // it claims: the artifact this operation exists to produce is not at
+            // the destination, which is what was read. It stays true whether the
+            // rename never ran or ran and was undone afterwards — telling those
+            // apart would need a history nobody has, and `failed` does not
+            // depend on which it was.
+            .destination_absent => resolved == .failed,
+            // Something is at the destination this transfer promised, and
+            // nothing this transfer committed to can say whether it is the
+            // right thing. `completed` is the verdict the driver itself would
+            // have reached from the same position — bytes arrived, no digest
+            // was ever available to check them — and it is the only one on
+            // offer: `failed` is contradicted by the artifact being there,
+            // `timed_out` is a claim about a deadline and `cancelled` one about
+            // a process, and this reading is neither. The checkpoint records
+            // the weakness that `ResolvedStatus` has no word for, in
+            // `completed_unverified`.
+            .destination_present_unverified => resolved == .completed,
+            // Something is at the destination and it is provably not what this
+            // transfer promised. `failed` is the only verdict the reading can
+            // carry, and each of the other three is excluded by a different
+            // thing: `completed` is contradicted by the digest, `timed_out` is a
+            // claim about a deadline and `cancelled` one about a process, and a
+            // hash of a file is neither.
+            //
+            // `completed` being excluded here rather than merely unlikely is the
+            // whole reason this is a variant of its own: `filesystem_effect`
+            // proves `completed` and nothing else, and had the contradicting
+            // reading been folded into it, the union would have to admit one
+            // variant proving two opposite outcomes with the comparison that
+            // separates them living in `resolve` instead of here.
+            .destination_present_contradicting => resolved == .failed,
             .operator_override => true,
         };
     }
@@ -711,18 +1028,220 @@ pub const ResolutionEvidence = union(enum) {
     /// mechanism runs. Otherwise the strength of a record leaks across
     /// domains: a job wrapper's exit status would be allowed to close a
     /// transfer whose bytes nobody ever checked.
-    pub fn appliesToKind(e: ResolutionEvidence, kind: []const u8) bool {
+    ///
+    /// Exhaustive in both directions, with no default arm anywhere, so adding
+    /// an `operations.Kind` or a `ResolutionEvidence` variant is a compile
+    /// error here until someone states what may settle what. The arm this
+    /// replaced was `else => true`: every kind not named admitted every kind of
+    /// evidence, and every kind added later inherited that — the widest
+    /// possible permit, granted by omission, on the path that decides whether a
+    /// resolution may lift the same-scope mutation barrier.
+    ///
+    /// Each cell answers "can evidence of this kind make a statement about work
+    /// of this kind at all", not "could it be useful here". Where the answer is
+    /// not clear the cell refuses and says why: a wrongly refused resolution is
+    /// an operator inconvenience that names exactly what it refused, while a
+    /// wrongly admitted one releases a safety barrier on a claim about
+    /// something else.
+    pub fn appliesToKind(e: ResolutionEvidence, kind: operations.Kind) bool {
         return switch (e) {
-            .filesystem_effect => std.mem.eql(u8, kind, "transfer_push") or
-                std.mem.eql(u8, kind, "transfer_pull") or
-                std.mem.eql(u8, kind, "fetch"),
+            // Refused for every kind, until something builds a producer that
+            // binds a report to the attempt it is about.
+            //
+            // The variant is kept rather than deleted — the supervisor is
+            // unbuilt work, not abandoned work — but nothing constructs one
+            // today, and admitting it meanwhile grants the widest permit in the
+            // union to the only mechanical variant with **no identity binding at
+            // all**. Every other one has something tying the reading to this
+            // operation, checked in `resolve`: `job_result` carries the request
+            // id the document itself names, `process_probe` is matched against
+            // the pid and start token the attempt recorded, and the four
+            // readings of a destination are compared against the side, path and
+            // digest the transfer committed to before it submitted. A
+            // `supervisor_report` carries a status and a sentence. Any caller
+            // holding any request id could hand one in and have it graded
+            // mechanical (`isMechanical`), which is the grade that releases the
+            // same-scope mutation barrier without an operator in the loop.
+            //
+            // **What a producer must supply for these cells to be reopened**,
+            // written here because this is where a future author will come to
+            // undo the refusal:
+            //
+            //  * a field on the variant naming what the report is *about*, in a
+            //    form the report's own writer filled in and this binary can
+            //    check against something it wrote down first. The two shapes
+            //    that already work are `job_result`'s — the request id, read out
+            //    of the document, compared against the operation being resolved
+            //    — and `process_probe`'s — a process identity, compared against
+            //    the one the attempt recorded on its trail. The wrapper in
+            //    `supervisor.zig` already writes both a request id and a pid, so
+            //    either is available; what is not acceptable is a field the
+            //    caller fills from the operation it is resolving, which compares
+            //    a value against itself and can never fire;
+            //  * the check in `resolve`, next to the `job_result` and
+            //    `process_probe` arms and before `supports`, refusing with
+            //    `evidence_wrong_operation` (or `evidence_wrong_process`) rather
+            //    than with a generic error;
+            //  * then, and only then, a decision per cell here about which kinds
+            //    that mechanism actually supervises — which is a narrower
+            //    question than "which kinds run a remote process", and the
+            //    reasons the old `exec, .job => true` cell gave for each group
+            //    are kept below because they will still be the reasons.
+            //
+            // The old cell's reasoning, unchanged and still the starting point:
+            // `exec` and `job` are one supervised remote command each, so what
+            // the attempt did is what that command did and its supervisor's
+            // report is a statement about the whole of it. A transfer's outcome
+            // is whether the bytes are at the destination and hash to what was
+            // promised in advance — a copier that wrote to the wrong path, or
+            // whose rename never ran, still exits 0, and this variant would
+            // carry that 0 straight to `completed` past the digest comparison
+            // every other route to a transfer's verdict has to pass. Nothing in
+            // this binary creates a `tunnel`, `plan_phase`, `audit` or `cleanup`
+            // operation, so nothing supervises one either.
+            //
+            // Refusing everywhere costs nothing that is reachable: no command
+            // constructs this variant, so no operator route disappears, and
+            // `operator_override` remains admissible for every kind — nothing is
+            // left with no way to be settled.
+            .supervisor_report => switch (kind) {
+                .exec,
+                .job,
+                .transfer_push,
+                .transfer_pull,
+                .fetch,
+                .tunnel,
+                .plan_phase,
+                .audit,
+                .cleanup,
+                => false,
+            },
+            // A pid and start-token reading of a process. `resolve` requires it
+            // to be a reading of *this operation's own* recorded process, so
+            // the kinds it may speak for are the ones a process identity is
+            // recorded for.
+            .process_probe => switch (kind) {
+                // An `exec` records the pid and start token the shell reported
+                // for the command it ran (`supervisor.Identity`, put on the
+                // trail by `execution.remoteStarted`).
+                .exec => true,
+                // A `job` records neither of those things. `cmd_job` launches
+                // into a tmux session and reports `Tmux.panePid`, so the identity
+                // on a job's trail is the *pane's* pid with no start token — a
+                // reading about one process, admitted to settle a different one.
+                // `supervisor.zig` says outright what that is worth: "a command
+                // that daemonized, called `disown`, or ran under `setsid`
+                // outlives the pane". `cmd_job`'s own kill path honours that — it
+                // writes `remote_cancel_confirmed` only when
+                // `verified_cancellation` is satisfied, which shell mode never
+                // satisfies — and while this cell was `true`, a probe arriving
+                // here made the same claim with nothing asked of it: pane gone,
+                // `cancelled`, scope released, child still running.
+                //
+                // It was left admissible once on the argument that the honest
+                // rule is about the recorded *identity* rather than the kind, and
+                // that narrowing the cell would encode today's job launcher into
+                // the evidence contract. The argument is sound and the conclusion
+                // was wrong: a job already has two evidence chains of its own
+                // that are addressed to it — `job_sentinel` and `job_result` —
+                // so refusing here removes no route, while admitting it keeps a
+                // permit alive for a reading that is structurally about the
+                // wrong process. If a launcher ever reports the command's own pid
+                // and start token onto the job's trail, this cell is where that
+                // becomes true again, and it should be reopened in the same
+                // change that makes it true rather than held open in advance.
+                .job => false,
+                // A transfer writes down a destination and a digest, not a
+                // process. "It is no longer running" is equally true of a
+                // transfer that finished and one that died mid-rename, and
+                // `cancelled` — the only thing a dead process establishes —
+                // would release the barrier on the second while its checkpoint
+                // went on holding the path against everyone else.
+                .transfer_push, .transfer_pull, .fetch => false,
+                // As above: no such operation exists yet, so none of them
+                // records a process a probe could be a reading of.
+                .tunnel, .plan_phase, .audit, .cleanup => false,
+            },
             // Both are exit statuses recorded by the job wrapper — the
             // sidecar it writes and the sentinel it echoes. Neither exists
             // for any other kind of operation, so one turning up against a
             // transfer or a fetch means the evidence was misrouted, not that
             // the operation is settled.
-            .job_result, .job_sentinel => std.mem.eql(u8, kind, "job"),
-            else => true,
+            .job_result, .job_sentinel => switch (kind) {
+                .job => true,
+                .exec, .transfer_push, .transfer_pull, .fetch, .tunnel, .plan_phase, .audit, .cleanup => false,
+            },
+            // A file read at a path and hashed. It can only mean anything for
+            // work that said in advance which file would prove it — `resolve`
+            // compares side, path and digest against that commitment, and no
+            // other kind of operation makes one. A hash cannot say whether an
+            // arbitrary command did what it was asked.
+            .filesystem_effect => switch (kind) {
+                .transfer_push, .transfer_pull, .fetch => true,
+                .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => false,
+            },
+            // The same address, read and found empty. Only work that named a
+            // destination in advance can be spoken about this way — `resolve`
+            // compares side and path against that commitment — and only a
+            // transfer names one. "Nothing is at /srv/app/out.bin" is not a
+            // statement about what an arbitrary command did, however true it is.
+            //
+            // Its two positive twins are the same cell for the same reason: all
+            // three are readings of an address, and only a transfer has one on
+            // record. They travel together because a kind that can be told its
+            // artifact is there must be tellable that it is not and that it is
+            // the wrong one, or some of its outcomes have no evidence that can
+            // express them at all — which is how the parked publish came to be
+            // wedged in the first place.
+            .destination_absent,
+            .destination_present_unverified,
+            .destination_present_contradicting,
+            => switch (kind) {
+                .transfer_push, .transfer_pull, .fetch => true,
+                .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => false,
+            },
+            // A human's decision, and the only variant that is about the
+            // *operation* rather than about some mechanism's output — so there
+            // is no kind of work it cannot speak about. Admissible everywhere
+            // on purpose: an attempt nothing mechanical can settle holds its
+            // scope until somebody settles it, and a kind admitted no evidence
+            // at all could never be settled by anyone. That is not hypothetical
+            // any more — `supervisor_report` is now refused for every kind and
+            // `process_probe` for every kind but `exec`, so for a `tunnel` or a
+            // `plan_phase` this cell is the *only* admissible one. What keeps it
+            // honest lives elsewhere — it is recorded as a decision
+            // (`isMechanical`), and `publishAdjudication` refuses to let it
+            // write an artifact fact nobody read.
+            //
+            // That refusal is also the limit of what this cell buys, and the
+            // limit is real rather than theoretical: for a transfer parked in
+            // `indeterminate_publish` an override is admitted here and then
+            // fails the whole resolution with
+            // `error.PublishAdjudicationUndetermined`, because the checkpoint
+            // has to be judged in the same transaction and an override cannot
+            // judge it. Such an operation is settleable by a reading of its
+            // destination and by nothing else, and there is now one for each
+            // answer a look can produce: `filesystem_effect` matching the digest
+            // it declared, `destination_present_contradicting` when the artifact
+            // is there and hashes to something else,
+            // `destination_present_unverified` when it declared no digest at
+            // all, or `destination_absent` at the path it committed to. All four
+            // are available to the operator who checked by hand — that is the
+            // same act with the reading attached — so the limit is a requirement
+            // to say what was seen.
+
+            .operator_override => switch (kind) {
+                .exec,
+                .job,
+                .transfer_push,
+                .transfer_pull,
+                .fetch,
+                .tunnel,
+                .plan_phase,
+                .audit,
+                .cleanup,
+                => true,
+            },
         };
     }
 
@@ -732,7 +1251,29 @@ pub const ResolutionEvidence = union(enum) {
     /// `detail_json` promises already-redacted content, and a reconciler
     /// pasting a command line into `detail` must not be how a token reaches
     /// the ledger.
-    pub fn toJson(e: ResolutionEvidence, arena: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    ///
+    /// Two of the fields are *corroboration*: facts only `resolve` can know,
+    /// because the evidence carries what it read and what it had to match is in
+    /// the store. Both are written out as null rather than omitted, so a reader
+    /// never has to decide whether a missing key means "not that kind of
+    /// evidence" or "written before this was recorded".
+    ///
+    ///  * `binding` — how strongly a `process_probe` was tied to this attempt.
+    ///    See `ProbeBinding`.
+    ///  * `declared_sha256` — the digest the transfer committed to before it
+    ///    sent a byte, for the readings that are judged against one. It exists
+    ///    for `destination_present_contradicting`: that receipt's whole content
+    ///    is that two digests disagree, and one of them written down alone is
+    ///    half a fact. It cannot come from the caller — the caller would be
+    ///    echoing back a value it read out of this same database, which compares
+    ///    a number with itself — so it is read here, off the checkpoint, in the
+    ///    transaction that judges it.
+    pub fn toJson(
+        e: ResolutionEvidence,
+        arena: std.mem.Allocator,
+        binding: ?ProbeBinding,
+        declared_sha256: ?[]const u8,
+    ) std.mem.Allocator.Error![]u8 {
         const redacted: ResolutionEvidence = switch (e) {
             .supervisor_report => |s| .{ .supervisor_report = .{
                 .reported = s.reported,
@@ -747,6 +1288,22 @@ pub const ResolutionEvidence = union(enum) {
                 .path = try redact(arena, f.path),
                 .sha256 = f.sha256,
             } },
+            .destination_absent => |a| .{ .destination_absent = .{
+                .side = a.side,
+                .path = try redact(arena, a.path),
+                .verification_method = try redact(arena, a.verification_method),
+            } },
+            .destination_present_unverified => |p| .{ .destination_present_unverified = .{
+                .side = p.side,
+                .path = try redact(arena, p.path),
+                .verification_method = try redact(arena, p.verification_method),
+            } },
+            .destination_present_contradicting => |c| .{ .destination_present_contradicting = .{
+                .side = c.side,
+                .path = try redact(arena, c.path),
+                .sha256 = c.sha256,
+                .verification_method = try redact(arena, c.verification_method),
+            } },
             .operator_override => |o| .{ .operator_override = .{
                 .reason = try redact(arena, o.reason),
                 .by = try redact(arena, o.by),
@@ -760,15 +1317,63 @@ pub const ResolutionEvidence = union(enum) {
             .schemaVersion = schema_version,
             .kind = e.kindName(),
             .mechanical = e.isMechanical(),
+            .probeIdentity = if (binding) |b| @tagName(b) else null,
+            .declaredSha256 = declared_sha256,
             .evidence = redacted,
         }, .{}, &writer.writer) catch return error.OutOfMemory;
         return writer.toOwnedSlice();
     }
 };
 
+/// What a `process_probe` was actually matched against.
+///
+/// A probe names no request. What ties it to an operation is the process
+/// identity that operation recorded while it ran, and that identity comes in
+/// two strengths — which is a fact about the *host*, not about the probe:
+/// `supervisor.wrapShell` reads the start time out of `/proc/<pid>/stat` or
+/// `ps -o lstart=`, and a host that can do neither reports a pid alone
+/// (`supervisor.Capability.pid_proof == .weak`).
+///
+/// The contract, written here because it had none and two readings of the
+/// missing token were both defensible:
+///
+///  * A recorded token the probe did not read is a **mismatch**. The attempt
+///    knew something and the probe declined to check it.
+///  * A recorded token the probe read differently is a **mismatch**. That is
+///    the recycled pid the token exists to catch.
+///  * No recorded token is **admitted, as `pid_only`**. Refusing would leave
+///    every attempt on such a host with no mechanical route to resolution at
+///    all, and the pid really is the whole of what that attempt ever knew about
+///    its own process. What is *not* acceptable is admitting it silently: pids
+///    are recycled, so a pid-only match is a weaker claim than a pid+token one
+///    and the receipt has to say which it was. That is the whole reason this
+///    enum exists rather than a bool inside `resolve`.
+///  * A token the probe read against an attempt that recorded none is still
+///    `pid_only`. Nothing here was compared with anything — a token nobody
+///    wrote down cannot corroborate a match — and grading the binding by what
+///    the *probe* volunteered would let a caller strengthen its own evidence by
+///    supplying a field.
+pub const ProbeBinding = enum {
+    /// The attempt recorded a start token and the probe read the same one.
+    pid_and_start_token,
+    /// The attempt never recorded a start token, so the pid is the whole of
+    /// the match. A different process may since have been given that pid.
+    pid_only,
+};
+
 fn redact(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     return history.redactSecrets(arena, text);
 }
+
+/// The process identity an operation recorded for itself, read back off its
+/// event trail.
+pub const RecordedProcess = struct {
+    pid: i64,
+    /// Null when the shell could not read a start time. `pid_proof` is only
+    /// `weak` then (see `supervisor.Capability`), and the pid is the whole of
+    /// what a later probe can be checked against.
+    start_token: ?[]const u8,
+};
 
 pub const ResolveOutcome = union(enum) {
     resolved,
@@ -794,6 +1399,22 @@ pub const ResolveOutcome = union(enum) {
         /// The request id being resolved.
         request_id: []const u8,
     },
+    /// A process probe was offered for an operation whose process it is not a
+    /// reading of. The identity analogue of `evidence_wrong_operation`, one
+    /// domain over: a probe is addressed by pid rather than by request id, so
+    /// what binds it to this operation is the pid and start token the attempt
+    /// recorded while it ran.
+    ///
+    /// Carries both sides because they send an operator to three different
+    /// places — another process, a recycled pid, or an attempt that never had a
+    /// process at all — and only the payload knows which.
+    evidence_wrong_process: struct {
+        probed_pid: i64,
+        probed_start_token: ?[]const u8,
+        /// What this operation recorded, or null when it never recorded a
+        /// process identity at all.
+        recorded: ?RecordedProcess,
+    },
     /// A published-file hash was offered for an operation that never declared
     /// what would count, or whose declaration it does not match. Separate from
     /// `evidence_does_not_support` because the evidence *kind* is right and
@@ -811,6 +1432,109 @@ pub const ResolveOutcome = union(enum) {
             sha256: []const u8,
         };
     },
+    /// An absence reading was offered for a destination this transfer never
+    /// committed to, or for a request that has no checkpoint at all. Separate
+    /// from `effect_hash_unproven` because there is no digest in the question:
+    /// what does not line up is the address, and printing a hash comparison for
+    /// it would send an operator to look at bytes.
+    absence_wrong_destination: struct {
+        /// Where the caller says it looked.
+        observed: transfers.Destination,
+        /// Where the transfer said it would publish, if it has a checkpoint.
+        committed: ?transfers.Destination,
+    },
+    /// A reading of the destination was offered for a transfer whose publish is
+    /// not an open question.
+    ///
+    /// A destination reading settles what became of a *rename nobody watched*,
+    /// which is the one thing `indeterminate_publish` records. Anywhere else it
+    /// is a statement about a path, and the two are not interchangeable: a
+    /// transfer that published and verified, then lost its reply and settled
+    /// `indeterminate`, could otherwise be resolved `failed` from an absence
+    /// read after a rotation removed the file — leaving the ledger holding
+    /// `resolved_status = failed` and a receipt saying the artifact was never
+    /// delivered, next to a checkpoint that says `published`. The next transfer
+    /// aimed there would then repeat a delivery the store's own record
+    /// contradicts.
+    ///
+    /// Carries the state so the refusal can say which way the question was
+    /// already answered.
+    publish_not_in_question: struct {
+        observed: transfers.Destination,
+        /// What the checkpoint records about that destination now.
+        state: []const u8,
+    },
+    /// A "present, nothing to check it against" reading was offered for a
+    /// transfer that *did* declare a digest.
+    ///
+    /// The reading is not wrong, it is weaker than the one available for the
+    /// same act of looking: the file is there and the transfer said in advance
+    /// what it should hash to, so hashing it settles the question properly.
+    /// Admitting the unverified form here would be a way of skipping a check
+    /// that exists, on the path that decides whether an artifact is recorded as
+    /// delivered.
+    unverified_reading_when_digest_declared: struct {
+        observed: transfers.Destination,
+        /// What the transfer committed to, so the caller knows what to compare
+        /// its hash against.
+        expected_sha256: []const u8,
+    },
+    /// A "the artifact here is the wrong artifact" reading that does not
+    /// actually contradict anything.
+    ///
+    /// Two situations wearing one name, told apart by `declared`, and they send
+    /// the caller to two different readings:
+    ///
+    ///  * `declared == null` — the transfer never said what its artifact would
+    ///    hash to, so there is nothing for this digest to disagree with and no
+    ///    reading of the bytes can be judged at all. What the look established
+    ///    is that *something* is there, which is
+    ///    `destination_present_unverified`.
+    ///  * `declared` equals what was read — the artifact is the one that was
+    ///    promised. That is a delivery, not a failure, and the reading for it is
+    ///    `filesystem_effect`.
+    ///
+    /// Refused rather than quietly redirected, because the two verdicts are
+    /// opposite: admitting the second would let a caller turn a correctly
+    /// delivered artifact into `failed` and `failed_hash_mismatch` by choosing a
+    /// variant, on the path that decides whether a scope barrier is released.
+    contradiction_not_established: struct {
+        observed: transfers.Destination,
+        /// The digest the caller says it read off the destination.
+        observed_sha256: []const u8,
+        /// What the transfer committed to in advance, or null if it committed
+        /// to nothing.
+        declared: ?[]const u8,
+    },
+    /// A destination reading arrived with no account of how it was read. The
+    /// method is what makes it a reading rather than a conclusion — see
+    /// `ResolutionEvidence.destination_absent.verification_method`.
+    reading_has_no_method: struct { evidence_kind: []const u8 },
+    /// A published-file hash matched this transfer's declaration, against a
+    /// checkpoint whose own record says the transfer never got as far as
+    /// putting an artifact there.
+    ///
+    /// The sibling of `publish_not_in_question`, one variant over and in the
+    /// opposite direction. That one refuses a reading of a destination whose
+    /// question is already answered; this one refuses a reading whose answer
+    /// contradicts what the transfer recorded about itself. A digest match binds
+    /// the reading to the *declaration* and to nothing else, so on a row that
+    /// records a failure — most reachably `failed_clobber_conflict`, whose
+    /// ordinary cause is the previous delivery of the very same artifact still
+    /// sitting at the path — it would settle the operation `completed` and lift
+    /// the scope barrier while the checkpoint went on saying no byte was ever
+    /// written and holding the destination.
+    ///
+    /// Not folded into `effect_hash_unproven`: the hash *was* proven, and
+    /// telling an operator their digest did not match would send them to
+    /// re-hash a file that is exactly what they said it was. What is wrong is
+    /// the conclusion drawn from it, so the refusal carries the state instead of
+    /// the digests.
+    effect_reading_against_recorded_outcome: struct {
+        observed: transfers.Destination,
+        /// What the checkpoint records about that destination now.
+        state: []const u8,
+    },
     /// Only an `indeterminate` attempt can be resolved. Carries what the
     /// status actually is, so the caller can say why it refused.
     not_indeterminate: op_state.Status,
@@ -820,24 +1544,234 @@ pub const ResolveOutcome = union(enum) {
     unknown_operation,
 };
 
-/// Length of the longest `operations.Kind` name.
+/// The newest process identity this operation recorded, or null if it never
+/// recorded one.
 ///
-/// Derived from the enum rather than guessed at, because the buffer it sizes
-/// carries the operation's kind out of a statement that is about to be
-/// finalized and into `appliesToKind`, which decides whether evidence is
-/// allowed to release the scope barrier. A hand-picked size can stop being
-/// big enough the day someone adds a longer kind, and the failure mode of the
-/// old `@min(raw_kind.len, kind_buf.len)` copy was silent: a kind longer than
-/// the buffer was compared as a truncated prefix. With the old 64-byte buffer
-/// that could only ever over-refuse — no 64-character prefix matches a kind
-/// name — so it was never an authorization hole, but it would have become one
-/// the moment the buffer was sized down to fit. Sized here it cannot be too
-/// small for a kind that exists, and anything longer is rejected, not trimmed.
-const max_kind_len = blk: {
-    var longest: usize = 0;
-    for (@typeInfo(operations.Kind).@"enum".fields) |field| longest = @max(longest, field.name.len);
-    break :blk longest;
+/// Newest wins because one attempt can report a pid more than once — the start
+/// marker, then the terminal — and the last process we saw running is the one a
+/// later probe is a reading of.
+///
+/// The token is then read back **for that pid**, newest first, rather than off
+/// whichever row supplied the pid. Two things follow, and both are the point:
+/// a token can never be checked against a pid it did not belong to, and an
+/// identity cannot be *downgraded*. The columns are independently optional at
+/// every writer (`Observation` and `TerminalExtra` both expose them as free
+/// optionals), so a later event carrying the pid without the token would
+/// otherwise take the operation from pid+token binding to pid-only — turning a
+/// probe that could not read a start time from refused into admitted, on an
+/// attempt that had already proved it could read one.
+///
+/// The first of those two is a property of *this* statement only across rows.
+/// Within one row it is the writer's, and one writer used to be able to break
+/// it: `terminalEvent`'s `remote_cancel_confirmed` arm filled pid and token
+/// from two independent `orelse`s, so a caller correcting only the pid produced
+/// a row pairing it with the evidence's token — a pair no host ever reported,
+/// read back here as a `pid_and_start_token` identity. That arm now takes both
+/// halves from one source. Saying "that is a property of the callers, not of
+/// the table" was true and was not a reason to leave the caller wrong.
+///
+/// A row that never carried a token leaves this null. `pid_proof` is only
+/// `weak` then (see `supervisor.Capability`) and the pid is the whole of the
+/// identity — see `startTokenFits` for what that admits and `ProbeBinding` for
+/// what the receipt is then allowed to claim about it.
+///
+/// Both statements walk this request's own events newest-first over
+/// `UNIQUE(request_id, seq)` and stop at the first hit, so together they read at
+/// most one operation's trail. Caller must hold the write transaction.
+fn recordedProcessLocked(store: *Store, arena: Allocator, request_id: []const u8) Error!?RecordedProcess {
+    const pid = blk: {
+        var stmt = try store.db.prepare(
+            \\SELECT remote_pid
+            \\  FROM operation_events
+            \\ WHERE request_id = ?1 AND remote_pid IS NOT NULL
+            \\ ORDER BY seq DESC LIMIT 1
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, request_id);
+        if (!try stmt.step()) return null;
+        break :blk stmt.columnInt(0);
+    };
+
+    var stmt = try store.db.prepare(
+        \\SELECT remote_start_token
+        \\  FROM operation_events
+        \\ WHERE request_id = ?1 AND remote_pid = ?2 AND remote_start_token IS NOT NULL
+        \\ ORDER BY seq DESC LIMIT 1
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, request_id);
+    try stmt.bindInt(2, pid);
+    return .{
+        .pid = pid,
+        // Duped: the statement is finalized before this is read, and the value
+        // travels out of `resolve` inside the refusal.
+        .start_token = if (try stmt.step()) try arena.dupe(u8, stmt.columnText(0)) else null,
+    };
+}
+
+/// Whether a probe's start token clears the identity the operation recorded.
+///
+/// Half of the contract in `ProbeBinding`, and the half that decides admission:
+/// a recorded token the probe did not read, or read differently, is a mismatch
+/// and not a pass. The token is the only thing separating our process from
+/// whatever the kernel handed that pid next, which is the entire reason it is
+/// recorded; a probe that could not read one has not ruled that out.
+///
+/// A probe that *did* read one for an attempt that recorded none is not a
+/// mismatch — there is nothing here to contradict it, and the pid is all this
+/// operation ever knew about its own process. It is not a stronger match
+/// either: `bindingFor` grades that case `pid_only`, because the token was
+/// compared with nothing.
+fn startTokenFits(recorded: ?[]const u8, probed: ?[]const u8) bool {
+    const want = recorded orelse return true;
+    const got = probed orelse return false;
+    return std.mem.eql(u8, want, got);
+}
+
+/// How strong the match was, given what the attempt had written down.
+///
+/// Read off the *recorded* identity alone. `startTokenFits` has already said
+/// the probe is admissible; this says how much that admission is worth, and it
+/// goes on the receipt so the claim there is no stronger than the evidence
+/// behind it.
+fn bindingFor(recorded: RecordedProcess) ProbeBinding {
+    return if (recorded.start_token == null) .pid_only else .pid_and_start_token;
+}
+
+/// What a resolution's evidence forces on a checkpoint parked in
+/// `indeterminate_publish`, or null when it forces nothing.
+///
+/// A narrower question than the one `supports` answers. `supports` asks what
+/// the evidence proves about the *operation*; this asks what it proves about a
+/// rename that may or may not have run — and `indeterminate_publish` is
+/// recorded precisely when the process's own fate stopped answering that. Every
+/// arm has to justify itself, because a null refuses a whole resolution and a
+/// wrong non-null writes a fabricated fact about a file on someone's disk.
+///
+/// `reading` travels with the verdict because for the two verdicts that have one
+/// the reading and the verdict are one fact: for `published` the digest that
+/// proved the artifact is the digest the checkpoint then records as its own, and
+/// for `failed_hash_mismatch` the digest that disproved it is what the state is
+/// *about*. See `transfers.adjudicateLocked` for why the row cannot supply
+/// either and why carrying them here is not a weakening.
+///
+/// Exhaustive over the union so a new evidence variant has to say what it can
+/// establish about a destination before it can be used at all.
+const PublishVerdict = struct {
+    to: transfers.State,
+    /// The digest read off the destination, for the two verdicts that turn on
+    /// one.
+    reading: ?[]const u8 = null,
 };
+
+/// Whether this evidence can say what became of a rename nobody watched.
+///
+/// The same question `publishAdjudication` answers, exposed as a bool so the
+/// operator-facing text that has to enumerate these readings is checked against
+/// the set rather than against a hand-kept list. A refusal that tells an
+/// operator to offer a reading has to name every reading that would work, and
+/// the last time that list was maintained by hand it went stale the moment a
+/// fourth reading landed — leaving a transfer whose only route was the reading
+/// the sentence did not mention.
+pub fn adjudicatesParkedPublish(e: ResolutionEvidence) bool {
+    return publishAdjudication(e) != null;
+}
+
+fn publishAdjudication(e: ResolutionEvidence) ?PublishVerdict {
+    return switch (e) {
+        // The one variant that reads the destination *and* has something to
+        // check it against. By the time this is asked, `resolve` has compared
+        // all three halves — side, path and digest — against what the transfer
+        // committed to before it sent anything, so the artifact is at the
+        // destination and hashes to what was promised. That is what `published`
+        // means, and the reading goes with it: a row whose owner was killed
+        // before it could hash its own result has no `verified_sha256`, and
+        // this reading is that column's honest content.
+        .filesystem_effect => |fx| .{ .to = .published, .reading = fx.sha256 },
+        // The artifact is there and this transfer never declared anything that
+        // could say it is the right artifact. `completed_unverified` is the
+        // state for exactly that, and no reading accompanies it — the digest
+        // conjunct on that target requires the column to stay null, which is
+        // what "unverified" means.
+        .destination_present_unverified => .{ .to = .completed_unverified },
+        // The artifact is there and it is provably the wrong artifact. By the
+        // time this is asked, `resolve` has compared side and path against the
+        // committed destination, established that the transfer declared a digest
+        // in advance, and established that this reading is not that digest.
+        //
+        // `failed_hash_mismatch` says the digest did not match, which is exactly
+        // what was proven — the state's literal meaning, not the nearest legal
+        // answer. It is a *failure* verdict reached from a *present* artifact,
+        // and that only reads oddly until the hold is taken into account: every
+        // `failed_*` keeps its destination (`transfers.State.holdsDestination`),
+        // so the wrong bytes are not silently clobbered by the next transfer
+        // aimed there, and the operator's exit is `supersede` once they have
+        // decided what to do about them.
+        //
+        // The reading travels with the verdict, and it has to. A parked row can
+        // already carry a digest — the driver hashed the staged bytes while
+        // verifying, then died mid-rename, and the normalisation to
+        // `indeterminate_publish` deliberately keeps it — and that digest is of
+        // the bytes *before* the rename while this one is of what is at the
+        // destination *after* it. The state records the second, so the column
+        // has to hold the second. Leaving the first in place produced a
+        // `failed_hash_mismatch` whose columns said the digest agreed;
+        // `transfers.evidenceClause` now refuses that row outright, so a verdict
+        // carrying no reading could not reach the state at all.
+        .destination_present_contradicting => |reading| .{
+            .to = .failed_hash_mismatch,
+            .reading = reading.sha256,
+        },
+
+        // The other reading of the same destination, and the only thing that
+        // can produce `failed_publish`. By the time this is asked, `resolve`
+        // has compared side and path against what the transfer committed to at
+        // `create`, so what was inspected is this transfer's destination and it
+        // does not carry the artifact.
+        //
+        // `failed_publish` says the publish did not put the artifact at the
+        // path — which is what was read — and deliberately does not say the
+        // rename never ran, because an absence now cannot distinguish a rename
+        // that never happened from one that happened and was undone. Nothing
+        // downstream needs that distinction: the row keeps holding its
+        // destination either way (`State.holdsDestination` covers every
+        // failure), so the next transfer aimed there still has to be let
+        // through by an operator rather than walking into the leftovers.
+        .destination_absent => .{ .to = .failed_publish },
+        // A report about how the *process* ended, from a supervisor that does
+        // not speak about files. Exit 0 is compatible with a rename that landed
+        // and with one whose reply was the thing that got lost; a non-zero one
+        // is compatible with a rename that had already succeeded. Reading
+        // either as a fact about the destination is the guess this refuses.
+        .supervisor_report => null,
+        // Weaker still: a dead process proves it is no longer running, and
+        // nothing whatever about what it left behind.
+        .process_probe => null,
+        // A human's decision about the operation, carrying no reading of the
+        // destination. Recording `published` from it would put an artifact fact
+        // in the checkpoint table with nothing marking it as asserted rather
+        // than observed, while `resolve` keeps an override legible as an
+        // override everywhere else.
+        //
+        // That reasoning used to hold in one direction only: the operator's
+        // route was to hash the file and offer `filesystem_effect`, and there
+        // was no route for the negative case or for a transfer that never
+        // declared a digest, so refusing here left both wedged. It now holds in
+        // all four — an operator who looked reports what they saw, and there is
+        // a variant for each thing there is to see. The refusal is a requirement
+        // to say what was seen.
+        .operator_override => null,
+        .job_result, .job_sentinel => null,
+        // Five of the nine arms above no longer reach this point at all:
+        // `appliesToKind` admits only the four destination readings and
+        // `operator_override` for the three transfer kinds, and only a transfer
+        // has a checkpoint. They are answered rather than asserted
+        // `unreachable` because the guard that makes them dead lives in another
+        // function — a null costs one refusal if that ever changes, a wrong
+        // `unreachable` costs the process. Their reasons are kept because they
+        // are why those cells are refused a step earlier, not leftovers.
+    };
+}
 
 /// Records the later-proven truth for an unsettled attempt.
 ///
@@ -851,9 +1785,13 @@ const max_kind_len = blk: {
 ///   row count is checked;
 /// * evidence is typed, so an operator override stays legible as one instead
 ///   of passing for a mechanical proof;
-/// * evidence that names a request must name *this* one, and evidence must
-///   suit the kind of operation it is offered for — a barrier that trusts its
-///   callers to aim correctly is not a barrier;
+/// * evidence that names a request must name *this* one, a probe must be a
+///   reading of the process this attempt recorded, and evidence must suit the
+///   kind of operation it is offered for — a barrier that trusts its callers to
+///   aim correctly is not a barrier;
+/// * a transfer whose rename was never observed is adjudicated here too, in
+///   this transaction, so the operation's verdict and the artifact's fate land
+///   together or not at all;
 /// * the resolution and its append-only reconcile event commit together, so
 ///   a resolution can never exist without evidence explaining it.
 pub fn resolve(
@@ -864,8 +1802,6 @@ pub fn resolve(
     evidence: ResolutionEvidence,
     now: i64,
 ) Error!ResolveOutcome {
-    const evidence_json = try evidence.toJson(arena);
-
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
 
@@ -875,8 +1811,7 @@ pub fn resolve(
     var found = false;
     var current_status: op_state.Status = undefined;
     var current_resolution: ?op_state.ResolvedStatus = null;
-    var kind_buf: [max_kind_len]u8 = undefined;
-    var kind: []const u8 = "";
+    var kind: operations.Kind = undefined;
     {
         var stmt = try store.db.prepare(
             "SELECT status, resolved_status, kind FROM operations WHERE request_id = ?1",
@@ -887,16 +1822,18 @@ pub fn resolve(
             found = true;
             current_status = try op_state.Status.parse(stmt.columnText(0));
             current_resolution = if (stmt.columnOptText(1)) |v| try op_state.ResolvedStatus.parse(v) else null;
-            const raw_kind = stmt.columnText(2);
-            // Longer than the longest kind that exists means it is not a kind
-            // this binary knows, so there is nothing here to authorize from.
-            // Copying a prefix instead — which is what `@min(raw_kind.len,
-            // kind_buf.len)` did — hands `appliesToKind` a string the
-            // operation never had, on the path that decides whether evidence
-            // may release the scope barrier. Fail instead of narrowing.
-            if (raw_kind.len > kind_buf.len) return error.UnknownOperationKind;
-            @memcpy(kind_buf[0..raw_kind.len], raw_kind);
-            kind = kind_buf[0..raw_kind.len];
+            // `kind` carries no CHECK constraint, so a future version, a manual
+            // edit or a corrupted row can leave anything in it. Whatever it
+            // holds, a kind this binary cannot name is one it cannot reason
+            // about, and `appliesToKind` — which decides whether evidence may
+            // release the scope barrier — only has answers for the kinds it
+            // knows. Parse or refuse; there is no third option that is honest.
+            //
+            // Parsing is also what closes the hole underneath: the column used
+            // to be copied into a buffer and compared as text, so an
+            // unrecognised *short* kind matched nothing, fell through the old
+            // `else => true`, and admitted every variant in the union.
+            kind = operations.Kind.parse(stmt.columnText(2)) catch return error.UnknownOperationKind;
         }
     }
 
@@ -921,6 +1858,19 @@ pub fn resolve(
     // `request_id` comes from the document (see its doc comment); filled from
     // the operation being resolved, this compares a value against itself and
     // can never fire.
+    //
+    // A probe is the same question addressed differently. It names no request,
+    // so what ties it to this operation is the process identity the attempt
+    // recorded while it ran — and until that was read, a probe of any process
+    // on any host settled any operation, releasing its barrier on a claim about
+    // an unrelated pid. It is asked here, with the other identity check and
+    // before `supports`, because "a live process proves nothing" is a true
+    // sentence about *some* process: printed for a probe of somebody else's,
+    // it sends an operator to look at the wrong one.
+    // How firmly a probe was tied to this attempt, filled by the check below
+    // and carried into the receipt. Null for every other kind of evidence, and
+    // for a probe that never got past the check — nothing is written then.
+    var probe_binding: ?ProbeBinding = null;
     switch (evidence) {
         .job_result => |r| if (!std.mem.eql(u8, r.request_id, request_id)) {
             try rollback(store);
@@ -928,6 +1878,33 @@ pub fn resolve(
                 .evidence_request_id = r.request_id,
                 .request_id = request_id,
             } };
+        },
+        .process_probe => |probe| {
+            const recorded = try recordedProcessLocked(store, arena, request_id);
+            // An attempt that never recorded a process is one a probe cannot
+            // speak about — the same shape as a transfer that never declared a
+            // digest, and refused for the same reason. Waving it through
+            // because there is nothing to contradict would make the check
+            // vacuous exactly where it is needed: an attempt whose process we
+            // never identified is the one nobody can go and look for.
+            const fits = if (recorded) |had|
+                had.pid == probe.pid and startTokenFits(had.start_token, probe.start_token)
+            else
+                false;
+            if (!fits) {
+                try rollback(store);
+                return .{ .evidence_wrong_process = .{
+                    .probed_pid = probe.pid,
+                    .probed_start_token = probe.start_token,
+                    .recorded = recorded,
+                } };
+            }
+            // Admitted — and how strongly, because the two are not the same
+            // claim and only this function knows which one it just made. See
+            // `ProbeBinding`: a pid-only match is admitted deliberately, and a
+            // receipt that did not say so would read as a pid+token match on a
+            // number the kernel is free to reissue.
+            probe_binding = bindingFor(recorded.?);
         },
         else => {},
     }
@@ -943,12 +1920,12 @@ pub fn resolve(
     }
     if (!evidence.appliesToKind(kind)) {
         try rollback(store);
-        // `kind` is duped because it points into a buffer on this frame, and
-        // an outcome that outlives it has to carry the operation's real kind:
-        // reporting the evidence's kind in both fields told a caller nothing
-        // about what refused it.
+        // `@tagName` rather than the column's text: the two fields answer two
+        // different questions — what refused, and what was offered — and
+        // reporting the evidence's kind in both told a caller nothing about
+        // which pairing was rejected.
         return .{ .evidence_wrong_kind = .{
-            .operation_kind = try arena.dupe(u8, kind),
+            .operation_kind = @tagName(kind),
             .evidence_kind = evidence.kindName(),
         } };
     }
@@ -967,6 +1944,13 @@ pub fn resolve(
     // do. Without this, `filesystem_effect` was the weakest evidence in the
     // union behaving like the strongest: a stale file left at the right path
     // by an earlier run would settle an indeterminate transfer `completed`.
+    //
+    // The digest a transfer committed to, filled by the one arm below whose
+    // verdict is *about* that digest, and carried into the receipt beside the
+    // reading that contradicts it. Null everywhere else, including for
+    // `filesystem_effect`, whose receipt records a digest that agreed and needs
+    // no second copy of it.
+    var declared_sha256: ?[]const u8 = null;
     switch (evidence) {
         .filesystem_effect => |fx| {
             const expected = try transfers.expectedEffectLocked(store, arena, request_id);
@@ -983,6 +1967,132 @@ pub fn resolve(
                     .expected = expected,
                 } };
             }
+            // The digest binds the reading to this transfer's *declaration*. It
+            // does not say this transfer ever put anything at that path, and
+            // that second question has an answer sitting in the same row — the
+            // checkpoint's state. The three destination readings below ask it
+            // (`publish_not_in_question`); this arm did not, and was the only
+            // way a reading could overrule a recorded verdict rather than fill
+            // in a missing one. See `State.renameMayHaveLanded` for the
+            // clobber-conflict sequence that walks through the digest check
+            // with the hash of somebody else's artifact.
+            if (!expected.?.state.renameMayHaveLanded()) {
+                try rollback(store);
+                return .{ .effect_reading_against_recorded_outcome = .{
+                    .observed = .{ .side = fx.side, .path = fx.path },
+                    .state = expected.?.state.text(),
+                } };
+            }
+        },
+        // The same question with nothing to hash, or with a hash that has to
+        // disagree, for the three readings that report an address. Five things
+        // are asked, and each closes a way of settling a transfer from a look at
+        // the wrong thing:
+        //
+        //  * the method must be there. It is what makes this a reading rather
+        //    than a conclusion, and a field that is "required" only by its type
+        //    is one a caller satisfies with `""`.
+        //  * side and path must match the destination the transfer committed to
+        //    at `create`, before it submitted. Without the path a reconciler
+        //    could report any empty path it liked; without the side, looking at
+        //    the local copy of a push would prove the host's destination empty.
+        //  * the checkpoint's publish must still be an open question. See
+        //    `publish_not_in_question`: a reading of a destination answers what
+        //    became of a rename nobody watched, and against a row that already
+        //    records what became of it, it is a statement about a path with a
+        //    verdict attached.
+        //  * for the unverified positive reading only, the transfer must have
+        //    declared no digest. If it declared one there is a stronger reading
+        //    to be had from the same look.
+        //  * for the contradicting positive reading only, the mirror of that:
+        //    the transfer must have declared a digest *and* the reading must
+        //    disagree with it. Either half missing and the reading contradicts
+        //    nothing — see `contradiction_not_established`, which names the two
+        //    cases apart because they send the caller to two different readings
+        //    with opposite verdicts.
+        //
+        // The commitment read here is deliberately *not* `expectedEffectLocked`.
+        // That one is null unless a digest was declared, and the first three
+        // claims need no digest — a transfer that never declared one still
+        // promised a path, and requiring a digest would leave its parked publish
+        // unjudgeable, which is the wedge these variants exist to open. A
+        // request with no checkpoint at all has committed to nothing and is
+        // refused: there is no address to have looked at. The digest is read
+        // separately, by the two arms whose rules turn on whether one exists.
+        // The three arms are one arm with `inline`, because their payloads are
+        // distinct anonymous struct types that happen to share the three fields
+        // read here — the rules above are identical for all three and a second
+        // copy of them is a second thing to keep in step.
+        inline .destination_absent,
+        .destination_present_unverified,
+        .destination_present_contradicting,
+        => |reading| {
+            if (reading.verification_method.len == 0) {
+                try rollback(store);
+                return .{ .reading_has_no_method = .{ .evidence_kind = evidence.kindName() } };
+            }
+            const observed: transfers.Destination = .{
+                .side = reading.side,
+                .path = reading.path,
+            };
+            const committed = try transfers.committedDestinationLocked(store, arena, request_id);
+            const same_place = if (committed) |want|
+                want.side == observed.side and std.mem.eql(u8, want.path, observed.path)
+            else
+                false;
+            if (!same_place) {
+                try rollback(store);
+                return .{ .absence_wrong_destination = .{
+                    .observed = observed,
+                    .committed = if (committed) |c| c.address() else null,
+                } };
+            }
+            if (committed.?.state != .indeterminate_publish) {
+                try rollback(store);
+                return .{ .publish_not_in_question = .{
+                    .observed = observed,
+                    .state = committed.?.state.text(),
+                } };
+            }
+            if (evidence == .destination_present_unverified) {
+                if (try transfers.expectedEffectLocked(store, arena, request_id)) |declared| {
+                    try rollback(store);
+                    return .{ .unverified_reading_when_digest_declared = .{
+                        .observed = observed,
+                        .expected_sha256 = declared.sha256,
+                    } };
+                }
+            }
+            if (evidence == .destination_present_contradicting) {
+                const read_back = evidence.destination_present_contradicting.sha256;
+                const declared = try transfers.expectedEffectLocked(store, arena, request_id);
+                // A contradiction needs two sides. Nothing declared and there is
+                // no promise to have broken; the same digest and the promise was
+                // kept. In both cases the honest reading is a different variant
+                // with a different verdict, so this is refused rather than
+                // resolved to the nearest thing — the difference between them is
+                // `completed` and `failed`.
+                const contradicts = if (declared) |want|
+                    !std.mem.eql(u8, want.sha256, read_back)
+                else
+                    false;
+                if (!contradicts) {
+                    try rollback(store);
+                    return .{ .contradiction_not_established = .{
+                        .observed = observed,
+                        .observed_sha256 = read_back,
+                        .declared = if (declared) |d| d.sha256 else null,
+                    } };
+                }
+                // Kept for the receipt. The reading alone says "the artifact
+                // hashes to X"; what makes it a *contradiction* is the digest
+                // this transfer committed to before it sent a byte, and a
+                // receipt holding only one of the two is half the fact. It is
+                // read here, off the checkpoint, rather than taken from the
+                // caller — a caller echoing back a value out of this database
+                // would be comparing a number with itself. See `toJson`.
+                declared_sha256 = declared.?.sha256;
+            }
         },
         else => {},
     }
@@ -995,18 +2105,54 @@ pub fn resolve(
         return .{ .not_indeterminate = current_status };
     }
 
+    // Whether this resolution also has to say what became of an artifact, and
+    // what it says. Decided before anything is written, because the two answers
+    // are not both recoverable afterwards: an evidence variant that cannot
+    // settle the rename must leave the ledger exactly as it found it rather
+    // than resolve the operation — lifting the scope barrier — and abandon a
+    // checkpoint that goes on holding its destination against everyone.
+    //
+    // A null id is the ordinary case and is not an error: the operation is not
+    // a transfer, or its transfer never reached a rename, or the rename's
+    // outcome was observed at the time and the row already records it. Nothing
+    // to adjudicate is nothing to do.
+    //
+    // The refusal returns an error and lets the `errdefer` roll back, the way
+    // `UnknownOperationKind` above does; the explicit `rollback` calls are for
+    // paths that hand back a *business outcome*, where there is no error for
+    // the deferred one to fire on.
+    const Adjudication = struct { checkpoint_id: i64, verdict: PublishVerdict };
+    var adjudication: ?Adjudication = null;
+    if (try transfers.pendingPublishLocked(store, request_id)) |checkpoint_id| {
+        adjudication = .{
+            .checkpoint_id = checkpoint_id,
+            .verdict = publishAdjudication(evidence) orelse
+                return error.PublishAdjudicationUndetermined,
+        };
+    }
+
+    // Serialised here rather than on the way in, because until the probe check
+    // above has run there is no honest answer for `probeIdentity` — the
+    // document would have to claim a binding strength before anything had been
+    // compared. The same is true of `declaredSha256`, which is read off the
+    // checkpoint by the contradiction check. Every refusal before this point
+    // writes nothing at all, so nothing is lost by not having it earlier.
+    const evidence_json = try evidence.toJson(arena, probe_binding, declared_sha256);
+
     var updated: i64 = 0;
     {
         // Conditional update, then verify it matched: two reconcilers racing
-        // must not both believe they wrote the resolution.
-        var stmt = try store.db.prepare(
+        // must not both believe they wrote the resolution. The status is
+        // rendered from the enum rather than typed out, so renaming the variant
+        // moves this guard with it instead of quietly matching no row.
+        var stmt = try store.db.prepare(comptime std.fmt.comptimePrint(
             \\UPDATE operations
             \\   SET resolved_status = ?1, reconciled_at = ?2,
             \\       resolution_evidence = ?3, updated_at = ?2
             \\ WHERE request_id = ?4
-            \\   AND status = 'indeterminate'
+            \\   AND status = '{s}'
             \\   AND resolved_status IS NULL
-        );
+        , .{@tagName(op_state.Status.indeterminate)}));
         defer stmt.deinit();
         try stmt.bindText(1, resolved.text());
         try stmt.bindInt(2, now);
@@ -1019,6 +2165,21 @@ pub fn resolve(
         try rollback(store);
         return .{ .already_resolved = resolved };
     }
+
+    // `transfers` stays the sole writer of its own table; this calls its writer
+    // rather than reaching into the table, so every rule that statement carries
+    // — ownership, the transition list, and the evidence `published` demands —
+    // applies to a resolution exactly as it applies to the transfer itself. A
+    // refusal here propagates and the `errdefer` rolls the resolution back with
+    // it, which is the point of doing both inside one transaction.
+    if (adjudication) |verdict| try transfers.adjudicateLocked(
+        store,
+        verdict.checkpoint_id,
+        request_id,
+        verdict.verdict.to,
+        verdict.verdict.reading,
+        now,
+    );
 
     const seq = try nextSeqLocked(store, request_id);
     _ = try insert(store, .{

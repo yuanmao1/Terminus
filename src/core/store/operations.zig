@@ -116,14 +116,17 @@ pub const Error = Db.Error || error{ UnknownStatus, InvalidRequestId };
 
 pub fn create(store: *Store, opts: CreateOptions) Error!void {
     try ids.validate(opts.request_id);
-    var stmt = try store.db.prepare(
+    // The seed status is rendered from the enum for the same reason every other
+    // status list in this store now is: a rename of the variant has to move the
+    // statement with it rather than leave a row nothing can parse.
+    var stmt = try store.db.prepare(comptime std.fmt.comptimePrint(
         \\INSERT INTO operations (
         \\  request_id, schema_version, server_id, server_name, kind,
         \\  scope_kind, scope_key, alias, status,
         \\  argv_redacted, argv_sha256, cwd, shell, capability_json, transport,
         \\  mutating, created_at, updated_at
-        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'created', ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?15, ?15)
-    );
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{s}', ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?15, ?15)
+    , .{@tagName(Status.created)}));
     defer stmt.deinit();
     try stmt.bindText(1, opts.request_id);
     try stmt.bindInt(2, schema_version);
@@ -224,6 +227,7 @@ pub fn advanceLocked(
     to: op_state.LiveStatus,
     now: i64,
 ) (Error || error{ IllegalTransition, UnknownOperation })!void {
+    try store.db.requireTransaction();
     const current = try statusOfLocked(store, request_id);
     if (!op_state.canTransition(current, to.toStatus())) return error.IllegalTransition;
 
@@ -239,6 +243,7 @@ pub fn advanceLocked(
 
 /// Caller must hold the write transaction.
 pub fn statusOfLocked(store: *Store, request_id: []const u8) (Error || error{UnknownOperation})!Status {
+    try store.db.requireTransaction();
     var stmt = try store.db.prepare("SELECT status FROM operations WHERE request_id = ?1");
     defer stmt.deinit();
     try stmt.bindText(1, request_id);
@@ -254,10 +259,26 @@ pub fn statusOfLocked(store: *Store, request_id: []const u8) (Error || error{Unk
 /// invariant is enforced in `receipts.resolve`, but a safety barrier should
 /// not depend on a rule held somewhere else: a resolution written against a
 /// still-running `submitted` attempt would otherwise silently lift the block.
-const unsettled_predicate =
-    \\ (status IN ('submitted','remote_started')
-    \\  OR (status = 'indeterminate' AND resolved_status IS NULL))
-;
+///
+/// The status list is rendered from `Status.blocksScope`, not typed out. It was
+/// typed out until now — the last live copy of an operation-status list in this
+/// store, and the barrier itself, so a member added to the predicate and not to
+/// this string would have left the new status blocking nothing. `transfers` had
+/// five copies of the checkpoint equivalent and one of them drifted; there is
+/// no reason to keep the sixth here.
+///
+/// The exception is written as a subtraction because that is what it is: every
+/// status in the list blocks, and exactly one of them stops blocking once
+/// somebody has proved what really happened. Naming `indeterminate` once, next
+/// to the column that resolves it, keeps the two halves of that sentence in one
+/// place.
+const unsettled_predicate = std.fmt.comptimePrint(
+    \\ (status IN ({[blocking]s})
+    \\  AND (status <> '{[resolvable]s}' OR resolved_status IS NULL))
+, .{
+    .blocking = op_state.sqlList(Status.blocksScope),
+    .resolvable = @tagName(Status.indeterminate),
+});
 
 /// The scope barrier is held by writers only.
 ///
@@ -268,28 +289,87 @@ const unsettled_predicate =
 /// it ran, which was allowed to proceed alongside a mutation.
 const holds_scope_predicate = unsettled_predicate ++ " AND mutating = 1";
 
-pub fn unsettled(store: *Store, arena: Allocator, server_id: i64) (Error || Allocator.Error)![]Operation {
-    return selectWhere(store, arena, server_id, unsettled_predicate);
+/// Which set of attempts a barrier query is about: one host, or — when null —
+/// this machine.
+///
+/// `operations.server_id` is nullable, and until now every guard matched it
+/// with `= ?1`, which is never true of NULL. An attempt with no server was
+/// therefore invisible to every barrier in both directions: it saw nobody and
+/// nobody saw it. `fetch` is exactly that shape — its destination is local, so
+/// there is no row in `servers` to point at — so the one guard standing between
+/// two commands writing the same place would silently not have applied to it.
+/// Written in that mood deliberately: no command creates a `fetch`, so the
+/// local realm is currently empty and this is a hole that was closed before
+/// anything could fall into it.
+///
+/// `IS ?1` matches NULL against NULL, which turns "no server" into a realm of
+/// its own rather than a hole. The two realms still do not see each other, and
+/// that is the correct reading rather than a leftover: work on `web-01` and
+/// work in a local directory cannot collide, so a barrier that made them block
+/// each other would refuse changes for no reason. What changed is that two
+/// pieces of *local* work now collide with each other.
+///
+/// Spelled `?i64` rather than a two-variant union because that is the type the
+/// column, `BeginOptions.server_id` and every caller already carry; a union
+/// would be clearer in isolation and would put a conversion at every call site
+/// that has nothing to convert.
+pub const Realm = ?i64;
+
+pub fn unsettled(store: *Store, arena: Allocator, realm: Realm) (Error || Allocator.Error)![]Operation {
+    return selectWhere(store, arena, realm, unsettled_predicate);
 }
 
 /// The subset of `unsettled` that actually bars a change: writers.
-fn holdingScope(store: *Store, arena: Allocator, server_id: i64) (Error || Allocator.Error)![]Operation {
-    return selectWhere(store, arena, server_id, holds_scope_predicate);
+fn holdingScope(store: *Store, arena: Allocator, realm: Realm) (Error || Allocator.Error)![]Operation {
+    return selectWhere(store, arena, realm, holds_scope_predicate);
 }
 
 fn selectWhere(
     store: *Store,
     arena: Allocator,
-    server_id: i64,
+    realm: Realm,
     comptime predicate: []const u8,
 ) (Error || Allocator.Error)![]Operation {
     var out: std.ArrayList(Operation) = .empty;
     var stmt = try store.db.prepare(select_columns ++
-        " WHERE server_id = ?1 AND " ++ predicate ++ " ORDER BY created_at DESC");
+        " WHERE server_id IS ?1 AND " ++ predicate ++ " ORDER BY created_at DESC");
     defer stmt.deinit();
-    try stmt.bindInt(1, server_id);
+    try stmt.bindOptInt(1, realm);
     while (try stmt.step()) try out.append(arena, try rowToOperation(arena, &stmt));
     return out.toOwnedSlice(arena);
+}
+
+/// How many attempts on this server still have an open remote outcome.
+///
+/// The barrier `servers.remove` refuses over, counted with the *same* rendered
+/// predicate the mutation guard uses, so there is one definition of "still
+/// unsettled" rather than two that can drift apart.
+///
+/// Deleting a server sets `operations.server_id` to NULL — the FK says so — and
+/// that un-scopes every attempt on it at once: an unsettled writer stops
+/// blocking the mutation it was blocking, and `request ls` (which filters by
+/// server) stops listing any of them, so the route by which an operator would
+/// have reconciled them leaves with the row.
+///
+/// It counts `unsettled` rather than the narrower `holds_scope` set, and the
+/// difference is deliberate. The mutation guard asks "can this change collide",
+/// which a read cannot; removal asks "does deleting this row destroy the only
+/// way to find out what happened", which a read whose outcome is unknown is
+/// just as exposed to. The wider predicate is also the safer mistake: refusing
+/// once too often costs a reconcile, and refusing once too rarely releases a
+/// barrier.
+///
+/// Caller must hold the write transaction. A count taken outside it describes a
+/// moment that has already passed by the time the DELETE runs.
+pub fn unsettledCountLocked(store: *Store, server_id: i64) Db.Error!i64 {
+    try store.db.requireTransaction();
+    var stmt = try store.db.prepare(
+        "SELECT COUNT(*) FROM operations WHERE server_id IS ?1 AND " ++ unsettled_predicate,
+    );
+    defer stmt.deinit();
+    try stmt.bindInt(1, server_id);
+    if (!try stmt.step()) return error.Sqlite;
+    return stmt.columnInt(0);
 }
 
 /// Unsettled *writers* overlapping a scope, for the mutation guard.
@@ -308,10 +388,10 @@ fn selectWhere(
 pub fn unsettledInScope(
     store: *Store,
     arena: Allocator,
-    server_id: i64,
+    realm: Realm,
     target: scope.Scope,
 ) (Error || Allocator.Error)![]Operation {
-    const candidates = try holdingScope(store, arena, server_id);
+    const candidates = try holdingScope(store, arena, realm);
     var out: std.ArrayList(Operation) = .empty;
     for (candidates) |op| {
         if (op.scopeOf().overlaps(target)) try out.append(arena, op);
