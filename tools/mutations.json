@@ -1,0 +1,108 @@
+{
+  "comment": [
+    "Deliberate breakages of rules the release gates claim to enforce.",
+    "Each entry names the gate that must fail when the rule is removed.",
+    "Run with: python tools/mutate.py",
+    "`find` must appear exactly once in `file`; if it does not, the mutation",
+    "reports NOT_APPLIED rather than passing, because a manifest that has",
+    "drifted from the code tests nothing."
+  ],
+  "mutations": [
+    {
+      "id": "M2g-finished-at",
+      "rule": "A terminal receipt may not fill `finished_at` with the local clock when nothing reported a finish time.",
+      "file": "src/core/store/receipts.zig",
+      "find": "        .finished_at = extra.finished_at,",
+      "replace": "        .finished_at = extra.finished_at orelse now,",
+      "expect_gate": "gate: the ledger records the time we looked, never a finish time we were not told"
+    },
+    {
+      "id": "M3-evidence-path",
+      "rule": "Filesystem evidence must match the declared destination path, not just the digest.",
+      "file": "src/core/store/receipts.zig",
+      "find": "const matches = if (expected) |want|\n                want.side == fx.side and\n                    std.mem.eql(u8, want.path, fx.path) and\n                    std.mem.eql(u8, want.sha256, fx.sha256)\n            else\n                false;",
+      "replace": "const matches = if (expected) |want|\n                std.mem.eql(u8, want.sha256, fx.sha256)\n            else\n                false;",
+      "expect_gate": "gate: a job's exit status cannot settle a transfer"
+    },
+    {
+      "id": "M3-evidence-side",
+      "rule": "Filesystem evidence must have been read on the machine the transfer publishes to.",
+      "file": "src/core/store/receipts.zig",
+      "find": "const matches = if (expected) |want|\n                want.side == fx.side and\n                    std.mem.eql(u8, want.path, fx.path) and\n                    std.mem.eql(u8, want.sha256, fx.sha256)\n            else\n                false;",
+      "replace": "const matches = if (expected) |want|\n                std.mem.eql(u8, want.path, fx.path) and\n                    std.mem.eql(u8, want.sha256, fx.sha256)\n            else\n                false;",
+      "expect_gate": "gate: a job's exit status cannot settle a transfer"
+    },
+    {
+      "id": "M3-digest-write-once",
+      "rule": "A declared digest may never be overwritten.",
+      "file": "src/core/store/transfers.zig",
+      "find": "        \\\\   AND expected_sha256 IS NULL\n",
+      "replace": "",
+      "expect_gate": "gate: the digest a transfer will be judged by is declared once, before it sends"
+    },
+    {
+      "id": "M3-digest-phase",
+      "rule": "A digest may only be declared while the operation is still in created/connecting.",
+      "file": "src/core/store/transfers.zig",
+      "find": "        \\\\   AND request_id IN (\n        \\\\         SELECT request_id FROM operations\n        \\\\          WHERE status IN ('created','connecting')\n        \\\\       )\n",
+      "replace": "",
+      "expect_gate": "gate: the digest a transfer will be judged by is declared once, before it sends"
+    },
+    {
+      "id": "M3-checkpoint-fail-loud",
+      "rule": "A checkpoint UPDATE that matches no row is an error, not a success.",
+      "file": "src/core/store/transfers.zig",
+      "find": "        return error.CheckpointRowMissing;",
+      "replace": "        return;",
+      "expect_gate": "gate: a checkpoint write that lands on no row is an error, not a success"
+    },
+    {
+      "id": "M3-prefix-proof",
+      "rule": "A resume from a non-zero offset requires both the recorded and the observed prefix hash.",
+      "file": "src/core/store/transfers.zig",
+      "find": "    if (confirmed > 0) {",
+      "replace": "    if (false) {",
+      "expect_gate": "verifyResume refuses a mismatched partial"
+    },
+    {
+      "id": "v11-request-unique",
+      "rule": "One request may hold at most one checkpoint, so it can declare at most one digest.",
+      "file": "src/core/store/migrate.zig",
+      "find": "  request_id        TEXT NOT NULL UNIQUE REFERENCES operations(request_id) ON DELETE CASCADE,",
+      "replace": "  request_id        TEXT NOT NULL REFERENCES operations(request_id) ON DELETE CASCADE,",
+      "expect_gate": "gate: one request cannot hold two checkpoints, or two live transfers one destination"
+    },
+    {
+      "id": "v11-live-dest-unique",
+      "rule": "At most one in-flight transfer may hold a given destination.",
+      "file": "src/core/store/migrate.zig",
+      "find": "CREATE UNIQUE INDEX idx_checkpoints_live_dest",
+      "replace": "CREATE INDEX idx_checkpoints_live_dest",
+      "expect_gate": "gate: one request cannot hold two checkpoints, or two live transfers one destination"
+    },
+    {
+      "id": "v11-offset-needs-proof",
+      "rule": "A non-zero confirmed offset requires a prefix hash to prove it.",
+      "file": "src/core/store/migrate.zig",
+      "find": "  \\\\  CHECK (confirmed_offset = 0 OR partial_sha256 IS NOT NULL),\n",
+      "replace": "",
+      "expect_gate": "gate: a confirmed offset without a prefix hash is refused by the schema"
+    },
+    {
+      "id": "M3-no-coalesce",
+      "rule": "Advancing the offset replaces the prefix hash; it may not keep the previous offset's proof.",
+      "file": "src/core/store/transfers.zig",
+      "find": "       partial_sha256 = ?3, updated_at = ?4",
+      "replace": "       partial_sha256 = COALESCE(?3, partial_sha256), updated_at = ?4",
+      "expect_gate": "gate: a confirmed offset without a prefix hash is refused by the schema"
+    },
+    {
+      "id": "M2g-final-probe-unknown",
+      "rule": "A post-kill re-probe may only upgrade a cancellation when it establishes an exit code.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    if (probe.exit_code == null) return null;\n",
+      "replace": "",
+      "expect_gate": "cmd_job.decltest.finalProbe"
+    }
+  ]
+}
