@@ -2721,7 +2721,16 @@ const handover_bound_sql = sqlList(State, membersWhere(State, dependsOnHandover)
 /// because `dest_side` names the machine only for a push: a pull publishes
 /// `local` and knows which host its source is on solely through its operation.
 /// Both are the server's transfers and both lose the same conjunct.
-pub fn handoverBoundCount(store: *Store, server_id: i64) Db.Error!i64 {
+///
+/// Caller must hold the write transaction, for the reason its two sibling
+/// barriers in `servers.removeLocked` do (`operations.unsettledCountLocked`,
+/// `leases.activeCountLocked`): a count taken outside the lock describes a
+/// moment that has already passed by the time the DELETE runs, and a checkpoint
+/// minted in between is stranded by a delete that had already decided there were
+/// none. It is the same window `removeLocked` folded this check in to close, and
+/// this barrier was the one of the three not asserting that it had been.
+pub fn handoverBoundCountLocked(store: *Store, server_id: i64) Db.Error!i64 {
+    try store.db.requireTransaction();
     var stmt = try store.db.prepare(handover_bound_count_sql);
     defer stmt.deinit();
     try stmt.bindInt(1, server_id);

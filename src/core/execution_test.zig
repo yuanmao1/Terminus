@@ -134,6 +134,30 @@ const Harness = struct {
         return (try operations.get(&h.store, h.arena, request_id)).?;
     }
 
+    /// Records the launch a later `job_sentinel` resolution is checked against.
+    ///
+    /// `begin` creates the operation; it does not create the `job_attempts`
+    /// row, because in production that row is `cmd_job`'s to write — it stores
+    /// the sentinel it chose at `cmd_job.zig:314`, some sixty lines before
+    /// `sendKeys` can put that sentinel into a remote log. So a job whose log
+    /// could carry a sentinel always has this row, and a gate that resolved
+    /// from one without it was modelling a job that never launched.
+    ///
+    /// It has to match on all three of the things that make the row this
+    /// launch's — request id, server, and the sentinel itself — or the
+    /// comparison in `receipts.resolve` passes with nothing true behind it.
+    fn recordLaunch(h: *Harness, request_id: []const u8, job_name: []const u8, sentinel: []const u8) !void {
+        _ = try Store.job_attempts.create(&h.store, .{
+            .request_id = request_id,
+            .server_id = 1,
+            .server_name = "box",
+            .job_name = job_name,
+            .attempt_no = try Store.job_attempts.nextAttemptNo(&h.store, 1, job_name),
+            .sentinel = sentinel,
+            .now = 1000,
+        });
+    }
+
     fn terminalRow(h: *Harness, request_id: []const u8) !receipts.Row {
         const rows = try receipts.list(&h.store, h.arena, request_id);
         for (rows) |row| {
@@ -254,6 +278,10 @@ test "M2 gate: a lost response is reconcilable, not guessable" {
     var exec = start.ready;
     defer exec.deinit();
     try exec.connecting();
+    // The launch record `cmd_job` writes before the command can reach the
+    // shell. The sentinel resolution below is checked against it — see
+    // `Harness.recordLaunch`.
+    try h.recordLaunch(exec.id(), "migrate", "__TERMINUS_JOB_7__");
 
     // The job finished on the remote; the answer never arrived. From here
     // this is indistinguishable from "still running", which is why it is
@@ -556,6 +584,12 @@ test "M2b gate: a vanished job session is unknown, not killed" {
     try mustSubmit(&launcher);
     try launcher.remoteStarted(.{ .pid = 4242 });
     try launcher.detach("running");
+    // The sentinel this launch chose. Recorded at launch and not at exit: the
+    // string in `job_attempts` is the one `cmd_job` picked before the command
+    // was sent, while the *line* below is what the remote wrapper echoes into
+    // the log when the command ends. "No sentinel was ever written" in the
+    // comment below is about the log, which is why both can be true at once.
+    try h.recordLaunch(launcher.id(), "migrate", "__TERMINUS_JOB_1__");
 
     // The pane is gone and no sentinel was ever written. That happens when a
     // command finishes and the shell exits, when somebody kills it, and when
@@ -633,6 +667,7 @@ test "M2b gate: relaunching a job whose fate is unknown is refused" {
     var first = start.ready;
     try first.connecting();
     try mustSubmit(&first);
+    try h.recordLaunch(first.id(), "deploy", "__S__");
     _ = try first.transportLoss("eof"); // indeterminate
 
     // The deploy may or may not have happened. Running it again could apply
@@ -640,10 +675,13 @@ test "M2b gate: relaunching a job whose fate is unknown is refused" {
     const blocked = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
     try t.expectEqual(op_state.Status.indeterminate, blocked.blocked.unsettled.status);
 
-    // Resolving the question unblocks it.
-    _ = try receipts.resolve(&h.store, h.arena, first.id(), .failed, .{
+    // Resolving the question unblocks it. The outcome is asserted rather than
+    // discarded: this used to be `_ =`, so a resolution the ledger *refused*
+    // showed up three lines below as a panic on the wrong union tag, with
+    // nothing naming the refusal that caused it.
+    try t.expect((try receipts.resolve(&h.store, h.arena, first.id(), .failed, .{
         .job_sentinel = .{ .sentinel = "__S__", .exit_code = 1 },
-    }, 6000);
+    }, 6000)) == .resolved);
     const allowed = try h.begin(.{ .kind = .job, .scope = scope, .alias = "deploy", .mutating = true });
     var second = allowed.ready;
     defer second.deinit();

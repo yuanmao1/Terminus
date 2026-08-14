@@ -4,9 +4,18 @@
 //! Three properties are deliberately enforced by the database rather than by
 //! convention:
 //!
-//! * **One active lease per scope.** A partial unique index on
+//! * **No two active leases whose scopes overlap.** Two halves, and they are
+//!   not interchangeable. A partial unique index on
 //!   `(server_id, scope_kind, scope_key) WHERE released_at IS NULL` makes a
-//!   double acquisition impossible even under a race.
+//!   double acquisition of the *identical* key impossible even under a race —
+//!   that is all an index on three columns can see. Overlap is a relation
+//!   between two different keys (`path:/srv/app` against
+//!   `path:/srv/app/dist`), which no index expresses, so it is decided in code
+//!   under the write lock: `acquire` refuses on any overlap and `takeover`
+//!   displaces *every* overlap. A writer here that handled only the first
+//!   overlap it found would leave the second one active and hit no constraint
+//!   on the way out — the index cannot catch that mistake, so the loops have
+//!   to.
 //! * **Append only.** Acquiring never mutates a peer's row. Expiry and
 //!   takeover *release* the old row (recording why) and insert a new one, so
 //!   the table is its own audit chain via `superseded_by`.
@@ -240,12 +249,19 @@ pub fn acquire(store: *Store, arena: Allocator, opts: AcquireOptions) Error!Acqu
         }
     }
 
-    const lease = try insertLocked(store, arena, opts, null);
+    const lease = try insertLocked(store, arena, opts, &.{});
     try store.db.exec("COMMIT");
     return .{ .acquired = lease };
 }
 
-fn insertLocked(store: *Store, arena: Allocator, opts: AcquireOptions, supersedes: ?i64) Error!Lease {
+/// Inserts the new row and links every row it displaced to it.
+///
+/// `supersedes` is a list rather than one id because a takeover can displace
+/// more than one lease at a time: two non-overlapping leases are legal, and a
+/// third scope containing both overlaps them both. Every displaced row is
+/// linked, so the audit chain is complete for each of them rather than for
+/// whichever one happened to be looked at first.
+fn insertLocked(store: *Store, arena: Allocator, opts: AcquireOptions, supersedes: []const i64) Error!Lease {
     var stmt = try store.db.prepare(
         \\INSERT INTO leases (server_id, scope_kind, scope_key, owner_token,
         \\                    owner_label, note, request_id,
@@ -265,7 +281,11 @@ fn insertLocked(store: *Store, arena: Allocator, opts: AcquireOptions, supersede
     _ = try stmt.step();
     const id = store.db.lastInsertRowId();
 
-    if (supersedes) |old_id| {
+    // One statement per displaced row. `Db.Stmt` has no `reset`, and adding
+    // one to bind a second set of parameters to a live statement is a change to
+    // the sqlite wrapper for a loop that runs over the handful of leases a
+    // single scope can overlap.
+    for (supersedes) |old_id| {
         var link = try store.db.prepare("UPDATE leases SET superseded_by = ?1 WHERE id = ?2");
         defer link.deinit();
         try link.bindInt(1, id);
@@ -350,47 +370,94 @@ pub fn release(
     return store.db.changes() > 0;
 }
 
+/// A takeover displaced a lease that was read as active a few statements
+/// earlier under this transaction's own write lock, and the release matched no
+/// row.
+///
+/// The same shape of impossibility as `servers.ServerVanishedDuringRemoval`,
+/// and named for the same reason: nothing on this connection can have released
+/// that lease in between, so a zero-row UPDATE is not "somebody got there
+/// first" — it is proof the write lock is not doing what the rest of this
+/// function assumes. Continuing would insert the new lease and report a
+/// takeover of a row whose release never happened.
+///
+/// Declared on `takeover` alone rather than folded into `Error`: widening the
+/// module's error set would reach every lease caller for a condition only this
+/// function can produce.
+pub const TakeoverError = Error || error{LeaseVanishedDuringTakeover};
+
 pub const TakeoverOutcome = union(enum) {
-    /// Took it from `from`, whose row now records the takeover.
-    taken: struct { lease: Lease, from: Lease },
+    /// Took it from every lease that overlapped `scope`. Each row in `from` now
+    /// records `takeover` as its release reason and links to `lease` through
+    /// `superseded_by`.
+    ///
+    /// `from` is a list and not a single lease because more than one can be
+    /// displaced at once: `acquire` only refuses overlaps, so two leases that do
+    /// not overlap *each other* — `path:/srv/app/dist` and `path:/srv/app/build`
+    /// — are both legally held, and a takeover of `path:/srv/app` contains both.
+    /// A caller told about one of them would read "I displaced one owner" off a
+    /// transaction that displaced two, and would notify half the peers it just
+    /// took work away from. Newest first, the order `activeLocked` returns.
+    ///
+    /// Never empty in this variant: nothing displaced is `acquired`.
+    taken: struct { lease: Lease, from: []const Lease },
     /// Nothing was held; a plain acquisition happened instead.
     acquired: Lease,
 };
 
-/// Deliberately seizes a scope. The incumbent's row is released with
-/// `takeover` and linked via `superseded_by`, so the audit chain shows who
-/// displaced whom and when — a takeover is never invisible.
-pub fn takeover(store: *Store, arena: Allocator, opts: AcquireOptions) Error!TakeoverOutcome {
+/// Deliberately seizes a scope, displacing every lease that overlaps it.
+///
+/// *Every* one, in this transaction, is the substance of the function. The
+/// overlap relation is not one-to-one — `acquire` refuses an overlapping lease
+/// but permits any number of mutually non-overlapping ones, so a scope wide
+/// enough to contain several of them is ordinary rather than exotic. Stopping
+/// at the first match released one incumbent and inserted the new lease beside
+/// the rest, and nothing downstream objected: the partial unique index is on
+/// `(server_id, scope_kind, scope_key)` exactly, so `path:/srv/app` and the
+/// `path:/srv/app/build` it now overlapped were two different keys and the
+/// transaction committed clean, holding the state the whole file exists to
+/// prevent.
+///
+/// Each displaced row is released with `takeover` and linked via
+/// `superseded_by`, so the audit chain shows who displaced whom and when — for
+/// all of them. Dropping the second row's link would leave a lease that ends
+/// with no successor recorded, which reads as an expiry rather than as a
+/// seizure.
+pub fn takeover(store: *Store, arena: Allocator, opts: AcquireOptions) TakeoverError!TakeoverOutcome {
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
 
     try expireLapsedLocked(store, opts.server_id, opts.now);
     const held = try activeLocked(store, arena, opts.server_id);
 
-    var incumbent: ?Lease = null;
+    var displaced: std.ArrayList(Lease) = .empty;
+    var displaced_ids: std.ArrayList(i64) = .empty;
     for (held) |lease| {
-        if (lease.scope().overlaps(opts.scope)) {
-            incumbent = lease;
-            break;
-        }
+        if (!lease.scope().overlaps(opts.scope)) continue;
+        try displaced.append(arena, lease);
+        try displaced_ids.append(arena, lease.id);
     }
 
-    if (incumbent) |old| {
+    for (displaced.items) |old| {
         var stmt = try store.db.prepare(
             \\UPDATE leases SET released_at = ?1, release_reason = 'takeover'
-            \\ WHERE id = ?2
+            \\ WHERE id = ?2 AND released_at IS NULL
         );
         defer stmt.deinit();
         try stmt.bindInt(1, opts.now);
         try stmt.bindInt(2, old.id);
         _ = try stmt.step();
-
-        const fresh = try insertLocked(store, arena, opts, old.id);
-        try store.db.exec("COMMIT");
-        return .{ .taken = .{ .lease = fresh, .from = old } };
+        // `released_at IS NULL` is in the WHERE so this check has something to
+        // catch: the row was read as active under this lock, so a release that
+        // matches nothing means the lock did not hold.
+        if (store.db.changes() == 0) return error.LeaseVanishedDuringTakeover;
     }
 
-    const fresh = try insertLocked(store, arena, opts, null);
+    const fresh = try insertLocked(store, arena, opts, displaced_ids.items);
     try store.db.exec("COMMIT");
-    return .{ .acquired = fresh };
+    if (displaced.items.len == 0) return .{ .acquired = fresh };
+    return .{ .taken = .{
+        .lease = fresh,
+        .from = try displaced.toOwnedSlice(arena),
+    } };
 }

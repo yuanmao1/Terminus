@@ -537,7 +537,22 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             if (attempt) |a| a.request_id else null,
             from,
             limit,
-        ) catch |err| fatalTmux(err, executor, session);
+        ) catch |err| switch (err) {
+            // Named here rather than left to `fatalTmux`'s catch-all, because
+            // this is the one command whose whole contract is "give me the
+            // bytes after my cursor and move it". The remote's read script
+            // prints the log's byte count on a line of its own on every path
+            // it can take, so an answer with no newline in it is not a short
+            // log — it is an answer that was cut short. `readLog` used to
+            // report that as a successful read of an empty log with the cursor
+            // left where it was, which is a broken link wearing the shape of a
+            // job that has printed nothing yet.
+            error.TruncatedResponse => fatal(
+                "the remote's answer for job '{s}' was cut short before its size line, so nothing was read and the cursor has not moved; this is a broken read, not an empty log. Re-run it",
+                .{job.name},
+            ),
+            else => fatalTmux(err, executor, session),
+        };
         // A refused cursor advance is a failure of this command's contract:
         // the caller asked for the bytes after its position *and* for that
         // position to move, and the next `--from-cursor` will now hand it the
@@ -569,6 +584,8 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 .finishedAt = state.finished_at,
                 .observedAt = state.observed_at,
                 .conflict = ConflictJson.from(state.conflict),
+                .resultRecord = state.sidecar.code(),
+                .resultRecordError = state.sidecarNote(ctx),
                 .from = from,
                 // What the cursor *is* now, which on a refusal is not where
                 // this read ended. `cursorAdvanced` is the difference, and an
@@ -582,6 +599,7 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             .human => {
                 try ctx.out.print("{s}", .{probe.output});
                 if (cursor_hint) |text| try ctx.out.print("\n{s}\n", .{text});
+                if (state.sidecarNote(ctx)) |text| try ctx.out.print("\n{s}\n", .{text});
                 if (state.hint(ctx, job.name, attempt)) |text| try ctx.out.print("\n{s}\n", .{text});
             },
         }
@@ -664,6 +682,18 @@ const State = struct {
     /// with no exit code, which is indistinguishable from "the job left
     /// nothing behind" and sends the operator to a reconcile that will refuse.
     conflict: ?Tmux.JobProbe.Conflict = null,
+    /// What was at the job's result sidecar, whether or not it answered.
+    ///
+    /// Carried out to the caller for the reason `conflict` is: without it,
+    /// "there is no result record" and "there is one and it is corrupt, or it
+    /// belongs to another request" are one indistinguishable silence. They are
+    /// not the same situation — the first is ordinary for a job launched
+    /// before sidecars existed or one whose evidence was discarded, the second
+    /// means the remote wrapper is from another build or something truncated a
+    /// write, and the third means two operations are writing to one address.
+    /// Only the first is unremarkable, and it is the one all three used to
+    /// look like.
+    sidecar: Tmux.SidecarReading = .not_requested,
     business_result: ?[]const u8 = null,
     /// The row is still a reservation, so the probe's reading of its tmux
     /// session establishes nothing about it — see `applyProbe`.
@@ -702,6 +732,25 @@ const State = struct {
         const first = cache_text orelse return settlement_text;
         const second = settlement_text orelse return first;
         return std.fmt.allocPrint(ctx.arena, "{s}. Also: {s}", .{ first, second }) catch first;
+    }
+
+    /// The sentence a defective result record earns, or null when the reading
+    /// was one of the three ordinary ones (not looked for, not there, ours).
+    ///
+    /// Deliberately not folded into `hint`. `hint` answers "what does the
+    /// operator still owe" — a reconcile, a second look at a row that moved.
+    /// This answers "what did we find that we could not use", which is a fact
+    /// about the host rather than a task, and it is reported even on the paths
+    /// that settled cleanly from the log sentinel. Keeping the two apart is
+    /// also what keeps a defective sidecar out of the exit-code decision: it
+    /// is a report, not a refusal.
+    fn sidecarNote(state: State, ctx: *Cli.Ctx) ?[]const u8 {
+        if (!state.sidecar.anomalous()) return null;
+        // Three of the four sentences need an allocation. If one fails we
+        // still name the reading rather than saying nothing — silence would
+        // turn a defective record back into the plain absence this field
+        // exists to tell it apart from.
+        return state.sidecar.describe(ctx.arena) catch state.sidecar.code();
     }
 };
 
@@ -981,6 +1030,38 @@ fn forgetRow(
     };
 }
 
+/// The store's vocabulary for what this probe found at the result-record
+/// address, ready to travel into the terminal receipt.
+///
+/// An exhaustive switch and not a cast: `Store.receipts.ResultRecordReading` is
+/// a separate type because nothing under `store/` may import `session/`, so
+/// this is the seam where the two could drift. Adding a reading to
+/// `Tmux.SidecarReading` is a compile error here until it has been named on the
+/// store side too, which is the only thing keeping the receipt's vocabulary and
+/// the probe's the same list.
+///
+/// Every reading is carried, not just the four defective ones. "We looked and
+/// there was nothing" and "we did not look" are different facts about the
+/// settlement, and a receipt that recorded only anomalies could not tell either
+/// of them from a settlement that predates this field.
+fn resultRecordOf(
+    ctx: *Cli.Ctx,
+    reading: Tmux.SidecarReading,
+) Store.receipts.TerminalExtra.ResultRecord {
+    return .{
+        .arena = ctx.arena,
+        .reading = switch (reading) {
+            .not_requested => .not_requested,
+            .absent => .absent,
+            .malformed => .malformed,
+            .unknown_schema => .unknown_schema,
+            .exit_code_out_of_range => .exit_code_out_of_range,
+            .foreign => |claimed| .{ .foreign = claimed },
+            .present => .present,
+        },
+    };
+}
+
 /// Turns an observation into a settlement — or into nothing at all.
 ///
 /// Four cases; three of them settle the ledger and the fourth records nothing:
@@ -1022,7 +1103,7 @@ fn applyProbe(
                 .{ clash.result_exit_code, clash.sentinel_exit_code },
             ) catch "the job's result file and its log sentinel report different exit codes",
             .last_observed = if (execution) |e| e.status else .remote_started,
-        } }, .{}, .none);
+        } }, .{ .result_record = resultRecordOf(ctx, probe.sidecar) }, .none);
         return .{
             // A contradiction is unknown however it was recorded, and the one
             // case where a `no_attempt` reading is still not an answer: two
@@ -1034,6 +1115,7 @@ fn applyProbe(
             .finished_at = null,
             .observed_at = ctx.now,
             .conflict = clash,
+            .sidecar = probe.sidecar,
             .business_result = probe.business_result,
             .cache = settled.cache,
         };
@@ -1047,7 +1129,15 @@ fn applyProbe(
         // is what we *report* — see `State.finished_at` and `State.observed_at`.
         const settled = settleObserved(ctx, store, if (execution) |*e| e else null, attempt, .{
             .exited = .{ .exit_code = code },
-        }, .{ .finished_at = probe.finished_at, .stdout = .{ .bytes = @intCast(probe.output.len) } }, finishSync(job, .exited, code, probe.finished_at orelse ctx.now));
+        }, .{
+            .finished_at = probe.finished_at,
+            .stdout = .{ .bytes = @intCast(probe.output.len) },
+            // The case this field exists for: the settlement can be perfectly
+            // sound — the log sentinel answered — while a document that is not
+            // ours, or not readable, sits at this request's own address. The
+            // verdict is right and the anomaly is still a fact about the host.
+            .result_record = resultRecordOf(ctx, probe.sidecar),
+        }, finishSync(job, .exited, code, probe.finished_at orelse ctx.now));
         return .{
             // The ledger's verdict, not the probe's reading. Only when there
             // is no attempt at all does the host's exit code stand on its own,
@@ -1057,6 +1147,7 @@ fn applyProbe(
             .exit_code = code,
             .finished_at = probe.finished_at,
             .observed_at = ctx.now,
+            .sidecar = probe.sidecar,
             .business_result = probe.business_result,
             .cache = settled.cache,
         };
@@ -1089,6 +1180,7 @@ fn applyProbe(
             .exit_code = null,
             .finished_at = null,
             .observed_at = ctx.now,
+            .sidecar = probe.sidecar,
             .business_result = probe.business_result,
         };
 
@@ -1098,7 +1190,7 @@ fn applyProbe(
         const settled = settleObserved(ctx, store, if (execution) |*e| e else null, attempt, .{ .indeterminate = .{
             .reason = "job session disappeared without reporting an exit status",
             .last_observed = if (execution) |e| e.status else .remote_started,
-        } }, .{}, finishSync(job, .killed, null, ctx.now));
+        } }, .{ .result_record = resultRecordOf(ctx, probe.sidecar) }, finishSync(job, .killed, null, ctx.now));
         return .{
             .status = settled.status orelse .indeterminate,
             // A vanished session with no exit status proves nothing whoever
@@ -1111,6 +1203,7 @@ fn applyProbe(
             // timestamp here would read as a finish we never witnessed.
             .finished_at = null,
             .observed_at = ctx.now,
+            .sidecar = probe.sidecar,
             .business_result = probe.business_result,
             .cache = settled.cache,
         };
@@ -1122,6 +1215,7 @@ fn applyProbe(
         .exit_code = null,
         .finished_at = null,
         .observed_at = ctx.now,
+        .sidecar = probe.sidecar,
         .business_result = probe.business_result,
     };
 }
@@ -1219,6 +1313,12 @@ fn reportStatus(
             .finishedAt = state.finished_at,
             .observedAt = state.observed_at,
             .conflict = ConflictJson.from(state.conflict),
+            // What was at the result sidecar's address, and — when that is
+            // something we could not use — why. `"absent"` and `"malformed"`
+            // are different answers and an agent may branch on which it got;
+            // they used to be the same silence.
+            .resultRecord = state.sidecar.code(),
+            .resultRecordError = state.sidecarNote(ctx),
             .hint = state.hint(ctx, job.name, attempt),
             .transport = transport,
             .daemonError = daemon_error,
@@ -1231,6 +1331,7 @@ fn reportStatus(
                 "  its result file says exit {d}, its log sentinel says exit {d}; one of them is wrong and nothing mechanical can say which\n",
                 .{ clash.result_exit_code, clash.sentinel_exit_code },
             );
+            if (state.sidecarNote(ctx)) |text| try ctx.out.print("  {s}\n", .{text});
             if (state.hint(ctx, job.name, attempt)) |text| try ctx.out.print("  {s}\n", .{text});
         },
     }
@@ -1280,6 +1381,8 @@ fn watchJob(
             .businessResult = state.business_result,
             .stillRunning = still_running,
             .conflict = ConflictJson.from(state.conflict),
+            .resultRecord = state.sidecar.code(),
+            .resultRecordError = state.sidecarNote(ctx),
             .hint = state.hint(ctx, job.name, attempt),
             .polls = polls,
             .transport = conn.transport,
@@ -1298,6 +1401,7 @@ fn watchJob(
                 "  its result file says exit {d}, its log sentinel says exit {d}; one of them is wrong and nothing mechanical can say which\n",
                 .{ clash.result_exit_code, clash.sentinel_exit_code },
             );
+            if (state.sidecarNote(ctx)) |text| try ctx.out.print("  {s}\n", .{text});
             if (state.hint(ctx, job.name, attempt)) |text| try ctx.out.print("  {s}\n", .{text});
         },
     }
@@ -2648,6 +2752,108 @@ test "gate: two things to do are both said" {
         u8,
         reserved.hint(&ctx, "deploy", attempt).?,
         "still a reservation",
+    ) != null);
+}
+
+test "gate: a result record that was there and unusable is not silence" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_sidecar_reading");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    // The four ways a result record can be there and unusable. Each says its
+    // own thing: a wrong-build wrapper, a truncated write, an impossible exit
+    // code and a colliding request id send an operator to four different
+    // places, and all four used to arrive as the same silence a job that never
+    // wrote a sidecar produces.
+    const defects = [_]Tmux.SidecarReading{
+        .malformed,
+        .{ .unknown_schema = 7 },
+        .{ .exit_code_out_of_range = 9000 },
+        .{ .foreign = "01JQXW8ZK4N0RS7T3VYB2MCXYZ" },
+    };
+    var sentences: [defects.len][]const u8 = undefined;
+    for (defects, 0..) |reading, i| {
+        const state: State = .{
+            .status = .remote_started,
+            .settlement = .open,
+            .exit_code = null,
+            .finished_at = null,
+            .observed_at = 2000,
+            .sidecar = reading,
+        };
+        const note = state.sidecarNote(&ctx) orelse {
+            std.debug.print("reading {s} said nothing\n", .{reading.code()});
+            return error.UnusableResultRecordReportedAsSilence;
+        };
+        try t.expect(std.mem.indexOf(u8, note, "present") != null);
+        // Not folded into `hint`: a defective document is a fact about the
+        // host, not a task the operator owes, and `hint`'s two sentences are
+        // gated separately above.
+        try t.expectEqual(@as(?[]const u8, null), state.hint(&ctx, "deploy", null));
+        // A report, not a refusal. Deliberate and stated: the sentinel still
+        // settles what it always settled, and this note travels beside the
+        // answer rather than changing it.
+        try t.expectEqual(Exit.ok, observationExit(state, false));
+        sentences[i] = note;
+    }
+    for (sentences, 0..) |a, i| for (sentences[i + 1 ..]) |b|
+        try t.expect(!std.mem.eql(u8, a, b));
+
+    // The three ordinary readings stay silent, so the note means something
+    // when it appears.
+    for ([_]Tmux.SidecarReading{ .not_requested, .absent, .present }) |ordinary| {
+        const state: State = .{
+            .status = .remote_started,
+            .settlement = .open,
+            .exit_code = null,
+            .finished_at = null,
+            .observed_at = 2000,
+            .sidecar = ordinary,
+        };
+        try t.expectEqual(@as(?[]const u8, null), state.sidecarNote(&ctx));
+    }
+
+    // And the reading survives the trip through `applyProbe`, which is the
+    // only route from the probe to anything a command prints.
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+    _ = try Store.jobs.create(&store, 1, "deploy", "make deploy", "__S__", "01AAAAAAAA0123456789ABCDEF", 1000);
+    try t.expect(try Store.jobs.markStarted(&store, "01AAAAAAAA0123456789ABCDEF"));
+    const job = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    const probe: Tmux.JobProbe = .{
+        .output = "building...\n",
+        .next_cursor = 12,
+        .exit_code = null,
+        .exit_source = .none,
+        .finished_at = null,
+        .sidecar = .{ .foreign = "01JQXW8ZK4N0RS7T3VYB2MCXYZ" },
+        .session_alive = true,
+    };
+    const state = applyProbe(&ctx, &store, job, probe, null);
+    try t.expectEqualStrings("foreign", state.sidecar.code());
+    try t.expect(std.mem.indexOf(
+        u8,
+        state.sidecarNote(&ctx).?,
+        "01JQXW8ZK4N0RS7T3VYB2MCXYZ",
     ) != null);
 }
 

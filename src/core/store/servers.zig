@@ -315,7 +315,7 @@ pub fn removeLocked(store: *Store, name: []const u8, now: i64) RemoveError!Remov
     // Two checks in two transactions is two windows, and the one this closes is
     // the same one: a checkpoint minted between the count and the delete would
     // have been stranded by a delete that had already decided there were none.
-    const resumable = try transfers.handoverBoundCount(store, server_id);
+    const resumable = try transfers.handoverBoundCountLocked(store, server_id);
     if (resumable > 0) return .{ .refused = .{ .resumable_transfers = resumable } };
 
     if (comptime builtin.is_test) {

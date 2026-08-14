@@ -27,6 +27,11 @@ const operations = @import("operations.zig");
 // point: a second direct writer on one authoritative table is the entropy an
 // audit has already flagged elsewhere in this store.
 const transfers = @import("transfers.zig");
+// Read inside this module's own transaction, to bind offered `job_sentinel`
+// evidence to the sentinel this binary wrote down when it launched the job.
+// One-way, like `transfers`: `job_attempts` imports only `std`, `Store` and
+// `Db`, so it knows nothing about receipts and this edge closes no cycle.
+const job_attempts = @import("job_attempts.zig");
 const history = @import("history.zig");
 
 pub const schema_version: i64 = 1;
@@ -113,6 +118,57 @@ pub const Event = struct {
     detail_json: ?[]const u8 = null,
 };
 
+/// What was found at a job's result-record address at the moment it settled.
+///
+/// A job can settle cleanly from the sentinel in its log while a document that
+/// is *not* usable sits at the address derived from that same request — a
+/// document naming a different request, one this build cannot parse, one from
+/// a wrapper of another version, one reporting an exit code no shell produces.
+/// The settlement is correct: the sentinel answered. But the anomaly is a fact
+/// about the host — a result directory being reused, two request ids colliding,
+/// a mismatched remote wrapper — and it was reaching the operator's screen and
+/// then being dropped. The receipt, which is the one durable record, kept the
+/// verdict and lost the contradiction standing next to it.
+///
+/// Deliberately *not* `Tmux.SidecarReading` itself. Nothing under `store/`
+/// imports `session/`, and reversing that to reuse an enum would make the
+/// persistence layer depend on the transport layer for the shape of a column's
+/// contents. The tag names are identical on purpose — `SidecarReading.code()`
+/// renders exactly these strings — and `cmd_job`'s mapping is an exhaustive
+/// switch, so a reading added there is a compile error until it is named here.
+///
+/// `foreign` carries its claimed id in the type rather than in a sibling
+/// optional field, so a `foreign` record without one cannot be constructed and
+/// no other reading can carry one. That is the whole of the "half a fact"
+/// problem: `foreign` is the reading whose entire content is *which other*
+/// request the document named, and a receipt recording the tag alone would say
+/// a collision happened while withholding the only thing that identifies it.
+pub const ResultRecordReading = union(enum) {
+    /// No request id was given, so no result record was looked for. Distinct
+    /// from `absent`: one is "we did not ask", the other is "we asked and
+    /// there is nothing there".
+    not_requested,
+    /// Looked, and the address is empty. Ordinary: the job predates result
+    /// records, or its evidence was discarded.
+    absent,
+    /// Bytes are there and they are not a document this build can parse.
+    malformed,
+    /// Parsed, and declares a schema version this build does not know.
+    unknown_schema,
+    /// Parsed and ours, but the exit code is not a shell exit status.
+    exit_code_out_of_range,
+    /// Parsed, and names a different request. Carries the id it claimed.
+    foreign: []const u8,
+    /// A document we can read, at our address, naming us.
+    present,
+
+    /// The stable machine-readable name, derived from the tag so the receipt's
+    /// vocabulary and this union cannot drift.
+    pub fn code(r: ResultRecordReading) []const u8 {
+        return @tagName(r);
+    }
+};
+
 /// Supplementary facts a caller may attach to a terminal.
 ///
 /// Deliberately narrow. Everything that the `Terminal` evidence itself
@@ -139,6 +195,26 @@ pub const TerminalExtra = struct {
     correlation_id: ?[]const u8 = null,
     detail_json: ?[]const u8 = null,
     source: Source = .live,
+    /// What was at this job's result-record address when it settled, and the
+    /// arena to render it with.
+    ///
+    /// Null means the settlement recorded nothing about a result record, which
+    /// is the ordinary case for everything that is not a job observation. It is
+    /// *not* the same as `.not_requested`, which is a job observation that
+    /// deliberately did not look — see `ResultRecordReading`.
+    ///
+    /// The arena travels inside the value rather than as a parameter on
+    /// `settle` because `settle`, `settleLocked` and every wrapper over them in
+    /// `execution` take no allocator, and threading one through would change
+    /// four signatures to serve one annotation. It is required by the type
+    /// whenever a reading is present, so there is no state where the store
+    /// holds a reading it cannot write down.
+    result_record: ?ResultRecord = null,
+
+    pub const ResultRecord = struct {
+        arena: Allocator,
+        reading: ResultRecordReading,
+    };
 };
 
 /// The ledger's own refusals, plus the ones `transfers.adjudicateLocked` can
@@ -179,6 +255,17 @@ pub const Error = Db.Error || transfers.AdjudicateError || error{
     /// Supplementary fields contradict the evidence (e.g. a remote pid on a
     /// request whose command was provably never handed over).
     ContradictoryEvidence,
+    /// A terminal carried both a caller-built `detail_json` and a
+    /// result-record reading for this module to render into one.
+    ///
+    /// Our defect and not an operator's: the two would have to be merged, and
+    /// merging a document whose shape this module does not control into one
+    /// whose shape it promises is not something it can do correctly. Refused
+    /// rather than resolved by dropping one, because either drop loses a fact
+    /// that something went to the trouble of recording. Nothing constructs the
+    /// combination today — every `detail_json` producer in the tree writes it
+    /// on a `checkpoint` or an `audit` event.
+    ConflictingTerminalDetail,
     /// The operation's transfer is parked in `indeterminate_publish` — its
     /// rename may or may not have landed — and the evidence offered cannot say
     /// which. The *whole* resolution is refused: resolving the operation and
@@ -482,6 +569,42 @@ fn terminalEvent(
     }
     const connected = extra.connected orelse derived;
 
+    // The result-record annotation is a *store-derived* field on the receipt
+    // document, the way `probeIdentity` and `declaredSha256` are on a
+    // resolution's. It goes in `detail_json` rather than in a column of its own
+    // because the document is versioned precisely so a new fact does not need
+    // one, and because what it records is an observation about a settlement
+    // rather than a property of the operation.
+    //
+    // A caller that supplied its own `detail_json` is refused rather than
+    // merged or overwritten. No caller does today — every producer in the tree
+    // writes `detail_json` on a `checkpoint` or `audit` event, never through
+    // `TerminalExtra` — so this refuses a combination nothing constructs, and
+    // refuses it because the alternatives are worse: silently dropping either
+    // document loses a fact, and nesting one opaque string inside another would
+    // put a document whose shape this module does not control inside one whose
+    // shape it promises.
+    const detail_json = if (extra.result_record) |record| blk: {
+        if (extra.detail_json != null) return error.ConflictingTerminalDetail;
+        var writer: std.Io.Writer.Allocating = .init(record.arena);
+        std.json.Stringify.value(.{
+            .schemaVersion = schema_version,
+            .resultRecord = .{
+                .reading = record.reading.code(),
+                // Written as null rather than omitted for every reading but
+                // `foreign`, for the reason `toJson` writes its corroboration
+                // fields out as null: a reader must never have to decide
+                // whether a missing key means "not that reading" or "written
+                // before this was recorded".
+                .claimedRequestId = switch (record.reading) {
+                    .foreign => |claimed| claimed,
+                    else => null,
+                },
+            },
+        }, .{}, &writer.writer) catch return error.OutOfMemory;
+        break :blk try writer.toOwnedSlice();
+    } else extra.detail_json;
+
     var event: Event = .{
         .request_id = request_id,
         .kind = .terminal,
@@ -510,7 +633,7 @@ fn terminalEvent(
         .stdout = extra.stdout,
         .stderr = extra.stderr,
         .correlation_id = extra.correlation_id,
-        .detail_json = extra.detail_json,
+        .detail_json = detail_json,
         .error_code = terminal.errorCode(),
         .last_observed = from.text(),
         .connected = connected,
@@ -1055,7 +1178,8 @@ pub const ResolutionEvidence = union(enum) {
             // all**. Every other one has something tying the reading to this
             // operation, checked in `resolve`: `job_result` carries the request
             // id the document itself names, `process_probe` is matched against
-            // the pid and start token the attempt recorded, and the four
+            // the pid and start token the attempt recorded, `job_sentinel` is
+            // matched against the sentinel the launch wrote down, and the four
             // readings of a destination are compared against the side, path and
             // digest the transfer committed to before it submitted. A
             // `supervisor_report` carries a status and a sentence. Any caller
@@ -1069,11 +1193,13 @@ pub const ResolutionEvidence = union(enum) {
             //
             //  * a field on the variant naming what the report is *about*, in a
             //    form the report's own writer filled in and this binary can
-            //    check against something it wrote down first. The two shapes
+            //    check against something it wrote down first. The three shapes
             //    that already work are `job_result`'s — the request id, read out
             //    of the document, compared against the operation being resolved
-            //    — and `process_probe`'s — a process identity, compared against
-            //    the one the attempt recorded on its trail. The wrapper in
+            //    — `process_probe`'s — a process identity, compared against
+            //    the one the attempt recorded on its trail — and
+            //    `job_sentinel`'s, a string compared against the one this binary
+            //    chose at launch and stored in `job_attempts`. The wrapper in
             //    `supervisor.zig` already writes both a request id and a pid, so
             //    either is available; what is not acceptable is a field the
             //    caller fills from the operation it is resolving, which compares
@@ -1414,6 +1540,32 @@ pub const ResolveOutcome = union(enum) {
         /// What this operation recorded, or null when it never recorded a
         /// process identity at all.
         recorded: ?RecordedProcess,
+    },
+    /// A job sentinel was offered for an operation whose sentinel it is not.
+    ///
+    /// The third identity refusal, and the one that was missing. A sentinel
+    /// names no request — it is a line scanned out of a window of an append-only
+    /// log that anything on the host can write to — so what ties it to this
+    /// operation is the sentinel `cmd_job` wrote down when it launched the
+    /// attempt. Until that was compared, `job_sentinel` was the only mechanical
+    /// variant in the union with **no identity binding at all**: its `sentinel`
+    /// field was carried into the receipt and never checked against anything,
+    /// while `isMechanical` graded it `true` — the grade that settles an
+    /// operation and releases the same-scope mutation barrier with no operator
+    /// in the loop. Any caller holding any request id could hand in any string
+    /// with an exit code attached.
+    ///
+    /// Carries both sides, for the reason `evidence_wrong_process` does: the
+    /// three cases in `RecordedSentinel` send an operator three different ways,
+    /// and only the payload knows which one this is. Refusing when nothing was
+    /// recorded is the correct direction and not an over-reach — absence of a
+    /// recording is not permission, and waving it through would make the check
+    /// vacuous exactly on the attempts nobody can go and verify.
+    evidence_wrong_sentinel: struct {
+        /// The sentinel the evidence carried.
+        offered: []const u8,
+        /// What the launch wrote down, or why there is nothing to compare with.
+        recorded: job_attempts.RecordedSentinel,
     },
     /// A published-file hash was offered for an operation that never declared
     /// what would count, or whose declaration it does not match. Separate from
@@ -1952,6 +2104,47 @@ pub fn resolve(
     // no second copy of it.
     var declared_sha256: ?[]const u8 = null;
     switch (evidence) {
+        // A sentinel is the third address the identity question is asked at, and
+        // the only one that has to wait until here to ask it. It names no
+        // request and no process — it is a string scanned out of a window of an
+        // append-only log that anything on the host can write to — so what ties
+        // it to this operation is the sentinel this binary chose and wrote into
+        // `job_attempts` before the launch line ever reached the shell
+        // (`cmd_job`, which records it before `sendKeys`; so a sentinel that
+        // could be in a log is necessarily one that is in that table).
+        //
+        // It sits *after* `appliesToKind` rather than beside the `job_result`
+        // and `process_probe` checks above, and the reason is that the question
+        // is unaskable before it. Only a job has an attempt row, so "no attempt
+        // recorded this sentinel" is true of every transfer and every fetch as
+        // well — asked first, it answers a `job_sentinel` offered for a transfer
+        // with an identity refusal, sending an operator to look for a launch
+        // record for work that never had one and hiding the fact that sentinels
+        // cannot speak about transfers at all. The category error is the larger
+        // fact and `evidence_wrong_kind` is where it is named. By the time this
+        // runs the operation is known to be a job, and what is left is whether
+        // this is *that* job's sentinel — which is exactly the position the
+        // transfer commitment checks below occupy for their own evidence.
+        //
+        // Both absences refuse. An attempt that recorded no sentinel is one no
+        // sentinel can speak for, exactly as an attempt that recorded no process
+        // is one no probe can speak for; admitting it because there is nothing
+        // to contradict would make the check vacuous on precisely the rows that
+        // need it most.
+        .job_sentinel => |s| {
+            const recorded = try job_attempts.sentinelForLocked(store, arena, request_id);
+            const fits = switch (recorded) {
+                .sentinel => |had| std.mem.eql(u8, had, s.sentinel),
+                .attempt_recorded_none, .no_attempt => false,
+            };
+            if (!fits) {
+                try rollback(store);
+                return .{ .evidence_wrong_sentinel = .{
+                    .offered = s.sentinel,
+                    .recorded = recorded,
+                } };
+            }
+        },
         .filesystem_effect => |fx| {
             const expected = try transfers.expectedEffectLocked(store, arena, request_id);
             const matches = if (expected) |want|

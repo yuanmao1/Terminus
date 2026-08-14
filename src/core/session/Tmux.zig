@@ -28,6 +28,23 @@ pub const Error = Ssh.ExecError || error{
     /// command likely terminated the shell, e.g. `exit`).
     SessionDied,
     RemoteFailed,
+    /// The remote answered, but not with the framing its own script
+    /// guarantees, so what came back is not a reading of anything.
+    ///
+    /// Deliberately not folded into `RemoteFailed`. That one means "the script
+    /// ran and reported failure" — a fact about the host. This one means "the
+    /// script's output did not arrive intact" — a fact about the channel. A
+    /// caller that cannot tell them apart cannot tell a broken log from a
+    /// broken connection, and only one of those is worth retrying unchanged.
+    ///
+    /// Adding this variant forces no caller to change: nothing switches
+    /// exhaustively on `Tmux.Error`. `fatalTmux` (cmd_exec.zig:407) takes
+    /// `anyerror` and ends in `else`, and the only other switch over these
+    /// errors — `execIn`'s failure arm at cmd_exec.zig:318 — ends in `else`
+    /// too, which routes this to `transportLoss` and settles the attempt
+    /// `indeterminate`. That is the honest reading of an answer that was cut
+    /// short: we asked, something came back, and it does not say anything.
+    TruncatedResponse,
     CommandTimeout,
 };
 
@@ -170,27 +187,174 @@ fn splitProbe(stdout: []const u8) ?ProbeHalves {
     return null;
 }
 
-/// Reads back the sidecar document.
+/// What the sidecar at one request's address turned out to be.
 ///
-/// Returns null for "no usable result", which covers a missing file, a
-/// truncated or malformed one, a schema version we do not know, and — the
-/// case that matters — a document naming a *different* request. The whole
-/// point of keying results by request id is that a leftover file from an
+/// Five readings, kept apart because an operator does three different things
+/// about them. The old return type was `?JobResult`, and `null` meant every
+/// one of the first four at once — so a caller could not tell "there is no
+/// evidence" from "there is evidence and we cannot read it" from "there is
+/// evidence and it belongs to somebody else", and the last of those, which is
+/// the loudest fact this parser can establish, was the quietest thing it said.
+///
+/// None of the four non-`present` readings settles anything, and that is not
+/// weakened here. What changes is that each of them now says which it is.
+pub const ResultReading = union(enum) {
+    /// Nothing at the address. The job predates sidecars, or
+    /// `--discard-evidence` took it away. The sentinel path is the answer, and
+    /// this is the only one of the four where falling through to it is
+    /// unremarkable rather than a report an operator needs.
+    absent,
+    /// Bytes are there and they are not a document this build can parse.
+    /// Either a different build of the remote wrapper wrote it, or the file
+    /// was cut short mid-write — `jobLaunchLine` writes a `.part` and renames
+    /// it precisely so a reader never sees a half-written document, so one
+    /// turning up anyway is a fact about the host, not a parser detail.
+    malformed,
+    /// Parsed, and declares a schema version this build does not know; carries
+    /// the version it declared. The recognised fields are deliberately not
+    /// read anyway: a reader that keeps the fields it understands is how a
+    /// future document whose `exitCode` means something else comes to settle
+    /// an operation.
+    unknown_schema: i64,
+    /// Parsed and ours, but `exitCode` is not a shell exit status (0-255), so
+    /// it was not written by our wrapper whatever it claims; carries the value
+    /// it carried.
+    exit_code_out_of_range: i64,
+    /// Parsed, and names a *different* request; carries the id it claimed, for
+    /// reporting only. This is the reading that means the result directory is
+    /// being reused or two request ids collided, and taking it as ours would
+    /// settle this operation from somebody else's exit code — which is the
+    /// whole reason results are keyed by request id.
+    foreign: []const u8,
+    /// A document we can read, at our address, naming us.
+    present: JobResult,
+
+    /// The document, when there is a usable one. The only way to a `JobResult`
+    /// from here, so a caller cannot reach one down an arm that refused it.
+    pub fn usable(r: ResultReading) ?JobResult {
+        return switch (r) {
+            .present => |doc| doc,
+            .absent, .malformed, .unknown_schema, .exit_code_out_of_range, .foreign => null,
+        };
+    }
+
+    /// This reading with the document dropped, for carrying on a `JobProbe`.
+    pub fn summary(r: ResultReading) SidecarReading {
+        return switch (r) {
+            .absent => .absent,
+            .malformed => .malformed,
+            .unknown_schema => |v| .{ .unknown_schema = v },
+            .exit_code_out_of_range => |code| .{ .exit_code_out_of_range = code },
+            .foreign => |claimed| .{ .foreign = claimed },
+            .present => .present,
+        };
+    }
+};
+
+/// What a probe found at the sidecar's address, minus the document itself.
+///
+/// The same readings as `ResultReading` plus "we did not look", and
+/// deliberately *without* the parsed document on the `present` arm. A
+/// `JobProbe` already publishes everything a usable document establishes —
+/// `exit_code`, `finished_at`, `result_request_id` — through fields that
+/// `readingOf` withholds when the two durable records disagree. Carrying the
+/// document here as well would put those same values back within reach on
+/// exactly the path that refuses to settle from them.
+pub const SidecarReading = union(enum) {
+    /// No request id was given, so no sidecar was looked for. Distinct from
+    /// `absent`: one is "we did not ask", the other is "we asked and there is
+    /// nothing there".
+    not_requested,
+    absent,
+    malformed,
+    unknown_schema: i64,
+    exit_code_out_of_range: i64,
+    foreign: []const u8,
+    present,
+
+    /// A stable machine-readable name, so a caller branches on the reading
+    /// rather than on prose. Derived from the tag so the two cannot drift.
+    pub fn code(r: SidecarReading) []const u8 {
+        return @tagName(r);
+    }
+
+    /// Whether this reading is something an operator has to be told about.
+    ///
+    /// "We did not look", "it is not there" and "it is there and it is ours"
+    /// are the three ordinary answers. The other three each mean somebody
+    /// wrote a document at this operation's own address that we could not use,
+    /// which is never routine.
+    pub fn anomalous(r: SidecarReading) bool {
+        return switch (r) {
+            .not_requested, .absent, .present => false,
+            .malformed, .unknown_schema, .exit_code_out_of_range, .foreign => true,
+        };
+    }
+
+    /// The sentence for an anomalous reading, or null when there is nothing
+    /// wrong to report.
+    ///
+    /// One sentence per reading rather than a shared "could not read the
+    /// result record": which of the three it is decides what happens next —
+    /// check the remote wrapper's build, or go and find out why two
+    /// operations are writing to one address.
+    pub fn describe(r: SidecarReading, arena: Allocator) Allocator.Error!?[]const u8 {
+        return switch (r) {
+            .not_requested, .absent, .present => null,
+            .malformed => "this job's result record is present but could not be parsed: something wrote a document this build cannot read, or the file was cut short mid-write. It was not read as evidence",
+            .unknown_schema => |v| try std.fmt.allocPrint(
+                arena,
+                "this job's result record is present but declares schema version {d}, which this build does not know (it reads version {d}); the remote wrapper is from a different build. It was not read as evidence",
+                .{ v, result_schema_version },
+            ),
+            .exit_code_out_of_range => |value| try std.fmt.allocPrint(
+                arena,
+                "this job's result record is present but reports exit {d}, which is not a shell exit status (0-255), so it was not written by our wrapper whatever it claims. It was not read as evidence",
+                .{value},
+            ),
+            .foreign => |claimed| try std.fmt.allocPrint(
+                arena,
+                "this job's result record is present but names request {s}, not this one: the result directory is being reused, or two request ids collided. It was not read as evidence",
+                .{claimed},
+            ),
+        };
+    }
+};
+
+/// Reads back the sidecar document, and says what it found.
+///
+/// The four non-`present` readings are all "no usable result", and the reason
+/// they are four values rather than one absence is that they are four
+/// different situations. A missing file is ordinary. A document that will not
+/// parse, or declares a schema we do not know, or carries an exit code no
+/// shell could have produced, means something wrote a document we cannot read.
+/// A document naming a *different* request means the result directory is being
+/// reused or a request id collided — the loudest of the three, and the one a
+/// single `null` return hid most completely.
+///
+/// The point of keying results by request id is that a leftover file from an
 /// earlier attempt must not be read as this attempt's outcome, so a mismatch
-/// is treated as no evidence at all rather than as evidence.
+/// yields no reading at all rather than a weaker one.
 ///
-/// The returned `claimed_request_id` is therefore always equal to
-/// `request_id` — and it is still carried, because the equality is a fact
-/// this parser established rather than one the receipt may assume. The Store
-/// checks the same thing again when the evidence is offered
+/// The returned `claimed_request_id` on the `present` arm is therefore always
+/// equal to `request_id` — and it is still carried, because the equality is a
+/// fact this parser established rather than one the receipt may assume. The
+/// Store checks the same thing again when the evidence is offered
 /// (`receipts.resolve`). Two independent checks on a scope-releasing path is
 /// the point, not redundancy to be collapsed: this one keeps a foreign
 /// document from ever being handed back as a reading, the other keeps a
 /// caller from aiming a perfectly good reading at the wrong operation. Delete
 /// either and the surviving one has to be trusted alone.
-fn parseJobResult(arena: Allocator, text: []const u8, request_id: []const u8) Allocator.Error!?JobResult {
+///
+/// The checks are in the order below and it is load-bearing. A document whose
+/// version we do not know is reported as such even if its `requestId` field
+/// also disagrees: under an unknown schema we cannot say that field still
+/// means what we think it means, so claiming to know whose document it is
+/// would be reading fields out of a layout we have just admitted we do not
+/// understand.
+fn parseJobResult(arena: Allocator, text: []const u8, request_id: []const u8) Allocator.Error!ResultReading {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return null;
+    if (trimmed.len == 0) return .absent;
     const Doc = struct {
         v: i64 = 0,
         requestId: []const u8 = "",
@@ -199,23 +363,27 @@ fn parseJobResult(arena: Allocator, text: []const u8, request_id: []const u8) Al
     };
     const doc = std.json.parseFromSliceLeaky(Doc, arena, trimmed, .{
         .ignore_unknown_fields = true,
-    }) catch return null;
-    if (doc.v != result_schema_version) return null;
-    if (!std.mem.eql(u8, doc.requestId, request_id)) return null;
+    }) catch return .malformed;
+    if (doc.v != result_schema_version) return .{ .unknown_schema = doc.v };
+    // Duped for the reason `claimed_request_id` is: the parser may hand back a
+    // slice into the caller's input buffer, and this value is reported to an
+    // operator long after the probe that read it.
+    if (!std.mem.eql(u8, doc.requestId, request_id))
+        return .{ .foreign = try arena.dupe(u8, doc.requestId) };
     // Shell exit statuses are 0-255; anything else means the document was not
     // written by our wrapper, whatever it claims.
-    if (doc.exitCode < 0 or doc.exitCode > 255) return null;
+    if (doc.exitCode < 0 or doc.exitCode > 255) return .{ .exit_code_out_of_range = doc.exitCode };
     return .{
-        // Duped: the parser may hand back a slice into the caller's input
-        // buffer, and this value outlives the probe that read it.
-        .claimed_request_id = try arena.dupe(u8, doc.requestId),
-        .exit_code = @intCast(doc.exitCode),
-        // 0 is the wrapper's own "the host had no usable `date`", and a
-        // negative stamp is nonsense from a host we should not be quoting
-        // either way. Both mean the remote could not say when this finished,
-        // which is not the same as it having finished at the epoch — and the
-        // answer to "the remote could not say" is never a local clock.
-        .finished_at = if (doc.finishedAt > 0) doc.finishedAt else null,
+        .present = .{
+            .claimed_request_id = try arena.dupe(u8, doc.requestId),
+            .exit_code = @intCast(doc.exitCode),
+            // 0 is the wrapper's own "the host had no usable `date`", and a
+            // negative stamp is nonsense from a host we should not be quoting
+            // either way. Both mean the remote could not say when this finished,
+            // which is not the same as it having finished at the epoch — and the
+            // answer to "the remote could not say" is never a local clock.
+            .finished_at = if (doc.finishedAt > 0) doc.finishedAt else null,
+        },
     };
 }
 
@@ -233,7 +401,14 @@ pub fn removeResult(executor: Executor, arena: Allocator, request_id: []const u8
 
 /// One round trip for just the sidecar, for callers already reading the log
 /// from a cursor and so unable to share `probeTail`'s window.
-pub fn readResult(executor: Executor, arena: Allocator, request_id: []const u8) Error!?JobResult {
+///
+/// Empty output *is* a legitimate reading here, and it means `absent`: the
+/// script's `[ -f "$r" ] || exit 0` deliberately prints nothing when the file
+/// is not there. That is the opposite of `readLog`'s rule below, where every
+/// exit prints a line and silence therefore means the answer never arrived —
+/// the difference is in the two scripts, not in how hard each reader is
+/// willing to look.
+pub fn readResult(executor: Executor, arena: Allocator, request_id: []const u8) Error!ResultReading {
     const script = try std.fmt.allocPrint(arena,
         \\r={s}/{s}.json
         \\[ -f "$r" ] || exit 0
@@ -467,7 +642,13 @@ fn interpretTail(
     request_id: ?[]const u8,
 ) Error!JobProbe {
     const split = splitProbe(stdout) orelse return error.RemoteFailed;
-    const sidecar = if (request_id) |id| try parseJobResult(arena, split.result, id) else null;
+    // Read once, reported twice: `doc` is what may settle something, `reading`
+    // is what happened when we looked. They come apart exactly when the
+    // document is there and unusable, which is the case the old `?JobResult`
+    // could not express.
+    const sidecar: ?ResultReading = if (request_id) |id| try parseJobResult(arena, split.result, id) else null;
+    const reading: SidecarReading = if (sidecar) |r| r.summary() else .not_requested;
+    const doc: ?JobResult = if (sidecar) |r| r.usable() else null;
 
     // No size line at all. The script emits `0` for a log that does not exist
     // yet, so reaching here means the output was truncated or garbled rather
@@ -476,7 +657,7 @@ fn interpretTail(
     // second record to disagree with it. The same rule is applied anyway so
     // this branch cannot drift away from the one below.
     const newline = std.mem.indexOfScalar(u8, split.rest, '\n') orelse {
-        const only_sidecar = readingOf(sidecar, null);
+        const only_sidecar = readingOf(doc, null);
         return .{
             .output = "",
             .next_cursor = 0,
@@ -485,6 +666,7 @@ fn interpretTail(
             .finished_at = only_sidecar.finished_at,
             .result_request_id = only_sidecar.claimed_request_id,
             .conflict = only_sidecar.conflict,
+            .sidecar = reading,
             .session_alive = false,
         };
     };
@@ -492,16 +674,17 @@ fn interpretTail(
     const log_size = std.fmt.parseInt(i64, size_text, 10) catch return error.RemoteFailed;
     const cleaned = try stripTerminalNoise(arena, split.rest[newline + 1 ..]);
 
-    const reading = readingOf(sidecar, findSentinel(cleaned, sentinel));
+    const result = readingOf(doc, findSentinel(cleaned, sentinel));
 
     return .{
         .output = cleaned,
         .next_cursor = log_size,
-        .exit_code = reading.exit_code,
-        .exit_source = reading.exit_source,
-        .finished_at = reading.finished_at,
-        .result_request_id = reading.claimed_request_id,
-        .conflict = reading.conflict,
+        .exit_code = result.exit_code,
+        .exit_source = result.exit_source,
+        .finished_at = result.finished_at,
+        .result_request_id = result.claimed_request_id,
+        .conflict = result.conflict,
+        .sidecar = reading,
         .session_alive = false,
         .business_result = try findBusinessResult(arena, cleaned),
     };
@@ -571,23 +754,65 @@ test "M2e gate: a result belonging to another request is not evidence" {
     const probe = try interpretTail(arena, foreign, "__S__", mine);
     try t.expectEqual(@as(?i32, null), probe.exit_code);
     try t.expectEqual(JobProbe.ExitSource.none, probe.exit_source);
+    // …and the probe says *why* it had nothing, naming the id that turned up
+    // where ours should have been. Without this the operator sees the same
+    // "no result record" a job that never wrote one produces, and never learns
+    // that two operations are writing to one address.
+    try t.expectEqualStrings("foreign", probe.sidecar.code());
+    try t.expectEqualStrings(theirs, probe.sidecar.foreign);
+    try t.expect(probe.sidecar.anomalous());
 
     // Neither is a document from a schema we do not know, nor one whose exit
-    // code is not a shell exit status, nor a truncated write.
-    const rejects = [_][]const u8{
-        "{\"v\":2,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":0,\"finishedAt\":1}",
-        "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":9000,\"finishedAt\":1}",
-        "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2M",
-        "",
+    // code is not a shell exit status, nor a truncated write. None of them
+    // settles anything — and each says which of them it was, because the three
+    // send an operator to three different places (the remote wrapper's build,
+    // a half-written file, a colliding request id) and "no sidecar" sends them
+    // nowhere at all.
+    const rejects = [_]struct { doc: []const u8, code: []const u8 }{
+        .{ .doc = "{\"v\":2,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":0,\"finishedAt\":1}", .code = "unknown_schema" },
+        .{ .doc = "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":9000,\"finishedAt\":1}", .code = "exit_code_out_of_range" },
+        .{ .doc = "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2M", .code = "malformed" },
+        .{ .doc = "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCXYZ\",\"exitCode\":0,\"finishedAt\":1}", .code = "foreign" },
+        .{ .doc = "", .code = "absent" },
     };
-    for (rejects) |doc| try t.expectEqual(@as(?JobResult, null), try parseJobResult(arena, doc, mine));
+    var seen: usize = 0;
+    for (rejects) |case| {
+        const reading = try parseJobResult(arena, case.doc, mine);
+        // The load-bearing half: none of these is usable as evidence.
+        try t.expectEqual(@as(?JobResult, null), reading.usable());
+        // The half that was missing: they are told apart.
+        try t.expectEqualStrings(case.code, reading.summary().code());
+        // Absence is the one that is not a defect; the other four are.
+        try t.expectEqual(!std.mem.eql(u8, case.code, "absent"), reading.summary().anomalous());
+        const sentence = try reading.summary().describe(arena);
+        if (reading.summary().anomalous()) {
+            // Each anomaly earns its own sentence, and none of them may read
+            // as "there was nothing there".
+            try t.expect(sentence.?.len > 40);
+            try t.expect(std.mem.indexOf(u8, sentence.?, "present") != null);
+            seen += 1;
+        } else {
+            try t.expectEqual(@as(?[]const u8, null), sentence);
+        }
+    }
+    try t.expectEqual(@as(usize, 4), seen);
+    // The numbers each reading carries are the ones the document held, so an
+    // operator is told which schema and which impossible code turned up.
+    try t.expectEqual(
+        @as(i64, 2),
+        (try parseJobResult(arena, rejects[0].doc, mine)).unknown_schema,
+    );
+    try t.expectEqual(
+        @as(i64, 9000),
+        (try parseJobResult(arena, rejects[1].doc, mine)).exit_code_out_of_range,
+    );
 
     // And a good one is accepted, so the rejections above mean something.
-    const good = try parseJobResult(
+    const good = (try parseJobResult(
         arena,
         "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":255,\"finishedAt\":42}",
         mine,
-    ) orelse return error.TestExpectedResult;
+    )).usable() orelse return error.TestExpectedResult;
     try t.expectEqual(@as(i32, 255), good.exit_code);
     try t.expectEqual(@as(?i64, 42), good.finished_at);
     // The identity comes out of the document, not out of what we searched
@@ -605,10 +830,83 @@ test "M2e gate: a result belonging to another request is not evidence" {
         "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":3,\"finishedAt\":0}",
         "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":3,\"finishedAt\":-5}",
     }) |doc| {
-        const clockless = try parseJobResult(arena, doc, mine) orelse return error.TestExpectedResult;
+        const clockless = (try parseJobResult(arena, doc, mine)).usable() orelse
+            return error.TestExpectedResult;
         try t.expectEqual(@as(i32, 3), clockless.exit_code);
         try t.expectEqual(@as(?i64, null), clockless.finished_at);
     }
+}
+
+test "gate: a corrupt or foreign sidecar is not the same reading as no sidecar" {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const mine = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+    const theirs = "01JQXW8ZK4N0RS7T3VYB2MCXYZ";
+
+    // The same log window under five different sidecars. The job's own
+    // sentinel is in the tail, so all five settle from the log — what differs
+    // is what each says about the document at this operation's address, which
+    // is the fact that used to be thrown away.
+    const tail = "\n40\nwork done\n__TERMINUS_JOB_9__:7\n";
+    const cases = [_]struct { doc: []const u8, code: []const u8, anomalous: bool }{
+        .{ .doc = "", .code = "absent", .anomalous = false },
+        .{ .doc = "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2M", .code = "malformed", .anomalous = true },
+        .{ .doc = "{\"v\":7,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":7,\"finishedAt\":1}", .code = "unknown_schema", .anomalous = true },
+        .{ .doc = "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCDEF\",\"exitCode\":-9,\"finishedAt\":1}", .code = "exit_code_out_of_range", .anomalous = true },
+        .{ .doc = "{\"v\":1,\"requestId\":\"01JQXW8ZK4N0RS7T3VYB2MCXYZ\",\"exitCode\":7,\"finishedAt\":1}", .code = "foreign", .anomalous = true },
+    };
+    for (cases) |case| {
+        const stdout = try std.fmt.allocPrint(arena, "{s}\n{s}{s}", .{ case.doc, probe_split_marker, tail });
+        const probe = try interpretTail(arena, stdout, "__TERMINUS_JOB_9__", mine);
+        // Unchanged: a document we will not read settles nothing, and the log
+        // sentinel is what answers. That is not what this gate protects; the
+        // next two lines are.
+        try t.expectEqual(@as(?i32, 7), probe.exit_code);
+        try t.expectEqual(JobProbe.ExitSource.log_sentinel, probe.exit_source);
+        try t.expectEqualStrings(case.code, probe.sidecar.code());
+        try t.expectEqual(case.anomalous, probe.sidecar.anomalous());
+        // Nothing from a refused document leaks out as this attempt's own: no
+        // finish time, and above all no identity for a receipt to quote.
+        try t.expectEqual(@as(?i64, null), probe.finished_at);
+        try t.expectEqual(@as(?[]const u8, null), probe.result_request_id);
+    }
+    try t.expectEqualStrings(theirs, (try interpretTail(
+        arena,
+        try std.fmt.allocPrint(arena, "{s}\n{s}{s}", .{ cases[4].doc, probe_split_marker, tail }),
+        "__TERMINUS_JOB_9__",
+        mine,
+    )).sidecar.foreign);
+
+    // A probe that was never given a request id did not look, which is a
+    // sixth answer and not any of the five above.
+    const unasked = try interpretTail(
+        arena,
+        try std.fmt.allocPrint(arena, "\n{s}{s}", .{ probe_split_marker, tail }),
+        "__TERMINUS_JOB_9__",
+        null,
+    );
+    try t.expectEqualStrings("not_requested", unasked.sidecar.code());
+    try t.expect(!unasked.sidecar.anomalous());
+
+    // The control: a usable document still reads as `present`, so the gate
+    // cannot pass by every reading having become an anomaly.
+    const good = try interpretTail(
+        arena,
+        try std.fmt.allocPrint(
+            arena,
+            "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":7,\"finishedAt\":1750000000}}\n{s}{s}",
+            .{ mine, probe_split_marker, tail },
+        ),
+        "__TERMINUS_JOB_9__",
+        mine,
+    );
+    try t.expectEqualStrings("present", good.sidecar.code());
+    try t.expect(!good.sidecar.anomalous());
+    try t.expectEqual(JobProbe.ExitSource.result_file, good.exit_source);
+    try t.expectEqualStrings(mine, good.result_request_id.?);
 }
 
 test "gate: two mechanical records that disagree settle nothing" {
@@ -691,7 +989,9 @@ pub const ReadResult = struct {
 };
 
 /// Reads the session's output log from byte offset `cursor`, at most
-/// `limit` bytes. Missing log file reads as empty.
+/// `limit` bytes. A missing log file reads as empty *and says so* — with a
+/// size line of `0`, which is a reading; see below for why that distinction is
+/// the whole of this function's contract.
 pub fn readLog(executor: Executor, arena: Allocator, name: []const u8, cursor: i64, limit: i64) Error!ReadResult {
     const path = try logPath(arena, name);
     // First line of output is the log size, the rest is the data window.
@@ -704,8 +1004,25 @@ pub fn readLog(executor: Executor, arena: Allocator, name: []const u8, cursor: i
     const result = try run(executor, arena, script);
     if (result.exit_code != 0) return error.RemoteFailed;
 
+    // A newline-free response cannot be a reading of anything.
+    //
+    // Both of the script's exits print the byte count on a line of its own:
+    // `echo 0` when the log is not there yet, `wc -c` when it is. There is no
+    // path through it that answers without a newline, and none that answers
+    // with no bytes at all. So silence here is not a log that happens to be
+    // empty — an empty log answers "0\n" — it is an answer that was cut short
+    // before its first line ended, or one that never started. Exit 0 with zero
+    // bytes is the same defect seen from the other end: the script reached
+    // neither exit, so the read did not happen.
+    //
+    // This used to return `{ .data = "", .next_cursor = cursor, .log_size = 0 }`,
+    // which hands every caller "the log is empty, zero bytes long, cursor
+    // unmoved" — indistinguishable from a genuinely empty log, and consumed as
+    // fact by `probeJob`, `execIn`, `job read` and `job watch`. A truncated
+    // read reported as a successful empty one is a failed link presented as a
+    // finished one.
     const newline = std.mem.indexOfScalar(u8, result.stdout, '\n') orelse
-        return .{ .data = "", .next_cursor = cursor, .log_size = 0 };
+        return error.TruncatedResponse;
     const size_text = std.mem.trim(u8, result.stdout[0..newline], " \t\r");
     const log_size = std.fmt.parseInt(i64, size_text, 10) catch return error.RemoteFailed;
     const data = result.stdout[newline + 1 ..];
@@ -714,6 +1031,64 @@ pub fn readLog(executor: Executor, arena: Allocator, name: []const u8, cursor: i
         .next_cursor = @min(cursor + @as(i64, @intCast(data.len)), log_size),
         .log_size = log_size,
     };
+}
+
+test "gate: a truncated read is not a successfully-read empty log" {
+    const t = std.testing;
+    const Scripted = @import("../exec.zig").Scripted;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+
+    // The remote script always emits the byte count followed by a newline, on
+    // both of its exits. A response without one was cut short, and the old
+    // code answered it with `{data:"", next_cursor:cursor, log_size:0}` — the
+    // same answer a genuinely empty log gets, which is how a broken channel
+    // came to read as "nothing has been printed yet".
+    var cut_short = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try arena.dupe(u8, "4"), .stderr = empty } },
+    });
+    try t.expectError(
+        error.TruncatedResponse,
+        readLog(cut_short.executor(), arena, "j", 0, 1 << 20),
+    );
+
+    // Nothing at all under exit 0 is the same defect from the other end: the
+    // script reached neither of its exits, so the read did not happen.
+    var silent = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectError(
+        error.TruncatedResponse,
+        readLog(silent.executor(), arena, "j", 7, 1 << 20),
+    );
+
+    // The controls, so this cannot be satisfied by a `readLog` that refuses
+    // everything. A log that is really empty says so, with a size line, and is
+    // still a successful read; and an ordinary window still comes back whole.
+    var absent_log = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try arena.dupe(u8, "0\n"), .stderr = empty } },
+    });
+    const nothing = try readLog(absent_log.executor(), arena, "j", 0, 1 << 20);
+    try t.expectEqualStrings("", nothing.data);
+    try t.expectEqual(@as(i64, 0), nothing.log_size);
+    try t.expectEqual(@as(i64, 0), nothing.next_cursor);
+
+    var window = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try arena.dupe(u8, "12\nhello\n"), .stderr = empty } },
+    });
+    const got = try readLog(window.executor(), arena, "j", 6, 1 << 20);
+    try t.expectEqualStrings("hello\n", got.data);
+    try t.expectEqual(@as(i64, 12), got.log_size);
+    try t.expectEqual(@as(i64, 12), got.next_cursor);
+
+    // And a remote that reported failure still reports failure, told apart
+    // from a remote whose answer never arrived.
+    var failed = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 1, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectError(error.RemoteFailed, readLog(failed.executor(), arena, "j", 0, 1 << 20));
 }
 
 pub const ExecInResult = struct {
@@ -853,6 +1228,21 @@ pub const JobProbe = struct {
     /// so a caller is structurally unable to settle from a conflict rather
     /// than merely discouraged from it.
     conflict: ?Conflict = null,
+    /// What was at the sidecar's address, whether or not it answered.
+    ///
+    /// Separate from `exit_source`, which says which record *did* answer. This
+    /// says what happened when we looked at the stronger of the two, and it is
+    /// the only place four of its five readings exist at all: a document that
+    /// would not parse, one from a schema this build does not know, one
+    /// carrying an impossible exit code and one naming another request are
+    /// each `exit_source == .none` with the sentinel then deciding — which
+    /// reads identically to a job that simply never wrote a sidecar.
+    ///
+    /// Carried so a caller can report which of them it hit. It never settles
+    /// anything on its own, and `.foreign`'s payload is a request id belonging
+    /// to somebody else: it is for printing, never for filling a receipt's
+    /// `request_id`, which comes from `result_request_id` and only from there.
+    sidecar: SidecarReading = .not_requested,
     session_alive: bool,
     /// Business-state marker: the value from the last `__TERMINUS_RESULT__:<v>`
     /// line the job printed, distinct from the process exit code (a job can
@@ -951,10 +1341,12 @@ pub fn probeJob(
 ) Error!JobProbe {
     const chunk = try readLog(executor, arena, name, cursor, limit);
     const cleaned = try stripTerminalNoise(arena, chunk.data);
-    const sidecar = if (request_id) |id| try readResult(executor, arena, id) else null;
+    const sidecar: ?ResultReading = if (request_id) |id| try readResult(executor, arena, id) else null;
+    const reading: SidecarReading = if (sidecar) |r| r.summary() else .not_requested;
+    const doc: ?JobResult = if (sidecar) |r| r.usable() else null;
 
     const from_log = findSentinel(cleaned, sentinel);
-    const reading = readingOf(sidecar, from_log);
+    const result = readingOf(doc, from_log);
     // Trim the marker out of what the caller shows the user; the window
     // happened to contain it, which is a property of where their cursor was,
     // not of how the job ended. Independent of what the records established:
@@ -964,11 +1356,12 @@ pub fn probeJob(
     return .{
         .output = output,
         .next_cursor = chunk.next_cursor,
-        .exit_code = reading.exit_code,
-        .exit_source = reading.exit_source,
-        .finished_at = reading.finished_at,
-        .result_request_id = reading.claimed_request_id,
-        .conflict = reading.conflict,
+        .exit_code = result.exit_code,
+        .exit_source = result.exit_source,
+        .finished_at = result.finished_at,
+        .result_request_id = result.claimed_request_id,
+        .conflict = result.conflict,
+        .sidecar = reading,
         .session_alive = try isAlive(executor, arena, name),
         .business_result = try findBusinessResult(arena, cleaned),
     };

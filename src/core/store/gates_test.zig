@@ -341,6 +341,39 @@ fn recordProcess(
     });
 }
 
+/// Records the launch a later `job_sentinel` resolution is checked against.
+///
+/// The counterpart of `recordProcess`, one evidence chain over, and written for
+/// the same reason: `cmd_job` stores the sentinel it chose in `job_attempts`
+/// before the launch line can reach the remote shell — `job_attempts.create` at
+/// `cmd_job.zig:314`, some sixty lines ahead of `sendKeys` — so a sentinel that
+/// could ever appear in a job's log is necessarily one this table already
+/// carries. A gate that resolved from a sentinel with no attempt row behind it
+/// would be proving something about a job that never launched.
+///
+/// The row has to match on all three of the things that make it this launch's:
+/// the request id, the server, and the sentinel itself. A row that merely
+/// exists would let the gate pass without the comparison ever having something
+/// true to compare.
+fn recordLaunchSentinel(
+    store: *Store,
+    request_id: []const u8,
+    server_name: []const u8,
+    job_name: []const u8,
+    sentinel: []const u8,
+    now: i64,
+) !void {
+    _ = try Store.job_attempts.create(store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = server_name,
+        .job_name = job_name,
+        .attempt_no = try Store.job_attempts.nextAttemptNo(store, 1, job_name),
+        .sentinel = sentinel,
+        .now = now,
+    });
+}
+
 const SettleCtx = struct {
     path: [:0]const u8,
     request_id: []const u8,
@@ -663,6 +696,9 @@ test "gate: transport loss after submission records indeterminate, never failed"
     // A job: the reconciliation below is a job's exit sentinel, and evidence
     // is only admissible for the kind of operation that produces it.
     try seedOperationOfKind(&store, request_id, .job);
+    // ...and only for the operation that *recorded* it. See
+    // `recordLaunchSentinel`.
+    try recordLaunchSentinel(&store, request_id, "race", "migrate", "__TERMINUS_JOB_1__", 100);
 
     // The only decision point for a dropped connection.
     const terminal = op_state.terminalForTransportLoss(.submitted, "channel eof");
@@ -783,6 +819,7 @@ test "gate: the statuses Zig calls scope-blocking are the ones the barrier query
     });
     try Store.operations.advance(&store, resolved_id, .connecting, 101);
     try Store.operations.advance(&store, resolved_id, .submitted, 102);
+    try recordLaunchSentinel(&store, resolved_id, "race", "bsresolved", "__TERMINUS_JOB_1__", 100);
     _ = try Store.receipts.settle(
         &store,
         resolved_id,
@@ -857,6 +894,7 @@ test "gate: resolution is write-once" {
     const rid = testId("once");
     const request_id: []const u8 = &rid;
     try seedOperationOfKind(&store, request_id, .job);
+    try recordLaunchSentinel(&store, request_id, "race", "once", "__S__", 100);
     _ = try Store.receipts.settle(
         &store,
         request_id,
@@ -866,7 +904,6 @@ test "gate: resolution is write-once" {
     );
 
     try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{ .job_sentinel = .{ .sentinel = "__S__", .exit_code = 0 } }, 400)) == .resolved);
-
     // A second reconciler must not overwrite the first one's evidence. The
     // rival evidence has to be evidence this kind *admits*, or the refusal
     // comes back from `appliesToKind` a step earlier and this gate passes
@@ -1051,14 +1088,15 @@ test "gate: lease lifecycle — renew, expire, takeover audit chain" {
     thief.owner_token = "owner-c";
     thief.now = 5020;
     const taken = try Store.leases.takeover(&store, arena, thief);
-    try t.expectEqualStrings("owner-b", taken.taken.from.owner_token);
+    try t.expectEqual(@as(usize, 1), taken.taken.from.len);
+    try t.expectEqualStrings("owner-b", taken.taken.from[0].owner_token);
 
     var stmt = try store.db.prepare(
         \\SELECT release_reason, superseded_by FROM leases
         \\ WHERE id = ?1
     );
     defer stmt.deinit();
-    try stmt.bindInt(1, taken.taken.from.id);
+    try stmt.bindInt(1, taken.taken.from[0].id);
     try t.expect(try stmt.step());
     try t.expectEqualStrings("takeover", stmt.columnText(0));
     try t.expectEqual(taken.taken.lease.id, stmt.columnInt(1));
@@ -1066,6 +1104,104 @@ test "gate: lease lifecycle — renew, expire, takeover audit chain" {
     // The guard used by write operations sees the conflict for others only.
     try t.expect((try Store.leases.conflictFor(&store, arena, 1, job_scope, "owner-a", 5030)) != null);
     try t.expect((try Store.leases.conflictFor(&store, arena, 1, job_scope, "owner-c", 5030)) == null);
+}
+
+// A takeover displaces *every* overlapping lease, not the first one it finds.
+//
+// The state this gate exists to make unreachable is two active leases whose
+// scopes overlap, which the schema cannot refuse: `idx_leases_active` is UNIQUE
+// on `(server_id, scope_kind, scope_key)` exactly, so `path:/srv/app` sitting
+// beside `path:/srv/app/build` is two distinct keys and commits clean. Nothing
+// downstream would have objected either — `conflictFor` returns the *first*
+// overlap it sees, so the surviving lease would have gone on blocking peers
+// while its owner had been told nothing and the new holder believed the scope
+// was theirs.
+//
+// The setup is ordinary rather than contrived: `acquire` refuses overlapping
+// leases and permits everything else, so two sibling directories are exactly
+// what a pair of cooperating sessions ends up holding.
+test "gate: takeover displaces every overlapping lease and links all of them" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_lease_takeover_all");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    const base: Store.leases.AcquireOptions = .{
+        .server_id = 1,
+        .scope = .{ .kind = .path, .key = "/srv/app/dist" },
+        .owner_token = "owner-a",
+        .ttl_secs = 1000,
+        .now = 1000,
+    };
+
+    // Two leases that do not overlap each other. Both are legal, and the second
+    // acquisition proves it rather than assuming it: if `acquire` ever started
+    // refusing this pair, the hole below would stop being reachable and this
+    // gate would be testing nothing.
+    try t.expect((try Store.leases.acquire(&store, arena, base)) == .acquired);
+    var sibling = base;
+    sibling.scope = .{ .kind = .path, .key = "/srv/app/build" };
+    sibling.owner_token = "owner-b";
+    sibling.now = 1010;
+    try t.expect((try Store.leases.acquire(&store, arena, sibling)) == .acquired);
+
+    // A third scope containing both.
+    var thief = base;
+    thief.scope = .{ .kind = .path, .key = "/srv/app" };
+    thief.owner_token = "owner-c";
+    thief.now = 1100;
+    const taken = try Store.leases.takeover(&store, arena, thief);
+
+    // Both owners are reported. A caller told about one of them would notify
+    // half the peers whose work it just seized.
+    try t.expectEqual(@as(usize, 2), taken.taken.from.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (taken.taken.from) |old| {
+        if (std.mem.eql(u8, old.owner_token, "owner-a")) saw_a = true;
+        if (std.mem.eql(u8, old.owner_token, "owner-b")) saw_b = true;
+    }
+    try t.expect(saw_a and saw_b);
+
+    // ...and the audit chain is complete for each: a displaced row with no
+    // successor recorded reads as an expiry rather than as a seizure.
+    for (taken.taken.from) |old| {
+        var stmt = try store.db.prepare(
+            "SELECT release_reason, superseded_by FROM leases WHERE id = ?1",
+        );
+        defer stmt.deinit();
+        try stmt.bindInt(1, old.id);
+        try t.expect(try stmt.step());
+        try t.expectEqualStrings("takeover", stmt.columnText(0));
+        try t.expectEqual(taken.taken.lease.id, stmt.columnInt(1));
+    }
+
+    // The invariant itself, read back off the table: one active lease on the
+    // server, and it is the new one.
+    const still_held = try Store.leases.active(&store, arena, 1, 1110);
+    try t.expectEqual(@as(usize, 1), still_held.len);
+    try t.expectEqualStrings("owner-c", still_held[0].owner_token);
+
+    // Both former owners are now blocked, and by the same lease. A survivor
+    // would show up here as one of them still being free to write.
+    for ([_][]const u8{ "owner-a", "owner-b" }) |owner| {
+        const blocked = try Store.leases.conflictFor(
+            &store,
+            arena,
+            1,
+            .{ .kind = .path, .key = "/srv/app/dist" },
+            owner,
+            1110,
+        );
+        try t.expect(blocked != null);
+        try t.expectEqual(taken.taken.lease.id, blocked.?.id);
+    }
 }
 
 test "gate: job attempts survive a same-name rerun and job rm" {
@@ -1849,6 +1985,10 @@ test "gate: evidence must entail the result it is used to justify" {
     // question here is whether the evidence entails the *result*, and it can
     // only get asked of an operation the evidence is allowed to speak about.
     try seedOperationOfKind(&store, request_id, .job);
+    // The sentinel below has to be one this attempt actually launched with, or
+    // it is refused as another job's log line and this gate never reaches the
+    // entailment question it is about. See `recordLaunchSentinel`.
+    try recordLaunchSentinel(&store, request_id, "race", "supports", "__S__", 100);
     _ = try Store.receipts.settle(
         &store,
         request_id,
@@ -2020,6 +2160,272 @@ test "gate: a result document naming another request settles nothing here" {
         op_state.ResolvedStatus.completed,
         (try Store.operations.get(&store, arena, request_id)).?.resolved_status.?,
     );
+}
+
+// The third identity binding, and the one that was missing.
+//
+// A sentinel names nothing. It is a string scanned out of a window of an
+// append-only log that anything on the host can write to, so unlike a result
+// document (which carries a request id) and unlike a probe (which carries a
+// pid), it has no address of its own at all. What makes one *this* operation's
+// is that this binary chose it and wrote it into `job_attempts` before the
+// launch line could reach the shell. Until that was compared, `job_sentinel`
+// was the only mechanical variant in the union with nothing tying it to the
+// operation it settled — and `isMechanical` grades it `true`, which is the
+// grade that releases the same-scope mutation barrier with no operator in the
+// loop.
+//
+// All four readings are exercised, because the union has to keep them apart:
+// a matching sentinel still settles, a foreign one is refused, an attempt that
+// recorded no sentinel is refused, and a request with no attempt row at all is
+// refused — and the last three are three different things to go and do.
+test "gate: a job sentinel settles only the job that recorded it" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_sentinel_identity");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("mysent");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .job);
+    try recordLaunchSentinel(&store, request_id, "race", "deploy", "__TERMINUS_JOB_9__", 100);
+    _ = try Store.receipts.settle(
+        &store,
+        request_id,
+        .{ .indeterminate = .{ .reason = "caller walked away", .last_observed = .submitted } },
+        .{},
+        200,
+    );
+
+    // Somebody else's sentinel, carrying a perfectly good exit code. Admitting
+    // it would settle this operation from another job's log line — the exact
+    // shape the result-document check refuses one variant over, arriving
+    // through the variant that had no check.
+    const foreign = try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_sentinel = .{ .sentinel = "__TERMINUS_JOB_4__", .exit_code = 0 },
+    }, 300);
+    try t.expectEqualStrings("__TERMINUS_JOB_4__", foreign.evidence_wrong_sentinel.offered);
+    try t.expectEqualStrings("__TERMINUS_JOB_9__", foreign.evidence_wrong_sentinel.recorded.sentinel);
+
+    // Nothing was written by the refusal: no resolution, and no reconcile event
+    // claiming one was considered.
+    try t.expectEqual(
+        @as(?op_state.ResolvedStatus, null),
+        (try Store.operations.get(&store, arena, request_id)).?.resolved_status,
+    );
+    try t.expectEqual(@as(usize, 0), try countKind(&store, arena, request_id, "reconcile"));
+
+    // An attempt that recorded no sentinel. Refused, and refused *distinctly*:
+    // no amount of re-reading that job's log will produce a sentinel that can
+    // be tied to it, which is a different instruction from "you read the wrong
+    // line".
+    const nrid = testId("nosent");
+    const no_sentinel: []const u8 = &nrid;
+    try Store.operations.create(&store, .{
+        .request_id = no_sentinel,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .job,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, no_sentinel, .connecting, 101);
+    try Store.operations.advance(&store, no_sentinel, .submitted, 102);
+    _ = try Store.job_attempts.create(&store, .{
+        .request_id = no_sentinel,
+        .server_id = 1,
+        .server_name = "race",
+        .job_name = "sentinel-less",
+        .attempt_no = 1,
+        .now = 100,
+    });
+    _ = try Store.receipts.settle(
+        &store,
+        no_sentinel,
+        .{ .indeterminate = .{ .reason = "caller walked away", .last_observed = .submitted } },
+        .{},
+        200,
+    );
+    const unrecorded = try Store.receipts.resolve(&store, arena, no_sentinel, .completed, .{
+        .job_sentinel = .{ .sentinel = "__TERMINUS_JOB_9__", .exit_code = 0 },
+    }, 300);
+    try t.expect(unrecorded.evidence_wrong_sentinel.recorded == .attempt_recorded_none);
+
+    // A request no launch ever registered. Also refused, and also distinctly:
+    // this one is evidence aimed at something that is not a job launch, not a
+    // job whose launch forgot to write something down.
+    const arid = testId("noatt");
+    const no_attempt: []const u8 = &arid;
+    try Store.operations.create(&store, .{
+        .request_id = no_attempt,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .job,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, no_attempt, .connecting, 101);
+    try Store.operations.advance(&store, no_attempt, .submitted, 102);
+    _ = try Store.receipts.settle(
+        &store,
+        no_attempt,
+        .{ .indeterminate = .{ .reason = "caller walked away", .last_observed = .submitted } },
+        .{},
+        200,
+    );
+    const unlaunched = try Store.receipts.resolve(&store, arena, no_attempt, .completed, .{
+        .job_sentinel = .{ .sentinel = "__TERMINUS_JOB_9__", .exit_code = 0 },
+    }, 300);
+    try t.expect(unlaunched.evidence_wrong_sentinel.recorded == .no_attempt);
+
+    // And the binding is not a blanket refusal: this attempt's own sentinel
+    // still settles it, which is what keeps the check from costing the job its
+    // route. Last, so the three refusals above cannot have been the resolution
+    // having already happened.
+    try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
+        .job_sentinel = .{ .sentinel = "__TERMINUS_JOB_9__", .exit_code = 0 },
+    }, 400)) == .resolved);
+    try t.expectEqual(
+        op_state.ResolvedStatus.completed,
+        (try Store.operations.get(&store, arena, request_id)).?.resolved_status.?,
+    );
+}
+
+// A settlement records what was sitting at its result-record address.
+//
+// The hole this closes: a job settles cleanly from the sentinel in its log
+// while a document that is *not* usable sits at the address derived from that
+// same request — most sharply a `foreign` one, which means the result directory
+// is being reused or two request ids collided. The settlement is correct and
+// the anomaly is a fact about the host, and the receipt — the one durable
+// record — kept the verdict and dropped the contradiction standing next to it.
+// The operator saw it on screen once and nothing kept it.
+//
+// Recorded in `detail_json` rather than in a column, so the schema is untouched
+// and the versioned document carries it the way it carries `probeIdentity` and
+// `declaredSha256` for a resolution.
+test "gate: a terminal records what was at the job's result-record address" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_result_record_receipt");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // Settles one job with `reading` at its result address and hands back the
+    // terminal receipt's detail document.
+    const settleWith = struct {
+        fn f(
+            s: *Store,
+            a: std.mem.Allocator,
+            request_id: []const u8,
+            reading: Store.receipts.ResultRecordReading,
+        ) ![]const u8 {
+            try Store.operations.create(s, .{
+                .request_id = request_id,
+                .server_id = 1,
+                .server_name = "race",
+                .kind = .job,
+                .now = 100,
+            });
+            try Store.operations.advance(s, request_id, .connecting, 101);
+            try Store.operations.advance(s, request_id, .submitted, 102);
+            _ = try Store.receipts.settle(s, request_id, .{ .exited = .{ .exit_code = 0 } }, .{
+                .result_record = .{ .arena = a, .reading = reading },
+            }, 200);
+            for (try Store.receipts.list(s, a, request_id)) |row| {
+                if (row.is_terminal) return row.detail_json orelse
+                    error.TerminalRecordedNoResultRecord;
+            }
+            return error.NoTerminalRecorded;
+        }
+    }.f;
+
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'race', '10.0.0.1', 22, 'ubuntu', 100, 100);
+    );
+
+    // The loud one. A document naming somebody else was found at this
+    // request's own address, and the receipt has to carry *which* somebody —
+    // the tag alone would say a collision happened while withholding the only
+    // thing that identifies it.
+    const frid = testId("rrforeign");
+    const foreign = try settleWith(&store, arena, &frid, .{ .foreign = "01OTHEROTHER0123456789ABCD" });
+    try t.expect(std.mem.indexOf(u8, foreign, "\"reading\":\"foreign\"") != null);
+    try t.expect(std.mem.indexOf(u8, foreign, "01OTHEROTHER0123456789ABCD") != null);
+
+    // The three unremarkable readings, and the reason the field is not just a
+    // flag for anomalies: "we looked and there was nothing" and "we did not
+    // look" are different facts, and a receipt that told them apart from
+    // nothing would also fail to tell either of them from a settlement written
+    // before this field existed.
+    const arid = testId("rrabsent");
+    const absent = try settleWith(&store, arena, &arid, .absent);
+    try t.expect(std.mem.indexOf(u8, absent, "\"reading\":\"absent\"") != null);
+    try t.expect(std.mem.indexOf(u8, absent, "\"claimedRequestId\":null") != null);
+
+    const nrid = testId("rrnotreq");
+    const not_requested = try settleWith(&store, arena, &nrid, .not_requested);
+    try t.expect(std.mem.indexOf(u8, not_requested, "\"reading\":\"not_requested\"") != null);
+    // The distinctness itself, asserted rather than implied: these two must
+    // never render to the same document.
+    try t.expect(!std.mem.eql(u8, absent, not_requested));
+
+    const prid = testId("rrpresent");
+    const present = try settleWith(&store, arena, &prid, .present);
+    try t.expect(std.mem.indexOf(u8, present, "\"reading\":\"present\"") != null);
+
+    // The two remaining defect readings, so all six names reach the ledger and
+    // none of them collapses into a neighbour.
+    const mrid = testId("rrmalform");
+    const malformed = try settleWith(&store, arena, &mrid, .malformed);
+    try t.expect(std.mem.indexOf(u8, malformed, "\"reading\":\"malformed\"") != null);
+
+    const urid = testId("rrunkschema");
+    const unknown = try settleWith(&store, arena, &urid, .unknown_schema);
+    try t.expect(std.mem.indexOf(u8, unknown, "\"reading\":\"unknown_schema\"") != null);
+
+    const xrid = testId("rroutrange");
+    const out_of_range = try settleWith(&store, arena, &xrid, .exit_code_out_of_range);
+    try t.expect(std.mem.indexOf(u8, out_of_range, "\"reading\":\"exit_code_out_of_range\"") != null);
+
+    // Every document is versioned, for the reason the resolution document is:
+    // this field was added to a shape that already had readers.
+    try t.expect(std.mem.indexOf(u8, foreign, "\"schemaVersion\"") != null);
+
+    // And a caller handing in both its own detail document and a reading is
+    // refused rather than having one of the two silently dropped. Nothing
+    // constructs this pair today; the refusal is what keeps it that way instead
+    // of letting the next caller discover which one survives.
+    const crid = testId("rrclash");
+    const clash: []const u8 = &crid;
+    try Store.operations.create(&store, .{
+        .request_id = clash,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .job,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, clash, .connecting, 101);
+    try Store.operations.advance(&store, clash, .submitted, 102);
+    try t.expectError(error.ConflictingTerminalDetail, Store.receipts.settle(
+        &store,
+        clash,
+        .{ .exited = .{ .exit_code = 0 } },
+        .{
+            .detail_json = "{\"mine\":true}",
+            .result_record = .{ .arena = arena, .reading = .absent },
+        },
+        200,
+    ));
+    // The refusal wrote nothing: no terminal, so the attempt is still settleable.
+    try t.expect((try Store.receipts.terminalOf(&store, clash)) == null);
 }
 
 test "gate: a result with no remote clock records absence, not the epoch" {
@@ -2922,6 +3328,12 @@ test "gate: a job is not settled by a reading of its pane's process" {
     const rid = testId("panepid");
     const request_id: []const u8 = &rid;
     try seedOperationOfKind(&store, request_id, .job);
+    // The launch record, for the same reason `recordProcess` below writes the
+    // process identity: the closing assertion of this gate is that a job's
+    // *other* evidence chain still settles it, and a sentinel no launch
+    // recorded is not that chain — it is an unaddressed string. Seeding this is
+    // what makes the last line prove the sentence the comment above it claims.
+    try recordLaunchSentinel(&store, request_id, "race", "panepid", "__TERMINUS_JOB_1__", 100);
     _ = try Store.receipts.settle(
         &store,
         request_id,
@@ -8132,11 +8544,23 @@ test "gate: a *Locked writer refuses to run outside a transaction" {
         error.NotInTransaction,
         Store.transfers.supersedeLocked(&store, 1, request_id, 100),
     );
+    // The third of `servers.removeLocked`'s three barriers. It is a reader
+    // rather than a writer, which is why it went so long without the guard its
+    // two siblings have — and why it needs one: a count taken outside the lock
+    // describes a moment that has already passed by the time the DELETE runs,
+    // so the barrier would be answering about a database nobody is holding
+    // still. Its siblings `operations.unsettledCountLocked` and
+    // `leases.activeCountLocked` both assert; this one did not.
+    try t.expectError(
+        error.NotInTransaction,
+        Store.transfers.handoverBoundCountLocked(&store, 1),
+    );
 
     // And inside one they run, so the guard is checking for a transaction
-    // rather than refusing everything. Both readers answer "nothing here",
-    // which is the right answer for a request that was never created — what
-    // matters is that they got as far as asking.
+    // rather than refusing everything. All three readers answer "nothing
+    // here", which is the right answer for a request that was never created
+    // and a server with no transfers — what matters is that they got as far as
+    // asking.
     try t.expectEqual(
         @as(?i64, null),
         try locked(&store, Store.transfers.pendingPublishLocked, .{ &store, request_id }),
@@ -8144,6 +8568,10 @@ test "gate: a *Locked writer refuses to run outside a transaction" {
     try t.expectEqual(
         @as(i64, 1),
         try locked(&store, Store.receipts.nextSeqLocked, .{ &store, request_id }),
+    );
+    try t.expectEqual(
+        @as(i64, 0),
+        try locked(&store, Store.transfers.handoverBoundCountLocked, .{ &store, 1 }),
     );
 }
 

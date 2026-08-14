@@ -189,6 +189,59 @@ pub fn history(store: *Store, arena: Allocator, server_id: i64, job_name: []cons
     return out.toOwnedSlice(arena);
 }
 
+/// What this binary wrote down as an attempt's sentinel, or why there is no
+/// sentinel to compare against.
+///
+/// Three values rather than `?[]const u8`, because the two absences are two
+/// different facts and they send an operator two different ways. "This job
+/// launched without a sentinel" is a statement about the launcher — a shell-mode
+/// run, or a build that predates sentinels — and no amount of looking at the
+/// host will produce one. "There is no attempt row for this request" means the
+/// evidence is aimed at something `cmd_job` never registered as a job launch at
+/// all, which is a misrouted reading rather than a missing field. Collapsing
+/// them into one null would tell the first operator to go looking for a row that
+/// exists and the second to go looking for a sentinel that never will.
+pub const RecordedSentinel = union(enum) {
+    /// The launch recorded this sentinel. The only value evidence can match.
+    sentinel: []const u8,
+    /// An attempt row exists for this request and its `sentinel` column is
+    /// NULL.
+    attempt_recorded_none,
+    /// No `job_attempts` row names this request.
+    no_attempt,
+};
+
+/// The sentinel recorded at launch for `request_id`.
+///
+/// One column rather than `byRequest`'s nineteen, and it asserts its
+/// transaction: this is read by `receipts.resolve` inside its `BEGIN IMMEDIATE`
+/// to decide whether offered `job_sentinel` evidence is about this attempt, and
+/// that decision releases the same-scope mutation barrier. Every sibling read
+/// `resolve` makes from inside that transaction asserts the same way
+/// (`transfers.expectedEffectLocked`, `transfers.committedDestinationLocked`,
+/// `receipts.recordedProcessLocked`); a reading taken outside the lock describes
+/// a moment that has already passed by the time the resolution lands.
+///
+/// `byRequest` is deliberately not reused. It asserts nothing, and a barrier
+/// that borrows an unguarded reader inherits the absence of the guard.
+pub fn sentinelForLocked(
+    store: *Store,
+    arena: Allocator,
+    request_id: []const u8,
+) Error!RecordedSentinel {
+    try store.db.requireTransaction();
+    var stmt = try store.db.prepare(
+        "SELECT sentinel FROM job_attempts WHERE request_id = ?1",
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, request_id);
+    if (!try stmt.step()) return .no_attempt;
+    const recorded = stmt.columnOptText(0) orelse return .attempt_recorded_none;
+    // Duped: the statement is finalized before this is read, and the value
+    // travels out of `resolve` inside the refusal.
+    return .{ .sentinel = try arena.dupe(u8, recorded) };
+}
+
 /// Latest observation of a running attempt. `last_probed_at` travels with
 /// every field so a stale reading is always identifiable as such.
 pub const ProbeState = struct {
