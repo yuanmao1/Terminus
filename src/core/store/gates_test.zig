@@ -1602,8 +1602,10 @@ test "gate: a job's exit status cannot settle a transfer" {
     const checkpoint = try Store.transfers.create(&store, .{
         .request_id = request_id,
         .direction = .push,
-        .remote_path = "/srv/app/out.bin",
-        .remote_partial_path = "/srv/app/out.bin.terminus-part",
+        .dest_side = .{ .server = 1 },
+        .dest_path = "/srv/app/out.bin",
+        .partial_path = "/srv/app/out.bin.terminus-part",
+        .source = .{ .local_file = .{ .path = "./out.bin" } },
         .chunk_size = 1 << 20,
         .expected_sha256 = "abc",
         .now = 200,
@@ -1911,8 +1913,10 @@ test "gate: the digest a transfer will be judged by is declared once, before it 
     const checkpoint = try Store.transfers.create(&store, .{
         .request_id = early,
         .direction = .push,
-        .remote_path = "/srv/app/out.bin",
-        .remote_partial_path = "/srv/app/out.bin.terminus-part",
+        .dest_side = .{ .server = 1 },
+        .dest_path = "/srv/app/out.bin",
+        .partial_path = "/srv/app/out.bin.terminus-part",
+        .source = .{ .local_file = .{ .path = "./out.bin" } },
         .chunk_size = 1 << 20,
         .now = 100,
     });
@@ -1942,8 +1946,10 @@ test "gate: the digest a transfer will be judged by is declared once, before it 
     const late_checkpoint = try Store.transfers.create(&store, .{
         .request_id = late,
         .direction = .push,
-        .remote_path = "/srv/app/late.bin",
-        .remote_partial_path = "/srv/app/late.bin.terminus-part",
+        .dest_side = .{ .server = 1 },
+        .dest_path = "/srv/app/late.bin",
+        .partial_path = "/srv/app/late.bin.terminus-part",
+        .source = .{ .local_file = .{ .path = "./late.bin" } },
         .chunk_size = 1 << 20,
         .now = 100,
     });
@@ -1983,9 +1989,9 @@ test "gate: a checkpoint write that lands on no row is an error, not a success" 
     );
 }
 
-test "gate: two declared digests for one request refuse to settle it" {
+test "gate: one request cannot hold two checkpoints, or two live transfers one destination" {
     const t = std.testing;
-    var scratch = try Scratch.init(t.allocator, "gate_ambiguous_checkpoint");
+    var scratch = try Scratch.init(t.allocator, "gate_checkpoint_uniqueness");
     defer scratch.deinit();
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -1994,47 +2000,170 @@ test "gate: two declared digests for one request refuse to settle it" {
     var store = try Store.open(scratch.path);
     defer store.close();
 
-    const rid = testId("ambig");
+    const rid = testId("uniq");
     const request_id: []const u8 = &rid;
     try seedOperationOfKind(&store, request_id, .transfer_push);
-    _ = try Store.receipts.settle(
-        &store,
-        request_id,
-        op_state.terminalForTransportLoss(.submitted, "eof"),
-        .{},
-        300,
+
+    const opts: Store.transfers.CreateOptions = .{
+        .request_id = request_id,
+        .direction = .push,
+        .dest_side = .{ .server = 1 },
+        .dest_path = "/srv/app/out.bin",
+        .partial_path = "/srv/app/out.bin.terminus-part",
+        .source = .{ .local_file = .{ .path = "./out.bin" } },
+        .chunk_size = 1 << 20,
+        .expected_sha256 = "abc",
+        .now = 200,
+    };
+    const first = try Store.transfers.create(&store, opts);
+
+    // A second checkpoint on the same request would mean two declared
+    // digests, and settling from a published-file hash would then have to
+    // pick one — turning insertion order into a scope-releasing decision.
+    // `receipts.resolve` refuses that case; this is what makes it unreachable.
+    //
+    // Aimed at a *different* destination on purpose. Reusing the same one
+    // would be rejected by the live-destination index instead, and the
+    // assertion would pass without the request-id constraint existing at all.
+    var second = opts;
+    second.expected_sha256 = "def";
+    second.dest_path = "/srv/app/elsewhere.bin";
+    second.partial_path = "/srv/app/elsewhere.bin.terminus-part";
+    try t.expectError(error.Constraint, Store.transfers.create(&store, second));
+
+    // A different request aimed at the same live destination is refused too,
+    // and by a different rule. This is the only guard a locally-published
+    // transfer gets: `unsettledInScope` filters by server, so two pulls from
+    // different servers into one local path both clear the scope guard.
+    const other = testId("uniq2");
+    const other_id: []const u8 = &other;
+    try Store.operations.create(&store, .{
+        .request_id = other_id,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .transfer_push,
+        .now = 100,
+    });
+    var rival = opts;
+    rival.request_id = other_id;
+    try t.expectError(error.Constraint, Store.transfers.create(&store, rival));
+
+    // Once the first transfer settles it stops holding the destination, and
+    // the next one may have it. A live index over live states is the point:
+    // a finished transfer blocking its own path forever would be a leak.
+    try Store.transfers.setState(&store, first, .published, null, 300);
+    _ = try Store.transfers.create(&store, rival);
+
+    // And the settled one stays settled: nothing may walk a terminal
+    // checkpoint back into the live set it just left.
+    try t.expectError(
+        error.CheckpointRowMissing,
+        Store.transfers.setState(&store, first, .transferring, null, 400),
+    );
+    try t.expectEqual(
+        Store.transfers.State.published,
+        (try Store.transfers.get(&store, arena, first)).?.state,
+    );
+}
+
+test "gate: a confirmed offset without a prefix hash is refused by the schema" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_offset_needs_hash");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    const rid = testId("offset");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .transfer_push);
+    const id = try Store.transfers.create(&store, .{
+        .request_id = request_id,
+        .direction = .push,
+        .dest_side = .{ .server = 1 },
+        .dest_path = "/srv/app/out.bin",
+        .partial_path = "/srv/app/out.bin.terminus-part",
+        .source = .{ .local_file = .{ .path = "./out.bin" } },
+        .chunk_size = 100,
+        .now = 100,
+    });
+
+    // The confirmed offset is a claim about bytes we can still prove are ours,
+    // and the prefix hash is the proof. Advancing without one used to be
+    // possible in two ways: passing null, or letting the old `COALESCE` keep
+    // the *previous* offset's hash while the offset moved past it. Either way
+    // the pair `verifyResume` compares stopped describing the same bytes.
+    try t.expectError(
+        error.Constraint,
+        Store.transfers.confirmOffset(&store, id, 400, 400, null, 110),
+    );
+    try t.expectEqual(
+        @as(i64, 0),
+        (try Store.transfers.get(&store, arena, id)).?.confirmed_offset,
     );
 
-    for ([_][]const u8{ "abc", "def" }) |digest| {
-        _ = try Store.transfers.create(&store, .{
-            .request_id = request_id,
-            .direction = .push,
-            .remote_path = "/srv/app/out.bin",
-            .remote_partial_path = "/srv/app/out.bin.terminus-part",
-            .chunk_size = 1 << 20,
-            .expected_sha256 = digest,
-            .now = 200,
-        });
-    }
+    // With the proof, it advances.
+    try Store.transfers.confirmOffset(&store, id, 400, 400, "bbbb", 111);
+    const advanced = (try Store.transfers.get(&store, arena, id)).?;
+    try t.expectEqual(@as(i64, 400), advanced.confirmed_offset);
+    try t.expectEqualStrings("bbbb", advanced.partial_sha256.?);
 
-    // Two promises, both plausible. Picking one by `ORDER BY id DESC` would
-    // make a scope-releasing decision out of insertion order, so this refuses
-    // instead — and refuses as an error, because unlike a mismatch it is not
-    // a fact about the transfer, it is a fact about our own bookkeeping.
-    try t.expectError(error.AmbiguousCheckpoint, Store.receipts.resolve(
-        &store,
-        arena,
-        request_id,
-        .completed,
-        .{ .filesystem_effect = .{ .side = .remote, .path = "/srv/app/out.bin", .sha256 = "abc" } },
-        400,
-    ));
+    // The dangerous case, and the one the old `COALESCE` allowed: advancing
+    // *past* proven bytes while passing no new proof. Under COALESCE the
+    // offset moved to 800 and kept the hash of the first 400, so the pair
+    // `verifyResume` compares silently stopped describing the same bytes —
+    // and a resume would then splice at 800 on the strength of a digest that
+    // only ever covered half of it. A plain assignment turns it into a null,
+    // which the schema refuses outright.
+    try t.expectError(
+        error.Constraint,
+        Store.transfers.confirmOffset(&store, id, 800, 800, null, 112),
+    );
+    const unmoved = (try Store.transfers.get(&store, arena, id)).?;
+    try t.expectEqual(@as(i64, 400), unmoved.confirmed_offset);
+    try t.expectEqualStrings("bbbb", unmoved.partial_sha256.?);
 
-    // The refusal left the ledger untouched — including the transaction it
-    // had already opened.
-    try t.expectEqual(
-        @as(?op_state.ResolvedStatus, null),
-        (try Store.operations.get(&store, arena, request_id)).?.resolved_status,
+    // A regressing offset matches no row: a late reply from an earlier chunk
+    // must not walk the durable offset backwards.
+    try t.expectError(
+        error.CheckpointRowMissing,
+        Store.transfers.confirmOffset(&store, id, 300, 300, "aaaa", 113),
+    );
+    try t.expectEqualStrings(
+        "bbbb",
+        (try Store.transfers.get(&store, arena, id)).?.partial_sha256.?,
+    );
+
+    // Zero needs no proof — there is nothing to prove.
+    const fresh = testId("fresh");
+    const fresh_id: []const u8 = &fresh;
+    try Store.operations.create(&store, .{
+        .request_id = fresh_id,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .transfer_push,
+        .now = 100,
+    });
+    const second = try Store.transfers.create(&store, .{
+        .request_id = fresh_id,
+        .direction = .push,
+        .dest_side = .{ .server = 1 },
+        .dest_path = "/srv/app/other.bin",
+        .partial_path = "/srv/app/other.bin.terminus-part",
+        .source = .{ .local_file = .{ .path = "./other.bin" } },
+        .chunk_size = 100,
+        .now = 100,
+    });
+    try Store.transfers.confirmOffset(&store, second, 0, 0, null, 110);
+
+    // And a checkpoint that has settled cannot take progress at all.
+    try Store.transfers.setState(&store, second, .failed_hash_mismatch, "digest mismatch", 120);
+    try t.expectError(
+        error.CheckpointRowMissing,
+        Store.transfers.confirmOffset(&store, second, 100, 100, "cccc", 130),
     );
 }
 

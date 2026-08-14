@@ -155,6 +155,10 @@ pub const Error = Db.Error || error{
     /// request. Choosing between them would make a scope-releasing decision
     /// by `ORDER BY`; see `transfers.expectedEffectLocked`.
     AmbiguousCheckpoint,
+    /// A checkpoint's `dest_side` is not a value this binary writes. Like
+    /// `UnknownOperationKind`, it means the row is not one we can reason
+    /// about, so no admissibility decision may be made from it.
+    UnknownDestSide,
     /// The `operations.kind` column holds something longer than any kind this
     /// binary knows. Not a business outcome: it means the row is not one we
     /// can reason about, so no admissibility decision may be made from it.

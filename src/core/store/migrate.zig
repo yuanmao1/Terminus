@@ -399,6 +399,91 @@ const migrations = [_][:0]const u8{
     // reason.
     \\ALTER TABLE operations ADD COLUMN mutating INTEGER NOT NULL DEFAULT 1;
     ,
+    // v11: `transfer_checkpoints` in destination roles instead of push shapes.
+    //
+    // The v6 table calls the source `local_*` and the staging file
+    // `remote_partial_*`. That is true of a push and false of a pull, where
+    // the source is remote and the partial is local, and `remote_path NOT
+    // NULL` makes a locally-published transfer impossible to even record. So
+    // the columns are re-cut by *role*: `dest_side` / `dest_path` for where
+    // the artifact is published, `partial_*` for the staging file (always on
+    // the destination side), and one exhaustive `source_kind` family for
+    // where the bytes came from.
+    //
+    // Dropped and recreated rather than altered. Every database on the
+    // machine was enumerated read-only before this was written: the real
+    // store is at v4 and does not have the table, one dev store has it with
+    // zero rows, and the only rows anywhere belong to this repo's own test
+    // scratch. Nothing is being discarded — but this is drop DDL, so it was
+    // established rather than assumed.
+    //
+    // Two constraints carry weight that code cannot:
+    //
+    // * `UNIQUE(request_id)`. A request with two checkpoints has two declared
+    //   digests, and settling it from a published-file hash would then have
+    //   to pick one — turning insertion order into a scope-releasing
+    //   decision. `receipts.resolve` refuses that case; this makes it
+    //   unreachable.
+    // * the partial unique index over live states. It is the *only* guard a
+    //   locally-published transfer gets: `unsettledInScope` filters by
+    //   `server_id`, so two pulls from different servers into one local path
+    //   both clear the scope guard, and a fetch has no server at all.
+    \\DROP INDEX IF EXISTS idx_checkpoints_request;
+    \\DROP INDEX IF EXISTS idx_checkpoints_resume;
+    \\DROP TABLE IF EXISTS transfer_checkpoints;
+    \\CREATE TABLE transfer_checkpoints (
+    \\  id                INTEGER PRIMARY KEY,
+    \\  request_id        TEXT NOT NULL UNIQUE REFERENCES operations(request_id) ON DELETE CASCADE,
+    \\  schema_version    INTEGER NOT NULL,
+    \\  direction         TEXT NOT NULL CHECK (direction IN ('push','pull','fetch')),
+    \\
+    \\  dest_side         TEXT NOT NULL CHECK (dest_side = 'local' OR dest_side LIKE 'server:%'),
+    \\  dest_path         TEXT NOT NULL,
+    \\  partial_path      TEXT NOT NULL,
+    \\  partial_len       INTEGER NOT NULL DEFAULT 0,
+    \\  partial_sha256    TEXT,
+    \\
+    \\  source_kind       TEXT NOT NULL CHECK (source_kind IN ('local_file','remote_file','http')),
+    \\  source_path       TEXT,
+    \\  source_size       INTEGER,
+    \\  source_mtime_ns   INTEGER,
+    \\  source_sha256     TEXT,
+    \\  source_url        TEXT,
+    \\  source_etag       TEXT,
+    \\  source_last_modified TEXT,
+    \\
+    \\  chunk_size        INTEGER NOT NULL,
+    \\  confirmed_offset  INTEGER NOT NULL DEFAULT 0,
+    \\  total_bytes       INTEGER,
+    \\  expected_sha256   TEXT,
+    \\  verified_sha256   TEXT,
+    \\  no_clobber        INTEGER NOT NULL DEFAULT 0 CHECK (no_clobber IN (0,1)),
+    \\  state             TEXT NOT NULL,
+    \\  failure_reason    TEXT,
+    \\  created_at        INTEGER NOT NULL,
+    \\  updated_at        INTEGER NOT NULL,
+    \\
+    \\  -- A file source is identified by path; an http source by url. Neither
+    \\  -- may borrow the other's columns, because `verifyResume` switches on
+    \\  -- `source_kind` and a row that carries the wrong family would take a
+    \\  -- branch that then reads nulls.
+    \\  CHECK (
+    \\    (source_kind IN ('local_file','remote_file')
+    \\       AND source_path IS NOT NULL AND source_url IS NULL)
+    \\    OR
+    \\    (source_kind = 'http'
+    \\       AND source_url IS NOT NULL AND source_path IS NULL)
+    \\  ),
+    \\  -- The confirmed offset is a claim about bytes we can still prove are
+    \\  -- ours, and the proof is the prefix hash. Zero needs none: there is
+    \\  -- nothing to prove.
+    \\  CHECK (confirmed_offset = 0 OR partial_sha256 IS NOT NULL),
+    \\  CHECK (confirmed_offset >= 0 AND partial_len >= 0)
+    \\);
+    \\CREATE UNIQUE INDEX idx_checkpoints_live_dest
+    \\  ON transfer_checkpoints(dest_side, dest_path)
+    \\  WHERE state IN ('planned','probing','transferring','paused');
+    ,
 };
 
 /// Number of schema versions this binary knows about.
@@ -422,6 +507,9 @@ pub fn apply(db: *Db) Db.Error!void {
 pub fn checkPreReleaseDrift(db: *Db) (Db.Error || error{PreReleaseSchemaDrift})!void {
     if (try userVersion(db) < 5) return;
     if (!try hasColumn(db, "operation_events", "last_observed"))
+        return error.PreReleaseSchemaDrift;
+    if (try userVersion(db) < 11) return;
+    if (!try hasColumn(db, "transfer_checkpoints", "dest_side"))
         return error.PreReleaseSchemaDrift;
 }
 
