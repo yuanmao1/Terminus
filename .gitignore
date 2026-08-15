@@ -4,3 +4,7 @@ npm/bin/Terminus.exe
 npm/*.tgz
 CLAUDE.md
 __pycache__/
+
+# The full census: absolute paths, file sizes, user-data counts and checkpoint
+# request ids. `--json` writes the committed, tokenised artifact instead.
+docs/evidence/raw/

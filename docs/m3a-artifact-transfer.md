@@ -38,50 +38,117 @@ picking between them would turn insertion order into a scope-releasing
 decision. §7.4's `UNIQUE(request_id)` is what makes that case unreachable
 rather than merely refused.
 
-**Settled, and the residual risk moved into the code.** The audit below was
-run before the drop-and-recreate DDL was written; it found no checkpoint row
-in any store outside this repo's test scratch, and the v11 migration records
-that in its own comment (`src/core/store/migrate.zig:413-418`). A database
-this census never reached is no longer covered by the audit but by a refusal:
+**Settled, and the residual risk moved into the code.** The audit that
+preceded the drop-and-recreate DDL was an ad-hoc command, not the census in
+§7.0.1: it ran on 2026-08-14 and found no checkpoint row in any store outside
+this repo's test scratch, and the v11 migration records that in its own
+comment (`src/core/store/migrate.zig:413-418`). The census below was written
+afterwards to make that claim re-runnable, and it has never returned a status
+that would authorise the recut — see §7.0.1. A database no census reached is
+therefore covered not by an audit but by a refusal:
 `checkBeforeApply` returns `error.CheckpointsWouldBeDropped` for any store
 below v11 that still holds checkpoint rows, and runs before `apply` rather
 than after it, so such a store is refused rather than silently emptied
-(`migrate.zig:626-630, 679-689`).
+(`migrate.zig:759`, refusal at `:790-799`).
 
 ### 7.0.1 The store census (read-only, 2026-08-14; re-run 2026-08-15)
 
 Reproduce with exactly this:
 
 ```
-python tools/enumerate_stores.py --json docs/evidence/store-census.json
+python tools/enumerate_stores.py --json docs/evidence/store-census.json \
+                                 --corroboration
 ```
 
-The artifact that command writes is at `docs/evidence/store-census.json` —
-regenerated 2026-08-15 and **not yet committed** (`docs/evidence/` is
-untracked, and `tools/enumerate_stores.py` has uncommitted changes, so
-re-running from HEAD produces the older JSON shape) — and every number below is
-in it. Commit both, or this section's evidence is not reproducible from the
-repository. The script prints its own scope, which is the
-point: the first version of this audit was an ad-hoc command whose answer —
-"there is no non-test row anywhere" — was unfalsifiable, and wrong in two
-places besides.
+That command exits **2** on this machine, not 0. The exit status carries two
+verdicts and this run fails the second one; both are set out below. The
+corroboration artifact is written regardless, for the reason given there.
 
-**The scope is part of the claim, so it is stated inside the claim.** Seven
+The artifact that command writes is at `docs/evidence/store-census.json`.
+Both it and `tools/enumerate_stores.py` were committed in `c979d92`, so this
+section's evidence is reproducible from the repository rather than from one
+machine's shell history, and every number below is in it. The script prints
+its own scope, which is the point: the first version of this audit was an
+ad-hoc command whose answer — "there is no non-test row anywhere" — was
+unfalsifiable, and wrong in two places besides.
+
+**The committed artifact is deliberately not the whole census.** `--json`
+writes only what the claims here rest on: the two verdicts below, the coverage
+numbers, the filesystem effect, and per store its `user_version`, whether it
+has a `transfer_checkpoints` table, and whether that table holds any row
+(`tools/enumerate_stores.py:471-519`). It carries no file sizes, no counts of
+anybody's servers, keys, memories or facts, and no checkpoint request ids. A
+public repository is the wrong place for a description of the author's
+machine, and the request-id field is the sharper edge: today every row it
+would name is a gate fixture, but the first time this census finds a real
+checkpoint it would commit real request ids to a public repository as a side
+effect of running the audit. `--raw` writes everything the census saw,
+untokenised and including those ids, and defaults to
+`docs/evidence/raw/store-census.raw.json` (`tools/enumerate_stores.py:222`).
+That file is not fit to commit — it names absolute paths on whichever machine
+ran it — so `docs/evidence/raw/` is ignored wholesale in `.gitignore:10`.
+
+**The scope is part of the claim, so it is stated inside the claim.** Ten
 roots were searched — `%APPDATA%/terminus`, `%TEMP%`, `~/.terminus`,
-`~/Desktop`, `~/Downloads`, `~/Documents`, and this repo — to a depth of six
+`~/Desktop`, `~/Downloads`, `~/Documents`, `~/Videos`, `~/Pictures`,
+`~/Music`, and this repo — to a depth of six
 directories below each, skipping `node_modules`, `.git`, `.venv`, `venv`,
 `__pycache__` and `.codegraph` by directory name and `AppData/Local/Google`,
 `AppData/Local/Microsoft`, `AppData/Local/Mozilla`, `playwright_chromium`,
-`pw-apply-profile`, `codex-apply-extension` by path fragment. An eighth root,
+`pw-apply-profile`, `codex-apply-extension` by path fragment. An eleventh root,
 `%LOCALAPPDATA%/terminus`, does not exist on this machine and was therefore
-**not** searched; the script now reports absent roots rather than dropping
-them, so a mistyped `--root` can no longer yield a confident census of
-somewhere else. Three directories refused to open
-(`%USERPROFILE%/Documents/My Pictures`, `My Music`, `My Videos`), two files
-refused on permission, and eighteen directories vanished mid-walk under a
-concurrent build; those 23 paths are holes and each is listed with its error
-in the artifact's `unexaminable`. So everything below is quantified over *the
-databases those seven roots reach at that depth* — never over "this machine".
+**not** searched; the script reports absent roots rather than dropping them, so
+a mistyped `--root` can no longer yield a confident census of somewhere else.
+It does **not** count as a hole. A directory that does not exist contains no
+databases, so that is an empty set the census verified rather than a place it
+failed to look; what does count is an environment variable that was unset,
+because then no path could be formed and nothing is known about where that
+root would have been (`tools/enumerate_stores.py:151-190`).
+
+**A link is not a directory, and the census now says where each one goes.** A
+reparse point is recorded, resolved, and never walked into
+(`tools/enumerate_stores.py:374-426, 539-619`). Resolving it answers the only question
+that matters — is the target already covered by a declared root? — and that
+answer is the verdict. A target inside a root is a second name for territory
+being read under its first name, and closes. A target that does not exist
+holds nothing, and closes. A target outside every root is a gap, and it is the
+one kind of gap that names its own remedy, because the record carries the
+target. Detection uses Win32's own `IsReparseTagNameSurrogate` bit rather than
+the reparse attribute alone, because OneDrive placeholders, AppExecLink stubs
+and deduplicated files all carry that attribute and are ordinary readable
+files; treating those as links would drop real candidates out of the census,
+which is the same mistake as walking into a junction, pointed the other way.
+Links are stepped over rather than followed, so a junction pointing at its own
+ancestor cannot loop, and directories are visited once however many names
+reach them.
+
+**`~/Videos`, `~/Pictures` and `~/Music` are declared roots because of that
+rule.** `~/Documents` contains Windows' legacy compatibility junctions
+`My Videos`, `My Pictures` and `My Music`, which point at those three
+directories and carry a deny-everyone ACL. The census cannot read the
+junctions, so under the link rule they were three gaps whose remedy their own
+records named. Declaring the targets searches strictly more rather than
+excusing anything, and the three closed. The published scope grew by three
+directories, which is why it is written down here.
+
+**The link rule shrank the file counts, and what it exposed is a fact about
+the instrument.** `files_seen` fell from 107,567 to **94,189** and files
+sniffed from 6,919 to **1,753** between the previous artifact and this one.
+Nothing that was ever declared stopped being searched. Those ~13,000 files were
+reached *through* links, into `%PROGRAMFILES%/Microsoft/jdk-25`, a bazel output
+cache and a Codex runtime's `node_modules`. The old walk followed junctions
+silently, because `is_dir(follow_symlinks=False)` reports a junction as a
+directory and `scandir` on a junction opens its target — so every previous run
+of this census, and every file count this section has ever quoted, was reading
+outside the roots it declared. The scope claim was false, and it was false in
+the direction that is hardest to notice: the census was over-reaching, not
+under-reaching, so nothing was missing from the output to give it away. Nobody
+could have caught it from the artifact, because the artifact reported the
+roots it intended to search and the counts it got by searching more than that.
+The twenty new gaps are not new territory lost. They are the places the census
+had been entering undeclared, now declined and named. An audit tool whose own
+scope claim was wrong, and whose output could not reveal it, is exactly the
+kind of thing this document exists to record.
 
 A file counts as a Terminus store when it has the
 `servers`+`keys`+`memories`+`facts` tables, and it becomes a candidate by
@@ -90,53 +157,60 @@ name filter was a hole on its face: a copy can be called anything, and most of
 the SQLite databases under these roots are named something other than `*.db` —
 some of them are called `Login Data`. That breakdown is not in the artifact and
 never has been: the script states it in a docstring
-(`tools/enumerate_stores.py:266`) and does not compute it, so it is an argument
-here rather than a number. Of **106,827** files seen, 100,218 were rejected on
-size alone (a whole SQLite database is an exact number of pages, so its size is
-always a non-zero multiple of 512), 6,379 were opened and sniffed — two of
-which could not be read at all and are recorded in `unexaminable` as holes —
-**417 carry the SQLite header**, and **113 of those are Terminus stores**: 8
-listed one by one and 105 repo-scratch stores with no checkpoint row,
-summarised. Not one SQLite file refused to open: the 306 "unreadable"
+(`tools/enumerate_stores.py:627-628`) and does not compute it, so it is an
+argument here rather than a number. Of **94,189** files seen, 92,436 were
+rejected on size alone (a whole SQLite database is an exact number of pages, so
+its size is always a non-zero multiple of 512), 1,753 were opened and sniffed —
+one of which could not be read at all and is recorded in `unexaminable` as a
+hole — **443 carry the SQLite header**, and **139 of those are Terminus
+stores**: 9 listed one by one and 130 repo-scratch stores with no checkpoint
+row, summarised. Not one SQLite file refused to open: the 306 "unreadable"
 candidates the first census reported were files that are not databases at all,
 which is not evidence of anything. That distinction is kept — a database that
 will not open is a hole and is printed loudly; a file that was never a database
 is merely counted.
 
-| Store | `user_version` | `transfer_checkpoints` | rows |
+| Store | `user_version` | `transfer_checkpoints` | holds a row |
 |---|---|---|---|
-| `%APPDATA%/terminus/terminus.db` — the real one, 363,249,664 bytes | **4** | absent | — |
-| `%TEMP%/f0.db`, `%TEMP%/t.db` — empty dev scratch | 11 | yes | 0 |
-| `%TEMP%/t0.db` — empty dev scratch, table present at version 0 | 0 | yes | 0 |
-| 4 × `<repo>/.zig-cache/tmp/gate_*.db` — gate scratch | 10–11 | yes | **1** each |
-| 105 × `<repo>/.zig-cache/tmp/*.db` — gate scratch, summarised | — | — | 0 |
+| `%APPDATA%/terminus/terminus.db` — the real one | **4** | absent | — |
+| `%TEMP%/f0.db`, `%TEMP%/t.db` — empty dev scratch | 11 | yes | no |
+| `%TEMP%/t0.db` — empty dev scratch, table present at version 0 | 0 | yes | no |
+| 5 × `<repo>/.zig-cache/tmp/gate_*.db` — gate scratch | 10–11 | yes | **yes** |
+| 130 × `<repo>/.zig-cache/tmp/*.db` — gate scratch, summarised | — | — | no |
 
 Four stores sit outside this repo's test scratch and not one of them holds a
-checkpoint row; 109 are repo scratch and four of those do. Stores in the
-scratch that hold no row are summarised as a count rather than listed, because
-a full test run leaves dozens and the only interesting fact about them is
-which hold a row. Every path in the artifact is tokenised (`<repo>`, `%TEMP%`,
-`%APPDATA%`, `%USERPROFILE%`, `<user>`), so no absolute path or account name
-is committed.
+checkpoint row; 135 are repo scratch and five of those do. The counts move
+between runs because the test suite creates and deletes scratch databases
+constantly — they now span `user_version` 4 through 12 — and what does not
+move is which side of the scratch boundary a checkpoint row falls on. Stores
+in the scratch that hold no row are summarised as a count rather than listed,
+because a full test run leaves dozens and the only interesting fact about them
+is which hold a row. Every path in the artifact is tokenised (`<repo>`,
+`%TEMP%`, `%APPDATA%`, `%USERPROFILE%`, `<user>`), case-insensitively, because
+a reparse point records its target in whatever case the link was created with
+and a literal match would have redacted only one spelling of the same
+directory.
 
-**All four checkpoint rows are gate fixtures, and all four are in this repo's
-test scratch.** Their request ids are `PVSH0000000000000000000000` (twice),
-`ABSENT00000000000000000000` and `PR0CPVSH000000000000000000` — what
+**All five checkpoint rows are gate fixtures, and all five are in this repo's
+test scratch.** Their request ids are `PVSH0000000000000000000000` (three
+times), `ABSENT00000000000000000000` and `PR0CPVSH000000000000000000` — what
 `testId()` returns for the labels `push`, `absent` and `procpush` once it maps
 `O`→`0` and `U`→`V` (`src/core/store/gates_test.zig:278`) — and no real ULID
-is shaped like that. The census copies request ids into the artifact, so that
-sentence can be checked by reading the JSON instead of being taken on trust;
-it deliberately copies nothing else about the row, so the id shape is the
-whole of the claim.
+is shaped like that. Those ids are **not** in the committed artifact: they are
+in the `--raw` census, which is why that sentence is checkable by re-running
+the script and not by reading the committed JSON. That is a deliberate trade.
+Carrying the ids into a public artifact made this one claim self-evidencing at
+the cost of committing whatever ids the census finds next time, and the ids it
+finds next time are the ones that would matter.
 
 **The one checkpoint row this audit found outside the repo's scratch is gone
 with its file.** `%TEMP%/rotest.db` — a dev store at `user_version` 10 holding
 a single fixture row, created and last written 2026-08-14 14:02:17, which no
 test, tool or script in this repo names — was deleted between the 2026-08-14
 census and its 2026-08-15 re-run, and does not appear in the regenerated
-artifact. It is the reason the first run of this census exited 1 and the
-reason the second exits 0. What wrote it was never established, and now cannot
-be.
+artifact. It is the reason the first run of this census reported an offender
+and the reason later runs do not. What wrote it was never established, and now
+cannot be.
 
 **Two stores were missed by the first audit, not three.** `%TEMP%/v4copy.db`
 (created 2026-08-13 15:32:14) and the OCP-Catalog store (created 2026-07-28
@@ -145,53 +219,135 @@ be.
 Windows records its creation at 2026-08-14 14:02:17, 75 minutes after the audit
 was committed (`2f86f89`, 12:47:21 +0800).
 
-**The census is a gate, and it is now green.** It exits 1 when a checkpoint
-row exists in any store outside this repo's `.zig-cache` scratch — precisely
-the condition under which the v11 drop-and-recreate would destroy something
-(`tools/enumerate_stores.py:533, 585-588`). No store outside the repo's
-scratch holds one: the four such stores are three empty `%TEMP%` dev scratch
-databases and the real store, which has no `transfer_checkpoints` table at
-all. So the run above exits 0, and that is what cleared the v11 DDL to be
-written.
+**The census returns two verdicts, and it is not green.** It used to answer
+one question — is there a checkpoint row where the recut would destroy it —
+and exit 0 for everything else, including for its own blind spots. It now
+answers two independently, and either one withholds authorisation
+(`tools/enumerate_stores.py:847-876`):
+
+* `offender_found` is **false**. No store outside the repo's `.zig-cache`
+  scratch holds a checkpoint row: the four such stores are three empty
+  `%TEMP%` dev scratch databases and the real store, which has no
+  `transfer_checkpoints` table at all.
+* `coverage_incomplete` is **true**, for 21 paths in two kinds. **Twenty**
+  are links out of the declared roots — bazel convenience symlinks and a JDK
+  toolchain under `%TEMP%` and `~/Desktop` pointing into
+  `%PROGRAMFILES%/Microsoft/jdk-25`, a bazel output cache and a Codex runtime's
+  `node_modules`. **One** is `%TEMP%/hsperfdata_<user>/31172`, held open by a
+  live JVM. Twenty-three dangling links, ten links into searched territory and
+  one absent root are reported alongside these and count for nothing. An
+  earlier run also recorded two repo scratch databases the test suite deleted
+  between being listed and being opened — the only genuine mid-walk
+  disappearances this census has ever recorded, and gone from the committed
+  run.
+
+The run above therefore exits **2**. The codes are a bitmask: 1 is
+`offender_found`, 2 is `coverage_incomplete`, 3 is both, and 0 — the only
+status that clears the recut — means "searched everything it set out to
+search, and found no offender" (`tools/enumerate_stores.py:214-217, 1100`). A
+usage error exits 64 rather than argparse's default of 2, so a mistyped
+`--root` can never be read as a finding about the filesystem
+(`tools/enumerate_stores.py:249-259`).
+
+**The census has never gone green, and on this machine it cannot.** That is
+the result, not a failure to finish. Of the remaining gaps, one kind closes on
+an idle machine and one does not. The two vanished scratch databases an
+earlier run saw were the test suite's, and are absent with it quiet. The JVM's
+perf-data file is held for that process's lifetime; the *identity* of the
+blocking file has changed on every run — a 786,432-byte `.tmp`, then
+`hsperfdata_<user>/37304`, `/38072`, `/31172` — while the fact of at least one
+has not. And the twenty out-of-scope links are structural: closing them means
+declaring a JDK installation and a bazel cache to be places Terminus stores
+live, which they are not. **A census taken on a live workstation cannot
+authorise a destructive migration.** That is a more useful finding than a
+green light obtained by looking away, and it is why `checkBeforeApply` is the
+guard and this artifact is not.
+
+**The bounded negative is archived anyway, at
+`docs/evidence/v11-recut-corroboration.json`.** A red gate is not a reason to
+discard a real finding: ten declared roots were searched and nothing outside
+this repo's test scratch holds a checkpoint row. That is what this script was
+built to produce — "no such row among these N databases under these roots"
+rather than an unfalsifiable "anywhere" — and the green/red gate was layered
+on top of it afterwards. Nor would a clean-machine run be worth more, because
+it would prove the wrong machine: the one that might hold an old store is this
+one. The file is named `-corroboration` and not `-clearance` deliberately, and
+it carries its own guards against being misread as fields rather than as prose
+kept elsewhere: `asserts` (the claim, with N, the roots and the date),
+`does_not_assert` (not authorisation, not "anywhere", not more than this
+machine, not any moment but the one it ran in, and not that the census saw
+everything), `could_not_see` (all 21 gaps, each with its reason and, for a
+link, its resolved target — facts, with the judgement about whether a JDK
+install or a live JVM's `hsperfdata` file could hold a store left to the
+reader), and `postdates_what_it_corroborates` (the DDL landed in `14c8a2d`;
+the script that produced this was first committed sixteen hours later in
+`0d7ff00`). Regenerate it with `--corroboration`; it is written whatever the
+exit status, because a bounded negative is a finding even when the gate is
+red. **`checkBeforeApply` remains the guard**, and the artifact's own
+`the_guard` field says so.
+
+**This changes what the census can be said to have cleared, which is
+nothing.** The v11 drop-and-recreate landed in `14c8a2d` at 13:05 on
+2026-08-14, eighteen minutes after the ad-hoc audit it actually rested on was
+committed (`2f86f89`, 12:47). `tools/enumerate_stores.py` was not committed
+until `0d7ff00` the following morning, and its first run — which postdates the
+DDL either way — exited 1: it found a checkpoint row in `%TEMP%/rotest.db`
+that the ad-hoc audit could not have seen, because that file did not exist
+when the ad-hoc audit ran. The second run, recorded in the artifact committed
+at `c979d92`, left five paths it could not read, which under the contract
+above is exit 2. The run above is exit 2 as well. No run of this
+script has ever returned the status that authorises the recut. What covers the
+databases the census did not reach is therefore not the audit but the refusal:
+`checkBeforeApply` returns `error.CheckpointsWouldBeDropped` for any store
+below v11 that still holds checkpoint rows, and runs before `apply`
+(`src/core/store/migrate.zig:759`, refusal at `:790-799`). That is the guard §7.0 already names,
+and on this record it is not a backstop to the audit — it is the guard.
 
 **What "read-only" is measured to mean, rather than asserted to mean.** Every
 candidate's `.db`, `-wal` and `-shm` is digested — size, mtime_ns, and SHA-256
 of the file or of its first and last 4 KiB — before the run and again after. In
-the run recorded in that artifact, **205** `-shm` files changed mtime — the
-only category in `filesystem_effect.by_category` — across the **1,251**
-database, `-wal` and `-shm` files digested before and after, and **no database
-file changed in size, mtime or content, and no `-wal` gained a byte**. That is the
-entire effect. A `mode=ro` reader of a WAL-mode database does create an empty
-`-wal` and a 32 KiB `-shm` where none existed, and does move read marks inside
-an existing `-shm`: an earlier run of this same script created 85 empty `-wal`
-and 92 `-shm` sidecars that way. "Nothing was written" is therefore true of
-business data and false of the filesystem taken literally, and the census
-cannot tell its own effect from a concurrent writer's — which is why it reports
-the difference instead of promising there isn't one.
+the run recorded in that artifact, **1,329** database, `-wal` and `-shm` files
+were digested before and after; **231** `-shm` files changed mtime and nothing
+else changed at all — no `-shm` changed content, no sidecar was created, and
+**no database file changed in size, mtime or content, and no `-wal` gained a
+byte**. That is the entire
+effect, and `filesystem_effect.contradicting_read_only` is empty. A `mode=ro`
+reader of a WAL-mode database does create an empty `-wal` and a 32 KiB `-shm`
+where none existed, and does move read marks inside an existing `-shm`: an
+earlier run of this same script created 85 empty `-wal` and 92 `-shm` sidecars
+that way. "Nothing was written" is therefore true of business data and false
+of the filesystem taken literally, and the census cannot tell its own effect
+from a concurrent writer's — which is why it reports the difference instead of
+promising there isn't one. An earlier run of this census, taken while the test
+suite was writing, showed seven `-shm` files changing content as well as
+mtime; that is the distinction doing its job rather than a failure of it.
 
 **The two plaintext copies this audit found are gone.** `%TEMP%/v4copy.db` —
 361,644,032 bytes, `user_version` 7, 12 rows in `keys` — and the second real
 store under `~/Desktop/drafts/OCP-Catalog/.codex-work/terminus/`, which held
 11 more, were both deleted between the 2026-08-14 census and its 2026-08-15
 re-run: neither file is on disk and neither appears in the regenerated
-artifact, whose only store with key material is the real one (`keys: 12`).
-Terminus still stores private keys and passphrases in plaintext, so what
-stands is the hazard rather than the instance: the only surviving copy of the
-e2e fixture key recorded in `MEMORY.md` now lives in the real store alone, and
-any future copy of that store is twelve private keys in whatever directory it
-is left in.
+artifact. The sizes and key counts in that sentence come from the earlier
+artifact, which committed them; the artifact as it now stands carries no file
+sizes and no `keys` counts at all, so the surviving claim it supports is that
+the real store is the only Terminus store outside the repo's scratch that has
+ever held key material. Terminus still stores private keys and passphrases in
+plaintext, so what stands is the hazard rather than the instance: the only
+surviving copy of the e2e fixture key recorded in `MEMORY.md` now lives in the
+real store alone, and any future copy of that store is twelve private keys in
+whatever directory it is left in.
 
 **Two things follow for the migration.** The real store has never been opened
 by a 0.2.0 build — it is still `user_version` 4 and has no
 `transfer_checkpoints` at all — so it will run v5 → v11 in one go the first
 time anything touches it, creating the table at v6 and replacing it at v11
 with nothing in it. And the migration must still be correct for a store that
-stopped anywhere in v6–v10: two of the eight individually enumerated stores
+stopped anywhere in v6–v10: two of the nine individually enumerated stores
 are exactly that, both repo scratch at v10, and both hold a fixture row. The
-versions of the 105 summarised scratch stores are not in the artifact. For
+versions of the 130 summarised scratch stores are not in the artifact. For
 those stores the rule is no longer "be correct" but "refuse":
 `checkBeforeApply` returns `error.CheckpointsWouldBeDropped` before any DDL
-runs (`src/core/store/migrate.zig:679-689`).
+runs (`src/core/store/migrate.zig:759`, refusal at `:790-799`).
 
 **Rehearsed, not assumed.** A copy of the real 362 MB store was migrated v4 →
 v11 with the built binary: 0.8 s, `user_version` 11, all seven table counts
@@ -248,8 +404,8 @@ path (`src/core/ssh/Client.zig:410-425`).
 `Store.history.add(...) catch {}` at `src/cli/cmd_transfer.zig:77-83` and
 `src/cli/cmd_sync.zig:59-67`, on the success path only, with
 `.exit_code = 0` hardcoded (`cmd_transfer.zig:80`, `cmd_sync.zig:64`) and the
-write error swallowed. `src/cli/cli.zig:222` already names this pattern as the thing `receiptFatal`
-(`src/cli/cli.zig:226`) exists to replace.
+write error swallowed. `src/cli/cli.zig:295` already names this pattern as the thing `receiptFatal`
+(`src/cli/cli.zig:299`) exists to replace.
 
 **D5 — a stderr read error is treated as EOF, discarding the remote's
 diagnosis.** `drainBoth` at `src/core/ssh/Client.zig:338`:
@@ -315,8 +471,8 @@ contain zero tests between them, and nothing exercises `Client.scpSendBytes`,
 Three rows that stood here — `transfers.zig` as a whole, the three transfer
 `operations.Kind` values, and `ResolutionEvidence.filesystem_effect` — are no
 longer dead and were removed rather than corrected. `transfers.zig` is 3708
-lines with 13 tests at `:3138-3708`, called by `execution.zig:424`/`:486`/
-`:491`/`:506` and by `receipts.resolve` at `receipts.zig:2149`/`:2231`/
+lines with 13 tests at `:3138-3708`, called by `execution.zig:440`/`:502`/
+`:507`/`:522` and by `receipts.resolve` at `receipts.zig:2149`/`:2231`/
 `:2251`/`:2261`/`:2319`/`:2368`. All three kinds are load-bearing — see
 `transfers.zig:1321-1323`, `receipts.zig:1169-1370`, and the gate
 constructors at `gates_test.zig:1465`, `:3590` and `:6949` (push), `:7348`
@@ -595,17 +751,28 @@ block scope (`op_state.zig:61`), so during the transfer the ledger's guard is
 not holding the destination. That is what the **lease** is for: `leases.acquire` on
 `{kind: .path, key: remote_side_path}` before probing, renewed during the
 transfer, released at settle — the remote destination for a push, the remote
-source for a pull, matching the scope §2.9 binds. A lease is always a claim
+source for a pull, matching the scope §2.9 binds. A lease is held by **one
+attempt, named by its `request_id`** (`leases.Lease.owner_request_id`,
+`leases.zig:71-73`; `heldBy` at `:89`), which is the only thing an acquisition
+compares. Until v12 it was held by `policy.ownerToken`, a token minted once per
+machine profile, so every session on one machine was the same owner and
+`acquire` read a peer's overlap as its own renewal; that token is still written
+on every row as `profile_token` and now decides nothing (`leases.zig:74-78`).
+A lease is always a claim
 inside one server's namespace (`leases.server_id` is `NOT NULL REFERENCES
-servers(id)`, `migrate.zig:276`; `AcquireOptions.server_id` is `i64`,
-`leases.zig:82`), so it cannot hold a *local* destination at all. For a pull
+servers(id)`, `migrate.zig:564`; `AcquireOptions.server_id` is `i64`,
+`leases.zig:109`), so it cannot hold a *local* destination at all. For a pull
 or a fetch the destination is local, and the only thing standing on it is
 `idx_checkpoints_live_dest` — "the only collision guard a locally-published
 transfer gets" (`transfers.zig:91-97`). `execution.begin` consults
-`leases.conflictForLocked` through `blockerLocked` (`execution.zig:260`,
-reached from `begin` at `:790`) and `submitted()` re-checks it under the write
-lock (`execution.zig:343`), so a peer is refused at both ends; the lease expires on its own if we die; `--force` overrides through the
-existing audited path. No new mechanism.
+`leases.conflictForLocked` through `blockerLocked` (`execution.zig:273`,
+reached from `begin` at `:791`) and `submitted()` re-checks it under the write
+lock (`execution.zig:352`, `:359`), so a peer is refused at both ends; the
+lease expires on its own if we die; `--force` does not skip the acquisition but
+reaches `leases.takeover`, which displaces every overlapping lease, links each
+displaced row through `superseded_by`, and writes a `forced_past_blocker` audit
+event naming both the request that was displaced and the machine that did it
+(`execution.zig:963-990`).
 
 ### 2.4 The remote programs
 
@@ -840,7 +1007,7 @@ until `supersedeLocked` (`transfers.zig:2545`) releases it (§2.7).
 FK, keyed on `expected_owner` so two racing resumes cannot both believe they
 won. It is a bare statement and requires an open transaction; that
 transaction, and the `checkpoint` observation on both operations naming the
-other, are `execution.Execution.adoptCheckpoint` (`execution.zig:411-428`). A
+other, are `execution.Execution.adoptCheckpoint` (`execution.zig:427`). A
 row whose owner died mid-`verifying` or mid-`publishing` is not adoptable — it
 goes through `recoverLocked` / `execution.recoverCheckpoint` first. The checkpoint is a mutable
 working record; the ledger is the audit trail.
@@ -870,9 +1037,9 @@ failure direction is a spurious refusal, never a spurious resume.
 
 | Layer | Mechanism | Covers |
 |---|---|---|
-| `begin` | `blockerLocked` (`execution.zig:224-266`) — `unsettledInScope` at `:235`, `leases.conflictForLocked` at `:260` — reached from `begin` at `execution.zig:790` | a peer already working this scope in this realm (a server, or — when `server_id` is null — this machine); refuses before dialing, and only against a *mutating* caller (`execution.zig:791`, `:344`). Its unsettled half counts only peers that declared `mutating = 1` (`holds_scope_predicate`, `operations.zig:290`) — the lease half is the only one blind to the peer's own flag |
-| `create` | `idx_checkpoints_live_dest`: `UNIQUE INDEX ON transfer_checkpoints(dest_side, dest_path)` over `State.holdsDestination` — **thirteen** states, not four: the six live ones, all six `failed_*`, and `indeterminate_publish` (`migrate.zig:504-511`, rendered from `transfers.zig:129-150`) | **any** second live transfer to the same destination on this machine, including pull and fetch, where `server_id` is null — today only `fetch`, since §2.9 gives a pull the remote host's id. The operation half of the guard *does* run in that realm: `blockerLocked` takes a `?i64` and null names the local realm rather than switching the check off (`execution.zig:206-266`). What the local realm cannot have is a *lease* — `leases.server_id` is `NOT NULL REFERENCES servers(id)` (`migrate.zig:276`) and `conflictForLocked` takes a plain `i64` (`leases.zig:154-157`), so `execution.zig:260` skips that half. A failed transfer goes on holding its destination until `supersedeLocked` (`transfers.zig:2545`) releases it |
-| `submitted()` | the scope guard re-checked under the write lock (`execution.zig:343`, inside `submitted`'s `BEGIN IMMEDIATE`) | the last-moment race between two racers that both cleared `begin` |
+| `begin` | `blockerLocked` (`execution.zig:240-279`) — `unsettledInScope` at `:250`, `leases.conflictForLocked` at `:273` — reached from `begin` at `execution.zig:791` | a peer already working this scope in this realm (a server, or — when `server_id` is null — this machine); refuses before dialing, and only against a *mutating* caller (`execution.zig:813`, `:360`). Its unsettled half counts only peers that declared `mutating = 1` (`holds_scope_predicate`, `operations.zig:290`) — the lease half is the only one blind to the peer's own flag |
+| `create` | `idx_checkpoints_live_dest`: `UNIQUE INDEX ON transfer_checkpoints(dest_side, dest_path)` over `State.holdsDestination` — **thirteen** states, not four: the six live ones, all six `failed_*`, and `indeterminate_publish` (`migrate.zig:504-511`, rendered from `transfers.zig:129-150`) | **any** second live transfer to the same destination on this machine, including pull and fetch, where `server_id` is null — today only `fetch`, since §2.9 gives a pull the remote host's id. The operation half of the guard *does* run in that realm: `blockerLocked` takes a `?i64` and null names the local realm rather than switching the check off (`execution.zig:240-279`, signature at `:243`). What the local realm cannot have is a *lease* — `leases.server_id` is `NOT NULL REFERENCES servers(id)` (`migrate.zig:564`, the v12 shape; the frozen v7 text at `:276` says the same) and `conflictForLocked` takes a plain `i64` (`leases.zig:189-196`), so `execution.zig:272-273` skips that half. A failed transfer goes on holding its destination until `supersedeLocked` (`transfers.zig:2545`) releases it |
+| `submitted()` | the scope guard re-checked under the write lock (`execution.zig:359`, inside `submitted`'s `BEGIN IMMEDIATE` at `:352`) | the last-moment race between two racers that both cleared `begin` |
 
 The partial unique index is the layer that matters for pull, and it is
 deliberately server-independent: `unsettledInScope` filters by `server_id`
@@ -900,7 +1067,7 @@ on SMB it is not guaranteed, and we do not claim it is.
 | pull: local rename succeeded and the destination re-read matches | `.local_effect{path, published_sha256}` (NEW — §7.2) | `completed` | 0 |
 | pull: local rename provably failed (`PathAlreadyExists`, `NoSpaceLeft`, `AccessDenied`) | `.local_effect{path, failure}` | `failed` | 1 |
 | pull: the rename outcome cannot be classified | `.indeterminate` | `indeterminate` | 75 |
-| any ledger write fails | `Cli.receiptFatal` (`cli.zig:226`) | — | **76** (`exit_code.receipt_persist_failed`, `cli.zig:168`) |
+| any ledger write fails | `Cli.receiptFatal` (`cli.zig:299`) | — | **76** (`exit_code.receipt_persist_failed`, `cli.zig:239`) |
 
 **`completed_unverified` is reachable in M3a by exactly two routes, and both
 record the weakness on the row rather than hiding it.** The driver reaches it
@@ -975,6 +1142,9 @@ const start = try execution.begin(&store, arena, io, .{
     .transport   = "direct",
     .argv_redacted = "<src> -> <dest>",
     .owner_token = try Store.policy.ownerToken(&store, arena, io, ctx.now),
+    // ^ audit subject, not identity: it records *which machine* forced past a
+    //   blocker. The lease is held by this operation's request_id
+    //   (`execution.zig:70-77`).
     .force       = parsed.boolean("force"),
     .now         = ctx.now,
 });
@@ -1024,7 +1194,7 @@ released at settle.
 said plainly rather than pretended otherwise); `Executor` (control commands
 still go through it — only two streaming primitives are added);
 `history.redactSecrets`, which has four live callers — `cmd_exec.zig:88`,
-`cmd_job.zig:141`, `cmd_job.zig:325`, and `receipts.zig:1491`, the `redact`
+`cmd_job.zig:145`, `cmd_job.zig:329`, and `receipts.zig:1491`, the `redact`
 helper `ResolutionEvidence.toJson` runs over every free-text field of every
 evidence variant — and is not dead even though
 `history.add` loses its last two (§7.6).
@@ -1044,14 +1214,14 @@ evidence variant — and is not dead even though
 | JSON: `backend` **removed**; `ok` is no longer hardcoded true | every JSON consumer | branch on `status` and `requestId`. New fields: `requestId`, `status` (`completed`\|`failed`\|`indeterminate`), `sha256` (the **destination read-back** digest), `verified` (bool), `bytesTotal`, `bytesMoved`, `resumedFrom`, `chunkSize`, `resumable`, `confirmedOffset`, `leftoverPartial`, `warnings` |
 | exit codes: `push`/`pull`/`sync` can now exit **75** and **76** | any agent treating non-zero as "retry" | 75 = indeterminate, reachable only if the connection dies inside the publish exec — **never retry blindly**, run `request reconcile <id> --verify-artifact` first. 76 = the receipt could not be written. `if push; then` keeps working |
 | `history` rows for `push`/`pull`/`sync` disappear | `terminus history <server>` users | `terminus request ls` / `request show <id>` / `request receipt <id>`. The rows being deleted were success-only with `exit_code` hardcoded 0, so the surface being removed could not represent a failure anyway |
-| transfers now take a `path` scope and a lease | anyone running two pushes to overlapping paths | the second is refused with "nothing was sent"; `--force` overrides and is audited |
+| transfers now take a `path` scope and a lease | anyone running two pushes to overlapping paths | the second is refused with "nothing was sent"; `--force` takes the lease over rather than skipping it, displacing every overlapping holder and recording each displacement |
 | `sync push --delete` prunes **after** a verified extraction | anyone relying on the old destroy-first ordering | none needed; the destination is no longer deleted before its replacement exists |
 | remote temp paths change | scripts watching `/tmp/.terminus_sync_<ts>.tar` | single-file transfers stage at `<dir>/.<name>.terminus-part`; sync stages under a request-id-derived path |
 | library surface: `Ssh.Progress`, `scpSend`, `scpSendBytes`, `scpRecvBytes`, `scpRecv`, `execWithStdin`, `Core.transfer.*` disappear | in-repo callers only (all rewritten) | `Core.artifact.run` |
-| **schema**: `transfer_checkpoints` dropped and recreated at v11 (§7.4) | a developer database below v11 that holds checkpoint rows | delete the rows, or the database. An empty pre-v11 table migrates in place; one with rows is refused at open with `error.CheckpointsWouldBeDropped` (`migrate.zig:679-689`) rather than silently emptied. The real store has no `transfer_checkpoints` at all and migrates v4 → v11 in one go |
-| `leases.TakeoverOutcome.taken.from` is `[]const Lease`, not `Lease` | any caller reading who was displaced | iterate. A takeover displaces *every* lease overlapping its scope, and `acquire` permits any number of mutually non-overlapping ones, so a takeover of `path:/srv/app` seizes both `path:/srv/app/dist` and `path:/srv/app/build`. Newest first, never empty — displacing nobody is `.acquired` (`leases.zig:389-406`, field at `:403`) |
-| `leases.takeover` returns `TakeoverError!TakeoverOutcome`, not `Error!` | any caller switching exhaustively on the error set | handle `error.LeaseVanishedDuringTakeover`: the release UPDATE matched no row under the write lock, which is proof the lock is not doing what the rest of the function assumes. Declared on `takeover` alone rather than widened into `Error`, so no other lease caller sees it (`leases.zig:387`, `:426`) |
-| `leases.insertLocked` takes `supersedes: []const i64`, not `?i64` | in-module callers only (`leases.zig:252`, `:456`) | pass `&.{}` for a plain acquisition, `displaced_ids.items` for a takeover. Every displaced row is linked through `superseded_by`, so a seizure cannot leave a lease that ends with no successor recorded and reads as an expiry (`leases.zig:288-294`) |
+| **schema**: `transfer_checkpoints` dropped and recreated at v11 (§7.4) | a developer database below v11 that holds checkpoint rows | delete the rows, or the database. An empty pre-v11 table migrates in place; one with rows is refused at open with `error.CheckpointsWouldBeDropped` (`migrate.zig:759`, refusal at `:790-799`) rather than silently emptied. The real store has no `transfer_checkpoints` at all and migrates v4 → v11 in one go |
+| `leases.TakeoverOutcome.taken.from` is `[]const Lease`, not `Lease` | any caller reading who was displaced | iterate. A takeover displaces *every* lease overlapping its scope, and `acquire` permits any number of mutually non-overlapping ones, so a takeover of `path:/srv/app` seizes both `path:/srv/app/dist` and `path:/srv/app/build`. Newest first, never empty — displacing nobody is `.acquired` (`leases.zig:430-447`, field at `:444`) |
+| `leases.takeover` returns `TakeoverError!TakeoverOutcome`, not `Error!` | any caller switching exhaustively on the error set | handle `error.LeaseVanishedDuringTakeover`: the release UPDATE matched no row under the write lock, which is proof the lock is not doing what the rest of the function assumes. Declared on `takeover` alone rather than widened into `Error`, so no other lease caller sees it (`leases.zig:467`, justified at `:425-428`) |
+| `leases.insertLocked` takes `supersedes: []const i64`, not `?i64` | in-module callers only (`leases.zig:291`, `:498`) | pass `&.{}` for a plain acquisition, `displaced_ids.items` for a takeover. Every displaced row is linked through `superseded_by`, so a seizure cannot leave a lease that ends with no successor recorded and reads as an expiry (`leases.zig:327-333`) |
 | `transfers.handoverBoundCount` renamed `handoverBoundCountLocked`, and refuses outside a transaction | `servers.removeLocked` (`servers.zig:318`) and the gates (`gates_test.zig:8556`, `:8574`) | call it inside the write transaction. It is the third of `removeLocked`'s three barriers and was the only one not asserting it held the lock; a count taken outside the lock describes a moment that has already passed by the time the DELETE runs (`transfers.zig:2732`) |
 
 ---
@@ -1136,7 +1306,9 @@ real scripts, real `ln`:
 **D. Ledger and concurrency** (`artifact_test.zig`, `gates_test.zig`), using
 the thread pattern already at `execution_test.zig:60`:
 * D1g. Two `begin`s on `{path, /srv/app/x}` → the second is `.blocked`;
-  `--force` proceeds and writes a `forced_past_blocker` audit event.
+  `--force` proceeds, takes the lease over from its holder, and writes a
+  `forced_past_blocker` audit event carrying the displaced request id and the
+  forcing machine's profile token (`execution.zig:963-990`).
 * D2g. Two `transfers.create` for the same `(dest_side, dest_path)` while live
   → `error.DestinationHeld` (and `error.CheckpointAlreadyExists` for two
   checkpoints on one request), not a convention. **Landed** at
@@ -1405,7 +1577,7 @@ over the destination-holding states (`:504`). `latest_version` is
 `recordVerifiedHash` (`:3091`), `adoptLocked` (`:2207`), `supersedeLocked`
 (`:2545`) — and rows do exist; see the census at §7.0.1. `Store.open` refuses
 a pre-v11 store carrying checkpoint rows with `error.CheckpointsWouldBeDropped`
-rather than recutting over them (`migrate.zig:679-689`, gated at
+rather than recutting over them (`migrate.zig:759`, refusal at `:790-799`, gated at
 `gates_test.zig:1869`).
 
 **Why it blocks.** §2.5 (pull's partial is local), §2.6 (F4, F5) and §2.7 (the
@@ -1465,9 +1637,9 @@ the release notes and revisiting in M4.
 `cmd_transfer.zig:77` and `cmd_sync.zig:59`. Both are deleted (§3, D4). After
 M3a the `history` table has **zero writers**, while `terminus history`
 (`cmd_history.zig`, registered in `dispatch.zig`) and `history.list` remain as
-readers of a table nothing fills. Separately, `history.redactSecrets` has three
-live callers (`cmd_exec.zig:88`, `cmd_job.zig:120`, `cmd_job.zig:289`) and
-`receipts.zig:731`, so `history.zig` itself is **not** dead.
+readers of a table nothing fills. Separately, `history.redactSecrets` has four
+live callers — `cmd_exec.zig:88`, `cmd_job.zig:145`, `cmd_job.zig:329` and
+`receipts.zig:1491` — so `history.zig` itself is **not** dead.
 
 **Why it blocks.** Nothing technical — M3a works either way. It is on this list
 because "a reader of a table nothing writes" is exactly the long-lived dead
@@ -1491,7 +1663,8 @@ decision too and it should be a deliberate one.
 ### 7.7 Where the streaming seam lives
 
 **Current state.** `Executor` (`exec.zig:9`) has three arms
-(`direct`/`daemon`/`scripted`) and one method (`exec`). Transfers today bypass
+(`direct`/`daemon`/`scripted`) and two methods, `exec` (`exec.zig:19`) and
+`errorMessage` (`:27`). Transfers today bypass
 it entirely and hold a raw `*Core.Ssh` (`cmd_transfer.zig:44`,
 `cmd_sync.zig`). `Scripted` (`exec.zig:37`) is a production-union test double
 with an in-source justification at `exec.zig:12-16`, and it is the backbone of
