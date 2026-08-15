@@ -359,6 +359,13 @@ const migrations = [_][:0]const u8{
     // changes every invocation, so an agent could never renew or release its
     // own lease. The token is minted once and reused, which is what makes
     // "same owner renews, different owner conflicts" meaningful.
+    //
+    // That last sentence was wrong, and v12 says why: one token per *machine*
+    // makes every session on it the same owner, so "different owner conflicts"
+    // could never fire between two agents in one checkout. The table stays —
+    // the token is a good audit subject — but nothing decides ownership by it
+    // any more. Left as written because migrations are frozen; read it with
+    // v12's note.
     \\CREATE TABLE local_identity (
     \\  key        TEXT PRIMARY KEY,
     \\  value      TEXT NOT NULL,
@@ -510,6 +517,71 @@ const migrations = [_][:0]const u8{
     \\                  'failed_clobber_conflict','failed_publish',
     \\                  'indeterminate_publish');
     ,
+    // v12: a lease is held by an attempt, not by a machine.
+    //
+    // v7's `owner_token` came from `policy.ownerToken`, which mints one token
+    // per machine profile and reuses it forever — and `leases.acquire` reads
+    // its own owner's overlap as a *renewal*. So every agent, editor and
+    // terminal on one machine was one lease owner: two concurrent sessions
+    // never conflicted, they renewed each other's claim, and the layer that
+    // exists to isolate peers isolated nothing.
+    //
+    // The owner is now `owner_request_id`, the id of the attempt holding the
+    // lease. The profile token stays and is still written on every row, as
+    // `profile_token`, purely as the audit subject — who the machine was. It
+    // decides nothing, and no query compares it.
+    //
+    // Three shapes are deliberate:
+    //
+    // * No foreign key on `owner_request_id`. Not every holder is a ledger
+    //   operation: `job kill` and `job rm` are supervisory acts on somebody
+    //   *else's* attempt, so they mint an id from the same generator and have
+    //   no `operations` row of their own. A foreign key would force either a
+    //   fake operation row or a nullable owner, and a nullable owner is the
+    //   defect this version removes.
+    // * `CHECK (owner_request_id <> '')`. An empty owner would match every
+    //   other empty owner and renew it — v7's defect written in one character
+    //   instead of one column.
+    // * v7's separate nullable `request_id` column is gone. The owner *is* the
+    //   request id now, and two columns both meaning "the request" is how they
+    //   come to disagree.
+    //
+    // Dropped and recreated rather than altered, and the rows are not carried.
+    // An old `owner_token` is a machine profile, not a request id, and reading
+    // one as the other would hand every pre-v12 row an owner that never
+    // existed. Released rows are history and go with the table; a row that is
+    // still *unreleased* is a live claim that cannot be re-owned at all, so
+    // `checkBeforeApply` refuses the open before this runs rather than voiding
+    // it — see `Refusal.live_leases_cannot_be_reowned`. Nothing in any shipped
+    // path has ever written this table: `acquire` and `takeover` have no
+    // non-test caller in the tree this replaces, so on a real store both counts
+    // are zero.
+    \\DROP INDEX IF EXISTS idx_leases_active;
+    \\DROP INDEX IF EXISTS idx_leases_owner;
+    \\DROP TABLE IF EXISTS leases;
+    \\CREATE TABLE leases (
+    \\  id               INTEGER PRIMARY KEY,
+    \\  server_id        INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    \\  scope_kind       TEXT NOT NULL CHECK (scope_kind IN ('server','job','path')),
+    \\  scope_key        TEXT NOT NULL,
+    \\  -- Identity. The only column a conflict is decided by.
+    \\  owner_request_id TEXT NOT NULL CHECK (owner_request_id <> ''),
+    \\  -- Audit subject: which machine profile the holder ran as. Never compared.
+    \\  profile_token    TEXT NOT NULL,
+    \\  owner_label      TEXT,
+    \\  note             TEXT,
+    \\  acquired_at      INTEGER NOT NULL,
+    \\  renewed_at       INTEGER NOT NULL,
+    \\  expires_at       INTEGER NOT NULL,
+    \\  released_at      INTEGER,
+    \\  release_reason   TEXT CHECK (release_reason IS NULL OR release_reason IN (
+    \\                     'released','expired','takeover','force')),
+    \\  superseded_by    INTEGER REFERENCES leases(id)
+    \\);
+    \\CREATE UNIQUE INDEX idx_leases_active
+    \\  ON leases(server_id, scope_kind, scope_key) WHERE released_at IS NULL;
+    \\CREATE INDEX idx_leases_owner ON leases(owner_request_id) WHERE released_at IS NULL;
+    ,
 };
 
 /// Number of schema versions this binary knows about.
@@ -522,6 +594,14 @@ pub const latest_version = migrations.len;
 /// it is a number in the frozen migration list rather than "the latest": it
 /// must not follow `latest_version` upwards.
 const checkpoints_recut_version = 11;
+
+/// The version at which `leases` was dropped and recreated around
+/// `owner_request_id`.
+///
+/// Named for the same two reasons as `checkpoints_recut_version`: the drift
+/// probes and the refusal to void a live claim both key on it, and it is a
+/// frozen number rather than "the latest".
+const leases_reowned_version = 12;
 
 /// The verbatim text of one frozen statement, sliced out of its migration.
 ///
@@ -573,6 +653,22 @@ pub const checkpoints_index_ddl = frozenStatement(
     "CREATE UNIQUE INDEX idx_checkpoints_live_dest",
 );
 
+/// The three v12 objects, as this binary writes them. Exposed for the same
+/// reason as the v11 pair: the gate that holds a fresh store against this text
+/// reads the same slices the runtime probe does.
+pub const leases_table_ddl = frozenStatement(
+    leases_reowned_version,
+    "CREATE TABLE leases (",
+);
+pub const leases_active_index_ddl = frozenStatement(
+    leases_reowned_version,
+    "CREATE UNIQUE INDEX idx_leases_active",
+);
+pub const leases_owner_index_ddl = frozenStatement(
+    leases_reowned_version,
+    "CREATE INDEX idx_leases_owner",
+);
+
 /// What a pre-write refusal knows, for a caller that can word a message.
 ///
 /// Zig error values carry no payload, and the numbers here are the whole
@@ -603,6 +699,18 @@ pub const Refusal = union(enum) {
     /// point `--db` elsewhere. A future build may carry the rows across — this
     /// one refuses rather than guessing that they are disposable.
     checkpoints_would_be_dropped: struct { rows: i64, version: i64 },
+    /// The store predates the re-owned `leases` and still holds claims nobody
+    /// has released. v12 decides conflicts by `owner_request_id`; a pre-v12 row
+    /// names a *machine profile*, which is not a request id and must never be
+    /// read as one, so those `rows` cannot be carried and cannot be re-owned.
+    ///
+    /// Refused rather than voided, because a live lease is somebody's claim on
+    /// a scope right now: dropping it silently un-blocks whatever it was
+    /// holding, which is the one thing the table exists to prevent. The
+    /// operator's options: release them with the binary that took them, or move
+    /// this database aside. Released rows are history, are not counted here, and
+    /// go with the table — their owner column was never a request id either.
+    live_leases_cannot_be_reowned: struct { rows: i64, version: i64 },
 };
 
 pub const PreApplyError = Db.Error || error{
@@ -617,6 +725,8 @@ pub const PreApplyError = Db.Error || error{
     PreReleaseSchemaDrift,
     /// See `Refusal.checkpoints_would_be_dropped`.
     CheckpointsWouldBeDropped,
+    /// See `Refusal.live_leases_cannot_be_reowned`.
+    LiveLeasesCannotBeReowned,
 };
 
 /// Everything that must be true of a database *as found*, before any DDL runs.
@@ -685,6 +795,23 @@ fn checkBeforeApplyLocked(db: *Db, refusal: ?*Refusal) PreApplyError!void {
                 .version = found,
             } };
             return error.CheckpointsWouldBeDropped;
+        }
+    }
+
+    // (e) Live lease claims that v12 cannot re-own.
+    //
+    // Unreleased rows only. A released one is history whose owner column was a
+    // machine profile either way, and refusing an open over a row that is
+    // already over would be a trap rather than a barrier — nothing would ever
+    // clear it, because expiry itself is lazy and needs the store open.
+    if (found < leases_reowned_version and try tableExists(db, "leases")) {
+        const rows = try countLiveLeases(db);
+        if (rows > 0) {
+            if (refusal) |out| out.* = .{ .live_leases_cannot_be_reowned = .{
+                .rows = rows,
+                .version = found,
+            } };
+            return error.LiveLeasesCannotBeReowned;
         }
     }
 }
@@ -809,6 +936,20 @@ pub fn checkPreReleaseDrift(db: *Db, refusal: ?*Refusal) (Db.Error || error{PreR
         return drifted(refusal, "transfer_checkpoints");
     if (!try schemaTextEquals(db, "idx_checkpoints_live_dest", checkpoints_index_ddl))
         return drifted(refusal, "idx_checkpoints_live_dest");
+    if (version < leases_reowned_version) return;
+    // Same reasoning one version on, and the property is narrower and easier to
+    // lose: what makes v12 a fix rather than a rename is that the owner column
+    // is `owner_request_id`, that it cannot be empty, and that the active index
+    // and the owner index are over it. A store built by an intermediate
+    // revision — the column added beside `owner_token` instead of replacing it,
+    // or the CHECK missing — reads as v12 and decides conflicts by whatever it
+    // has. Whole-statement equality is the only witness that separates them.
+    if (!try schemaTextEquals(db, "leases", leases_table_ddl))
+        return drifted(refusal, "leases");
+    if (!try schemaTextEquals(db, "idx_leases_active", leases_active_index_ddl))
+        return drifted(refusal, "idx_leases_active");
+    if (!try schemaTextEquals(db, "idx_leases_owner", leases_owner_index_ddl))
+        return drifted(refusal, "idx_leases_owner");
 }
 
 fn drifted(refusal: ?*Refusal, probe: []const u8) error{PreReleaseSchemaDrift} {
@@ -847,6 +988,21 @@ fn tableExists(db: *Db, name: [:0]const u8) Db.Error!bool {
 /// construction — nothing has ever shipped that writes it.
 fn countCheckpoints(db: *Db) Db.Error!i64 {
     var stmt = try db.prepare("SELECT COUNT(*) FROM transfer_checkpoints");
+    defer stmt.deinit();
+    if (!try stmt.step()) return error.Sqlite;
+    return stmt.columnInt(0);
+}
+
+/// How many leases the pre-v12 table still holds unreleased.
+///
+/// `released_at IS NULL` and not "unexpired": expiry in this schema is lazy, so
+/// a lapsed row stays unreleased until some command sweeps it, and this gate
+/// runs before any command can. Counting only what is genuinely still claimed
+/// would therefore need a clock the open path does not have — and over-refusing
+/// on a lapsed row is the safe direction, because the refusal names the number
+/// and leaves the file untouched.
+fn countLiveLeases(db: *Db) Db.Error!i64 {
+    var stmt = try db.prepare("SELECT COUNT(*) FROM leases WHERE released_at IS NULL");
     defer stmt.deinit();
     if (!try stmt.step()) return error.Sqlite;
     return stmt.columnInt(0);

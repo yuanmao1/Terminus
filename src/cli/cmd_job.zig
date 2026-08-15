@@ -42,11 +42,15 @@ const job_usage =
     \\  job status  <server> <name> [--json]     probe: running? exit code? businessResult?
     \\  job read    <server> <name> [--from-cursor] [--limit BYTES] [--json]
     \\  job watch   <server> <name> [--interval 15s] [--max N] [--json]
-    \\  job kill    <server> <name>              settle it from its recorded
+    \\  job kill    <server> <name> [--force]     settle it from its recorded
     \\                                           outcome if it already ended,
     \\                                           else terminate and verify
-    \\  job rm      <server> <name>              forget the job (kills if running)
+    \\  job rm      <server> <name> [--force]     forget the job (kills if running)
     \\  job inspect <server> <name> [--json]     what was launched, byte for byte
+    \\
+    \\'kill' and 'rm' hold a lease on the job for as long as they are working on
+    \\it, so a second session is refused rather than racing them. --force takes
+    \\that lease over: the displaced claim is recorded, never skipped.
     \\
     \\A job can print '__TERMINUS_RESULT__:<value>' to report business state
     \\separately from its process exit code.
@@ -502,6 +506,27 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // the row's owner rather than by its name — see `attemptOf`.
     const attempt = attemptOf(&store, ctx.arena, job);
 
+    // The two mutating verbs take the job scope *before* the connection is
+    // opened, so a peer's live claim refuses this command with nothing sent
+    // — not even a dial. Everything below it, including `Cli.connect`, then
+    // runs with the scope held.
+    const mutation: ?Claim = if (std.mem.eql(u8, verb, "kill") or std.mem.eql(u8, verb, "rm"))
+        switch (claimJobScope(ctx, &store, resolved.server.id, job_name, &parsed)) {
+            .held => |claim| claim,
+            .blocked => |lease| reportClaimBlocked(lease),
+            .seized => |seizure| blk: {
+                // Reported, not silent: `--force` displaced somebody, and the
+                // operator has to be told whose work they just took over.
+                for (seizure.displaced) |old| std.debug.print(
+                    "terminus: --force took the lease on job '{s}' from request {s} (on {s})\n",
+                    .{ job_name, old.owner_request_id, old.profile_token },
+                );
+                break :blk seizure.claim;
+            },
+        }
+    else
+        null;
+
     var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
     defer conn.deinit();
     const executor = conn.executor();
@@ -617,9 +642,9 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     } else if (std.mem.eql(u8, verb, "watch")) {
         try watchJob(ctx, &store, executor, session, job, attempt, &parsed, server_name, conn);
     } else if (std.mem.eql(u8, verb, "kill")) {
-        try killJob(ctx, &store, executor, session, job, attempt, resolved.server.id, &parsed);
+        try killJob(ctx, &store, executor, session, job, attempt, mutation.?);
     } else if (std.mem.eql(u8, verb, "rm")) {
-        try removeJob(ctx, &store, executor, session, job, attempt, resolved.server.id, &parsed);
+        try removeJob(ctx, &store, executor, session, job, attempt, mutation.?, &parsed);
     } else {
         fatal("unknown verb 'job {s}'\n{s}", .{ verb, job_usage });
     }
@@ -1508,11 +1533,10 @@ fn killJob(
     session: []const u8,
     job: Store.jobs.Job,
     attempt: ?Store.job_attempts.Attempt,
-    server_id: i64,
-    parsed: *const Cli.Args.Parsed,
+    claim: Claim,
 ) !void {
-    try requireNoForeignLease(ctx, store, server_id, job.name, parsed);
-
+    // The scope was taken in `jobCmd`, before the connection was opened, and
+    // is held from here through the kill to the settlement below.
     const probe = Tmux.probeTail(
         executor,
         ctx.arena,
@@ -1538,6 +1562,9 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
+        // Held from before the connection to here, and renewed once: this is
+        // the last stretch where losing it would matter.
+        holdClaim(claim, wallClockSeconds(ctx.io));
         const settled = settleObserved(
             ctx,
             store,
@@ -1556,6 +1583,10 @@ fn killJob(
         // reporting the kill as if it had established an outcome.
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
+        // The kill is on the far side of the settlement on this branch, so the
+        // scope is given back after it rather than at the settle: releasing in
+        // between would open the job to a peer mid-`kill-session`.
+        Cli.releaseClaim();
 
         switch (ctx.out.format) {
             .json => try ctx.out.json(.{
@@ -1602,6 +1633,7 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
+        holdClaim(claim, wallClockSeconds(ctx.io));
         const settled = settleObserved(
             ctx,
             store,
@@ -1619,6 +1651,7 @@ fn killJob(
 
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
+        Cli.releaseClaim();
 
         // A surviving session is a real failure even though the outcome is
         // known: `ensure` treats one as ready, so the next launch under this
@@ -1715,7 +1748,7 @@ fn killJob(
 
     if (session_gone) {
         if (finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)) |after| {
-            return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone);
+            return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone, claim);
         }
     }
 
@@ -1743,6 +1776,7 @@ fn killJob(
                 "kill issued but the job session is still present",
             .last_observed = if (execution) |e| e.status else .remote_started,
         } };
+    holdClaim(claim, wallClockSeconds(ctx.io));
     const settled = settleObserved(
         ctx,
         store,
@@ -1752,6 +1786,9 @@ fn killJob(
         .{},
         finishSync(job, .killed, null, ctx.now),
     );
+    // The remote work is done on this branch — the kill and the re-probe are
+    // both behind us — so the scope goes back with the settlement.
+    Cli.releaseClaim();
     const settled_status = settled.statusText();
 
     const proven = session_gone and can_prove;
@@ -1948,6 +1985,7 @@ fn reportFinishedDuringKill(
     attempt: ?Store.job_attempts.Attempt,
     probe: Tmux.JobProbe,
     session_gone: bool,
+    claim: Claim,
 ) !void {
     const code = probe.exit_code.?;
     var execution = if (attempt) |a|
@@ -1955,6 +1993,7 @@ fn reportFinishedDuringKill(
             Cli.storeFatal(store, err)
     else
         null;
+    holdClaim(claim, wallClockSeconds(ctx.io));
     const settled = settleObserved(
         ctx,
         store,
@@ -1969,6 +2008,7 @@ fn reportFinishedDuringKill(
         },
         finishSync(job, .exited, code, probe.finished_at orelse ctx.now),
     );
+    Cli.releaseClaim();
     const settled_status = settled.statusText();
     const proven = settled.settlement.proves();
     const cache_error = cacheError(ctx, job.name, settled.cache);
@@ -2037,10 +2077,11 @@ fn removeJob(
     session: []const u8,
     job: Store.jobs.Job,
     attempt: ?Store.job_attempts.Attempt,
-    server_id: i64,
+    claim: Claim,
     parsed: *const Cli.Args.Parsed,
 ) !void {
-    try requireNoForeignLease(ctx, store, server_id, job.name, parsed);
+    // The scope was taken in `jobCmd`, before the connection was opened, and
+    // is held through the kill, the evidence decision and the settlement.
     const discard = parsed.boolean("discard-evidence");
 
     // Look before destroying: if the outcome is provable right now, it need
@@ -2126,6 +2167,7 @@ fn removeJob(
                 "job removed before its outcome was established; the log is retained for 'request reconcile --from-log'",
             .last_observed = if (execution) |e| e.status else .remote_started,
         } };
+    holdClaim(claim, wallClockSeconds(ctx.io));
     const settled = settleObserved(
         ctx,
         store,
@@ -2138,6 +2180,7 @@ fn removeJob(
             .grounds = .session_proven_gone,
         } },
     );
+    Cli.releaseClaim();
     // `proven` is about the outcome, not about the deletion: it is true only
     // when a real exit code reached the ledger. A removal that settled
     // `indeterminate` deleted the row just the same, and saying otherwise
@@ -2343,22 +2386,179 @@ fn inspectJob(
     }
 }
 
-/// Job mutations refuse while somebody else holds an overlapping lease.
-fn requireNoForeignLease(
+/// The job-scope lease a `job kill` or `job rm` holds while it works.
+///
+/// The old shape was `requireNoForeignLease`: one read of `conflictFor` at the
+/// top of each command and nothing after it. That is a check, not a claim, and
+/// it was worth nothing twice over. It compared `policy.ownerToken`, which is
+/// one token per *machine*, so a second agent on this machine was never a
+/// foreign owner at all; and it took no lease of its own, so even between two
+/// machines the answer went stale the instant it was read — the whole of
+/// probe → kill → settle ran with nothing held.
+///
+/// Now the command takes the lease before its first remote call and holds it
+/// across all three steps. Ownership is `request_id`, minted per invocation, so
+/// two `job kill`s on one machine are two owners; `--force` is an audited
+/// `takeover` that displaces the incumbent and records it, never a way to skip
+/// the lease; and the claim is released at settle, from `Cli.releaseClaim` on
+/// every process-ending path, or by its TTL if the process is killed outright.
+const Claim = struct {
+    store: *Store,
+    server_id: i64,
+    scope: Core.execution.Scope,
+    /// This invocation's identity. Not the job's attempt: `job kill` acts *on*
+    /// somebody else's attempt, and holding the lease under that id would make
+    /// two concurrent kills renew each other — the defect one level down.
+    owner_request_id: []const u8,
+    job_name: []const u8,
+
+    /// Long enough that probe → kill → settle never renews in practice, short
+    /// enough that a hard-killed `job kill` does not lock the operator out of
+    /// its own job for long. A claim that outlives its holder is released by
+    /// lapsing, which is the only thing a dead process can do.
+    const ttl_secs: i64 = 120;
+
+    /// What a peer's live claim did to this command.
+    const Outcome = union(enum) {
+        held: Claim,
+        /// Somebody else holds an overlapping scope. Nothing remote has been
+        /// touched, because this runs before the connection is opened.
+        blocked: Store.leases.Lease,
+        /// `--force`: the incumbents were displaced and each one's row records
+        /// it — `release_reason = 'takeover'` and `superseded_by` pointing at
+        /// this claim.
+        seized: struct { claim: Claim, displaced: []const Store.leases.Lease },
+    };
+};
+
+/// Takes the job scope, before anything is sent to the host.
+///
+/// `--force` reaches `takeover` rather than skipping the acquisition: an
+/// override that took no lease would leave the scope free for a third session
+/// to walk into behind it, and would leave nothing saying whose claim was
+/// broken.
+fn claimJobScope(
     ctx: *Cli.Ctx,
     store: *Store,
     server_id: i64,
     job_name: []const u8,
     parsed: *const Cli.Args.Parsed,
-) !void {
-    if (parsed.boolean("force")) return;
-    const owner_token = Store.policy.ownerToken(store, ctx.arena, ctx.io, ctx.now) catch |err|
-        Cli.storeFatal(store, err);
-    const conflict = Store.leases.conflictFor(store, ctx.arena, server_id, jobScope(job_name), owner_token, ctx.now) catch |err|
-        Cli.storeFatal(store, err);
-    if (conflict) |lease| fatal(
-        "refused: {s} holds a lease on an overlapping scope until {d}; wait, take it over, or pass --force",
-        .{ lease.owner_token, lease.expires_at },
+) Claim.Outcome {
+    const minted = Store.ids.generate(ctx.io);
+    const owner_request_id = ctx.arena.dupe(u8, &minted) catch
+        fatal("out of memory claiming the scope for job '{s}'", .{job_name});
+    const opts: Store.leases.AcquireOptions = .{
+        .server_id = server_id,
+        .scope = jobScope(job_name),
+        .owner_request_id = owner_request_id,
+        // Audit subject: which machine did this. It decides nothing — that is
+        // the whole point of the column — but a claim with no record of who
+        // took it is not much of an audit trail.
+        .profile_token = Store.policy.ownerToken(store, ctx.arena, ctx.io, ctx.now) catch |err|
+            Cli.storeFatal(store, err),
+        .owner_label = job_name,
+        .ttl_secs = Claim.ttl_secs,
+        .now = ctx.now,
+    };
+    const claim: Claim = .{
+        .store = store,
+        .server_id = server_id,
+        .scope = opts.scope,
+        .owner_request_id = owner_request_id,
+        .job_name = job_name,
+    };
+
+    if (parsed.boolean("force")) {
+        const taken = Store.leases.takeover(store, ctx.arena, opts) catch |err|
+            Cli.storeFatal(store, err);
+        registerClaim(ctx, claim);
+        return switch (taken) {
+            .acquired => .{ .held = claim },
+            .taken => |t| .{ .seized = .{ .claim = claim, .displaced = t.from } },
+        };
+    }
+
+    return switch (Store.leases.acquire(store, ctx.arena, opts) catch |err|
+        Cli.storeFatal(store, err)) {
+        .acquired => blk: {
+            registerClaim(ctx, claim);
+            break :blk .{ .held = claim };
+        },
+        // A freshly minted request id cannot already hold a lease, so this
+        // variant is unreachable here and is not quietly folded into `held`:
+        // reaching it would mean `ids.generate` had repeated itself, and a
+        // second command silently sharing an owner is exactly what this
+        // whole change exists to stop.
+        .renewed => |lease| fatal(
+            "internal: the id minted for this command ({s}) already held a lease on job '{s}'; refusing to share an owner with whatever took it",
+            .{ lease.owner_request_id, job_name },
+        ),
+        .conflict => |lease| .{ .blocked = lease },
+    };
+}
+
+fn registerClaim(ctx: *Cli.Ctx, claim: Claim) void {
+    Cli.registerClaim(
+        claim.store,
+        claim.server_id,
+        claim.scope,
+        claim.owner_request_id,
+        claim.job_name,
+        ctx.now,
+    );
+}
+
+/// Refuses a job mutation while a peer's claim is live, before anything is sent.
+fn reportClaimBlocked(lease: Store.leases.Lease) noreturn {
+    fatal(
+        "refused: request {s} (on {s}) holds a lease on an overlapping scope until {d}; nothing was sent to the host. Wait, or pass --force to take it over",
+        .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
+    );
+}
+
+/// Wall-clock seconds, as opposed to `ctx.now` — which is the process's start
+/// time and is what every other row in this file is stamped with.
+///
+/// A lease is the one thing here that is *compared* against a clock rather than
+/// merely stamped with one: `expires_at` is what decides whether a peer may
+/// take the scope, and `leases.renew` refuses a lease that has already lapsed.
+/// Renewing with `ctx.now` would write back the same expiry the acquisition
+/// already set, so a command that outran its TTL would extend nothing while
+/// reporting that it had — the renewal would be a call that always succeeds and
+/// never does anything.
+fn wallClockSeconds(io: std.Io) i64 {
+    const ts = std.Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+}
+
+/// Keeps the claim alive across the remote work, and says so when it is gone.
+///
+/// Called once, between the last remote call and the settlement. A claim we no
+/// longer hold means somebody forced their way past us and may be acting on
+/// this job right now — which cannot change what we do next (the kill has
+/// already happened and the ledger must record it) but must not be silent
+/// either. Reported the way `finalProbe` reports a failed re-read: on the way
+/// out, where there is no error to return and no result to withhold.
+fn holdClaim(claim: Claim, now: i64) void {
+    const still_ours = Store.leases.renew(
+        claim.store,
+        claim.server_id,
+        claim.scope,
+        claim.owner_request_id,
+        Claim.ttl_secs,
+        now,
+    ) catch |err| {
+        std.debug.print(
+            "terminus: could not renew the scope lease for job '{s}': {s}; " ++
+                "recording this command's outcome anyway\n",
+            .{ claim.job_name, @errorName(err) },
+        );
+        return;
+    };
+    if (!still_ours) std.debug.print(
+        "terminus: this command's lease on job '{s}' is no longer held — it lapsed or was taken over " ++
+            "while the host was being contacted, so another session may be acting on the same job\n",
+        .{claim.job_name},
     );
 }
 
@@ -2374,8 +2574,8 @@ fn reportBlocked(blocker: Core.execution.Blocker) noreturn {
             .{ op.request_id, op.status.text(), op.request_id },
         ),
         .lease => |lease| fatal(
-            "refused: {s} holds a lease on an overlapping scope until {d}; the job was not started. Wait, take it over, or pass --force",
-            .{ lease.owner_token, lease.expires_at },
+            "refused: request {s} (on {s}) holds a lease on an overlapping scope until {d}; the job was not started. Wait, take it over, or pass --force",
+            .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
         ),
     }
 }
@@ -2454,6 +2654,151 @@ const Scratch = struct {
         s.allocator.destroy(s.threaded);
     }
 };
+
+test "gate: a job mutation takes the scope before it reaches the host, and --force takes it by audit" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_claim");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    // A peer's live claim on the same job, taken from the same machine. That
+    // last part is the whole point: `requireNoForeignLease` compared
+    // `policy.ownerToken`, one token per machine, so this lease was never
+    // "foreign" and every assertion below passed vacuously — two agents in one
+    // checkout killed each other's jobs freely.
+    const profile = try Store.policy.ownerToken(&store, arena, scratch.io, 4000);
+    const peer: []const u8 = "01PEEEEEEER0123456789ABCDE";
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = jobScope("deploy"),
+        .owner_request_id = peer,
+        .profile_token = profile,
+        .ttl_secs = 600,
+        .now = 4900,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.PeerLeaseDidNotTake,
+    }
+
+    const plain = Cli.parseArgs(&ctx, &.{ "box", "deploy" });
+    switch (claimJobScope(&ctx, &store, 1, "deploy", &plain)) {
+        .blocked => |lease| {
+            try t.expectEqualStrings(peer, lease.owner_request_id);
+            // The profile is reported, as the audit subject it now is — and it
+            // is *ours*, which is exactly why it cannot be what decides this.
+            try t.expectEqualStrings(profile, lease.profile_token);
+        },
+        .held, .seized => return error.PeerLeaseWasIgnored,
+    }
+
+    // Nothing was sent, and nothing could have been: `claimJobScope` has no
+    // executor to send with, `jobCmd` runs it before `Cli.connect`, and
+    // `killJob`/`removeJob` cannot be called without the `Claim` it is the only
+    // producer of. A refusal here is therefore a refusal with no dial, no
+    // probe and no `kill-session`.
+    comptime {
+        for (@typeInfo(@TypeOf(claimJobScope)).@"fn".params) |param| {
+            if (param.type) |ty| if (ty == Core.Executor) @compileError(
+                "claimJobScope must not be able to reach the host: it decides before the connection exists",
+            );
+        }
+        for (@typeInfo(@TypeOf(killJob)).@"fn".params) |param| {
+            if (param.type) |ty| if (ty == Claim) break;
+        } else @compileError("killJob must be unreachable without a held Claim");
+    }
+    // The peer still holds it, so the refusal took nothing away either.
+    try t.expectEqual(@as(usize, 1), (try Store.leases.active(&store, arena, 1, 5000)).len);
+
+    // `--force` is an audited takeover, not a way past the lease.
+    const forced = Cli.parseArgs(&ctx, &.{ "box", "deploy", "--force" });
+    const ours = switch (claimJobScope(&ctx, &store, 1, "deploy", &forced)) {
+        .seized => |seizure| blk: {
+            try t.expectEqual(@as(usize, 1), seizure.displaced.len);
+            try t.expectEqualStrings(peer, seizure.displaced[0].owner_request_id);
+            break :blk seizure.claim;
+        },
+        .held => return error.ForceFoundNothingToDisplace,
+        .blocked => return error.ForceWasRefused,
+    };
+
+    // A lease was really taken — `--force` did not simply skip the layer — and
+    // the displaced row records who took it from whom.
+    const held = try Store.leases.active(&store, arena, 1, 5001);
+    try t.expectEqual(@as(usize, 1), held.len);
+    try t.expectEqualStrings(ours.owner_request_id, held[0].owner_request_id);
+    {
+        var stmt = try store.db.prepare(
+            \\SELECT release_reason, superseded_by FROM leases WHERE owner_request_id = ?1
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, peer);
+        try t.expect(try stmt.step());
+        try t.expectEqualStrings("takeover", stmt.columnText(0));
+        try t.expectEqual(held[0].id, stmt.columnInt(1));
+    }
+
+    // Renewed across the remote work, which is what "hold" means: the claim
+    // taken at 5000 would otherwise lapse at 5120 while a slow probe → kill →
+    // settle was still running, and the settlement would land on a scope
+    // somebody else was free to take.
+    holdClaim(ours, 5100);
+    {
+        var stmt = try store.db.prepare(
+            "SELECT expires_at FROM leases WHERE owner_request_id = ?1 AND released_at IS NULL",
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, ours.owner_request_id);
+        try t.expect(try stmt.step());
+        try t.expectEqual(@as(i64, 5100 + 120), stmt.columnInt(0));
+    }
+
+    // Releasing is what every ending does — the settlements call it directly,
+    // and `Cli.fail`, `failWithCode`, `failIndeterminate`,
+    // `failIndeterminateAfterOutput` and `receiptFatal` all route through this
+    // same function because `std.process.exit` skips defers.
+    Cli.releaseClaim();
+    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, 5002)).len);
+
+    // ...and it is idempotent, so a settle that released followed by a fatal
+    // exit does not go looking for a second row to give away.
+    Cli.releaseClaim();
+    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, 5003)).len);
+
+    // With the scope free, an unrelated invocation takes it cleanly — so the
+    // release above really freed it rather than merely stopping the count.
+    switch (claimJobScope(&ctx, &store, 1, "deploy", &plain)) {
+        .held => {},
+        .blocked, .seized => return error.ScopeStillHeldAfterRelease,
+    }
+    // Two invocations, two ids: the second is refused even though both are
+    // this machine and this checkout.
+    switch (claimJobScope(&ctx, &store, 1, "deploy", &plain)) {
+        .blocked => {},
+        .held, .seized => return error.SecondInvocationSharedAnOwner,
+    }
+    Cli.releaseClaim();
+}
 
 test "gate: an observation the ledger will not accept is not reported as an outcome" {
     const t = std.testing;

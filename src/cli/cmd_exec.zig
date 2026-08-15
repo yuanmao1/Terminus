@@ -380,8 +380,8 @@ fn advisoryText(ctx: *Cli.Ctx, advisory: ?Core.execution.Blocker) ?[]const u8 {
         ) catch null,
         .lease => |lease| std.fmt.allocPrint(
             ctx.arena,
-            "{s} holds a lease on an overlapping scope until {d}",
-            .{ lease.owner_token, lease.expires_at },
+            "request {s} (on {s}) holds a lease on an overlapping scope until {d}",
+            .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
         ) catch null,
     };
 }
@@ -398,8 +398,8 @@ fn reportBlocked(blocker: Core.execution.Blocker) noreturn {
             .{ op.request_id, op.status.text(), op.request_id },
         ),
         .lease => |lease| fatal(
-            "refused: {s} holds a lease on an overlapping scope until {d}; nothing was sent. Wait, take it over, or pass --force",
-            .{ lease.owner_token, lease.expires_at },
+            "refused: request {s} (on {s}) holds a lease on an overlapping scope until {d}; nothing was sent. Wait, take it over, or pass --force",
+            .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
         ),
     }
 }

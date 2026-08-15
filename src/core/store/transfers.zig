@@ -1081,6 +1081,14 @@ pub const Error = AdjudicateError || error{
     /// source could describe the bytes it has been sending, or on a row whose
     /// source is an HTTP object and therefore has no file identity to record.
     SourceIdentityLocked,
+    /// `recordSourceIdentity` was called on a checkpoint whose operation has
+    /// already submitted. Its own name, not folded into `SourceIdentityLocked`:
+    /// that one is about the checkpoint's own columns and is answered by
+    /// looking at the row, while this one says the transfer is already in
+    /// flight, so no reading of the source taken now can describe the bytes it
+    /// has been sending. The commitment resume identity rests on has to be made
+    /// before the first byte, and after submission there is no way to make it.
+    SourceIdentityAfterSubmission,
     /// `adoptLocked` lost its compare-and-swap: another resume took the
     /// checkpoint over first. Distinct from `CheckpointNotOurs`, which tells a
     /// *writer* to stop; this tells a would-be heir it lost a race and may
@@ -2962,6 +2970,23 @@ const record_expected_hash_sql = std.fmt.comptimePrint(
 ///   currently cover it is how the shape it protects becomes writable again.
 /// * The state window is `beforeFirstByte`; see there for why it is narrower
 ///   than the offset window, and why `recordExpectedHash` shares it.
+/// * The owning operation must still be before submission. This was missing,
+///   and the checkpoint half does not cover it: a checkpoint's state is only as
+///   current as its last write, so an operation that has *submitted* may be
+///   sending bytes a row still parked at `planned` or `probing` has not heard
+///   about. Binding the source's identity then records "this is the file those
+///   bytes came from" after the bytes may already have moved — and resume
+///   identity rests entirely on that commitment having been made first.
+///   `recordExpectedHash` has required it all along, over the same window and
+///   for the same reason; the two are the two halves of one promise and only
+///   one of them was being kept.
+///
+/// A conjunct at a time, and named: `error.SourceIdentityAfterSubmission` says
+/// the operation moved on, `error.SourceIdentityLocked` says the checkpoint
+/// did. They send a caller to different places — the first means this transfer
+/// is already in flight and no reading of the source can describe it, the
+/// second means the row already carries an identity or is past offset zero —
+/// and one name for both would let either be mistaken for the other.
 ///
 /// All three values are written together and none is optional, because they
 /// are one observation of one file at one moment. Keeping a size read earlier
@@ -2988,7 +3013,12 @@ pub fn recordSourceIdentity(
     _ = try stmt.step();
     if (store.db.changes() != 0) return;
 
+    // `ownedRow` first: "no such row" and "not yours any more" are answers
+    // about whether this caller may write here at all, and they outrank both
+    // of the refusals below.
     _ = try ownedRow(store, id, owner_request_id);
+    if (!try ownerBeforeSubmission(store, owner_request_id))
+        return error.SourceIdentityAfterSubmission;
     return error.SourceIdentityLocked;
 }
 
@@ -3001,7 +3031,43 @@ const record_source_identity_sql = std.fmt.comptimePrint(
     \\   AND source_sha256 IS NULL
     \\   AND confirmed_offset = 0
     \\   AND state IN ({[before_first_byte]s})
-, .{ .file_kinds = file_source_sql, .before_first_byte = before_first_byte_sql });
+    \\   AND request_id IN (
+    \\         SELECT request_id FROM operations
+    \\          WHERE status IN ({[before_submission]s})
+    \\       )
+, .{
+    .file_kinds = file_source_sql,
+    .before_first_byte = before_first_byte_sql,
+    .before_submission = op_before_submission_sql,
+});
+
+/// Whether the operation named by `request_id` is still before submission.
+///
+/// Rendered from the same `op_before_submission_sql` the statement guards on,
+/// so the classifier cannot start naming a conjunct the write no longer
+/// contains — the rule `OwnedRow` states and the reason its facts are computed
+/// by sqlite rather than in Zig.
+///
+/// A missing operation answers false, and that is not a fallback: `request_id`
+/// is a foreign key into `operations`, so no row means the row this caller
+/// addressed is gone, and "gone" is certainly not "still safe to bind a source
+/// to". It is unreachable in any case — `ownedRow` runs first and refuses a
+/// checkpoint that is missing or not ours, and a checkpoint cannot outlive its
+/// operation.
+fn ownerBeforeSubmission(store: *Store, request_id: []const u8) Db.Error!bool {
+    var stmt = try store.db.prepare(owner_before_submission_sql);
+    defer stmt.deinit();
+    try stmt.bindText(1, request_id);
+    if (!try stmt.step()) return error.Sqlite;
+    return stmt.columnInt(0) != 0;
+}
+
+const owner_before_submission_sql = std.fmt.comptimePrint(
+    \\SELECT EXISTS (
+    \\  SELECT 1 FROM operations
+    \\   WHERE request_id = ?1 AND status IN ({[before_submission]s})
+    \\)
+, .{ .before_submission = op_before_submission_sql });
 
 /// The facts a refused write is classified from.
 const OwnedRow = struct {

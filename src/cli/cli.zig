@@ -37,6 +37,7 @@ pub fn setActiveCtx(ctx: *Ctx) void {
 pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     settleActiveExecution("command failed before recording an outcome");
     releaseReservation();
+    releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
@@ -62,6 +63,7 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 pub fn failWithCode(code: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
     settleActiveExecution("command failed before recording an outcome");
     releaseReservation();
+    releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
@@ -154,6 +156,75 @@ pub fn releaseReservation() void {
     };
 }
 
+/// A scope lease held by the command currently running.
+///
+/// `job kill` and `job rm` take one before their first remote call and hold it
+/// across probe → kill → settle, so a peer cannot start killing, removing or
+/// relaunching the same job underneath them. Because the claim is taken that
+/// early, every fatal exit in between would otherwise leave it held — and a
+/// lease is owned by the *attempt*, so the operator's very next `job kill`
+/// mints a new id and is refused by the corpse of the one that just failed,
+/// for the whole TTL. `fail` exits with `std.process.exit`, which skips
+/// defers, so it releases through here; the same shape as the reservation hook
+/// above and for the same reason.
+///
+/// Identity is `owner_request_id`. Releasing by scope alone would let a failing
+/// command hand away the claim of the peer that displaced it.
+const Claim = struct {
+    store: *Store,
+    server_id: i64,
+    scope: Core.execution.Scope,
+    owner_request_id: []const u8,
+    /// For the failure message only.
+    job_name: []const u8,
+    now: i64,
+};
+var active_claim: ?Claim = null;
+
+pub fn registerClaim(
+    store: *Store,
+    server_id: i64,
+    scope: Core.execution.Scope,
+    owner_request_id: []const u8,
+    job_name: []const u8,
+    now: i64,
+) void {
+    active_claim = .{
+        .store = store,
+        .server_id = server_id,
+        .scope = scope,
+        .owner_request_id = owner_request_id,
+        .job_name = job_name,
+        .now = now,
+    };
+}
+
+/// Gives the scope back, if this command still holds it.
+///
+/// Called at settle by the command itself and from every process-ending path
+/// below. A claim that is no longer ours — a peer took it over with `--force` —
+/// matches no row and is left exactly where it is.
+pub fn releaseClaim() void {
+    const held = active_claim orelse return;
+    active_claim = null; // never re-enter
+    _ = Store.leases.release(
+        held.store,
+        held.server_id,
+        held.scope,
+        held.owner_request_id,
+        .released,
+        held.now,
+    ) catch |err| {
+        // Reported, not swallowed: what is left behind is a scope that refuses
+        // the operator's next attempt on this job until the lease lapses.
+        std.debug.print(
+            "terminus: could not release the scope lease for job '{s}': {s}; " ++
+                "it will block further changes to that job until it expires\n",
+            .{ held.job_name, @errorName(err) },
+        );
+    };
+}
+
 /// Process exit codes with a defined meaning to callers.
 pub const exit_code = struct {
     pub const ok: u8 = 0;
@@ -174,6 +245,7 @@ pub const exit_code = struct {
 /// error would invite exactly the blind retry that can double-apply a remote
 /// side effect.
 pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observed: []const u8) noreturn {
+    releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             ctx.out.json(.{
@@ -205,6 +277,7 @@ pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observ
 /// first is safe to retry.
 pub fn failIndeterminateAfterOutput(request_id: []const u8) noreturn {
     clearExecution(); // already settled by the execution itself
+    releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .human) {
             std.debug.print(
@@ -228,6 +301,7 @@ pub fn receiptFatal(
     err: anyerror,
     known_remote_status: ?[]const u8,
 ) noreturn {
+    releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             ctx.out.json(.{
@@ -320,10 +394,10 @@ test "only an unsettled job blocker is worth opening a connection for" {
         .server_id = 1,
         .scope_kind = .job,
         .scope_key = "deploy",
-        .owner_token = "somebody-else",
+        .owner_request_id = "01SOMEBODYELSE0123456789AB",
+        .profile_token = "somebody-elses-machine",
         .owner_label = null,
         .note = null,
-        .request_id = null,
         .acquired_at = 1750000000,
         .renewed_at = 1750000000,
         .expires_at = 1750003600,
@@ -767,6 +841,21 @@ pub fn openStore(ctx: *Ctx, parsed: *const Args.Parsed) !Store {
         error.NotATerminusStore => fail(
             "the file at {s} is not a terminus database: {s}. Nothing was written to it; pass --db with a different path",
             .{ path, found.foreign_database.detail },
+        ),
+        // The other data-protecting refusal, and it protects a *claim* rather
+        // than bytes: those leases are what stops two sessions changing the
+        // same scope at once, and version {d} named their owner by machine
+        // rather than by attempt. Nothing here can work out which attempt held
+        // one, so it says so instead of voiding them.
+        error.LiveLeasesCannotBeReowned => fail(
+            "database at {s} is at schema version {d} and holds {d} lease(s) nobody has released; the upgrade to version {d} makes a lease belong to one attempt rather than to the whole machine, and a pre-{d} row names no attempt to carry over. Release them with the binary that took them, or move this file aside and let a new one be created — this command will not void somebody's live claim for you",
+            .{
+                path,
+                found.live_leases_cannot_be_reowned.version,
+                found.live_leases_cannot_be_reowned.rows,
+                Store.schema_version,
+                Store.schema_version,
+            },
         ),
         error.WalSetupExhausted => fail(
             "database at {s} could not be switched to WAL mode; another terminus process may be starting at the same instant under heavy load — retry",

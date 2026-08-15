@@ -970,7 +970,8 @@ fn acquireInThread(ctx: *LeaseRaceCtx) void {
     const outcome = Store.leases.acquire(&store, arena_state.allocator(), .{
         .server_id = 1,
         .scope = .{ .kind = .job, .key = "deploy" },
-        .owner_token = ctx.owner,
+        .owner_request_id = ctx.owner,
+        .profile_token = "one-shared-machine",
         .ttl_secs = 600,
         .now = 1000,
     }) catch |err| {
@@ -1046,11 +1047,21 @@ test "gate: lease lifecycle — renew, expire, takeover audit chain" {
     defer store.close();
     try seedServer(&store);
 
+    // One machine, three attempts. The profile token is deliberately identical
+    // on every acquisition below: until v12 it was what `acquire` compared, so
+    // this whole gate would have read as one owner renewing its own lease over
+    // and over and no line in it could have failed.
+    const profile = "one-shared-machine";
+    const attempt_a: []const u8 = "01AAAAAAAA0123456789ABCDEF";
+    const attempt_b: []const u8 = "01BBBBBBBB0123456789ABCDEF";
+    const attempt_c: []const u8 = "01CCCCCCCC0123456789ABCDEF";
+
     const job_scope: Store.leases.Scope = .{ .kind = .job, .key = "deploy" };
     const base: Store.leases.AcquireOptions = .{
         .server_id = 1,
         .scope = job_scope,
-        .owner_token = "owner-a",
+        .owner_request_id = attempt_a,
+        .profile_token = profile,
         .ttl_secs = 100,
         .now = 1000,
     };
@@ -1058,17 +1069,23 @@ test "gate: lease lifecycle — renew, expire, takeover audit chain" {
     // First acquisition.
     try t.expect((try Store.leases.acquire(&store, arena, base)).acquired.id > 0);
 
-    // The same owner asking again renews instead of piling up rows.
+    // The same *attempt* asking again renews instead of piling up rows.
     var again = base;
     again.now = 1050;
     try t.expect((try Store.leases.acquire(&store, arena, again)) == .renewed);
 
-    // A peer is blocked, and learns who holds it.
+    // A second attempt on the same machine is blocked, and learns which
+    // attempt holds it. This is the line the defect lived on.
     var peer = base;
-    peer.owner_token = "owner-b";
+    peer.owner_request_id = attempt_b;
     peer.now = 1060;
     const blocked = try Store.leases.acquire(&store, arena, peer);
-    try t.expectEqualStrings("owner-a", blocked.conflict.owner_token);
+    try t.expectEqualStrings(attempt_a, blocked.conflict.owner_request_id);
+    // ...and the profile is still recorded, as the audit subject it now is.
+    try t.expectEqualStrings(profile, blocked.conflict.profile_token);
+
+    // Exactly one row, so the renewal above really renewed.
+    try t.expectEqual(@as(usize, 1), (try Store.leases.active(&store, arena, 1, 1060)).len);
 
     // A whole-server lease overlaps the job scope, so it is blocked too.
     var server_scope = peer;
@@ -1081,15 +1098,27 @@ test "gate: lease lifecycle — renew, expire, takeover audit chain" {
 
     // Losing a lease must be visible: the old owner's renew fails rather
     // than silently reviving it underneath the new holder.
-    try t.expect(!try Store.leases.renew(&store, 1, job_scope, "owner-a", 100, 5010));
+    try t.expect(!try Store.leases.renew(&store, 1, job_scope, attempt_a, 100, 5010));
+
+    // An owner that names nobody is refused before it can be compared: an
+    // empty string matches every other empty string, which is the machine-wide
+    // owner all over again.
+    try t.expectError(
+        error.EmptyLeaseOwner,
+        Store.leases.renew(&store, 1, job_scope, "", 100, 5010),
+    );
+    try t.expectError(
+        error.EmptyLeaseOwner,
+        Store.leases.conflictFor(&store, arena, 1, job_scope, "", 5010),
+    );
 
     // Takeover leaves an audit chain rather than overwriting.
     var thief = base;
-    thief.owner_token = "owner-c";
+    thief.owner_request_id = attempt_c;
     thief.now = 5020;
     const taken = try Store.leases.takeover(&store, arena, thief);
     try t.expectEqual(@as(usize, 1), taken.taken.from.len);
-    try t.expectEqualStrings("owner-b", taken.taken.from[0].owner_token);
+    try t.expectEqualStrings(attempt_b, taken.taken.from[0].owner_request_id);
 
     var stmt = try store.db.prepare(
         \\SELECT release_reason, superseded_by FROM leases
@@ -1102,8 +1131,8 @@ test "gate: lease lifecycle — renew, expire, takeover audit chain" {
     try t.expectEqual(taken.taken.lease.id, stmt.columnInt(1));
 
     // The guard used by write operations sees the conflict for others only.
-    try t.expect((try Store.leases.conflictFor(&store, arena, 1, job_scope, "owner-a", 5030)) != null);
-    try t.expect((try Store.leases.conflictFor(&store, arena, 1, job_scope, "owner-c", 5030)) == null);
+    try t.expect((try Store.leases.conflictFor(&store, arena, 1, job_scope, attempt_a, 5030)) != null);
+    try t.expect((try Store.leases.conflictFor(&store, arena, 1, job_scope, attempt_c, 5030)) == null);
 }
 
 // A takeover displaces *every* overlapping lease, not the first one it finds.
@@ -1135,7 +1164,8 @@ test "gate: takeover displaces every overlapping lease and links all of them" {
     const base: Store.leases.AcquireOptions = .{
         .server_id = 1,
         .scope = .{ .kind = .path, .key = "/srv/app/dist" },
-        .owner_token = "owner-a",
+        .owner_request_id = "01AAAAAAAA0123456789ABCDEF",
+        .profile_token = "one-shared-machine",
         .ttl_secs = 1000,
         .now = 1000,
     };
@@ -1147,14 +1177,14 @@ test "gate: takeover displaces every overlapping lease and links all of them" {
     try t.expect((try Store.leases.acquire(&store, arena, base)) == .acquired);
     var sibling = base;
     sibling.scope = .{ .kind = .path, .key = "/srv/app/build" };
-    sibling.owner_token = "owner-b";
+    sibling.owner_request_id = "01BBBBBBBB0123456789ABCDEF";
     sibling.now = 1010;
     try t.expect((try Store.leases.acquire(&store, arena, sibling)) == .acquired);
 
     // A third scope containing both.
     var thief = base;
     thief.scope = .{ .kind = .path, .key = "/srv/app" };
-    thief.owner_token = "owner-c";
+    thief.owner_request_id = "01CCCCCCCC0123456789ABCDEF";
     thief.now = 1100;
     const taken = try Store.leases.takeover(&store, arena, thief);
 
@@ -1164,8 +1194,8 @@ test "gate: takeover displaces every overlapping lease and links all of them" {
     var saw_a = false;
     var saw_b = false;
     for (taken.taken.from) |old| {
-        if (std.mem.eql(u8, old.owner_token, "owner-a")) saw_a = true;
-        if (std.mem.eql(u8, old.owner_token, "owner-b")) saw_b = true;
+        if (std.mem.eql(u8, old.owner_request_id, "01AAAAAAAA0123456789ABCDEF")) saw_a = true;
+        if (std.mem.eql(u8, old.owner_request_id, "01BBBBBBBB0123456789ABCDEF")) saw_b = true;
     }
     try t.expect(saw_a and saw_b);
 
@@ -1186,11 +1216,11 @@ test "gate: takeover displaces every overlapping lease and links all of them" {
     // server, and it is the new one.
     const still_held = try Store.leases.active(&store, arena, 1, 1110);
     try t.expectEqual(@as(usize, 1), still_held.len);
-    try t.expectEqualStrings("owner-c", still_held[0].owner_token);
+    try t.expectEqualStrings("01CCCCCCCC0123456789ABCDEF", still_held[0].owner_request_id);
 
     // Both former owners are now blocked, and by the same lease. A survivor
     // would show up here as one of them still being free to write.
-    for ([_][]const u8{ "owner-a", "owner-b" }) |owner| {
+    for ([_][]const u8{ "01AAAAAAAA0123456789ABCDEF", "01BBBBBBBB0123456789ABCDEF" }) |owner| {
         const blocked = try Store.leases.conflictFor(
             &store,
             arena,
@@ -1724,6 +1754,48 @@ test "gate: pre-release drift is detected in the schema's shape, not just its co
         try t.expectEqualStrings("transfer_checkpoints", refusal.pre_release_drift.probe);
     }
 
+    // (b3) The same lesson at v12, where the property is one clause wide. This
+    //      store is at the current version and has a `leases` table that looks
+    //      right — same name, same scope columns, an owner column — but the
+    //      owner is `owner_token`, the machine-wide token v12 exists to stop
+    //      deciding conflicts by. `user_version` cannot express a change
+    //      *within* a version, and a column-name probe would not notice the swap
+    //      either, so the stored text is again the only witness. A store like
+    //      this decides every conflict the pre-v12 way while reporting itself as
+    //      fixed.
+    {
+        var scratch = try Scratch.init(t.allocator, "gate_drift_lease_owner");
+        defer scratch.deinit();
+        {
+            var db = try Db.open(scratch.path);
+            defer db.close();
+            try migrate.applyUpTo(&db, migrate.latest_version);
+            try db.exec(
+                \\DROP TABLE leases;
+                \\CREATE TABLE leases (
+                \\  id            INTEGER PRIMARY KEY,
+                \\  server_id     INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+                \\  scope_kind    TEXT NOT NULL,
+                \\  scope_key     TEXT NOT NULL,
+                \\  owner_token   TEXT NOT NULL,
+                \\  acquired_at   INTEGER NOT NULL,
+                \\  renewed_at    INTEGER NOT NULL,
+                \\  expires_at    INTEGER NOT NULL,
+                \\  released_at   INTEGER
+                \\);
+                \\CREATE UNIQUE INDEX idx_leases_active
+                \\  ON leases(server_id, scope_kind, scope_key) WHERE released_at IS NULL;
+                \\CREATE INDEX idx_leases_owner ON leases(owner_token) WHERE released_at IS NULL;
+            );
+        }
+        var refusal: migrate.Refusal = undefined;
+        try t.expectError(
+            error.PreReleaseSchemaDrift,
+            Store.openDiagnosed(scratch.path, &refusal),
+        );
+        try t.expectEqualStrings("leases", refusal.pre_release_drift.probe);
+    }
+
     // And the shape this binary actually writes satisfies every probe, so the
     // cases above are detecting drift rather than rejecting everything. This is
     // also what makes the comparison legitimate at all: it asserts that the
@@ -1751,6 +1823,9 @@ test "gate: pre-release drift is detected in the schema's shape, not just its co
         for ([_]struct { name: [:0]const u8, want: []const u8 }{
             .{ .name = "transfer_checkpoints", .want = migrate.checkpoints_table_ddl },
             .{ .name = "idx_checkpoints_live_dest", .want = migrate.checkpoints_index_ddl },
+            .{ .name = "leases", .want = migrate.leases_table_ddl },
+            .{ .name = "idx_leases_active", .want = migrate.leases_active_index_ddl },
+            .{ .name = "idx_leases_owner", .want = migrate.leases_owner_index_ddl },
         }) |object| {
             var stmt = try store.db.prepare("SELECT sql FROM sqlite_master WHERE name = ?1");
             defer stmt.deinit();
@@ -1930,6 +2005,98 @@ test "gate: checkpoint rows are never destroyed by the migration that recreates 
         var store = try Store.open(scratch.path);
         defer store.close();
         try t.expectEqual(@as(i64, migrate.latest_version), try migrate.userVersion(&store.db));
+    }
+}
+
+test "gate: a live pre-v12 lease stops the open rather than being voided" {
+    const t = std.testing;
+
+    // v12 recuts `leases` around `owner_request_id`. A v11 row's `owner_token`
+    // is a machine profile, not a request id, and reading one as the other
+    // would hand the row an owner that never existed — so no row can be
+    // carried. Released rows are history and go with the table. A row nobody
+    // has released is different in kind: it is somebody's claim on a scope
+    // right now, and dropping it silently un-blocks whatever it was holding,
+    // which is the one thing this table exists to prevent.
+    {
+        var scratch = try Scratch.init(t.allocator, "gate_preapply_live_lease");
+        defer scratch.deinit();
+        {
+            var db = try Db.open(scratch.path);
+            defer db.close();
+            try migrate.applyUpTo(&db, 11);
+            try db.exec(
+                \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+                \\VALUES (1, 'legacy', '10.0.0.1', 22, 'ubuntu', 100, 100);
+                \\INSERT INTO leases
+                \\  (server_id, scope_kind, scope_key, owner_token, acquired_at, renewed_at, expires_at)
+                \\VALUES (1, 'job', 'deploy', '01MACHINEPROFILE000000000', 100, 100, 100000);
+            );
+        }
+
+        var refusal: migrate.Refusal = undefined;
+        try t.expectError(
+            error.LiveLeasesCannotBeReowned,
+            Store.openDiagnosed(scratch.path, &refusal),
+        );
+        try t.expectEqual(@as(i64, 1), refusal.live_leases_cannot_be_reowned.rows);
+        try t.expectEqual(@as(i64, 11), refusal.live_leases_cannot_be_reowned.version);
+
+        // Refusing is the whole action: the row is untouched and the version has
+        // not moved, so the operator can still release it with the binary that
+        // took it.
+        var db = try Db.open(scratch.path);
+        defer db.close();
+        try t.expectEqual(@as(i64, 11), try migrate.userVersion(&db));
+        var count = try db.prepare("SELECT COUNT(*) FROM leases WHERE owner_token IS NOT NULL");
+        defer count.deinit();
+        try t.expect(try count.step());
+        try t.expectEqual(@as(i64, 1), count.columnInt(0));
+    }
+
+    // Released rows are not a barrier — otherwise every store that ever took a
+    // lease would be unopenable forever, since expiry in this schema is lazy
+    // and needs the store open to run. This half is also what stops the case
+    // above passing on a gate that simply refuses any v11 store with a `leases`
+    // table.
+    {
+        var scratch = try Scratch.init(t.allocator, "gate_preapply_dead_lease");
+        defer scratch.deinit();
+        {
+            var db = try Db.open(scratch.path);
+            defer db.close();
+            try migrate.applyUpTo(&db, 11);
+            try db.exec(
+                \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+                \\VALUES (1, 'legacy', '10.0.0.1', 22, 'ubuntu', 100, 100);
+                \\INSERT INTO leases
+                \\  (server_id, scope_kind, scope_key, owner_token, acquired_at, renewed_at,
+                \\   expires_at, released_at, release_reason)
+                \\VALUES (1, 'job', 'deploy', '01MACHINEPROFILE000000000', 100, 100, 200, 300, 'expired');
+            );
+        }
+        var store = try Store.open(scratch.path);
+        defer store.close();
+        try t.expectEqual(@as(i64, migrate.latest_version), try migrate.userVersion(&store.db));
+
+        // The table was recut, and the history went with it: `owner_token` is
+        // gone and `owner_request_id` is what a lease is keyed on now. Said as
+        // an emptiness rather than left implicit, because the alternative — a
+        // carried row with an invented owner — is the failure this whole
+        // version exists to avoid.
+        var count = try store.db.prepare("SELECT COUNT(*) FROM leases");
+        defer count.deinit();
+        try t.expect(try count.step());
+        try t.expectEqual(@as(i64, 0), count.columnInt(0));
+
+        // And the new shape refuses an owner that names nobody, at the schema
+        // level, where no caller can talk it round.
+        try t.expectError(error.Constraint, store.db.exec(
+            \\INSERT INTO leases
+            \\  (server_id, scope_kind, scope_key, owner_request_id, profile_token,
+            \\   acquired_at, renewed_at, expires_at)
+            \\VALUES (1, 'job', 'deploy', '', 'machine', 100, 100, 200);
+        ));
     }
 }
 
@@ -4157,6 +4324,87 @@ fn seedCheckpoint(
         .chunk_size = 100,
         .now = 100,
     });
+}
+
+test "gate: a source cannot be identified once its transfer has submitted" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_source_after_submit");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // The shape the hole lived in: the *operation* has submitted, so bytes may
+    // already be moving, while the *checkpoint* is still parked at `planned`
+    // and offset zero because nothing has written to it since. Every conjunct
+    // `recordSourceIdentity` used to have is satisfied here — file source, no
+    // digest yet, zero offset, a `beforeFirstByte` state — and the write went
+    // through, binding "this is the file those bytes came from" after the first
+    // byte may have gone. Resume identity is exactly that commitment, so a
+    // resume would then splice new bytes onto a head nobody had committed to.
+    const late = testId("srclate");
+    const late_id: []const u8 = &late;
+    const late_cp = try seedCheckpoint(
+        &store,
+        late_id,
+        "/srv/app/late.bin",
+        "/srv/app/late.bin.part",
+    );
+    // Clear the digest `seedCheckpoint` plants, so the write is refused by the
+    // conjunct under test and not by the write-once one.
+    try store.db.exec("UPDATE transfer_checkpoints SET source_sha256 = NULL");
+    try Store.operations.advance(&store, late_id, .connecting, 101);
+    try Store.operations.advance(&store, late_id, .submitted, 102);
+    try t.expectEqual(
+        Store.transfers.State.planned,
+        (try Store.transfers.get(&store, arena, late_cp)).?.state,
+    );
+
+    try t.expectError(
+        error.SourceIdentityAfterSubmission,
+        Store.transfers.recordSourceIdentity(&store, late_cp, late_id, 1000, 42, "aaaa", 103),
+    );
+    // Refused means nothing was written: not the digest, not the size, not the
+    // mtime. A partial identity would be worse than none — `verifyResume`
+    // compares whichever fields are there.
+    const untouched = (try Store.transfers.get(&store, arena, late_cp)).?.source.file().?;
+    try t.expectEqual(@as(?[]const u8, null), untouched.sha256);
+    try t.expectEqual(@as(?u64, null), untouched.size);
+
+    // The refusal is named, and named apart from the checkpoint's own. A row
+    // that already carries an identity is `SourceIdentityLocked` — a fact about
+    // the row — while the one above is a fact about the operation, and a caller
+    // that saw one name for both could not tell "you already did this" from
+    // "this transfer is already in flight".
+    const early = testId("srcearly");
+    const early_id: []const u8 = &early;
+    const early_cp = try seedCheckpoint(
+        &store,
+        early_id,
+        "/srv/app/early.bin",
+        "/srv/app/early.bin.part",
+    );
+    try store.db.exec(
+        "UPDATE transfer_checkpoints SET source_sha256 = NULL WHERE id = " ++
+            "(SELECT MAX(id) FROM transfer_checkpoints)",
+    );
+    // The control, and it is the half that stops this gate passing because
+    // `recordSourceIdentity` has simply stopped working: before submission the
+    // identical call lands.
+    try Store.transfers.recordSourceIdentity(&store, early_cp, early_id, 1000, 42, "aaaa", 110);
+    try t.expectEqualStrings(
+        "aaaa",
+        (try Store.transfers.get(&store, arena, early_cp)).?.source.file().?.sha256.?,
+    );
+    // ...and a second one is the *other* refusal, on a row whose operation is
+    // still `created`. Both names are reachable, and each on its own cause.
+    try t.expectError(
+        error.SourceIdentityLocked,
+        Store.transfers.recordSourceIdentity(&store, early_cp, early_id, 1000, 42, "bbbb", 111),
+    );
 }
 
 test "gate: a checkpoint cannot reach a state it has no path to" {
@@ -6475,7 +6723,8 @@ test "gate: a server with a lease still held on it cannot be deleted" {
     switch (try Store.leases.acquire(&store, arena, .{
         .server_id = server_id,
         .scope = scope,
-        .owner_token = "peer",
+        .owner_request_id = "01PEEEEEEER0123456789ABCDE",
+        .profile_token = "peer-machine",
         .ttl_secs = 300,
         .now = 200,
     })) {
@@ -6721,7 +6970,8 @@ test "gate: an attempt with no server is inside the barrier, not outside it" {
     try t.expectError(error.Constraint, Store.leases.acquire(&store, arena, .{
         .server_id = 0,
         .scope = local,
-        .owner_token = "agent-c",
+        .owner_request_id = "01AGENTCCCC0123456789ABCDE",
+        .profile_token = "one-shared-machine",
         .ttl_secs = 300,
         .now = 130,
     }));

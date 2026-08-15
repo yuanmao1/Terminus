@@ -348,7 +348,8 @@ test "gate: --force covers the cascade and no barrier" {
     switch (try Store.leases.acquire(&store, arena, .{
         .server_id = server_id,
         .scope = .{ .kind = .path, .key = "/srv/app" },
-        .owner_token = "peer",
+        .owner_request_id = "01PEEEEEEER0123456789ABCDE",
+        .profile_token = "peer-machine",
         .ttl_secs = 300,
         .now = 200,
     })) {
@@ -376,7 +377,7 @@ test "gate: --force covers the cascade and no barrier" {
         &store,
         server_id,
         .{ .kind = .path, .key = "/srv/app" },
-        "peer",
+        "01PEEEEEEER0123456789ABCDE",
         .released,
         220,
     );

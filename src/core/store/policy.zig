@@ -155,12 +155,22 @@ pub fn retention(store: *Store, table_name: []const u8) Db.Error!?i64 {
 
 const owner_token_key = "owner_token";
 
-/// The stable identity a lease is held under.
+/// This machine's stable identity, as an audit subject.
 ///
-/// It must survive across processes: a host-pid string changes every
-/// invocation, so an agent could never renew or release its own lease, and
-/// "same owner renews, different owner conflicts" would be meaningless. The
-/// token is minted once per machine-profile and reused thereafter.
+/// It must survive across processes, because that is what makes it a useful
+/// thing to *record*: a host-pid string changes every invocation, so a trail
+/// stamped with one could never be read as "these acts came from the same
+/// installation". The token is minted once per machine-profile and reused
+/// thereafter.
+///
+/// **Not an ownership identity, and this is the correction v12 made.** It used
+/// to be what `leases.acquire` compared, and one token per machine means every
+/// agent, editor and terminal on that machine was the same lease owner: two
+/// concurrent sessions never conflicted, they renewed each other's claims, and
+/// the lease layer isolated nothing. A lease is now held by an attempt's
+/// `request_id`; this token rides along as `leases.profile_token`, is reported,
+/// and decides nothing. Anything that compares it to decide who may act is
+/// reintroducing that defect.
 pub fn ownerToken(store: *Store, arena: Allocator, io: std.Io, now: i64) Error![]const u8 {
     if (try localIdentity(store, arena, owner_token_key)) |existing| return existing;
 

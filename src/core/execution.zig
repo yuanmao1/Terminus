@@ -67,6 +67,13 @@ pub const BeginOptions = struct {
     shell: ?[]const u8 = null,
     transport: ?[]const u8 = null,
     capability: Capability = supervisor.shell_capability,
+    /// The machine profile this attempt is running as (`policy.ownerToken`).
+    ///
+    /// Audit subject, never identity. It used to be what the lease guard
+    /// compared, which made every session on one machine the same lease owner;
+    /// a lease is now held by an attempt's `request_id` and this token only
+    /// records *which machine* forced its way past a barrier. See
+    /// `leases.Lease.profile_token`.
     owner_token: []const u8,
     /// Proceed despite a blocker, recording that the override happened.
     force: bool = false,
@@ -100,7 +107,8 @@ pub const Submit = union(enum) {
 };
 
 pub const Error = Store.Db.Error || receipts.Error || operations.Error ||
-    Allocator.Error || error{ IllegalTransition, UnknownOperation, UnknownScopeKind };
+    Allocator.Error || leases.Error ||
+    error{ IllegalTransition, UnknownOperation, UnknownScopeKind };
 
 /// What the `jobs` cache row must become when an attempt is settled, or why
 /// there is none to write.
@@ -205,6 +213,14 @@ pub const AdoptError = Error || transfers.Error;
 
 /// Whether anything else is laying claim to `target`, as one definition.
 ///
+/// `request_id` is this attempt's own identity, and it answers both halves at
+/// once: an unsettled operation with that id is *us*, and a lease with that
+/// owner is *ours*. Those used to be two parameters — the request id for the
+/// operation half and `policy.ownerToken` for the lease half — and the second
+/// was a token minted once per machine profile, so every agent on one machine
+/// skipped every other agent's lease as if it were its own. One id means the
+/// lease half can only ever exempt the attempt that actually took the lease.
+///
 /// `server_id` is optional and null is a real value here, not "skip the
 /// check": it names the local realm, the set of attempts recorded against no
 /// host. Until now this took a plain `i64` and both call sites reached it
@@ -226,17 +242,14 @@ fn blockerLocked(
     arena: Allocator,
     server_id: ?i64,
     target: Scope,
-    owner_token: []const u8,
-    exclude_request_id: ?[]const u8,
+    request_id: []const u8,
     now: i64,
 ) Error!?Blocker {
     var found: ?Blocker = null;
 
     const unsettled = try operations.unsettledInScope(store, arena, server_id, target);
     for (unsettled) |op| {
-        if (exclude_request_id) |self_id| {
-            if (std.mem.eql(u8, op.request_id, self_id)) continue;
-        }
+        if (std.mem.eql(u8, op.request_id, request_id)) continue;
         found = .{ .unsettled = op };
         break;
     }
@@ -257,7 +270,7 @@ fn blockerLocked(
     // leases on the way past, and that housekeeping should not depend on the
     // order the two checks happen to be in.
     if (server_id) |host| {
-        if (try leases.conflictForLocked(store, arena, host, target, owner_token, now)) |lease| {
+        if (try leases.conflictForLocked(store, arena, host, target, request_id, now)) |lease| {
             if (found == null) found = .{ .lease = lease };
         }
     }
@@ -281,9 +294,12 @@ pub const Execution = struct {
     /// The caller chose to proceed past a blocker. Carried through to
     /// `submitted`, where the guard is actually binding.
     force: bool = false,
-    /// Identifies who we are for lease purposes, so our own lease is not
-    /// mistaken for someone else's.
-    owner_token: []const u8 = "",
+    /// The machine profile that opened this attempt, recorded on the override
+    /// audit so it says *who* forced its way past a barrier. Null on a handle
+    /// re-opened by `attach`: that is a later process observing somebody else's
+    /// attempt, and naming its own profile there would attribute the act to the
+    /// wrong machine. Never an identity — see `BeginOptions.owner_token`.
+    owner_token: ?[]const u8 = null,
     /// Mirror of the persisted status, so transport failures can be
     /// classified without another read.
     status: op_state.Status = .created,
@@ -340,7 +356,7 @@ pub const Execution = struct {
         // directly, because a null server names the local realm and not "no
         // guard". A `fetch` writes a local path and used to skip this
         // entirely.
-        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.owner_token, self.id(), at)) |blocker| {
+        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at)) |blocker| {
             if (self.mutating and !self.force) {
                 // Nothing of ours was written, so committing only keeps
                 // the lease expiry pass that the check performed.
@@ -354,7 +370,7 @@ pub const Execution = struct {
                     .request_id = self.id(),
                     .kind = .audit,
                     .observed_at = at,
-                    .detail_json = try forcedJson(self.arena, blocker),
+                    .detail_json = try forcedJson(self.arena, blocker, self.owner_token),
                 }, audit_seq);
             }
         }
@@ -787,7 +803,13 @@ pub fn begin(
     var advisory: ?Blocker = null;
     // Unconditional in the server, for the reason given at `blockerLocked`: a
     // null server is the local realm, not an excuse to skip the guard.
-    if (try blockerLocked(store, arena, opts.server_id, opts.scope, opts.owner_token, null, opts.now)) |blocker| {
+    //
+    // The id passed is the one about to be created, which cannot yet own
+    // anything: no operation row, and — because a lease is held by an attempt —
+    // no lease either. So nothing is exempted here, which is correct for a
+    // brand new attempt and is why this call needed no separate "exclude"
+    // argument once the owner became the request id.
+    if (try blockerLocked(store, arena, opts.server_id, opts.scope, &request_id, opts.now)) |blocker| {
         if (opts.mutating and !opts.force) {
             // Nothing was inserted; the commit only keeps the lease
             // expiry pass the check performed on its way through.
@@ -825,7 +847,7 @@ pub fn begin(
             .request_id = &request_id,
             .kind = .audit,
             .observed_at = opts.now,
-            .detail_json = try forcedJson(arena, advisory.?),
+            .detail_json = try forcedJson(arena, advisory.?, opts.owner_token),
         }, seq);
     }
 
@@ -938,7 +960,7 @@ pub fn attach(
     };
 }
 
-fn forcedJson(arena: Allocator, blocker: Blocker) Allocator.Error![]u8 {
+fn forcedJson(arena: Allocator, blocker: Blocker, forced_by_profile: ?[]const u8) Allocator.Error![]u8 {
     var writer: std.Io.Writer.Allocating = .init(arena);
     switch (blocker) {
         .unsettled => |op| std.json.Stringify.value(.{
@@ -947,13 +969,21 @@ fn forcedJson(arena: Allocator, blocker: Blocker) Allocator.Error![]u8 {
             .blocker = "unsettled_operation",
             .blockingRequestId = op.request_id,
             .blockingStatus = op.status.text(),
+            .forcedByProfile = forced_by_profile,
         }, .{}, &writer.writer) catch return error.OutOfMemory,
         .lease => |lease| std.json.Stringify.value(.{
             .schemaVersion = receipts.schema_version,
             .event = "forced_past_blocker",
             .blocker = "lease",
-            .owner = lease.owner_token,
+            // The attempt whose claim this displaced, and the machine it ran
+            // on. Two fields, because they answer different questions and the
+            // second one cannot answer the first: one machine profile covers
+            // every session on that machine, which is exactly why it stopped
+            // being what a lease is keyed on.
+            .owner = lease.owner_request_id,
+            .ownerProfile = lease.profile_token,
             .expiresAt = lease.expires_at,
+            .forcedByProfile = forced_by_profile,
         }, .{}, &writer.writer) catch return error.OutOfMemory,
     }
     return writer.toOwnedSlice();

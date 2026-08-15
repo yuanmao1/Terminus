@@ -1,6 +1,15 @@
 //! Ownership leases (`leases`), so two agent sessions do not retry, restart
 //! or rewrite the same thing at once.
 //!
+//! **A lease is held by one attempt, named by its `request_id`.** Until v12 it
+//! was held by `policy.ownerToken`, a token minted once per machine profile and
+//! reused forever — so every agent, editor and terminal on one machine was the
+//! same owner, and `acquire` reads its own owner's overlap as a renewal. Two
+//! concurrent sessions therefore never conflicted: they renewed each other's
+//! locks, and the layer that exists to isolate peers isolated nothing. The
+//! profile token is still written on every row as `profile_token`, and is now
+//! purely the audit subject — who the machine was. It decides nothing.
+//!
 //! Three properties are deliberately enforced by the database rather than by
 //! convention:
 //!
@@ -59,10 +68,16 @@ pub const Lease = struct {
     server_id: i64,
     scope_kind: ScopeKind,
     scope_key: []const u8,
-    owner_token: []const u8,
+    /// Who holds it: the `request_id` of the attempt that took it. This — and
+    /// only this — decides whether an acquisition renews or conflicts.
+    owner_request_id: []const u8,
+    /// Which machine profile the holder was running as (`policy.ownerToken`).
+    /// Audit subject only: it is written, reported and never compared. Two
+    /// attempts on one machine share it, which is exactly why it cannot be the
+    /// thing a conflict is decided by.
+    profile_token: []const u8,
     owner_label: ?[]const u8,
     note: ?[]const u8,
-    request_id: ?[]const u8,
     acquired_at: i64,
     renewed_at: i64,
     expires_at: i64,
@@ -71,23 +86,43 @@ pub const Lease = struct {
         return .{ .kind = l.scope_kind, .key = l.scope_key };
     }
 
-    pub fn heldBy(l: Lease, owner_token: []const u8) bool {
-        return std.mem.eql(u8, l.owner_token, owner_token);
+    pub fn heldBy(l: Lease, owner_request_id: []const u8) bool {
+        return std.mem.eql(u8, l.owner_request_id, owner_request_id);
     }
 };
 
-pub const Error = Db.Error || error{ UnknownScopeKind, OutOfMemory };
+pub const Error = Db.Error || error{
+    UnknownScopeKind,
+    OutOfMemory,
+    /// A lease operation was handed an empty owner.
+    ///
+    /// Named rather than left to the schema's `CHECK`, because only the two
+    /// writers reach that CHECK: `conflictFor`, `renew` and `release` compare
+    /// the owner instead, and an empty one there silently matches every other
+    /// empty one — which is v11's "everybody is the same owner" defect
+    /// reappearing one column narrower. A caller with no attempt id has nothing
+    /// to hold a lease as, and that is a bug in the caller, not a conflict.
+    EmptyLeaseOwner,
+};
 
 pub const AcquireOptions = struct {
     server_id: i64,
     scope: Scope,
-    owner_token: []const u8,
+    /// The attempt taking the lease. Identity; see `Lease.owner_request_id`.
+    owner_request_id: []const u8,
+    /// The machine profile it is running as. Audit only; see
+    /// `Lease.profile_token`.
+    profile_token: []const u8,
     owner_label: ?[]const u8 = null,
     note: ?[]const u8 = null,
-    request_id: ?[]const u8 = null,
     ttl_secs: i64,
     now: i64,
 };
+
+/// Refuses an owner that names nobody, before it can be compared to anything.
+fn requireOwner(owner_request_id: []const u8) error{EmptyLeaseOwner}!void {
+    if (owner_request_id.len == 0) return error.EmptyLeaseOwner;
+}
 
 pub const AcquireOutcome = union(enum) {
     /// Freshly taken.
@@ -100,8 +135,8 @@ pub const AcquireOutcome = union(enum) {
 };
 
 const select_columns =
-    \\SELECT id, server_id, scope_kind, scope_key, owner_token, owner_label,
-    \\       note, request_id, acquired_at, renewed_at, expires_at
+    \\SELECT id, server_id, scope_kind, scope_key, owner_request_id, profile_token,
+    \\       owner_label, note, acquired_at, renewed_at, expires_at
     \\FROM leases
 ;
 
@@ -111,10 +146,10 @@ fn rowToLease(arena: Allocator, stmt: *Db.Stmt) Error!Lease {
         .server_id = stmt.columnInt(1),
         .scope_kind = try ScopeKind.parse(stmt.columnText(2)),
         .scope_key = try arena.dupe(u8, stmt.columnText(3)),
-        .owner_token = try arena.dupe(u8, stmt.columnText(4)),
-        .owner_label = if (stmt.columnOptText(5)) |v| try arena.dupe(u8, v) else null,
-        .note = if (stmt.columnOptText(6)) |v| try arena.dupe(u8, v) else null,
-        .request_id = if (stmt.columnOptText(7)) |v| try arena.dupe(u8, v) else null,
+        .owner_request_id = try arena.dupe(u8, stmt.columnText(4)),
+        .profile_token = try arena.dupe(u8, stmt.columnText(5)),
+        .owner_label = if (stmt.columnOptText(6)) |v| try arena.dupe(u8, v) else null,
+        .note = if (stmt.columnOptText(7)) |v| try arena.dupe(u8, v) else null,
         .acquired_at = stmt.columnInt(8),
         .renewed_at = stmt.columnInt(9),
         .expires_at = stmt.columnInt(10),
@@ -156,13 +191,14 @@ pub fn conflictForLocked(
     arena: Allocator,
     server_id: i64,
     target: Scope,
-    owner_token: []const u8,
+    owner_request_id: []const u8,
     now: i64,
 ) Error!?Lease {
+    try requireOwner(owner_request_id);
     try store.db.requireTransaction();
     try expireLapsedLocked(store, server_id, now);
     for (try activeLocked(store, arena, server_id)) |lease| {
-        if (lease.heldBy(owner_token)) continue;
+        if (lease.heldBy(owner_request_id)) continue;
         if (lease.scope().overlaps(target)) return lease;
     }
     return null;
@@ -207,42 +243,45 @@ pub fn activeCountLocked(store: *Store, server_id: i64, now: i64) Db.Error!i64 {
     return stmt.columnInt(0);
 }
 
-/// The lease blocking `scope`, if a *different* owner holds an overlapping
+/// The lease blocking `scope`, if a *different* attempt holds an overlapping
 /// one. This is what the write-operation guard calls.
 pub fn conflictFor(
     store: *Store,
     arena: Allocator,
     server_id: i64,
     scope: Scope,
-    owner_token: []const u8,
+    owner_request_id: []const u8,
     now: i64,
 ) Error!?Lease {
+    try requireOwner(owner_request_id);
     const held = try active(store, arena, server_id, now);
     for (held) |lease| {
-        if (lease.heldBy(owner_token)) continue;
+        if (lease.heldBy(owner_request_id)) continue;
         if (lease.scope().overlaps(scope)) return lease;
     }
     return null;
 }
 
 pub fn acquire(store: *Store, arena: Allocator, opts: AcquireOptions) Error!AcquireOutcome {
+    try requireOwner(opts.owner_request_id);
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
 
     try expireLapsedLocked(store, opts.server_id, opts.now);
     const held = try activeLocked(store, arena, opts.server_id);
 
-    // An overlapping lease held by someone else blocks us outright.
+    // An overlapping lease held by another attempt blocks us outright.
     for (held) |lease| {
-        if (!lease.heldBy(opts.owner_token) and lease.scope().overlaps(opts.scope)) {
+        if (!lease.heldBy(opts.owner_request_id) and lease.scope().overlaps(opts.scope)) {
             try store.db.exec("COMMIT"); // the expiry pass is worth keeping
             return .{ .conflict = lease };
         }
     }
     // Our own overlapping lease is a renewal, which is how a long operation
-    // holds its scope without a second row per heartbeat.
+    // holds its scope without a second row per heartbeat. "Our own" means the
+    // same `request_id` — one attempt — and not merely the same machine.
     for (held) |lease| {
-        if (lease.heldBy(opts.owner_token) and lease.scope().overlaps(opts.scope)) {
+        if (lease.heldBy(opts.owner_request_id) and lease.scope().overlaps(opts.scope)) {
             const renewed = try renewLocked(store, arena, lease.id, opts.ttl_secs, opts.now);
             try store.db.exec("COMMIT");
             return .{ .renewed = renewed };
@@ -263,8 +302,8 @@ pub fn acquire(store: *Store, arena: Allocator, opts: AcquireOptions) Error!Acqu
 /// whichever one happened to be looked at first.
 fn insertLocked(store: *Store, arena: Allocator, opts: AcquireOptions, supersedes: []const i64) Error!Lease {
     var stmt = try store.db.prepare(
-        \\INSERT INTO leases (server_id, scope_kind, scope_key, owner_token,
-        \\                    owner_label, note, request_id,
+        \\INSERT INTO leases (server_id, scope_kind, scope_key, owner_request_id,
+        \\                    profile_token, owner_label, note,
         \\                    acquired_at, renewed_at, expires_at)
         \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
     );
@@ -272,10 +311,10 @@ fn insertLocked(store: *Store, arena: Allocator, opts: AcquireOptions, supersede
     try stmt.bindInt(1, opts.server_id);
     try stmt.bindText(2, @tagName(opts.scope.kind));
     try stmt.bindText(3, opts.scope.key);
-    try stmt.bindText(4, opts.owner_token);
-    try stmt.bindOptText(5, opts.owner_label);
-    try stmt.bindOptText(6, opts.note);
-    try stmt.bindOptText(7, opts.request_id);
+    try stmt.bindText(4, opts.owner_request_id);
+    try stmt.bindText(5, opts.profile_token);
+    try stmt.bindOptText(6, opts.owner_label);
+    try stmt.bindOptText(7, opts.note);
     try stmt.bindInt(8, opts.now);
     try stmt.bindInt(9, opts.now + opts.ttl_secs);
     _ = try stmt.step();
@@ -298,10 +337,10 @@ fn insertLocked(store: *Store, arena: Allocator, opts: AcquireOptions, supersede
         .server_id = opts.server_id,
         .scope_kind = opts.scope.kind,
         .scope_key = try arena.dupe(u8, opts.scope.key),
-        .owner_token = try arena.dupe(u8, opts.owner_token),
+        .owner_request_id = try arena.dupe(u8, opts.owner_request_id),
+        .profile_token = try arena.dupe(u8, opts.profile_token),
         .owner_label = if (opts.owner_label) |v| try arena.dupe(u8, v) else null,
         .note = if (opts.note) |v| try arena.dupe(u8, v) else null,
-        .request_id = if (opts.request_id) |v| try arena.dupe(u8, v) else null,
         .acquired_at = opts.now,
         .renewed_at = opts.now,
         .expires_at = opts.now + opts.ttl_secs,
@@ -325,14 +364,15 @@ fn renewLocked(store: *Store, arena: Allocator, id: i64, ttl_secs: i64, now: i64
     return try rowToLease(arena, &read);
 }
 
-/// Extends an operation's own lease. Returns false when the lease is gone
+/// Extends an attempt's own lease. Returns false when the lease is gone
 /// (expired and taken over): a lost lease must be *visible*, not silently
 /// re-acquired underneath a peer.
-pub fn renew(store: *Store, server_id: i64, scope: Scope, owner_token: []const u8, ttl_secs: i64, now: i64) Error!bool {
+pub fn renew(store: *Store, server_id: i64, scope: Scope, owner_request_id: []const u8, ttl_secs: i64, now: i64) Error!bool {
+    try requireOwner(owner_request_id);
     var stmt = try store.db.prepare(
         \\UPDATE leases SET renewed_at = ?1, expires_at = ?2
         \\ WHERE server_id = ?3 AND scope_kind = ?4 AND scope_key = ?5
-        \\   AND owner_token = ?6 AND released_at IS NULL AND expires_at > ?1
+        \\   AND owner_request_id = ?6 AND released_at IS NULL AND expires_at > ?1
     );
     defer stmt.deinit();
     try stmt.bindInt(1, now);
@@ -340,7 +380,7 @@ pub fn renew(store: *Store, server_id: i64, scope: Scope, owner_token: []const u
     try stmt.bindInt(3, server_id);
     try stmt.bindText(4, @tagName(scope.kind));
     try stmt.bindText(5, scope.key);
-    try stmt.bindText(6, owner_token);
+    try stmt.bindText(6, owner_request_id);
     _ = try stmt.step();
     return store.db.changes() > 0;
 }
@@ -350,14 +390,15 @@ pub fn release(
     store: *Store,
     server_id: i64,
     scope: Scope,
-    owner_token: []const u8,
+    owner_request_id: []const u8,
     reason: ReleaseReason,
     now: i64,
 ) Error!bool {
+    try requireOwner(owner_request_id);
     var stmt = try store.db.prepare(
         \\UPDATE leases SET released_at = ?1, release_reason = ?2
         \\ WHERE server_id = ?3 AND scope_kind = ?4 AND scope_key = ?5
-        \\   AND owner_token = ?6 AND released_at IS NULL
+        \\   AND owner_request_id = ?6 AND released_at IS NULL
     );
     defer stmt.deinit();
     try stmt.bindInt(1, now);
@@ -365,7 +406,7 @@ pub fn release(
     try stmt.bindInt(3, server_id);
     try stmt.bindText(4, @tagName(scope.kind));
     try stmt.bindText(5, scope.key);
-    try stmt.bindText(6, owner_token);
+    try stmt.bindText(6, owner_request_id);
     _ = try stmt.step();
     return store.db.changes() > 0;
 }
@@ -424,6 +465,7 @@ pub const TakeoverOutcome = union(enum) {
 /// with no successor recorded, which reads as an expiry rather than as a
 /// seizure.
 pub fn takeover(store: *Store, arena: Allocator, opts: AcquireOptions) TakeoverError!TakeoverOutcome {
+    try requireOwner(opts.owner_request_id);
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
 
