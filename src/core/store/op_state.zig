@@ -280,6 +280,52 @@ pub const Terminal = union(enum) {
         /// How absence was established (e.g. "kill -0 -pgid => ESRCH").
         verification_method: []const u8,
     },
+    /// A live terminal accepted the caller's bytes, and that is the whole of
+    /// what was established.
+    ///
+    /// `terminus write` types input into a shell somebody else is running. The
+    /// remote answers exactly one question — did the terminal take these bytes
+    /// — and answers nothing else: the input may not have started, may not
+    /// parse, may run for an hour, may fail. There is no exit status anywhere
+    /// in that sentence, which is why this is a variant of its own rather than
+    /// `exited` with a zero in it. A receipt carrying `exit_code = 0` for a
+    /// write would say, in the column an auditor reads first, that a command
+    /// succeeded. None did; one was typed.
+    ///
+    /// What it carries is what was taken — the byte count and the digest of
+    /// exactly those bytes — because that is the only fact this terminal has.
+    /// They live in the evidence rather than in `receipts.TerminalExtra` so
+    /// that a receipt recording an acceptance cannot omit what was accepted,
+    /// the same reason `ResultRecordReading.foreign` carries its claimed id in
+    /// the type.
+    input_accepted: struct {
+        bytes: i64,
+        /// Hex SHA-256 of the accepted bytes.
+        sha256: []const u8,
+    },
+    /// A live terminal refused the caller's bytes *before the shell was
+    /// touched*, so they provably did not reach it.
+    ///
+    /// The negative counterpart of `input_accepted`, and a proven failure
+    /// rather than an unknown: the remote answered, and what it answered is
+    /// that there was nothing to type into.
+    ///
+    /// Deliberately not `never_submitted`. That variant claims the bytes never
+    /// left this machine; these did — the remote received them and declined to
+    /// deliver them — and `canSettle` refuses it after submission for exactly
+    /// that reason. Widening `never_submitted` instead would have let any
+    /// attempt claim, from `submitted`, that nothing was ever handed over.
+    ///
+    /// Only for an answer that establishes the shell was untouched. A remote
+    /// verdict that cannot tell "nothing was typed" from "the text landed and
+    /// what followed did not" is `indeterminate`, not this: a caller told
+    /// `failed` retries, and a retry types the same bytes into a pane that may
+    /// already hold them.
+    input_refused: struct {
+        /// What the remote answered, e.g. "the session does not exist".
+        reason: []const u8,
+        error_code: []const u8 = "INPUT_REFUSED",
+    },
     /// We cannot establish the remote outcome. Carries why, plus the last
     /// state we did observe, so reconcile knows where to look.
     indeterminate: struct {
@@ -295,6 +341,11 @@ pub const Terminal = union(enum) {
             .never_submitted => .failed,
             .remote_deadline => .timed_out,
             .local_abandon, .remote_cancel_confirmed => .cancelled,
+            // The operation is "hand these bytes to that terminal", and the
+            // terminal took them. Nothing about the input's own fate is
+            // claimed, here or anywhere else on the receipt.
+            .input_accepted => .completed,
+            .input_refused => .failed,
             .indeterminate => .indeterminate,
         };
     }
@@ -305,6 +356,8 @@ pub const Terminal = union(enum) {
             .never_submitted => |n| n.error_code,
             .remote_deadline => "REMOTE_DEADLINE",
             .local_abandon, .remote_cancel_confirmed => null,
+            .input_accepted => null,
+            .input_refused => |r| r.error_code,
             .indeterminate => |i| i.error_code,
         };
     }
@@ -370,6 +423,15 @@ pub fn canSettle(from: Status, terminal: Terminal) bool {
             .submitted, .remote_started => true,
             else => false,
         },
+        // A terminal's answer about bytes it was offered only exists once they
+        // were offered, and offering them *is* submission. Before that nothing
+        // has been handed over and there is nobody to have answered — an
+        // acceptance recorded from `created` would be a `completed` receipt
+        // for an attempt that never dialed.
+        .input_accepted, .input_refused => switch (from) {
+            .submitted, .remote_started => true,
+            else => false,
+        },
         // Only work that was in flight can become unknown, and the recorded
         // `last_observed` has to be the state we were actually in — otherwise
         // the field a reconciler navigates by would be fiction.
@@ -422,6 +484,18 @@ test canSettle {
     // Nothing settles an already-settled attempt.
     try t.expect(!canSettle(.completed, .{ .exited = .{ .exit_code = 0 } }));
     try t.expect(!canSettle(.indeterminate, .{ .exited = .{ .exit_code = 0 } }));
+
+    // A terminal's answer about bytes it was offered needs the bytes to have
+    // been offered, which is submission. Nothing before that has handed
+    // anything over, so there is nobody to have answered.
+    const accepted: Terminal = .{ .input_accepted = .{ .bytes = 5, .sha256 = "abc" } };
+    const refused: Terminal = .{ .input_refused = .{ .reason = "no such session" } };
+    try t.expect(canSettle(.submitted, accepted));
+    try t.expect(canSettle(.submitted, refused));
+    try t.expect(!canSettle(.created, accepted));
+    try t.expect(!canSettle(.connecting, accepted));
+    try t.expect(!canSettle(.created, refused));
+    try t.expect(!canSettle(.connecting, refused));
 }
 
 test "terminalForTransportLoss always produces settleable evidence" {
@@ -483,6 +557,27 @@ test "terminal evidence maps to status" {
         .absence_verified_at = 5,
         .verification_method = "ps",
     } }).status());
+    // A terminal took the bytes, and that is all. `completed` is the
+    // operation's own verdict — the bytes were delivered — and it carries no
+    // error code because nothing failed and no command was judged.
+    try t.expectEqual(
+        Status.completed,
+        (Terminal{ .input_accepted = .{ .bytes = 4, .sha256 = "abcd" } }).status(),
+    );
+    try t.expectEqual(
+        @as(?[]const u8, null),
+        (Terminal{ .input_accepted = .{ .bytes = 4, .sha256 = "abcd" } }).errorCode(),
+    );
+    // A refusal read before the shell was touched is a proven failure, and it
+    // is named as its own kind of failure rather than borrowing an exit code's.
+    try t.expectEqual(
+        Status.failed,
+        (Terminal{ .input_refused = .{ .reason = "no such session" } }).status(),
+    );
+    try t.expectEqualStrings(
+        "INPUT_REFUSED",
+        (Terminal{ .input_refused = .{ .reason = "no such session" } }).errorCode().?,
+    );
 }
 
 test canTransition {

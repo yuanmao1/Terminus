@@ -1078,7 +1078,17 @@ pub fn runCommand(
     } };
 }
 
-fn describe(executor: Executor, err: anyerror) []const u8 {
+/// The best available text for a transport failure.
+///
+/// The connection's own message when it has one, the error name otherwise —
+/// never both, and never an empty string standing in for "no reason given".
+///
+/// `pub` because `runCommand` is not the only caller that hands a transport
+/// error to `transportLoss`: a command whose remote act is a single tmux
+/// invocation (`terminus write`) drives the boundary step by step and reaches
+/// the same decision point with the same two sources of text. Two copies of
+/// "message, or else the error name" is how one of them comes to pass `""`.
+pub fn describe(executor: Executor, err: anyerror) []const u8 {
     const message = executor.errorMessage();
     return if (message.len > 0) message else @errorName(err);
 }

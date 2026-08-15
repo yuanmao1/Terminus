@@ -694,6 +694,40 @@ fn terminalEvent(
             event.transport_error = i.reason;
             event.timed_out = null;
         },
+        .input_accepted => |a| {
+            // What the terminal took, written from the evidence rather than
+            // from `extra`. A caller supplying its own reading of the same
+            // stream would leave the receipt holding two answers to the one
+            // question this terminal exists to answer, so it is refused the
+            // way `never_submitted` refuses a remote process.
+            if (extra.stdin.bytes != null or extra.stdin.sha256 != null or
+                extra.stdin.digest != null or extra.stdin.truncated)
+                return error.ContradictoryEvidence;
+            event.stdin = .{ .bytes = a.bytes, .sha256 = a.sha256 };
+            // No exit code, and none may be inferred from the absence: this
+            // operation delivered bytes, and nothing here judged a command.
+            // `timed_out = false` because no deadline was involved either.
+            event.timed_out = false;
+        },
+        .input_refused => |r| {
+            // The claim is that the shell was never touched, so no stream
+            // evidence may say bytes arrived and no remote process may be
+            // named — the same contradiction `never_submitted` refuses, one
+            // stage later.
+            if (extra.stdin.bytes != null or extra.stdin.sha256 != null or
+                extra.stdin.digest != null or extra.stdin.truncated)
+                return error.ContradictoryEvidence;
+            if (extra.remote_pid != null or extra.remote_pgid != null or extra.remote_start_token != null)
+                return error.ContradictoryEvidence;
+            // This column is the table's "what went wrong, in words" field —
+            // `never_submitted` and `indeterminate` both use it for reasons
+            // that are not always transport failures either. The machine-
+            // readable half is `error_code`, filled from `terminal.errorCode()`
+            // above.
+            event.transport_error = r.reason;
+            event.remote_started = false;
+            event.timed_out = false;
+        },
     }
     return event;
 }
@@ -1233,6 +1267,7 @@ pub const ResolutionEvidence = union(enum) {
             .supervisor_report => switch (kind) {
                 .exec,
                 .job,
+                .session_write,
                 .transfer_push,
                 .transfer_pull,
                 .fetch,
@@ -1277,6 +1312,17 @@ pub const ResolutionEvidence = union(enum) {
                 // becomes true again, and it should be reopened in the same
                 // change that makes it true rather than held open in advance.
                 .job => false,
+                // A `session_write` records no process at all, and there is no
+                // shape in which it could: `Tmux.sendKeys` runs one tmux
+                // command and reports nothing about the pane, let alone about
+                // whatever the shell went on to fork. So there is nothing for
+                // a probe to be a reading *of* — `resolve` would find no
+                // recorded identity and refuse with `evidence_wrong_process`
+                // anyway, and this cell says why that is the permanent answer
+                // rather than a gap somebody should fill by recording the
+                // pane's pid. The pane's pid is not the input's process; that
+                // mistake is the one the `.job` cell above was closed for.
+                .session_write => false,
                 // A transfer writes down a destination and a digest, not a
                 // process. "It is no longer running" is equally true of a
                 // transfer that finished and one that died mid-rename, and
@@ -1293,9 +1339,29 @@ pub const ResolutionEvidence = union(enum) {
             // for any other kind of operation, so one turning up against a
             // transfer or a fetch means the evidence was misrouted, not that
             // the operation is settled.
+            //
+            // A `session_write` is the case worth naming, because it is the
+            // one kind that shares a mechanism with a job and still admits
+            // neither: `cmd_job` types its launch line into a tmux session
+            // exactly as `write` types the operator's, and the job's two
+            // evidence chains come from the *wrapper* that line carries — a
+            // sentinel echoed after the command, a sidecar written at an
+            // address derived from the request id. A write carries no wrapper.
+            // Nothing it types is obliged to echo anything, and an operator
+            // who typed a wrapper of their own would be offering a document
+            // this binary never asked any host to produce.
             .job_result, .job_sentinel => switch (kind) {
                 .job => true,
-                .exec, .transfer_push, .transfer_pull, .fetch, .tunnel, .plan_phase, .audit, .cleanup => false,
+                .exec,
+                .session_write,
+                .transfer_push,
+                .transfer_pull,
+                .fetch,
+                .tunnel,
+                .plan_phase,
+                .audit,
+                .cleanup,
+                => false,
             },
             // A file read at a path and hashed. It can only mean anything for
             // work that said in advance which file would prove it — `resolve`
@@ -1304,7 +1370,7 @@ pub const ResolutionEvidence = union(enum) {
             // arbitrary command did what it was asked.
             .filesystem_effect => switch (kind) {
                 .transfer_push, .transfer_pull, .fetch => true,
-                .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => false,
+                .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => false,
             },
             // The same address, read and found empty. Only work that named a
             // destination in advance can be spoken about this way — `resolve`
@@ -1324,7 +1390,7 @@ pub const ResolutionEvidence = union(enum) {
             .destination_present_contradicting,
             => switch (kind) {
                 .transfer_push, .transfer_pull, .fetch => true,
-                .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => false,
+                .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => false,
             },
             // A human's decision, and the only variant that is about the
             // *operation* rather than about some mechanism's output — so there
@@ -1355,10 +1421,38 @@ pub const ResolutionEvidence = union(enum) {
             // are available to the operator who checked by hand — that is the
             // same act with the reading attached — so the limit is a requirement
             // to say what was seen.
-
+            //
+            // `session_write` is the newest kind for which this is the *only*
+            // admissible cell, and unlike a `tunnel` that is not because
+            // nothing creates one — `terminus write` creates one every time it
+            // runs. It is because a write's own terminal
+            // (`op_state.Terminal.input_accepted`) settles it at the moment the
+            // remote answers, so the only writes that reach a reconcile are the
+            // ones whose answer was lost, and about *those* no mechanism on
+            // this host or that one has anything to say. The bytes are either
+            // in a pane or they are not; nothing recorded which.
+            //
+            // **What a future mechanical producer would have to bind itself
+            // to**, written here for the reason `supervisor_report`'s refusal
+            // is: an operator arriving to widen a cell should find the terms
+            // rather than invent them. A write records exactly two things
+            // about itself before it sends — the session it is aimed at
+            // (`operations.alias`, and the scope key, which are the same
+            // string) and the digest of the bytes it is about to type
+            // (`operations.argv_sha256`). So evidence that could speak for a
+            // `session_write` has to be a reading of *that pane* carrying
+            // *that digest*, checked in `resolve` against those two columns
+            // before `supports` runs, and refused with a named identity
+            // outcome the way `evidence_wrong_sentinel` is. What would not do:
+            // a reading of the pane alone — every write to a busy session
+            // would match it, which is the "compares a value against itself"
+            // shape — or a marker the *operator's own input* was asked to
+            // echo, since nothing makes an operator type one and a write that
+            // did not is exactly the write nobody can settle.
             .operator_override => switch (kind) {
                 .exec,
                 .job,
+                .session_write,
                 .transfer_push,
                 .transfer_pull,
                 .fetch,

@@ -29,6 +29,14 @@ pub const schema_version: i64 = 1;
 pub const Kind = enum {
     exec,
     job,
+    /// Bytes typed into a live session's shell (`terminus write`).
+    ///
+    /// Named for the act rather than for its effect, because the effect is not
+    /// knowable from here: the terminal takes the bytes and says nothing about
+    /// what the shell then makes of them. Everything downstream of this name —
+    /// the terminal receipt, what evidence may settle it — is built on that
+    /// gap. See `op_state.Terminal.input_accepted`.
+    session_write,
     transfer_push,
     transfer_pull,
     fetch,

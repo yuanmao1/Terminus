@@ -928,3 +928,108 @@ test "M2 gate: reconciliation releases a scope only with evidence" {
     defer second.deinit();
     try t.expect(again == .ready);
 }
+
+test "M4 gate: a write holds its session's scope, in both directions" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m4_write_scope");
+    defer h.deinit();
+
+    // `terminus write` names its scope the way `terminus exec
+    // <server>:<session>` does (cmd_exec.zig:82). One vocabulary, so a write
+    // and a run on the same session see each other; two would be a hole, not a
+    // detail.
+    const build: scope_mod.Scope = .{ .kind = .job, .key = "build" };
+    const other: scope_mod.Scope = .{ .kind = .job, .key = "deploy" };
+
+    // A run on that session whose outcome was lost.
+    {
+        const start = try h.begin(.{ .kind = .job, .scope = build, .alias = "build" });
+        var exec = start.ready;
+        try exec.connecting();
+        try mustSubmit(&exec);
+        _ = try exec.transportLoss("eof");
+    }
+
+    // The write is refused before it dials, and told what is in the way. This
+    // is the whole point of routing it through the boundary: until now it
+    // typed into the shell regardless and printed `ok`.
+    const blocked = try h.begin(.{ .kind = .session_write, .scope = build, .alias = "build" });
+    try t.expectEqual(op_state.Status.indeterminate, blocked.blocked.unsettled.status);
+
+    // A write to a *different* session is unaffected — the barrier is the
+    // session's, not the host's.
+    const elsewhere = try h.begin(.{ .kind = .session_write, .scope = other, .alias = "deploy" });
+    var elsewhere_exec = elsewhere.ready;
+    defer elsewhere_exec.deinit();
+    try t.expect(elsewhere == .ready);
+
+    // And the write is subject to the barrier in the other direction too: an
+    // unsettled write blocks a run on the same session, because bytes that may
+    // be in a pane are exactly the case a second launch must not walk into.
+    try elsewhere_exec.connecting();
+    try mustSubmit(&elsewhere_exec);
+    _ = try elsewhere_exec.transportLoss("eof");
+    const run_blocked = try h.begin(.{ .kind = .job, .scope = other, .alias = "deploy" });
+    try t.expectEqualStrings(elsewhere_exec.id(), run_blocked.blocked.unsettled.request_id);
+}
+
+test "M4 gate: a delivered write is a delivery, not an outcome" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m4_write_terminal");
+    defer h.deinit();
+
+    const scope: scope_mod.Scope = .{ .kind = .job, .key = "build" };
+    const start = try h.begin(.{ .kind = .session_write, .scope = scope, .alias = "build" });
+    var exec = start.ready;
+    defer exec.deinit();
+    try exec.connecting();
+    try mustSubmit(&exec);
+
+    _ = try exec.settle(.{ .input_accepted = .{ .bytes = 9, .sha256 = "beef" } }, .{});
+
+    const op = try h.operationOf(exec.id());
+    try t.expectEqual(op_state.Status.completed, op.status);
+    // Completed, and it releases the scope — which is correct and is the
+    // reason the receipt has to be so careful about what it claims. The
+    // operation ("hand these bytes to that terminal") really is over; the
+    // input it delivered may run for an hour, and nothing in this ledger will
+    // ever say how that went.
+    try t.expect(!op.effectiveStatus().blocksScope());
+
+    const row = try h.terminalRow(exec.id());
+    try t.expectEqual(@as(?i64, null), row.exit_code);
+    try t.expectEqual(@as(?[]const u8, null), row.error_code);
+    try t.expectEqual(@as(?i64, 9), row.stdin_bytes);
+    try t.expectEqualStrings("beef", row.stdin_sha256.?);
+    // Nothing was read back out of the session, and the receipt says so by
+    // carrying no output evidence at all rather than a zero.
+    try t.expectEqual(@as(?i64, null), row.stdout_bytes);
+    // `finished_at` answers "when did the remote work end". A delivery has no
+    // such moment to report, and the time we looked is `observed_at`.
+    try t.expectEqual(@as(?i64, null), row.finished_at);
+}
+
+test "M4 gate: a write whose answer was lost stays unknown, and holds its session" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "m4_write_lost");
+    defer h.deinit();
+
+    const scope: scope_mod.Scope = .{ .kind = .job, .key = "build" };
+    const start = try h.begin(.{ .kind = .session_write, .scope = scope, .alias = "build" });
+    var exec = start.ready;
+    try exec.connecting();
+    try mustSubmit(&exec);
+
+    // The connection broke after the bytes were handed over. They may be in
+    // the pane. `failed` here would tell an agent it is safe to type them
+    // again, which is the one conclusion that is not available.
+    _ = try exec.transportLoss("channel closed");
+    const op = try h.operationOf(exec.id());
+    try t.expectEqual(op_state.Status.indeterminate, op.status);
+    try t.expect(op.effectiveStatus().blocksScope());
+
+    // And a second write to the same session is refused rather than repeating
+    // the input.
+    const again = try h.begin(.{ .kind = .session_write, .scope = scope, .alias = "build" });
+    try t.expectEqualStrings(exec.id(), again.blocked.unsettled.request_id);
+}

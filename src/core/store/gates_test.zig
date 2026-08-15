@@ -2945,6 +2945,25 @@ fn pinnedCell(kind: Store.operations.Kind, tag: EvidenceTag) bool {
             .destination_present_contradicting,
             => false,
         },
+        // Bytes typed into somebody else's shell. It records no process, no
+        // sentinel, no sidecar and no destination — the only thing it ever
+        // knew was that a terminal took some bytes, and its own terminal
+        // receipt says so at the moment it happens. A write that reaches a
+        // reconcile is one whose answer was lost, and nothing mechanical has
+        // anything to say about those: the bytes are in a pane or they are
+        // not, and nothing recorded which.
+        .session_write => switch (tag) {
+            .operator_override => true,
+            .supervisor_report,
+            .process_probe,
+            .job_sentinel,
+            .job_result,
+            .filesystem_effect,
+            .destination_absent,
+            .destination_present_unverified,
+            .destination_present_contradicting,
+            => false,
+        },
         // A transfer's outcome is a fact about a file at a declared
         // destination — that it is there and right, that it is there and
         // wrong, that it is there and uncheckable, or that it is not there.
@@ -3040,10 +3059,191 @@ test "gate: every kind × evidence cell is decided, and none of them by default"
         // Every kind keeps its escape hatch. A kind with no admissible
         // evidence at all would hold its scope forever with no way out, which
         // is the trap `request reconcile` exists to prevent — and with the two
-        // refusals above, four of the nine kinds now have this as their only
+        // refusals above, five of the ten kinds now have this as their only
         // admissible evidence.
         try t.expect(sampleEvidence(.operator_override).appliesToKind(kind));
     }
+
+    // The newest of those five, stated as its own claim because it is the only
+    // one that is reachable today: `terminus write` creates a `session_write`
+    // every time it runs, while nothing in this binary creates a `tunnel`, a
+    // `plan_phase`, an `audit` or a `cleanup`. So this is not "no producer has
+    // been built yet" — it is that a write records nothing a later mechanism
+    // could be a reading of, and the only writes that ever reach a reconcile
+    // are the ones whose answer was lost.
+    inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
+        const tag: EvidenceTag = @field(EvidenceTag, field.name);
+        const admissible = sampleEvidence(tag).appliesToKind(.session_write);
+        try t.expectEqual(tag == .operator_override, admissible);
+    }
+}
+
+test "gate: a delivered write records what was taken, and no exit status" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_write_accepted");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("wraccept");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .session_write);
+
+    // Nothing has been offered to a terminal before submission, so nothing can
+    // have answered. The two answers are refused by different guards, and the
+    // difference is worth pinning: `input_accepted` claims `completed`, which
+    // the transition graph already forbids from `created`, while
+    // `input_refused` claims `failed` — a status `created` may legally reach,
+    // via `never_submitted`. So the *only* thing standing between an attempt
+    // that never dialed and a receipt saying a remote terminal turned it away
+    // is `canSettle`.
+    {
+        const early = testId("wrearly");
+        const early_id: []const u8 = &early;
+        try Store.operations.create(&store, .{
+            .request_id = early_id,
+            .server_id = 1,
+            .server_name = "race",
+            .kind = .session_write,
+            .now = 100,
+        });
+        try t.expectError(error.IllegalTransition, Store.receipts.settle(&store, early_id, .{
+            .input_accepted = .{ .bytes = 7, .sha256 = "d0" },
+        }, .{}, 150));
+        try t.expectError(error.EvidenceDoesNotFit, Store.receipts.settle(&store, early_id, .{
+            .input_refused = .{ .reason = "no such session" },
+        }, .{}, 151));
+        try Store.operations.advance(&store, early_id, .connecting, 152);
+        try t.expectError(error.EvidenceDoesNotFit, Store.receipts.settle(&store, early_id, .{
+            .input_refused = .{ .reason = "no such session" },
+        }, .{}, 153));
+    }
+
+    const outcome = try Store.receipts.settle(&store, request_id, .{
+        .input_accepted = .{ .bytes = 12, .sha256 = "aabbcc" },
+    }, .{}, 200);
+    try t.expectEqual(op_state.Status.completed, outcome.recorded.status);
+
+    const row = try terminalRowOf(&store, arena, request_id);
+    // The whole point of the variant. `exited` is the only other route to
+    // `completed`, and it writes a zero here — a number an auditor reads as
+    // "the command succeeded" on a receipt where no command was judged.
+    try t.expectEqual(@as(?i64, null), row.exit_code);
+    try t.expectEqual(@as(?i64, null), row.term_signal);
+    try t.expectEqual(@as(?[]const u8, null), row.error_code);
+    try t.expectEqual(@as(?bool, false), row.timed_out);
+    try t.expectEqual(@as(?bool, false), row.remote_started);
+    // What *was* established, in the columns that describe the input stream.
+    try t.expectEqual(@as(?i64, 12), row.stdin_bytes);
+    try t.expectEqualStrings("aabbcc", row.stdin_sha256.?);
+
+    // A caller may not supply a second reading of the same stream: the receipt
+    // would then hold two answers to the one question this terminal exists to
+    // answer, and nothing says which the ledger meant.
+    const second = testId("wrdouble");
+    const second_id: []const u8 = &second;
+    try Store.operations.create(&store, .{
+        .request_id = second_id,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .session_write,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, second_id, .connecting, 101);
+    try Store.operations.advance(&store, second_id, .submitted, 102);
+    try t.expectError(error.ContradictoryEvidence, Store.receipts.settle(&store, second_id, .{
+        .input_accepted = .{ .bytes = 12, .sha256 = "aabbcc" },
+    }, .{ .stdin = .{ .bytes = 999 } }, 210));
+}
+
+test "gate: a refused write is a proven failure, and only a human can reconcile a lost one" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_write_refused");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("wrrefuse");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .session_write);
+
+    // The remote answered before it touched a pane, so the bytes provably did
+    // not reach the shell. That is a failure with a name of its own — not an
+    // exit code borrowed from a command nobody ran, and not `never_submitted`,
+    // which claims the bytes never left this machine.
+    const outcome = try Store.receipts.settle(&store, request_id, .{
+        .input_refused = .{ .reason = "the remote tmux session does not exist" },
+    }, .{}, 200);
+    try t.expectEqual(op_state.Status.failed, outcome.recorded.status);
+
+    const row = try terminalRowOf(&store, arena, request_id);
+    try t.expectEqual(@as(?i64, null), row.exit_code);
+    try t.expectEqualStrings("INPUT_REFUSED", row.error_code.?);
+    try t.expectEqualStrings("the remote tmux session does not exist", row.transport_error.?);
+    // Nothing arrived, so no stream evidence may say otherwise.
+    try t.expectEqual(@as(?i64, null), row.stdin_bytes);
+    try t.expectEqual(@as(?bool, false), row.remote_started);
+
+    // A write whose answer was lost is `indeterminate`, and the only evidence
+    // that may release its scope is a human saying what they saw. A job's
+    // exit status is the tempting one — a write and a job both type into a
+    // tmux session — and it is refused by category, before anything asks
+    // whether the document is this operation's.
+    const lost = testId("wrlost");
+    const lost_id: []const u8 = &lost;
+    try Store.operations.create(&store, .{
+        .request_id = lost_id,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .session_write,
+        .now = 100,
+    });
+    try Store.operations.advance(&store, lost_id, .connecting, 101);
+    try Store.operations.advance(&store, lost_id, .submitted, 102);
+    _ = try Store.receipts.settle(
+        &store,
+        lost_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        210,
+    );
+
+    switch (try Store.receipts.resolve(&store, arena, lost_id, .completed, .{
+        .job_result = .{ .request_id = lost_id, .exit_code = 0 },
+    }, 220)) {
+        .evidence_wrong_kind => |refusal| {
+            try t.expectEqualStrings("session_write", refusal.operation_kind);
+            try t.expectEqualStrings("job_result", refusal.evidence_kind);
+        },
+        else => return error.WrongKindEvidenceAdmitted,
+    }
+    // The escape hatch is open, and it is legible as a human's decision: the
+    // reconcile event is stamped as an override rather than passing for proof.
+    try t.expect((try Store.receipts.resolve(&store, arena, lost_id, .completed, .{
+        .operator_override = .{ .reason = "read the pane by hand", .by = "tester" },
+    }, 230)) == .resolved);
+    const rows = try Store.receipts.list(&store, arena, lost_id);
+    const last = rows[rows.len - 1];
+    try t.expectEqualStrings("reconcile", last.kind);
+    try t.expectEqualStrings("OPERATOR_OVERRIDE", last.error_code.?);
+}
+
+/// The one terminal row of an operation, for gates that assert its shape.
+fn terminalRowOf(
+    store: *Store,
+    arena: std.mem.Allocator,
+    request_id: []const u8,
+) !Store.receipts.Row {
+    for (try Store.receipts.list(store, arena, request_id)) |row| {
+        if (row.is_terminal) return row;
+    }
+    return error.NoTerminalRecorded;
 }
 
 test "gate: a report about a process cannot settle a transfer" {
