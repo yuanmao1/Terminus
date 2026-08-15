@@ -20,7 +20,7 @@
 | 7.1 | closing the `filesystem_effect` laundering hole | **A**, tightened further | **implemented** (`212289e`) |
 | 7.2 | a terminal for a locally-published artifact | **A** — new `Terminal.local_effect` | not started |
 | 7.3 | HTTP fetch in M3a or M3b | **defer to M3b** | not started |
-| 7.4 | reshaping `transfer_checkpoints` | **A** — new migration, drop and recreate | not started; gated on the row-count audit below |
+| 7.4 | reshaping `transfer_checkpoints` | **A** — new migration, drop and recreate | **implemented** (`14c8a2d`, amended by `2b670a9`) |
 | 7.5 | what happens to `terminus sync` | **port onto the artifact primitive** | not started |
 | 7.6 | the `history` table's last two writers | **B**, scheduled for **M4**, not M3 | not started |
 | 7.7 | where the streaming seam lives | **A** — on `Executor`, `daemon` refuses loudly | not started |
@@ -38,33 +38,171 @@ picking between them would turn insertion order into a scope-releasing
 decision. §7.4's `UNIQUE(request_id)` is what makes that case unreachable
 rather than merely refused.
 
-**Still open before §7.4 can be implemented:** the claim that
-`transfer_checkpoints` is empty everywhere rests on "the current source has no
-writer", which does not establish anything about databases written by earlier
-builds or by hand. The real database must be enumerated read-only and its row
-count established before any drop-and-recreate DDL is written.
+**Settled, and the residual risk moved into the code.** The audit below was
+run before the drop-and-recreate DDL was written; it found no checkpoint row
+in any store outside this repo's test scratch, and the v11 migration records
+that in its own comment (`src/core/store/migrate.zig:413-418`). A database
+this census never reached is no longer covered by the audit but by a refusal:
+`checkBeforeApply` returns `error.CheckpointsWouldBeDropped` for any store
+below v11 that still holds checkpoint rows, and runs before `apply` rather
+than after it, so such a store is refused rather than silently emptied
+(`migrate.zig:626-630, 679-689`).
 
-### 7.0.1 The row-count audit (read-only, 2026-08-14)
+### 7.0.1 The store census (read-only, 2026-08-14; re-run 2026-08-15)
 
-Every SQLite database on this machine that could be a Terminus store was
-opened with `mode=ro` and counted. Nothing was written.
+Reproduce with exactly this:
 
-| Database | `user_version` | has `transfer_checkpoints` | rows |
+```
+python tools/enumerate_stores.py --json docs/evidence/store-census.json
+```
+
+The artifact that command writes is at `docs/evidence/store-census.json` —
+regenerated 2026-08-15 and **not yet committed** (`docs/evidence/` is
+untracked, and `tools/enumerate_stores.py` has uncommitted changes, so
+re-running from HEAD produces the older JSON shape) — and every number below is
+in it. Commit both, or this section's evidence is not reproducible from the
+repository. The script prints its own scope, which is the
+point: the first version of this audit was an ad-hoc command whose answer —
+"there is no non-test row anywhere" — was unfalsifiable, and wrong in two
+places besides.
+
+**The scope is part of the claim, so it is stated inside the claim.** Seven
+roots were searched — `%APPDATA%/terminus`, `%TEMP%`, `~/.terminus`,
+`~/Desktop`, `~/Downloads`, `~/Documents`, and this repo — to a depth of six
+directories below each, skipping `node_modules`, `.git`, `.venv`, `venv`,
+`__pycache__` and `.codegraph` by directory name and `AppData/Local/Google`,
+`AppData/Local/Microsoft`, `AppData/Local/Mozilla`, `playwright_chromium`,
+`pw-apply-profile`, `codex-apply-extension` by path fragment. An eighth root,
+`%LOCALAPPDATA%/terminus`, does not exist on this machine and was therefore
+**not** searched; the script now reports absent roots rather than dropping
+them, so a mistyped `--root` can no longer yield a confident census of
+somewhere else. Three directories refused to open
+(`%USERPROFILE%/Documents/My Pictures`, `My Music`, `My Videos`), two files
+refused on permission, and eighteen directories vanished mid-walk under a
+concurrent build; those 23 paths are holes and each is listed with its error
+in the artifact's `unexaminable`. So everything below is quantified over *the
+databases those seven roots reach at that depth* — never over "this machine".
+
+A file counts as a Terminus store when it has the
+`servers`+`keys`+`memories`+`facts` tables, and it becomes a candidate by
+carrying the 16-byte SQLite header rather than by being named `*.db`. The old
+name filter was a hole on its face: a copy can be called anything, and most of
+the SQLite databases under these roots are named something other than `*.db` —
+some of them are called `Login Data`. That breakdown is not in the artifact and
+never has been: the script states it in a docstring
+(`tools/enumerate_stores.py:266`) and does not compute it, so it is an argument
+here rather than a number. Of **106,827** files seen, 100,218 were rejected on
+size alone (a whole SQLite database is an exact number of pages, so its size is
+always a non-zero multiple of 512), 6,379 were opened and sniffed — two of
+which could not be read at all and are recorded in `unexaminable` as holes —
+**417 carry the SQLite header**, and **113 of those are Terminus stores**: 8
+listed one by one and 105 repo-scratch stores with no checkpoint row,
+summarised. Not one SQLite file refused to open: the 306 "unreadable"
+candidates the first census reported were files that are not databases at all,
+which is not evidence of anything. That distinction is kept — a database that
+will not open is a hole and is printed loudly; a file that was never a database
+is merely counted.
+
+| Store | `user_version` | `transfer_checkpoints` | rows |
 |---|---|---|---|
-| `%APPDATA%/terminus/terminus.db` (the real one, 362 MB) | **4** | **no — the table does not exist** | — |
-| `%TEMP%/m1test.db` (M1 dev store) | 7 | yes | 0 |
-| 14 × `.zig-cache/tmp/*.db` (gate scratch left by crashed runs) | 9–10 | yes | 2 total |
+| `%APPDATA%/terminus/terminus.db` — the real one, 363,249,664 bytes | **4** | absent | — |
+| `%TEMP%/f0.db`, `%TEMP%/t.db` — empty dev scratch | 11 | yes | 0 |
+| `%TEMP%/t0.db` — empty dev scratch, table present at version 0 | 0 | yes | 0 |
+| 4 × `<repo>/.zig-cache/tmp/gate_*.db` — gate scratch | 10–11 | yes | **1** each |
+| 105 × `<repo>/.zig-cache/tmp/*.db` — gate scratch, summarised | — | — | 0 |
 
-The two rows are in `gate_job_evidence_kind_*.db`, written minutes earlier by
-the transfer gate in this repo's own test run. There is no non-test row
-anywhere.
+Four stores sit outside this repo's test scratch and not one of them holds a
+checkpoint row; 109 are repo scratch and four of those do. Stores in the
+scratch that hold no row are summarised as a count rather than listed, because
+a full test run leaves dozens and the only interesting fact about them is
+which hold a row. Every path in the artifact is tokenised (`<repo>`, `%TEMP%`,
+`%APPDATA%`, `%USERPROFILE%`, `<user>`), so no absolute path or account name
+is committed.
 
-Two things follow. The drop-and-recreate is safe — this is now established
-rather than inferred. And the real store has never been opened by a 0.2.0
-build at all: it will run v5 → v11 in one go the first time one touches it,
-creating `transfer_checkpoints` at v6 and replacing it at v11 with nothing in
-it. The migration still has to be correct for a store that stopped anywhere in
-v6–v10, because the dev stores above are exactly that.
+**All four checkpoint rows are gate fixtures, and all four are in this repo's
+test scratch.** Their request ids are `PVSH0000000000000000000000` (twice),
+`ABSENT00000000000000000000` and `PR0CPVSH000000000000000000` — what
+`testId()` returns for the labels `push`, `absent` and `procpush` once it maps
+`O`→`0` and `U`→`V` (`src/core/store/gates_test.zig:278`) — and no real ULID
+is shaped like that. The census copies request ids into the artifact, so that
+sentence can be checked by reading the JSON instead of being taken on trust;
+it deliberately copies nothing else about the row, so the id shape is the
+whole of the claim.
+
+**The one checkpoint row this audit found outside the repo's scratch is gone
+with its file.** `%TEMP%/rotest.db` — a dev store at `user_version` 10 holding
+a single fixture row, created and last written 2026-08-14 14:02:17, which no
+test, tool or script in this repo names — was deleted between the 2026-08-14
+census and its 2026-08-15 re-run, and does not appear in the regenerated
+artifact. It is the reason the first run of this census exited 1 and the
+reason the second exits 0. What wrote it was never established, and now cannot
+be.
+
+**Two stores were missed by the first audit, not three.** `%TEMP%/v4copy.db`
+(created 2026-08-13 15:32:14) and the OCP-Catalog store (created 2026-07-28
+13:19:26) both existed when that audit ran and neither appears in its table.
+`%TEMP%/rotest.db` was not missed, because there was nothing there to find:
+Windows records its creation at 2026-08-14 14:02:17, 75 minutes after the audit
+was committed (`2f86f89`, 12:47:21 +0800).
+
+**The census is a gate, and it is now green.** It exits 1 when a checkpoint
+row exists in any store outside this repo's `.zig-cache` scratch — precisely
+the condition under which the v11 drop-and-recreate would destroy something
+(`tools/enumerate_stores.py:533, 585-588`). No store outside the repo's
+scratch holds one: the four such stores are three empty `%TEMP%` dev scratch
+databases and the real store, which has no `transfer_checkpoints` table at
+all. So the run above exits 0, and that is what cleared the v11 DDL to be
+written.
+
+**What "read-only" is measured to mean, rather than asserted to mean.** Every
+candidate's `.db`, `-wal` and `-shm` is digested — size, mtime_ns, and SHA-256
+of the file or of its first and last 4 KiB — before the run and again after. In
+the run recorded in that artifact, **205** `-shm` files changed mtime — the
+only category in `filesystem_effect.by_category` — across the **1,251**
+database, `-wal` and `-shm` files digested before and after, and **no database
+file changed in size, mtime or content, and no `-wal` gained a byte**. That is the
+entire effect. A `mode=ro` reader of a WAL-mode database does create an empty
+`-wal` and a 32 KiB `-shm` where none existed, and does move read marks inside
+an existing `-shm`: an earlier run of this same script created 85 empty `-wal`
+and 92 `-shm` sidecars that way. "Nothing was written" is therefore true of
+business data and false of the filesystem taken literally, and the census
+cannot tell its own effect from a concurrent writer's — which is why it reports
+the difference instead of promising there isn't one.
+
+**The two plaintext copies this audit found are gone.** `%TEMP%/v4copy.db` —
+361,644,032 bytes, `user_version` 7, 12 rows in `keys` — and the second real
+store under `~/Desktop/drafts/OCP-Catalog/.codex-work/terminus/`, which held
+11 more, were both deleted between the 2026-08-14 census and its 2026-08-15
+re-run: neither file is on disk and neither appears in the regenerated
+artifact, whose only store with key material is the real one (`keys: 12`).
+Terminus still stores private keys and passphrases in plaintext, so what
+stands is the hazard rather than the instance: the only surviving copy of the
+e2e fixture key recorded in `MEMORY.md` now lives in the real store alone, and
+any future copy of that store is twelve private keys in whatever directory it
+is left in.
+
+**Two things follow for the migration.** The real store has never been opened
+by a 0.2.0 build — it is still `user_version` 4 and has no
+`transfer_checkpoints` at all — so it will run v5 → v11 in one go the first
+time anything touches it, creating the table at v6 and replacing it at v11
+with nothing in it. And the migration must still be correct for a store that
+stopped anywhere in v6–v10: two of the eight individually enumerated stores
+are exactly that, both repo scratch at v10, and both hold a fixture row. The
+versions of the 105 summarised scratch stores are not in the artifact. For
+those stores the rule is no longer "be correct" but "refuse":
+`checkBeforeApply` returns `error.CheckpointsWouldBeDropped` before any DDL
+runs (`src/core/store/migrate.zig:679-689`).
+
+**Rehearsed, not assumed.** A copy of the real 362 MB store was migrated v4 →
+v11 with the built binary: 0.8 s, `user_version` 11, all seven table counts
+identical across the migration (13 servers, 12 keys, 142 memories, 45 facts,
+959 jobs, 39 279 history, 6 sessions), `integrity_check` ok,
+`foreign_key_check` clean, key material intact — including the 1679-byte PEM
+that `MEMORY.md` records as the only surviving copy of the e2e fixture key. The
+copy was deleted immediately afterwards because it contained that key in
+plaintext. Those seven counts are the rehearsal's snapshot rather than a
+standing fact: the live store has been written since and now holds 960 jobs and
+39 369 history rows.
 
 ---
 
@@ -110,8 +248,8 @@ path (`src/core/ssh/Client.zig:410-425`).
 `Store.history.add(...) catch {}` at `src/cli/cmd_transfer.zig:77-83` and
 `src/cli/cmd_sync.zig:59-67`, on the success path only, with
 `.exit_code = 0` hardcoded (`cmd_transfer.zig:80`, `cmd_sync.zig:64`) and the
-write error swallowed. `src/cli/cli.zig:197` already names this pattern as the
-thing `receiptFatal` exists to replace.
+write error swallowed. `src/cli/cli.zig:222` already names this pattern as the thing `receiptFatal`
+(`src/cli/cli.zig:226`) exists to replace.
 
 **D5 — a stderr read error is treated as EOF, discarding the remote's
 diagnosis.** `drainBoth` at `src/core/ssh/Client.zig:338`:
@@ -142,13 +280,28 @@ leaves nothing.
 **D9 — total ledger bypass.** Neither `cmd_transfer.zig` nor `cmd_sync.zig`
 references `Core.execution`. No `request_id`, no scope guard, no receipt, no
 reconcile. `operations.Kind.transfer_push`, `.transfer_pull` and `.fetch`
-(`src/core/store/operations.zig:32-34`) have zero users;
-`transfer_checkpoints` (`src/core/store/migrate.zig:195-224`) has zero writers
-repo-wide; `ResolutionEvidence.filesystem_effect`
-(`src/core/store/receipts.zig:618`) has zero constructors.
+(`src/core/store/operations.zig:32-34`) are now required by
+`transfers.create_sql`, which refuses an insert whose operation kind does not
+match the checkpoint's direction (`transfers.zig:1321-1323`, and again on
+handover at `:2458-2460`), and by every arm of `receipts.appliesToKind`
+(`receipts.zig:1169-1370`). `transfer_checkpoints` is dropped and recreated by
+v11 (`src/core/store/migrate.zig:442-511`; the v6 table at `:195-224` is what
+it replaces), and `transfers.zig` is its only writer outside test fixtures:
+one INSERT at `transfers.zig:1308` and eight UPDATEs (`:1678`, `:1915`,
+`:2167`, `:2444`, `:2596`, `:2913`, `:2996`, `:3117`).
+`ResolutionEvidence.filesystem_effect` (`src/core/store/receipts.zig:874`) is
+constructed throughout the gate suite (`gates_test.zig:2025`, `:2644-2695`,
+`:4895-4914`, `:5211`, `:5607`) and admitted for the three transfer kinds in
+`appliesToKind` (`receipts.zig:1305-1306`). What none of them has is a
+constructor on the *live* transfer path: `cmd_transfer.zig` and `cmd_sync.zig`
+open no operation at all.
 
-**D10 — zero test coverage of the live transfer path.** The four tests in
-`src/core/store/transfers.zig:400-510` cover a module nothing calls.
+**D10 — zero test coverage of the live transfer path.**
+`src/core/store/transfers.zig` now carries 13 tests (`:3138-3708`) and is
+called by `execution.zig` and `receipts.resolve`, but none of that reaches the
+shipping commands: `src/cli/cmd_transfer.zig` and `src/cli/cmd_sync.zig`
+contain zero tests between them, and nothing exercises `Client.scpSendBytes`,
+`Client.scpRecvBytes` or `transfer.pushBytes`/`pullBytes`.
 
 ### 1.2 Confirmed dead code
 
@@ -158,9 +311,18 @@ repo-wide; `ResolutionEvidence.filesystem_effect`
 | `Client.scpSend` | `:359` | zero callers; the only streaming push (1 MiB buffer) in the repo |
 | `Client.scpRecv` | `:467` | zero callers; carries D1's shape at `:492` |
 | `Client.Progress` | `:351` | only used by the two dead functions |
-| `src/core/store/transfers.zig` | whole file | 510 lines, 4 passing tests, zero callers outside the `Store` re-export |
-| `operations.Kind.transfer_push/transfer_pull/fetch` | `operations.zig:32-34` | never constructed |
-| `ResolutionEvidence.filesystem_effect` | `receipts.zig:618` | never constructed |
+
+Three rows that stood here — `transfers.zig` as a whole, the three transfer
+`operations.Kind` values, and `ResolutionEvidence.filesystem_effect` — are no
+longer dead and were removed rather than corrected. `transfers.zig` is 3708
+lines with 13 tests at `:3138-3708`, called by `execution.zig:424`/`:486`/
+`:491`/`:506` and by `receipts.resolve` at `receipts.zig:2149`/`:2231`/
+`:2251`/`:2261`/`:2319`/`:2368`. All three kinds are load-bearing — see
+`transfers.zig:1321-1323`, `receipts.zig:1169-1370`, and the gate
+constructors at `gates_test.zig:1465`, `:3590` and `:6949` (push), `:7348`
+(pull) and `:6653` (fetch). `filesystem_effect` lives at `receipts.zig:874`
+and gained both constructors and an identity check in `resolve` at
+`receipts.zig:2148-2178`.
 
 ### 1.3 Design smells (not defects, but they are why the defects were possible)
 
@@ -176,41 +338,50 @@ repo-wide; `ResolutionEvidence.filesystem_effect`
   `cmd_sync.zig:151` and `catch 0` at `:162` silently drop stat failures out
   of the dry-run byte count; `catch {}` at `:249` drops the temp-file cleanup;
   `catch null` at `:271` drops the walk that produces the reported file count.
-* **`transfers.zig` is push-shaped and fail-silent.** `create`'s INSERT
-  (`transfers.zig:155-163`) omits `remote_partial_sha256`, so it is always
-  NULL; `confirmOffset` then writes
-  `remote_partial_sha256 = COALESCE(?3, remote_partial_sha256)`
-  (`transfers.zig:347`), so a caller passing null leaves it NULL forever and
-  `verifyResume`'s prefix-hash branch (`transfers.zig:324-329`) is dead code.
-  `confirmOffset` also hardcodes `state = 'transferring'` (`:348`), silently
-  un-pausing a paused row, and neither it nor `setState` (`:360`) checks
-  `changes()` — contrast `receipts.zig:923-928`, which does. `findResumable`
-  (`transfers.zig:250`) keys on `remote_path` alone (`:252`), with no server
-  dimension, so two hosts sharing `/srv/app.tar` share checkpoints.
-  `create` has a no-op `@divTrunc(l.mtime_ns, 1)` (`:171`) hiding an
-  unchecked `i128 → i64` narrowing.
-* **`verifyResume` rejects the only thing a real interruption produces.**
-  `transfers.zig:322` returns `partial_mismatch` when
-  `remote.len > confirmed_offset`, and its own comment names "a crash
-  mid-append" as the case it refuses. Since `confirmed_offset` may only
-  advance on a *confirmed* boundary, every genuine connection loss leaves a
-  partial longer than the confirmed offset. As written, resume is
-  unreachable. (Fixed in §2.6.)
-* **`verifyResume` cannot see an HTTP source at all.** The whole source
-  identity block is gated on `checkpoint.local_path != null`
-  (`transfers.zig:291`), so `source_etag` / `source_last_modified` /
-  `source_size` are consulted nowhere. A resumed `fetch` could splice two
-  object generations.
-* **`ResolutionEvidence.filesystem_effect` cannot prove anything.**
-  `sha256` is `?[]const u8 = null` (`receipts.zig:620`); `supports` is
-  `.filesystem_effect => resolved == .completed` (`receipts.zig:665`) with no
-  look at the hash; `resolve` runs an identity check for `.job_result` only
-  (`receipts.zig:867-877`). So `filesystem_effect{path, sha256: null}` flips
-  any `indeterminate` transfer to `completed` and releases the scope barrier
-  **on the strength of a path existing.** This is the single most dangerous
-  thing in the repo for M3, because it is the *designated* exit from the one
-  `indeterminate` M3 creates, and after a lost publish the most likely content
-  at the destination is the *previous* file. (Fixed in §2.8 / §7.1.)
+* **`transfers.zig` was push-shaped and fail-silent — closed in `14c8a2d` and
+  `2b670a9`.** The column is `partial_sha256`, paired with the offset by a
+  schema CHECK (`migrate.zig:489`); `confirmOffset` assigns the prefix hash
+  rather than `COALESCE`-ing it and writes no `state`, guarding
+  `state IN (acceptsOffset)` and `request_id` instead
+  (`transfers.zig:1677-1685`); every mutator now guards `changes()` and
+  classifies a zero-row write into a named refusal (`transfers.zig:1235`,
+  `:1667`, `:1904`, `:1974`, `:2343`, `:2560`, `:2906`, `:2989`, `:3105`);
+  `findResumable` keys on `(dest_side, dest_path)`
+  (`transfers.zig:1424-1442`); and the `i128 → i64` mtime narrowing is a
+  checked `std.math.cast` returning `error.MtimeOutOfRange`
+  (`transfers.zig:1147-1150`).
+* **`verifyResume` used to reject the only thing a real interruption produces
+  — closed in `b6e4254`, tightened in `14c8a2d`.** A partial longer than
+  `confirmed_offset` is now the normal interrupted shape: `verifyResume`
+  proves the head against the recorded prefix hash
+  (`transfers.zig:1534-1541`) and then returns
+  `.truncate_then_resume{offset, partial_len}` (`transfers.zig:1552-1555`), so
+  the unconfirmed tail is discarded rather than counted. `partial_mismatch`
+  now means a *shorter* partial (`:1525`), a missing or disagreeing prefix
+  hash (`:1535-1540`), or a partial that disappeared (`:1519-1521`). Held by
+  `transfers.zig:3675`.
+* **`verifyResume` used to be blind to an HTTP source — closed in
+  `14c8a2d`.** `local_path` is gone; the source is a `SourceIdentity` union
+  (`transfers.zig:870-888`) and `sourceChanged` is exhaustive over it, with
+  the `.http` arm refusing a resume when no strong validator (`etag`, else
+  `last_modified`) was recorded or is still offered
+  (`transfers.zig:1589-1602`). The schema says the same by name in
+  `offset_needs_source_identity` (`migrate.zig:498-502`). Held by
+  `transfers.zig:3618`.
+* **`ResolutionEvidence.filesystem_effect` used to prove nothing — closed in
+  `212289e`, tightened in `2b670a9`.** `sha256` is now `[]const u8`
+  (`receipts.zig:879`), so the null case is a compile error rather than a
+  settle, and the reading carries a `side` alongside the path
+  (`receipts.zig:877`). `resolve` compares side, path and digest against
+  `transfers.expectedEffectLocked` (`receipts.zig:2148-2162`,
+  `transfers.zig:2662-2686`) — the digest the transfer declared *before* it
+  submitted — and refuses `effect_hash_unproven` on any mismatch or missing
+  declaration; it then refuses `effect_reading_against_recorded_outcome`
+  unless the checkpoint's own state admits the rename may have landed
+  (`receipts.zig:2172-2178`). The `supports` arm is still
+  `.filesystem_effect => resolved == .completed` (`receipts.zig:1105`), and
+  that is now correct: the binding lives in `resolve`. Held by
+  `gates_test.zig:2644-2695` and `:4895-4914`.
 
 ---
 
@@ -369,7 +540,7 @@ pub fn run(
 **`src/core/artifact/remote.zig` — the generated programs**, as pure
 `fn(arena, args) Allocator.Error![]u8` builders. Their *text* is unit-tested
 in-process; their *behaviour* is tested by executing them through the real
-`-Dposix-sh` the build already resolves (`build.zig:165-172`).
+`-Dposix-sh` the build already resolves (`build.zig:167-174`).
 
 ### 2.3 The state machine, and where `submitted()` fires
 
@@ -379,7 +550,13 @@ independently said to keep.
 ```
 phase        checkpoint state   Execution status   what happens
 -----------------------------------------------------------------------------
-plan         planned            created            findResumable / create / adopt
+plan         planned            created            findResumable / create / adopt / recover
+                                                   (`findResumable` sees only the four
+                                                    adoptable states; a row abandoned in
+                                                    `verifying` or `publishing` still holds the
+                                                    path and needs `execution.recoverCheckpoint`,
+                                                    which normalises it to `paused` or
+                                                    `indeterminate_publish` first)
 lease        planned            created            leases.acquire {path,dest}
 probe        probing            connecting         ONE exec: capability, dest dir
                                                    writable, df, source stat,
@@ -396,7 +573,7 @@ published    published          completed          one atomic ln/mv, then a
 
 **`execution.submitted()` is called immediately before the single publish
 act, and nowhere earlier.** Everything before it is staging, in exactly the
-sense `op_state.zig:172-177` already blesses and `cmd_exec.zig:224-244`
+sense `op_state.zig:234-247` already blesses and `cmd_exec.zig:224-244`
 already relies on: it reaches the host, it can leave an artefact behind, and
 it is not the caller's operation. The destination path is not named by any
 command until the publish program, so it is *provably* untouched until then.
@@ -404,7 +581,8 @@ command until the publish program, so it is *provably* untouched until then.
 Consequences, all of them load-bearing:
 
 * A connection lost mid-transfer is `connecting`, so
-  `op_state.terminalForTransportLoss` (`op_state.zig:255`) gives
+  `op_state.terminalForTransportLoss` (`op_state.zig:316`, the
+  `.created, .connecting` arm at `:321`) gives
   `.never_submitted` → **failed, exit 1, resumable**. Not a shrug.
 * The `indeterminate` / exit-75 window collapses from a multi-GiB transfer to
   one `ln` syscall.
@@ -414,12 +592,19 @@ Consequences, all of them load-bearing:
 
 **The cost of submit-late, stated rather than hidden:** `connecting` does not
 block scope (`op_state.zig:61`), so during the transfer the ledger's guard is
-not holding the destination. That is what the **lease** is for:
-`leases.acquire` on `{kind: .path, key: dest}` before probing, renewed during
-the transfer, released at settle. `execution.begin` already consults
-`leases.conflictForLocked` (`execution.zig:130`) and `submitted()` re-checks
-it under the write lock (`execution.zig:209`), so a peer is refused at both
-ends; the lease expires on its own if we die; `--force` overrides through the
+not holding the destination. That is what the **lease** is for: `leases.acquire` on
+`{kind: .path, key: remote_side_path}` before probing, renewed during the
+transfer, released at settle — the remote destination for a push, the remote
+source for a pull, matching the scope §2.9 binds. A lease is always a claim
+inside one server's namespace (`leases.server_id` is `NOT NULL REFERENCES
+servers(id)`, `migrate.zig:276`; `AcquireOptions.server_id` is `i64`,
+`leases.zig:82`), so it cannot hold a *local* destination at all. For a pull
+or a fetch the destination is local, and the only thing standing on it is
+`idx_checkpoints_live_dest` — "the only collision guard a locally-published
+transfer gets" (`transfers.zig:91-97`). `execution.begin` consults
+`leases.conflictForLocked` through `blockerLocked` (`execution.zig:260`,
+reached from `begin` at `:790`) and `submitted()` re-checks it under the write
+lock (`execution.zig:343`), so a peer is refused at both ends; the lease expires on its own if we die; `--force` overrides through the
 existing audited path. No new mechanism.
 
 ### 2.4 The remote programs
@@ -549,15 +734,27 @@ block size is a 64× offset bug waiting to happen.
 
 ### 2.6 `transfer_checkpoints`: how it is used, and the six things fixed
 
-Used as built: `create`, `byRequest`, `confirmOffset`, `setState`,
-`recordVerifiedHash`, `contiguousPrefix`, and the *pure rules* of
-`verifyResume`. Fixed:
+Used as built: `contiguousPrefix` and the *pure rules* of `verifyResume`.
+Everything else was re-cut by v11. Every mutator now takes the owning
+`request_id` and CASes on it, and `create` is an `INSERT ... SELECT` over
+`operations` — four agreement conjuncts in the same statement as the write —
+followed by `if (store.db.changes() == 0) return
+error.CheckpointOperationMismatch`, because a SELECT that matched nothing is
+not an error to sqlite and `lastInsertRowId` would otherwise hand the caller
+another transfer's checkpoint id (`transfers.zig:1226-1236`). Four further
+mutators exist that the six fixes below do not name: `recordSourceIdentity`
+(`:2971`), `recoverLocked` (`:2258`), `supersedeLocked` (`:2545`) and
+`adjudicateLocked` (`:1836`). Fixed:
 
 **F1 — resume must survive the interruption it exists for.**
-`verifyResume` rejects `remote.len > confirmed_offset`
-(`transfers.zig:322`), which is exactly what a connection loss leaves. The
-rule stays; what changes is that the probe **proves the prefix, then truncates
-to it, in one remote script, with truncation gated on the proof**:
+`verifyResume` used to reject `partial.len > confirmed_offset`, which is
+exactly what a connection loss leaves. That rejection is gone: it now returns
+`.truncate_then_resume{ offset, partial_len }` (`transfers.zig:1552-1555`),
+having first proved the head from the recorded/observed `partial_sha256` pair
+(`:1534-1541`). The caller truncates to `offset` and continues. The remote
+script below is one way to perform that cut, not a precondition of calling
+`verifyResume`, and it keeps the same ordering — prove the prefix, then
+truncate to it, with truncation gated on the proof:
 
 ```sh
 n=$(wc -c < '<part>')
@@ -576,47 +773,92 @@ so the trail reads "found 8.3 GiB, proved 8.0 GiB, discarded 0.3 GiB".
 `dd if=/dev/null seek=` is used rather than `truncate(1)`, which is not
 universal.
 
-**F2 — the prefix hash must actually be written.** `create`'s INSERT
-(`transfers.zig:155-163`) omits `remote_partial_sha256`, and `confirmOffset`
-COALESCEs a null over it (`:347`), so `verifyResume`'s prefix branch
-(`:324-329`) is dead code today. The chunk-close confirm now passes the prefix
-digest **every time** — it is free, because `Sha256` is a value type:
-`var snap = hasher; snap.final(&d)` yields the digest of the confirmed prefix
-at each boundary — and the COALESCE becomes a plain assignment.
+**F2 — the prefix hash must actually be written.** The column is
+`partial_sha256`, `confirmOffset` plain-assigns it rather than COALESCEing it
+(`transfers.zig:1680`), and `verifyResume`'s prefix branch is mandatory rather
+than dead: at a non-zero offset both the recorded and the observed digest must
+be present and equal, or the verdict is `partial_mismatch`
+(`transfers.zig:1534-1541`). The schema enforces the same invariant —
+`CHECK (confirmed_offset = 0 OR partial_sha256 IS NOT NULL)`
+(`migrate.zig:489`) — so a null can no longer be written under a non-zero
+offset even by a caller that skips the guard. The chunk-close confirm now
+passes the prefix digest **every time** — it is free, because `Sha256` is a
+value type: `var snap = hasher; snap.final(&d)` yields the digest of the
+confirmed prefix at each boundary.
 
 **F3 — fail-silent writes become fail-loud.** `confirmOffset` gains
-`AND state IN ('planned','probing','transferring')` (so it cannot resurrect a
-paused or failed row) and checks `store.db.changes()`, returning
-`error.CheckpointNotAdvanced` when it matched nothing. `setState` refuses to
-leave a terminal checkpoint state and checks `changes()` the same way. Both
-follow `receipts.zig:923-928`, which already does this.
+`AND state IN (<acceptsOffset>)` — `planned`, `probing`, `transferring`,
+`paused`, rendered from `State.acceptsOffset` (`transfers.zig:393-410`), so it
+cannot advance a `verifying`, `publishing`, published or failed row. `paused`
+is deliberately in the set: it is where a resumable transfer waits. It also
+gains `AND request_id = ?6`, so only the operation that currently owns the
+checkpoint may write progress into it. It then checks `store.db.changes()` and
+re-reads the row through `ownedRow` to name which conjunct refused it:
+`CheckpointRowMissing`, `CheckpointNotOurs`, `IllegalCheckpointTransition`,
+`CheckpointNotAdvanced` (a regressing offset) or `PrefixHashConflict`
+(`transfers.zig:1666-1674`). `setState` classifies the same way through the
+same re-read, into the named members of `TransitionError` — including
+`CheckpointAwaitingAdjudication` and `SupersessionIsNotATransition`, which say
+the edge exists but belongs to `adjudicateLocked` or `supersedeLocked` rather
+than to a driver (`transfers.zig:1974-2010`).
 
 **F4 — the source shape becomes role-based, not push-shaped.**
-`verifyResume`'s `if (checkpoint.local_path != null)` gate
-(`transfers.zig:291`) is deleted and replaced by an exhaustive switch on a
-`SourceIdentity` union (`local_file` / `remote_file` / `http`), so a remote
-source is validated by its own size + mtime + digest, and an HTTP source by
-its strong validator. No source shape can fall through the check by being
-`null`. (For M3a only the first two are constructible; see §7.3.)
+`verifyResume`'s `if (checkpoint.local_path != null)` gate is gone, replaced
+by the `SourceIdentity` union (`transfers.zig:870-888`) and an exhaustive
+switch in `sourceChanged` (`transfers.zig:1565-1604`), so a remote source is
+validated by its own size + mtime + digest and an HTTP source by its strong
+validator. The schema enforces the same families — a file kind must carry
+`source_path` and no `source_url`, and vice versa (`migrate.zig:479-485`) —
+and goes one step further with `CONSTRAINT offset_needs_source_identity`
+(`migrate.zig:498-502`), which makes a non-zero `confirmed_offset` unstorable
+without a content digest for a file or a strong validator for an http object.
+`verifyResume` re-checks it purely, because it is handed a struct and cannot
+assume the schema ever saw the row, and returns a sixth verdict for it:
+`unidentified_source` (`transfers.zig:1487`, checked at `:1511-1515`). (For
+M3a only the first two source kinds are constructible; see §7.3.)
 
-**F5 — checkpoint identity gains a destination side.** `findResumable` keys on
-`remote_path` alone (`transfers.zig:252`) with no server dimension. It becomes
-`(dest_side, dest_path)` where `dest_side` is `server:<id>` or `local`, and
-gains a **partial unique index over live states** (§2.7).
+**F5 — checkpoint identity gains a destination side.** `findResumable` used to
+key on `remote_path` alone, with no server dimension. It now takes
+`(dest_side, dest_path)` — `dest_side` is `server:<id>` or `local` — and
+filters on `State.isAdoptable` (`transfers.zig:1410-1442`), so a `verifying`
+or `publishing` row still holds its path but is not offered as resumable; the
+`remote_*` columns are gone entirely (`migrate.zig:442-511`). It also gains a
+**partial unique index over every destination-holding state** —
+`idx_checkpoints_live_dest` (`migrate.zig:504-511`), whose predicate names the
+six live states, all six `failed_*` states and `indeterminate_publish`:
+thirteen in all, the same set as `State.holdsDestination`
+(`transfers.zig:129-150`), which `gates_test` pins against the stored DDL
+through `holds_destination_sql` (`transfers.zig:715`). Only `published`,
+`completed_unverified` and `superseded` release the path; a failed transfer
+goes on holding it, and answering the next `create` with `DestinationHeld`,
+until `supersedeLocked` (`transfers.zig:2545`) releases it (§2.7).
 
 **F6 — `adopt`.** A resumed transfer is a new operation with a new
 `request_id`, so the checkpoint row must be re-pointed:
-`transfers.adopt(store, id, new_request_id, now)` verifies the state is
-resumable and reassigns the FK in one transaction, writing a `checkpoint`
-observation on both operations naming the other. The checkpoint is a mutable
+`transfers.adoptLocked(store, id, expected_owner, new_request_id, now)`
+(`transfers.zig:2207`) verifies the state is `isAdoptable` and re-points the
+FK, keyed on `expected_owner` so two racing resumes cannot both believe they
+won. It is a bare statement and requires an open transaction; that
+transaction, and the `checkpoint` observation on both operations naming the
+other, are `execution.Execution.adoptCheckpoint` (`execution.zig:411-428`). A
+row whose owner died mid-`verifying` or mid-`publishing` is not adoptable — it
+goes through `recoverLocked` / `execution.recoverCheckpoint` first. The checkpoint is a mutable
 working record; the ledger is the audit trail.
 
-Also fixed: the no-op `@divTrunc(l.mtime_ns, 1)` (`transfers.zig:171`) becomes
-a checked narrowing.
+Also fixed: the no-op `@divTrunc(l.mtime_ns, 1)` is now `narrowMtime` —
+`std.math.cast(i64, v) orelse error.MtimeOutOfRange` (`transfers.zig:1147-1150`)
+— because narrowing a mtime silently would make a source that changed look
+unchanged.
 
 **Two writers, one verdict — the ordering rule.** `transfers.setState` and
-`receipts.settle` both record how a transfer ended, and they cannot share a
-transaction (`settle` opens its own `BEGIN IMMEDIATE`, `receipts.zig:509`).
+`receipts.settle` both record how a transfer ended, and they *can* now share a
+transaction: `receipts.settleLocked` (`receipts.zig:752`) was split out so a
+settlement can be composed with the other writes that have to land with it,
+and `receipts.resolve` (`receipts.zig:1949`) already lands a checkpoint
+adjudication and the operation's resolution together (`receipts.zig:2368` →
+`transfers.adjudicateLocked`, which calls `requireTransaction` at
+`transfers.zig:1844`). `settle` (`receipts.zig:718`) is only the wrapper that
+opens `BEGIN IMMEDIATE` (`receipts.zig:725`) for a caller holding no lock.
 The rule is: **the ledger is authoritative for the verdict; the checkpoint is
 authoritative for the offset; the offset is re-proved on every resume by the
 prefix hash.** Write order is checkpoint-first, then settle — chosen so that a
@@ -628,15 +870,17 @@ failure direction is a spurious refusal, never a spurious resume.
 
 | Layer | Mechanism | Covers |
 |---|---|---|
-| `begin` | `leases.conflictForLocked` (`execution.zig:130`) + `unsettledInScope` | a peer already working this destination on this server; refuses before dialing |
-| `create` | new `UNIQUE INDEX ON transfer_checkpoints(dest_side, dest_path) WHERE state IN ('planned','probing','transferring','paused')` | **any** second live transfer to the same destination on this machine, including pull and fetch, where `server_id` is null and the scope guard does not run at all (`execution.zig:208` skips the guard entirely for a null server) |
-| `submitted()` | the scope guard re-checked under the write lock (`execution.zig:209`) | the last-moment race between two racers that both cleared `begin` |
+| `begin` | `blockerLocked` (`execution.zig:224-266`) — `unsettledInScope` at `:235`, `leases.conflictForLocked` at `:260` — reached from `begin` at `execution.zig:790` | a peer already working this scope in this realm (a server, or — when `server_id` is null — this machine); refuses before dialing, and only against a *mutating* caller (`execution.zig:791`, `:344`). Its unsettled half counts only peers that declared `mutating = 1` (`holds_scope_predicate`, `operations.zig:290`) — the lease half is the only one blind to the peer's own flag |
+| `create` | `idx_checkpoints_live_dest`: `UNIQUE INDEX ON transfer_checkpoints(dest_side, dest_path)` over `State.holdsDestination` — **thirteen** states, not four: the six live ones, all six `failed_*`, and `indeterminate_publish` (`migrate.zig:504-511`, rendered from `transfers.zig:129-150`) | **any** second live transfer to the same destination on this machine, including pull and fetch, where `server_id` is null — today only `fetch`, since §2.9 gives a pull the remote host's id. The operation half of the guard *does* run in that realm: `blockerLocked` takes a `?i64` and null names the local realm rather than switching the check off (`execution.zig:206-266`). What the local realm cannot have is a *lease* — `leases.server_id` is `NOT NULL REFERENCES servers(id)` (`migrate.zig:276`) and `conflictForLocked` takes a plain `i64` (`leases.zig:154-157`), so `execution.zig:260` skips that half. A failed transfer goes on holding its destination until `supersedeLocked` (`transfers.zig:2545`) releases it |
+| `submitted()` | the scope guard re-checked under the write lock (`execution.zig:343`, inside `submitted`'s `BEGIN IMMEDIATE`) | the last-moment race between two racers that both cleared `begin` |
 
 The partial unique index is the layer that matters for pull, and it is
 deliberately server-independent: `unsettledInScope` filters by `server_id`
-(`operations.zig:308`), so two pulls *from different servers* into one local
-path would both clear the guard. A DB-level uniqueness constraint is the only
-thing that can see them both.
+(`operations.zig:388`), so two pulls *from different servers* into one local
+path would both clear the guard — and two pulls to the *same* server clear it
+too, because §2.9 declares a pull non-mutating and the unsettled half counts
+only `mutating = 1` peers (`operations.zig:290`). A DB-level uniqueness
+constraint is the only thing that can see them both.
 
 **What none of this covers, stated plainly:** two Terminus processes on two
 *different machines* writing the same NFS/SMB destination. Nothing local can
@@ -656,40 +900,61 @@ on SMB it is not guaranteed, and we do not claim it is.
 | pull: local rename succeeded and the destination re-read matches | `.local_effect{path, published_sha256}` (NEW — §7.2) | `completed` | 0 |
 | pull: local rename provably failed (`PathAlreadyExists`, `NoSpaceLeft`, `AccessDenied`) | `.local_effect{path, failure}` | `failed` | 1 |
 | pull: the rename outcome cannot be classified | `.indeterminate` | `indeterminate` | 75 |
-| any ledger write fails | `Cli.receiptFatal` (`cli.zig:201`) | — | **76** |
+| any ledger write fails | `Cli.receiptFatal` (`cli.zig:226`) | — | **76** (`exit_code.receipt_persist_failed`, `cli.zig:168`) |
 
-**`completed_unverified` is unreachable in M3a, and that is the point.** We
-compute our own digest over the bytes we handled and re-read the destination
-after publishing, so verification never depends on the *source* offering a
-hash. It depends only on a digest tool existing, and when one does not, we
-refuse before sending a byte. There is therefore **no path that writes
-`completed` to the ledger for an unverified artifact** — which is exactly the
-flaw all three input designs shared, each of them settling a
+**`completed_unverified` is reachable in M3a by exactly two routes, and both
+record the weakness on the row rather than hiding it.** The driver reaches it
+from `publishing` when no digest was ever declared — the target's evidence
+clause requires both digest columns to stay null (`transfers.evidenceClause`,
+`transfers.zig:2054`) — and a reconciler reaches it from
+`indeterminate_publish` by offering `destination_present_unverified`
+(`receipts.zig:1848`). Both predecessors are in the graph at
+`transfers.zig:564`, and `ownerOf` (`transfers.zig:662`) hands the first edge
+to the driver and the second to adjudication, so neither writer can walk the
+other's. No *driver* writes `completed` to the ledger for an unverified
+artifact: we compute our own digest over the bytes we handled and re-read the
+destination after publishing, so verification never depends on the *source*
+offering a hash — it depends only on a digest tool existing, and when one does
+not, we refuse before sending a byte. Reconcile can, and says so on its face:
+`destination_present_unverified` supports `.completed` (`receipts.zig:1129`)
+for a transfer that declared no digest, it is admissible for all three
+transfer kinds (`receipts.zig:1322-1328`), and the checkpoint it forces is
+`completed_unverified` (`receipts.zig:1848`), not `published` — so an auditor
+can tell a proven delivery from an unproven one without going to look at
+whether a commitment existed. Past a non-empty verification method, all
+`resolve` asks of it is side and path matching the destination committed at
+`create`, a publish still in question, and no digest ever declared
+(`receipts.zig:2219-2258`); the variant's own comment concedes that a stale
+file from an earlier run satisfies that (`receipts.zig:961-962`). That is
+still not the flaw all three input designs shared — each of them settled a
 `completed_unverified` fetch as ledger-`completed` via an `.exited{0}` that no
-process produced. The enum value stays in `transfers.State`
-(`transfers.zig:50`) unused, and its fate is tied to §7.3.
+process produced. The enum value is `transfers.State.completed_unverified`
+(`transfers.zig:65`); §7.3's argument (3) is superseded by this, and §7.3
+itself was already answered "defer to M3b" in §7.0.
 
-**The reconcile path, and the hole that must close first.**
-`ResolutionEvidence.filesystem_effect` today accepts `sha256: null`
-(`receipts.zig:620`), `supports` waves it through to `.completed`
-(`receipts.zig:665`), and `resolve` compares it to nothing
-(`receipts.zig:867-877` checks only `.job_result`). As it stands, the *one*
-`indeterminate` this design creates has exactly one documented exit and that
-exit is unproven: after a lost publish the destination most likely still holds
-the **old** file, and hashing it would settle `completed`. Required fix:
+**The reconcile path, and the hole that has since closed.**
+`ResolutionEvidence.filesystem_effect` carries `side`, `path` and a
+non-optional `sha256` (`receipts.zig:874-880`); `supports` maps it to
+`.completed` and nothing else (`receipts.zig:1105`); and `resolve` compares
+all three against `transfers.expectedEffectLocked`, refusing with
+`effect_hash_unproven` (`receipts.zig:2156-2161`) and then with
+`effect_reading_against_recorded_outcome` when the checkpoint records an
+outcome no rename could have reached (`receipts.zig:2172-2177`). The hazard
+that motivated it: the *one* `indeterminate` this design creates has exactly
+one documented exit, and unbound that exit proved nothing — after a lost
+publish the destination most likely still holds the **old** file, and hashing
+it would settle `completed`.
 
-1. `sha256` becomes non-optional on `filesystem_effect`.
-2. `resolve` gains an identity check for `.filesystem_effect`, structurally
-   parallel to the one it already runs for `.job_result`: inside the same
-   transaction, read `transfer_checkpoints` for this `request_id`, require
-   `expected_sha256` to be present, require `evidence.path` to equal the
-   checkpoint's destination path, and require `evidence.sha256` to equal
-   `expected_sha256`. A mismatch or a missing expectation returns a new
-   `evidence_unverifiable` outcome — never a resolution.
-3. `expected_sha256` must therefore exist *before* the publish exec. New
-   `transfers.recordExpectedHash(store, id, sha256, now)` is called after the
-   whole source is streamed and hashed and **before** `execution.submitted()`.
-   Without step 3, step 2 degenerates to "a file exists" again.
+All three required steps landed. Steps 1 and 2 are the sentence above; the
+outcome a failed comparison returns is `effect_hash_unproven`
+(`receipts.zig:1575`), not the `evidence_unverifiable` this section proposed,
+which exists nowhere in the tree. The comparison runs inside the `BEGIN
+IMMEDIATE` `resolve` opens itself (`receipts.zig:1957`, `:2148-2161`). Step 3
+is `transfers.recordExpectedHash(store, id, owner_request_id, sha256, now)`
+(`transfers.zig:2892`), called after the whole source is streamed and hashed
+and **before** `execution.submitted()`. It is write-once: a second
+declaration, or one attempted after the first byte, is
+`error.ExpectedHashLocked` (`transfers.zig:2909`).
 
 `terminus request reconcile <id> --verify-artifact` re-hashes the destination
 over a fresh connection and offers that as the evidence. The shape of this fix
@@ -751,15 +1016,17 @@ released at settle.
 | `src/cli/cmd_sync.zig:177-180`, `:246-248` | the two scp→exec fallback ladders | §1.3 |
 | `src/cli/cmd_sync.zig:183` + `:186-193` | `rm -rf '<dir>' && ` before extraction | **D8** — prune AFTER a verified extraction |
 | `src/cli/cmd_sync.zig:278-281` | the duplicate `validateRemotePath` | **D7** |
-| `src/core/store/transfers.zig` — push-shaped parts | `local_*`/`source_*` as the only two source shapes; `remote_partial_*` names; the `local_path != null` gate at `:291`; the hardcoded `state = 'transferring'` at `:348`; the COALESCE at `:347`; the `remote_path`-only key at `:252`; the no-op `@divTrunc` at `:171` | §2.6. The pure resume rules, `contiguousPrefix` and all four existing tests survive. |
+| ~~`src/core/store/transfers.zig` — push-shaped parts~~ | **Done in v11** (`migrate.zig:402-511`): the table is re-cut around `dest_side`/`dest_path`, the `local_*`/`remote_path`/`remote_partial_*` column families are gone, the `local_path != null` gate is replaced by the exhaustive `SourceIdentity` union (`transfers.zig:870`) and the no-op `@divTrunc` is deleted. | §2.6. The pure resume rules, `contiguousPrefix` (`transfers.zig:3129`) and all six pre-existing tests survived, two under new names. Only the state name `failed_remote_partial_mismatch` (`transfers.zig:67`) still carries the old vocabulary. |
 | `src/cli/dispatch.zig` help text | "upload a file over SCP" / "tar+md5" | no longer true |
 
 **Not deleted, deliberately:** `transfers.zig`'s resume rules and
 `contiguousPrefix` (unexercised in production until parallel fetch lands —
 said plainly rather than pretended otherwise); `Executor` (control commands
 still go through it — only two streaming primitives are added);
-`history.redactSecrets`, which has three live callers (`cmd_exec.zig:88`,
-`cmd_job.zig:120`, `cmd_job.zig:289`) and is not dead even though
+`history.redactSecrets`, which has four live callers — `cmd_exec.zig:88`,
+`cmd_job.zig:141`, `cmd_job.zig:325`, and `receipts.zig:1491`, the `redact`
+helper `ResolutionEvidence.toJson` runs over every free-text field of every
+evidence variant — and is not dead even though
 `history.add` loses its last two (§7.6).
 
 ---
@@ -781,7 +1048,11 @@ still go through it — only two streaming primitives are added);
 | `sync push --delete` prunes **after** a verified extraction | anyone relying on the old destroy-first ordering | none needed; the destination is no longer deleted before its replacement exists |
 | remote temp paths change | scripts watching `/tmp/.terminus_sync_<ts>.tar` | single-file transfers stage at `<dir>/.<name>.terminus-part`; sync stages under a request-id-derived path |
 | library surface: `Ssh.Progress`, `scpSend`, `scpSendBytes`, `scpRecvBytes`, `scpRecv`, `execWithStdin`, `Core.transfer.*` disappear | in-repo callers only (all rewritten) | `Core.artifact.run` |
-| **schema**: `transfer_checkpoints` reshaped (§7.4) | nobody's data — the table has never had a writer, so no row exists in any database anywhere | a dev database is migrated in place (or rejected with a clear message, depending on §7.4) |
+| **schema**: `transfer_checkpoints` dropped and recreated at v11 (§7.4) | a developer database below v11 that holds checkpoint rows | delete the rows, or the database. An empty pre-v11 table migrates in place; one with rows is refused at open with `error.CheckpointsWouldBeDropped` (`migrate.zig:679-689`) rather than silently emptied. The real store has no `transfer_checkpoints` at all and migrates v4 → v11 in one go |
+| `leases.TakeoverOutcome.taken.from` is `[]const Lease`, not `Lease` | any caller reading who was displaced | iterate. A takeover displaces *every* lease overlapping its scope, and `acquire` permits any number of mutually non-overlapping ones, so a takeover of `path:/srv/app` seizes both `path:/srv/app/dist` and `path:/srv/app/build`. Newest first, never empty — displacing nobody is `.acquired` (`leases.zig:389-406`, field at `:403`) |
+| `leases.takeover` returns `TakeoverError!TakeoverOutcome`, not `Error!` | any caller switching exhaustively on the error set | handle `error.LeaseVanishedDuringTakeover`: the release UPDATE matched no row under the write lock, which is proof the lock is not doing what the rest of the function assumes. Declared on `takeover` alone rather than widened into `Error`, so no other lease caller sees it (`leases.zig:387`, `:426`) |
+| `leases.insertLocked` takes `supersedes: []const i64`, not `?i64` | in-module callers only (`leases.zig:252`, `:456`) | pass `&.{}` for a plain acquisition, `displaced_ids.items` for a takeover. Every displaced row is linked through `superseded_by`, so a seizure cannot leave a lease that ends with no successor recorded and reads as an expiry (`leases.zig:288-294`) |
+| `transfers.handoverBoundCount` renamed `handoverBoundCountLocked`, and refuses outside a transaction | `servers.removeLocked` (`servers.zig:318`) and the gates (`gates_test.zig:8556`, `:8574`) | call it inside the write transaction. It is the third of `removeLocked`'s three barriers and was the only one not asserting it held the lock; a count taken outside the lock describes a moment that has already passed by the time the DELETE runs (`transfers.zig:2732`) |
 
 ---
 
@@ -790,7 +1061,7 @@ still go through it — only two streaming primitives are added);
 Two harnesses. `Executor.scripted` (`exec.zig:37`) replays exit codes for
 fault injection at chosen instants; `Executor.shell` runs the **actual
 generated programs** through the real POSIX shell the build already resolves
-(`build.zig:165-172`, `test/blackbox.zig:45`) against a real scratch
+(`build.zig:167-174`, `test/blackbox.zig:45`) against a real scratch
 directory. That is what makes this design gateable without a server: the gates
 test the protocol and the scripts, not a mock of them. What it does **not**
 cover is libssh2 channel behaviour, which stays in the live e2e. Said plainly
@@ -814,17 +1085,17 @@ emitted strings:
 * A6. A path containing `'`, `"`, `` ` ``, `$` or a newline is rejected **by
   the emitter**, before any channel is opened *(D7)*.
 
-**B. Pure rules** (`store/transfers.zig`, extending the four existing tests):
-* B1. Locally modified source rejects its old checkpoint, including a
-  modification inside the already-transferred prefix with size and mtime
-  unchanged. *(Agreed gate 3, unit half.)*
-* B2. Polluted partial: right length, wrong prefix digest → `partial_mismatch`.
-  *(Agreed gate 4, unit half.)*
-* B3. `confirmOffset` refuses to move backwards **and reports that it
-  refused**; refuses to resurrect a paused or failed row.
-* B4. `setState` refuses to leave a terminal checkpoint state.
-* B5. `verifyResume` validates a `remote_file` source by its own identity, and
-  no source shape falls through by being `null`.
+**B. Pure rules** (`store/transfers.zig`, now 13 tests at `:3138-3708`) —
+**B1, B2 and B5 have landed** (`transfers.zig:3567-3573`, same size and mtime
+with different content → `source_changed`; `:3657`, right length wrong prefix
+→ `partial_mismatch`; `:3602-3607` and `:3615` for a `remote_file` source and
+a null one). B3's backwards refusal is `error.CheckpointNotAdvanced`
+(`gates_test.zig:4006-4009`) and its terminal-row refusal
+`error.IllegalCheckpointTransition` (`:4045-4048`); B4 is gated at
+`gates_test.zig:3924-3935` and `:4162-4232`. B3's "refuses to resurrect a
+**paused** row" was not built and was decided against: `State.acceptsOffset`
+admits `.paused` (`transfers.zig:393-410`), because that is the state a resume
+starts from.
 
 **C. End to end through `Executor.shell`** (`artifact_test.zig`) — real files,
 real scripts, real `ln`:
@@ -867,9 +1138,14 @@ the thread pattern already at `execution_test.zig:60`:
 * D1g. Two `begin`s on `{path, /srv/app/x}` → the second is `.blocked`;
   `--force` proceeds and writes a `forced_past_blocker` audit event.
 * D2g. Two `transfers.create` for the same `(dest_side, dest_path)` while live
-  → `error.Constraint`, not a convention. Includes the **pull** case, where
-  `server_id` is null and the scope guard does not run at all. *(Agreed gate
-  5, with the hole §2.7 names.)*
+  → `error.DestinationHeld` (and `error.CheckpointAlreadyExists` for two
+  checkpoints on one request), not a convention. **Landed** at
+  `gates_test.zig:3840` (`:3882`, `:3899`, and the hold walked across
+  `probing`/`transferring`/`verifying`/`publishing` at `:3907-3911`); the §2.7
+  hole is closed by v11's partial unique index over `State.holdsDestination`
+  (`migrate.zig:504-511`). Still to add there: the local-destination case — a
+  pull whose scope guard is filtered by `server_id`, and a fetch that has none
+  at all. *(Agreed gate 5, with the hole §2.7 names.)*
 * D3g. **The submit-late boundary.** A transport failure one exec before the
   publish → exit 1 with a resumable checkpoint; a transport failure *inside*
   the publish exec → exit 75, `indeterminate_publish`, and an operation that
@@ -879,7 +1155,13 @@ the thread pattern already at `execution_test.zig:60`:
   hash that does not match `expected_sha256`, or against an operation with no
   recorded expectation → **refused**, `indeterminate` preserved. Only a
   matching hash at the recorded destination path resolves to `completed`.
-  *(Closes §1.3's worst finding. Does not exist today in any form.)*
+  *(Closes §1.3's worst finding. **Landed** in `receipts.resolve`'s
+  `.filesystem_effect` arm (`receipts.zig:2148-2178`), which compares side,
+  path and digest against `transfers.expectedEffectLocked` and then refuses a
+  reading that overrules a recorded verdict; gated at
+  `gates_test.zig:2645-2693`. The null-hash case is now unrepresentable —
+  `sha256` is `[]const u8` (`receipts.zig:879`). What is still unwritten is
+  the driver half: no transfer driver exists to produce the reading.)*
 * D5g. **Local publish evidence.** A pull whose local rename hits
   `PathAlreadyExists` settles `failed`, exit 1, pre-existing destination
   unchanged — never `completed`, never 75.
@@ -936,11 +1218,15 @@ until §7.1, §7.2 and §7.4 are answered.
    `Terminal.local_effect` with its `canSettle` arm, its
    both-fields/neither-field contradiction check, and the kind gate in
    `settle`. → gates **D5g** and the `op_state` unit tests.
-3. **Schema** (§7.4). `transfer_checkpoints` reshaped to role-based columns
-   (`source_kind/source_locator/source_size/source_mtime_ns/source_sha256`,
-   `dest_side/dest_path`, `partial_path/partial_len/partial_sha256`) plus the
-   partial unique index; `transfers.zig` rewritten onto them with the six
-   fixes of §2.6 and `adopt`/`recordExpectedHash`. → gates **B1–B5**, **D2g**.
+3. ~~**Schema** (§7.4)~~ — **done** (`14c8a2d`, amended by `2b670a9`).
+   `transfer_checkpoints` is recreated at v11 in role-based columns
+   (`dest_side`/`dest_path`, `partial_path`/`partial_len`/`partial_sha256`,
+   and one exhaustive `source_kind` family — `source_path` for a file,
+   `source_url`/`source_etag`/`source_last_modified` for HTTP, *not* a single
+   `source_locator`) plus the partial unique index `idx_checkpoints_live_dest`
+   (`src/core/store/migrate.zig:443-511`); `transfers.zig` is rewritten onto
+   them with `adoptLocked` and `recordExpectedHash`
+   (`src/core/store/transfers.zig:2207`, `:2892`). → gates **B1–B5**, **D2g**.
 4. **The transport.** `Executor.sendStream`/`recvStream`; `Client.execStreamIn`
    / `execStreamOut`; delete the six SCP/stdin functions and `"scp.c"`; fix
    `drainBoth`'s stderr-error-as-EOF. `ShellTransport`. → compiles; the
@@ -971,19 +1257,33 @@ marks where. None of these is settled anywhere else in this document.
 > All seven are now answered — see §7.0 for the answers and what has landed.
 > The option tables below are left exactly as they were written, before the
 > answers were known.
+>
+> Where a **Current state** paragraph has since been rewritten to record what
+> landed — §7.1's and §7.4's both were — the option table and the
+> recommendation under it were not. They still argue from the facts as they
+> stood before the answer, so a claim inside one — §7.4's "zero rows, zero
+> writers", for instance — can be contradicted by the opening paragraph of its
+> own section. That is the record, not an oversight.
 
 ---
 
 ### 7.1 How to close the `filesystem_effect` laundering hole
 
-**Current state.** `ResolutionEvidence.filesystem_effect` is
-`{ path: []const u8, sha256: ?[]const u8 = null }` (`receipts.zig:618-621`).
+**Current state (superseded — this landed in `212289e` and `2b670a9`).**
+`ResolutionEvidence.filesystem_effect` is `{ side: transfers.Side, path:
+[]const u8, sha256: []const u8 }` (`receipts.zig:874-880`), with three further
+destination readings beside it (`receipts.zig:909`, `:964`, `:1023`).
 `supports` is `.filesystem_effect => resolved == .completed`
-(`receipts.zig:665`) — true unconditionally, with no look at the hash.
-`resolve` runs an identity check for `.job_result` only
-(`receipts.zig:867-877`); nothing compares a filesystem hash to anything.
-`appliesToKind` (`receipts.zig:678-680`) already restricts this variant to
-`transfer_push`/`transfer_pull`/`fetch`. It has zero constructors today.
+(`receipts.zig:1105`), and that is now correct because the binding lives in
+`resolve`: it compares side, path and digest against
+`transfers.expectedEffectLocked` (`receipts.zig:2148-2162`) and then refuses a
+reading that overrules an already-recorded verdict (`receipts.zig:2172-2178`);
+the `.job_result` identity check is at `receipts.zig:2027`. `appliesToKind`
+(`receipts.zig:1305-1307`, now exhaustive with no default arm) restricts this
+variant to `transfer_push`/`transfer_pull`/`fetch`. It has constructors in the
+gate suite (e.g. `gates_test.zig:2646`, `:2709`, `:5607`); what it still lacks
+is a production producer — the only non-test construction of it is the receipt
+serialiser's re-wrap at `receipts.zig:1412`.
 
 **Why it blocks.** M3 creates exactly one `indeterminate`: a connection lost
 inside the publish exec. Its *only* documented exit is this evidence. After a
@@ -1012,12 +1312,12 @@ live is the transfer's own record.
 
 ### 7.2 A terminal for an artifact published on the *local* machine
 
-**Current state.** `op_state.canSettle` (`op_state.zig:291-293`) admits
-`.exited` only from `.submitted`/`.remote_started`, and `.exited` is
-documented as "the remote reported a real exit status"
-(`op_state.zig:163`). `canTransition` (`op_state.zig:138-141`) makes
-`connecting → completed` illegal, so an operation that never reaches
-`submitted` can never complete.
+**Current state.** `op_state.canSettle` (`op_state.zig:347`, the `.exited` arm
+at `:357-360`) admits `.exited` only from `.submitted`/`.remote_started`, and
+`.exited` is documented as "the remote reported a real exit status"
+(`op_state.zig:229`). `canTransition` (`op_state.zig:195`, the `.connecting`
+arm at `:204-207`) makes `connecting → completed` illegal, so an operation
+that never reaches `submitted` can never complete.
 
 **Why it blocks.** A **pull** publishes to a local path. There is no remote
 process whose exit status could stand for the local rename. Today a pull has
@@ -1062,8 +1362,11 @@ impossible, so `--sha256` must re-read the assembled file, and out-of-order
 chunks leave a partial longer than the confirmed prefix that must be truncated
 before `verifyResume` will accept it; (3) with no trustworthy validator there
 is no honest `completed`, which forces either a refusal or a new ledger status
-— and §2.8's guarantee that `completed_unverified` is unreachable holds only
-while fetch is out.
+— and `completed_unverified` is no longer unreachable: a push or pull that
+declares no digest and is killed mid-publish now settles there via
+`destination_present_unverified` (`transfers.zig:564`, `receipts.zig:1848`,
+ledger verdict at `receipts.zig:1129`, gated at `gates_test.zig:5573-5642`),
+so fetch would add no new ledger status.
 
 | Option | Change footprint | Breakage | Data impact | Effort | Long-term cost |
 |---|---|---|---|---|---|
@@ -1083,17 +1386,27 @@ values persist" cost knowingly.
 
 ### 7.4 How to reshape `transfer_checkpoints`
 
-**Current state.** The v6 DDL (`migrate.zig:195-224`) names the source
-`local_*` and the partial `remote_partial_*`, has `remote_path NOT NULL`, and
-indexes `(remote_path, state)` non-uniquely (`migrate.zig:224`). Those names
-are correct for push and an active lie for pull, where the partial is local
-and the source is remote; `remote_path NOT NULL` makes a local-destination
-transfer structurally impossible. A `source_size` column already exists, so a
-naive `local_size → source_size` rename is invalid SQL. `latest_version` is
-`migrations.len` (`migrate.zig:405`) and the chain currently runs to v10
-(`migrate.zig:386`). **The table has never had a writer**, so no row exists in
-any database anywhere — verifiable by grep: `transfers` appears only in the
-`Store.zig` re-export.
+**Current state (this section is now history — option A landed as v11 in
+`14c8a2d`).** The v6 DDL survives frozen at `migrate.zig:195-224`, naming the
+source `local_*` and the partial `remote_partial_*`, with `remote_path NOT
+NULL` and a non-unique `(remote_path, state)` index (`migrate.zig:224`) —
+names that are correct for push and an active lie for pull, and a `NOT NULL`
+that made a local-destination transfer structurally impossible. A
+`source_size` column already existed, so a naive `local_size → source_size`
+rename was invalid SQL. The live shape is v11 at `migrate.zig:440-511`:
+`dest_side`/`dest_path` (`:449-450`), `partial_path`/`partial_len`/
+`partial_sha256` (`:451-453`), a `source_kind` family with its own CHECK
+(`:455`, `:479`), `UNIQUE(request_id)` (`:445`) and the partial unique index
+over the destination-holding states (`:504`). `latest_version` is
+`migrations.len` (`migrate.zig:516`) and the chain runs to **v11**
+(`migrate.zig:402`, DDL at `:440`). The table now has writers —
+`transfers.create` (`transfers.zig:1183`), `setState` (`:1720`),
+`confirmOffset` (`:1642`), `recordExpectedHash` (`:2892`),
+`recordVerifiedHash` (`:3091`), `adoptLocked` (`:2207`), `supersedeLocked`
+(`:2545`) — and rows do exist; see the census at §7.0.1. `Store.open` refuses
+a pre-v11 store carrying checkpoint rows with `error.CheckpointsWouldBeDropped`
+rather than recutting over them (`migrate.zig:679-689`, gated at
+`gates_test.zig:1869`).
 
 **Why it blocks.** §2.5 (pull's partial is local), §2.6 (F4, F5) and §2.7 (the
 partial unique index that is the only guard a local destination gets) all
@@ -1101,7 +1414,7 @@ depend on the column shape. Nothing in M3a can be built against the current one.
 
 | Option | Change footprint | Breakage | Data impact | Effort | Long-term cost |
 |---|---|---|---|---|---|
-| **A. New v11 step** that drops and recreates the table with role-based columns and the partial unique index; v6 text stays frozen in the chain | `migrate.zig` ~+50 | none | **provably nil** — zero rows exist. Developer databases upgrade in place with no action | ~0.5 day | one more migration step, and dead v6 DDL that every fresh database still walks through |
+| **A. New v11 step** that drops and recreates the table with role-based columns and the partial unique index; v6 text stays frozen in the chain | `migrate.zig` ~+50 | none | **not nil in general** — a developer database below v11 whose `transfer_checkpoints` is *empty* upgrades in place with no action (`gates_test.zig:1918-1933`); one holding any row is refused outright with `error.CheckpointsWouldBeDropped` (`migrate.zig:679-689`, gated at `gates_test.zig:1878-1916`) and must be dealt with by hand | ~0.5 day | one more migration step, and dead v6 DDL that every fresh database still walks through |
 | **B. Edit v6 in place** and extend `checkPreReleaseDrift` (`migrate.zig:422`) to detect the old `remote_partial_path` column | `migrate.zig` ~+25 | **every existing developer database is rejected on next run** and must be deleted and recreated — including the live e2e fixture, which per `MEMORY.md` holds the only surviving test SSH key | nil for the table; **the e2e fixture must be backed up first** | ~0.3 day + the fixture dance | none; the chain stays clean |
 | **C. Additive only** — keep the old columns, add `dest_side`/`dest_path`/`partial_*` beside them | `migrate.zig` ~+30 | none | none | ~0.4 day | two column families for one concept, forever, and `verifyResume` has to decide which to trust — the compatibility-branch pattern the project forbids |
 

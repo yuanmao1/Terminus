@@ -148,11 +148,62 @@ class Census:
     non_sqlite_files: int
     sqlite_candidates: int
     stores: list[Store]
+    repo_scratch_without_checkpoints: int
     non_store_sqlite: int
     sqlite_unreadable: list[dict]
     unexaminable: list[dict]
-    filesystem_changes: list[dict]
+    filesystem_effect: dict
     seconds: float
+
+
+# Every path that reaches the JSON goes through this first. The artifact is
+# committed to a public repository and its subject is *where stores are*, not
+# whose machine this is; a token keeps the location and drops the identity.
+# Longest value wins, so %TEMP% beats %LOCALAPPDATA%. Replacement is anywhere
+# in the string, not just at the start, because the paths that leak are mostly
+# the ones an OSError embedded in the middle of its own message.
+def tokenise(text: str) -> str:
+    for token, value in sorted(PATH_TOKENS, key=lambda kv: -len(kv[1])):
+        for form in (value, value.replace("\\", "\\\\"), value.replace("\\", "/")):
+            if form in text:
+                text = text.replace(form, token)
+    return text
+
+
+PATH_TOKENS: list[tuple[str, str]] = []
+
+
+def build_path_tokens(repo: Path) -> None:
+    PATH_TOKENS.clear()
+    for token, value in (
+        ("<repo>", str(repo)),
+        ("%TEMP%", os.environ.get("TEMP", "")),
+        ("%LOCALAPPDATA%", os.environ.get("LOCALAPPDATA", "")),
+        ("%APPDATA%", os.environ.get("APPDATA", "")),
+        ("%USERPROFILE%", os.environ.get("USERPROFILE", "")),
+    ):
+        if value:
+            PATH_TOKENS.append((token, value))
+    # Last, and shortest, so the directory tokens above win wherever they can.
+    # This one exists for the names that *embed* the account rather than living
+    # under its profile — `%TEMP%\hsperfdata_<user>` is the one on this machine.
+    # Guarded on length because a two-letter account name would shred the
+    # document, and an unredacted short name is the lesser problem.
+    user = os.environ.get("USERNAME", "")
+    if len(user) >= 4:
+        PATH_TOKENS.append(("<user>", user))
+
+
+# Applied to the whole document rather than to a list of known path fields, so
+# a field added later is covered without anyone remembering to add it here.
+def tokenised(value):
+    if isinstance(value, dict):
+        return {k: tokenised(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [tokenised(v) for v in value]
+    if isinstance(value, str):
+        return tokenise(value)
+    return value
 
 
 @dataclass
@@ -414,7 +465,15 @@ def main() -> int:
         files_sniffed=len(walk.sized),
         non_sqlite_files=non_sqlite,
         sqlite_candidates=len(candidates),
-        stores=stores,
+        # Full records for every store outside this repo, and for the scratch
+        # ones that hold a checkpoint row — those two sets are what the census
+        # is for. The remaining scratch stores are a count: a full test run
+        # leaves a hundred of them, they are deleted by `zig build`, and the
+        # only interesting fact about one is the checkpoint row it does not
+        # have.
+        stores=[s for s in stores if not s.is_repo_scratch or s.checkpoint_rows],
+        repo_scratch_without_checkpoints=len(
+            [s for s in stores if s.is_repo_scratch and not s.checkpoint_rows]),
         # A count, not the paths. What the census has to establish is coverage —
         # how many SQLite files were opened and found not to be ours — and the
         # number carries that. The paths do not: they are every browser profile,
@@ -425,7 +484,15 @@ def main() -> int:
                               and str(p) not in {u["path"] for u in sqlite_unreadable}]),
         sqlite_unreadable=sqlite_unreadable,
         unexaminable=walk.unexaminable,
-        filesystem_changes=changes,
+        # The claim is "a mode=ro census changed no database". Hundreds of
+        # `-shm` mtime bumps are how that claim was measured, not the claim;
+        # they are summarised by category. Anything a read-only open cannot
+        # cause is listed in full, because that is the claim failing.
+        filesystem_effect={
+            "files_digested_before_and_after": len(before),
+            "by_category": dict(sorted(Counter(category(c) for c in changes).items())),
+            "contradicting_read_only": [c for c in changes if c["contradicts_read_only"]],
+        },
         seconds=round(time.time() - started, 1),
     )
 
@@ -511,7 +578,8 @@ def main() -> int:
     if args.json:
         out = Path(args.json)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(asdict(census), indent=2), encoding="utf-8")
+        build_path_tokens(repo)
+        out.write_text(json.dumps(tokenised(asdict(census)), indent=2), encoding="utf-8")
         print(f"wrote {args.json}")
 
     # Non-zero when a store outside this repo's test scratch holds a checkpoint:

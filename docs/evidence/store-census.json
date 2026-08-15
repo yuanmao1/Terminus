@@ -1,0 +1,271 @@
+{
+  "roots_searched": [
+    "%APPDATA%\\terminus",
+    "%TEMP%",
+    "%USERPROFILE%\\.terminus",
+    "%USERPROFILE%\\Desktop",
+    "%USERPROFILE%\\Downloads",
+    "%USERPROFILE%\\Documents",
+    "<repo>"
+  ],
+  "roots_absent": [
+    "%LOCALAPPDATA%\\terminus"
+  ],
+  "excluded_dir_names": [
+    ".codegraph",
+    ".git",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "venv"
+  ],
+  "excluded_path_fragments": [
+    "AppData/Local/Google",
+    "AppData/Local/Microsoft",
+    "AppData/Local/Mozilla",
+    "playwright_chromium",
+    "pw-apply-profile",
+    "codex-apply-extension"
+  ],
+  "max_depth": 6,
+  "files_seen": 106827,
+  "files_size_filtered": 100218,
+  "files_sniffed": 6379,
+  "non_sqlite_files": 5960,
+  "sqlite_candidates": 417,
+  "stores": [
+    {
+      "path": "%TEMP%\\f0.db",
+      "bytes": 204800,
+      "user_version": 11,
+      "has_checkpoints_table": true,
+      "checkpoint_rows": 0,
+      "checkpoint_request_ids": [],
+      "is_repo_scratch": false,
+      "counts": {
+        "facts": 0,
+        "keys": 0,
+        "memories": 0,
+        "servers": 0
+      }
+    },
+    {
+      "path": "%TEMP%\\t.db",
+      "bytes": 200704,
+      "user_version": 11,
+      "has_checkpoints_table": true,
+      "checkpoint_rows": 0,
+      "checkpoint_request_ids": [],
+      "is_repo_scratch": false,
+      "counts": {
+        "facts": 0,
+        "keys": 0,
+        "memories": 0,
+        "servers": 0
+      }
+    },
+    {
+      "path": "%TEMP%\\t0.db",
+      "bytes": 200704,
+      "user_version": 0,
+      "has_checkpoints_table": true,
+      "checkpoint_rows": 0,
+      "checkpoint_request_ids": [],
+      "is_repo_scratch": false,
+      "counts": {
+        "facts": 0,
+        "keys": 0,
+        "memories": 0,
+        "servers": 0
+      }
+    },
+    {
+      "path": "%APPDATA%\\terminus\\terminus.db",
+      "bytes": 363249664,
+      "user_version": 4,
+      "has_checkpoints_table": false,
+      "checkpoint_rows": null,
+      "checkpoint_request_ids": [],
+      "is_repo_scratch": false,
+      "counts": {
+        "facts": 45,
+        "keys": 12,
+        "memories": 142,
+        "servers": 13
+      }
+    },
+    {
+      "path": "<repo>\\.zig-cache\\tmp\\gate_absence_evidence_47924_82.db",
+      "bytes": 4096,
+      "user_version": 11,
+      "has_checkpoints_table": true,
+      "checkpoint_rows": 1,
+      "checkpoint_request_ids": [
+        "ABSENT00000000000000000000"
+      ],
+      "is_repo_scratch": true,
+      "counts": {
+        "facts": 0,
+        "keys": 0,
+        "memories": 0,
+        "servers": 2
+      }
+    },
+    {
+      "path": "<repo>\\.zig-cache\\tmp\\gate_job_evidence_kind_12736_50.db",
+      "bytes": 4096,
+      "user_version": 10,
+      "has_checkpoints_table": true,
+      "checkpoint_rows": 1,
+      "checkpoint_request_ids": [
+        "PVSH0000000000000000000000"
+      ],
+      "is_repo_scratch": true,
+      "counts": {
+        "facts": 0,
+        "keys": 0,
+        "memories": 0,
+        "servers": 1
+      }
+    },
+    {
+      "path": "<repo>\\.zig-cache\\tmp\\gate_job_evidence_kind_14952_50.db",
+      "bytes": 4096,
+      "user_version": 10,
+      "has_checkpoints_table": true,
+      "checkpoint_rows": 1,
+      "checkpoint_request_ids": [
+        "PVSH0000000000000000000000"
+      ],
+      "is_repo_scratch": true,
+      "counts": {
+        "facts": 0,
+        "keys": 0,
+        "memories": 0,
+        "servers": 1
+      }
+    },
+    {
+      "path": "<repo>\\.zig-cache\\tmp\\gate_process_evidence_kind_31180_55.db",
+      "bytes": 4096,
+      "user_version": 11,
+      "has_checkpoints_table": true,
+      "checkpoint_rows": 1,
+      "checkpoint_request_ids": [
+        "PR0CPVSH000000000000000000"
+      ],
+      "is_repo_scratch": true,
+      "counts": {
+        "facts": 0,
+        "keys": 0,
+        "memories": 0,
+        "servers": 1
+      }
+    }
+  ],
+  "repo_scratch_without_checkpoints": 105,
+  "non_store_sqlite": 304,
+  "sqlite_unreadable": [],
+  "unexaminable": [
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\tools",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\tools'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\tmp",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\tmp'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\third_party",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\third_party'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\scripts",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\scripts'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\release",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\release'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\pythonp",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\pythonp'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\protos",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\protos'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\javap",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\javap'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\infra",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\infra'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\golangp",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\golangp'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\experiment",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\experiment'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\docs",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\docs'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\ai",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\ai'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\.ruff_cache",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\.ruff_cache'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\.pytest_cache",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\.pytest_cache'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\.github",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\.github'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\.codex-tmp",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\.codex-tmp'"
+    },
+    {
+      "path": "%TEMP%\\codex-delivery-ack-bazel\\wtgbuhpw\\execroot\\_main\\.agents",
+      "error": "FileNotFoundError: [WinError 3] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002: '%TEMP%\\\\codex-delivery-ack-bazel\\\\wtgbuhpw\\\\execroot\\\\_main\\\\.agents'"
+    },
+    {
+      "path": "%USERPROFILE%\\Documents\\My Videos",
+      "error": "PermissionError: [WinError 5] \u62d2\u7edd\u8bbf\u95ee\u3002: '%USERPROFILE%\\\\Documents\\\\My Videos'"
+    },
+    {
+      "path": "%USERPROFILE%\\Documents\\My Pictures",
+      "error": "PermissionError: [WinError 5] \u62d2\u7edd\u8bbf\u95ee\u3002: '%USERPROFILE%\\\\Documents\\\\My Pictures'"
+    },
+    {
+      "path": "%USERPROFILE%\\Documents\\My Music",
+      "error": "PermissionError: [WinError 5] \u62d2\u7edd\u8bbf\u95ee\u3002: '%USERPROFILE%\\\\Documents\\\\My Music'"
+    },
+    {
+      "path": "%TEMP%\\7ebb0fed-0aaa-440a-9bb3-114f5c125cd3.tmp",
+      "error": "PermissionError: [Errno 13] Permission denied: '%TEMP%\\\\7ebb0fed-0aaa-440a-9bb3-114f5c125cd3.tmp'"
+    },
+    {
+      "path": "%TEMP%\\hsperfdata_<user>\\37304",
+      "error": "PermissionError: [Errno 13] Permission denied: '%TEMP%\\\\hsperfdata_<user>\\\\37304'"
+    }
+  ],
+  "filesystem_effect": {
+    "files_digested_before_and_after": 1251,
+    "by_category": {
+      "-shm changed: mtime_ns": 205
+    },
+    "contradicting_read_only": []
+  },
+  "seconds": 3.0
+}
