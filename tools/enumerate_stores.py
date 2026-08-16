@@ -35,19 +35,27 @@ its own definition, its own count and a `drives_coverage_incomplete` flag.
 category cannot be moved between the two sets to change a number without the
 move being visible in the artifact.
 
-Seven categories withhold authorisation, because in each of them the census
+Eight categories withhold authorisation, because in each of them the census
 could not answer:
 
     inside_but_not_visited   a link target inside a declared root that no walk
-                             ever read, and that no declared depth bound
-                             explains. This is the defect the matrix was built
-                             to expose: `covered_by != null` used to be
+                             ever read, and that no declared bound of this
+                             census explains. This is the defect the matrix was
+                             built to expose: `covered_by != null` used to be
                              published as though it meant "visited"
     depth_shadowed_target    the same, except that this census's own declared
                              `depth_max` is what stopped it. Still a gap — the
                              content was not read — but a named one: raising
                              `--depth` or declaring the target a root closes
                              it, and both change the declared scope
+    exclusion_shadowed_target
+                             the same, except that one of this census's own
+                             declared exclusion rules is what stopped it. Also
+                             a gap, for the same reason, and the rule that
+                             matched is on the record: an exclusion bounds
+                             where the walk goes, it says nothing about what is
+                             inside the target. Only removing the rule closes
+                             this one
     unreadable               an OS error stopped the census learning what a
                              path is, where it points, or what it holds
     vanished                 listed, then genuinely gone before it was opened
@@ -338,9 +346,10 @@ The three census codes are a bitmask: `status & 1` is the row, `status & 2`
 the holes. What counts as a hole is not a judgement made per run: every
 declined or failed path lands in exactly one failure_matrix category, each
 category declares once and for all whether it withholds, and the verdict is
-`any(count > 0)` over the ones that do. Seven withhold: inside_but_not_visited,
-depth_shadowed_target, unreadable, vanished, path_too_long,
-not_a_regular_file, root_unresolvable. Six do not: out_of_declared_scope,
+`any(count > 0)` over the ones that do. Eight withhold: inside_but_not_visited,
+depth_shadowed_target, exclusion_shadowed_target, unreadable, vanished,
+path_too_long, not_a_regular_file, root_unresolvable. Six do not:
+out_of_declared_scope,
 depth_limited, excluded, dangling, not_content_read, root_absent — every one
 of them either an answer the census got, or a bound the artifact publishes in
 effective_scope before the walk starts.
@@ -1221,6 +1230,7 @@ def corroboration(census: Census, as_of: str) -> dict:
                    if link.get("reason") in ("out_of_declared_scope",
                                              "inside_but_not_visited",
                                              "depth_shadowed_target",
+                                             "exclusion_shadowed_target",
                                              "unreadable_link")]
     # The other way a path goes unread: a bound the artifact publishes before
     # the walk starts. These are not in the list above and their paths are not
@@ -1516,6 +1526,7 @@ LINK_KEYS = (
     "within_declared_root", "covering_root", "target_depth_below_covering_root",
     "first_reaching_root", "target_depth_below_first_reaching_root",
     "actually_visited", "content_read", "not_visited_reason",
+    "matched_exclusion",
     "not_tested_because", "also_counted_in", "error", "remedy",
 )
 
@@ -1671,17 +1682,27 @@ def classify_links(links: list[dict], roots: list[Path], walk: Walk,
             # name, so the link adds nothing and there is no matrix record.
             record["reason"] = "covered_and_visited"
             continue
-        # P3(e) and P4. Inside the territory the census's own scope claim names
-        # by root, and nothing read it. Calling that "covered" was the defect;
-        # calling it "correctly declined" would be the same overclaim wearing a
-        # new label, because no run of this census established anything about
-        # those bytes. Both categories below withhold authorisation for exactly
-        # that reason. What separates them is which of two very different
-        # things a reader is being told.
+        # P3(e), P4 and P4b. Inside the territory the census's own scope claim
+        # names by root, and nothing read it. Calling that "covered" was the
+        # defect; calling it "correctly declined" would be the same overclaim
+        # wearing a new label, because no run of this census established
+        # anything about those bytes. All three categories below withhold
+        # authorisation for exactly that reason. What separates them is which of
+        # three very different things a reader is being told.
         why_not = "unknown"
+        matched = exclusion_rule(Path(target))
+        if matched is not None:
+            # Recorded whichever bound is named as the reason, in the same three
+            # fields the frontier's own `excluded` records use, so the two can
+            # be joined on the rule rather than on a reader's guess. When depth
+            # is named and this is set too, both bounds hold and the remedy
+            # below has to say so — see P4b.
+            record["matched_exclusion"] = {"matched_kind": matched[0],
+                                           "matched_rule": matched[1],
+                                           "matched_component": matched[2]}
         if effective_depth >= max_depth:
             why_not = "below_depth_limit"
-        elif exclusion_rule(Path(target)) is not None:
+        elif matched is not None:
             why_not = "under_exclusion"
         else:
             # Up the chain from the target's parent to the root that owns its
@@ -1709,19 +1730,24 @@ def classify_links(links: list[dict], roots: list[Path], walk: Walk,
                 if parent == ancestor:
                     break
                 ancestor = parent
-        # P4. `depth_shadowed_target` is a gap — the content genuinely was not
-        # read — but it says which gap: the census's own published depth_max
-        # stopped it, not an unbounded miss. `inside_but_not_visited` keeps the
-        # harder meaning, and a reader must be able to tell "my own declared
-        # bound stopped me" from "I should have reached this and did not".
-        record["reason"] = ("depth_shadowed_target" if why_not == "below_depth_limit"
-                            else "inside_but_not_visited")
+        # P4 and P4b. All three are gaps — the content genuinely was not read —
+        # but two of them say which gap: the census's own published depth_max
+        # stopped it, or one of its own published exclusions did, and neither is
+        # an unbounded miss. `inside_but_not_visited` keeps the harder meaning,
+        # and a reader must be able to tell "my own declared bound stopped me"
+        # from "I should have reached this and did not".
+        record["reason"] = {
+            "below_depth_limit": "depth_shadowed_target",
+            "under_exclusion": "exclusion_shadowed_target",
+        }.get(why_not, "inside_but_not_visited")
         record["not_visited_reason"] = why_not
         record["remedy"] = {
             "below_depth_limit": "raise --depth past the target's depth below its "
                                  "first-reaching root, or declare the target a root",
-            "under_exclusion": "remove the exclusion rule this target matches; "
-                               "raising --depth will not bring it in",
+            "under_exclusion": "remove the exclusion rule named in matched_exclusion; "
+                               "raising --depth will not bring this target in, and "
+                               "neither will declaring it a root, because a declared "
+                               "root is tested by the same rule",
             "ancestor_unreadable": "go and look at what is denying access on the "
                                    "unreadable ancestor",
             "ancestor_vanished": "re-run when the machine is quiet: an ancestor of "
@@ -1734,6 +1760,16 @@ def classify_links(links: list[dict], roots: list[Path], walk: Walk,
             "unknown": "investigate: the walk never entered this target and no "
                        "declared bound accounts for it",
         }[why_not]
+        if why_not == "below_depth_limit" and matched is not None:
+            # Both bounds hold. The depth remedy on its own would be false
+            # advice here: raising --depth leaves the exclusion in place, and so
+            # does declaring the target a root, because `collect` tests a root
+            # by the same rule. Depth is still what the reason names — the test
+            # order above is unchanged — so the record says both rather than
+            # silently giving the reader one that will not work.
+            record["remedy"] += ("; note that matched_exclusion is also set, so "
+                                 "neither of those alone will bring this target in "
+                                 "until that rule is removed as well")
 
 
 def sniff(path: Path) -> tuple[Path, str | None, dict | None]:
@@ -2043,8 +2079,8 @@ INSIDE_KEYS = ("path", "target", "target_resolved", "within_declared_root",
                "covering_root",
                "target_depth_below_covering_root", "first_reaching_root",
                "target_depth_below_first_reaching_root", "actually_visited",
-               "content_read", "not_visited_reason", "also_counted_in",
-               "reason", "remedy")
+               "content_read", "not_visited_reason", "matched_exclusion",
+               "also_counted_in", "reason", "remedy")
 
 
 def failure_matrix(walk: Walk, sqlite_unreadable: list[dict],
@@ -2055,12 +2091,14 @@ def failure_matrix(walk: Walk, sqlite_unreadable: list[dict],
     Disjointness is by construction rather than by adjudication: every record
     is produced at exactly one decision site and carries the `origin` of that
     site. `depth_limited` and `excluded` hold only walk-frontier records;
-    `out_of_declared_scope` and `inside_but_not_visited` hold only link
+    `out_of_declared_scope`, `inside_but_not_visited`,
+    `depth_shadowed_target` and `exclusion_shadowed_target` hold only link
     records; `root_unresolvable` and `root_absent` hold only root records.
 
     A path may still be named by two records of different origin — the link
-    targets in `inside_but_not_visited` are also, separately, frontier
-    directories their parent declined on depth. That is not double counting:
+    targets in `depth_shadowed_target` and `exclusion_shadowed_target` are
+    also, separately, frontier directories their parent declined on depth or on
+    an exclusion. That is not double counting:
     the census made two different decisions about that path and both are facts.
     The link record carries `also_counted_in` so the reconciliation is stated
     here rather than left for a reader to find by diffing path lists.
@@ -2130,15 +2168,26 @@ def failure_matrix(walk: Walk, sqlite_unreadable: list[dict],
             "Both withhold; conflating them told a reader the wrong thing about "
             "what to do next.",
             "P4b A link target under a published exclusion is "
-            "inside_but_not_visited, and withholds, while the excluded "
+            "exclusion_shadowed_target, and withholds, while the excluded "
             "directory itself is not a gap. The two are decided about different "
             "things — a directory the census declined to descend into, and "
             "content inside the declared scope that nothing read — and the "
-            "remedy on the link record says to remove the exclusion because "
-            "that is what would close it. Whether declining an exclusion should "
-            "instead stop the target being a gap, as declining to leave the "
-            "declared scope already does, is not settled by this artifact and "
-            "is not decided here.",
+            "link record names the rule in matched_exclusion so the two can be "
+            "joined. This artifact used to record the question of whether "
+            "declining an exclusion should instead stop the target being a gap, "
+            "as declining to leave the declared scope already does, as "
+            "unsettled. It is settled, and against that: an exclusion is a "
+            "bound on where the walk goes, not a statement about what is inside "
+            "the target, so the content is unread for the same kind of reason "
+            "as under depth_max — which already withholds. Treating the two "
+            "bounds differently would have been the inconsistency.",
+            "P4c The depth test runs before the exclusion test, so a target "
+            "that both bounds hold for is depth_shadowed_target. matched_"
+            "exclusion is recorded on that record too, and the remedy says that "
+            "raising --depth alone will not close it. Nothing in the verdict "
+            "turns on the order — both categories withhold — but the operator "
+            "instruction does, so the record carries both bounds rather than "
+            "the first one to fire.",
             "P5 FRONTIER: excluded wins over depth_limited when both hold, "
             "because raising --depth will never bring an excluded directory in.",
             "P6 Unresolved ties resolve toward withholding, and that may only "
@@ -2158,11 +2207,12 @@ def failure_matrix(walk: Walk, sqlite_unreadable: list[dict],
                 "A link whose target is under a searched root by longest-prefix "
                 "match, which no walk read — for a directory target, the target "
                 "is absent from the set of directories whose os.scandir "
-                "returned; for a file target, its parent is — and which "
-                "depth_max did not stop. A target depth_max did stop is "
-                "depth_shadowed_target. not_visited_reason is computed, never "
-                "guessed, and names what did stop the walk: an exclusion (see "
-                "P4b), an ancestor that was unreadable, vanished or too long to "
+                "returned; for a file target, its parent is — and which no "
+                "declared bound of this census explains. A target depth_max "
+                "stopped is depth_shadowed_target; a target an exclusion "
+                "stopped is exclusion_shadowed_target. not_visited_reason is "
+                "computed, never guessed, and names what did stop the walk: an "
+                "ancestor that was unreadable, vanished or too long to "
                 "name, an ancestor that is itself a reparse point the link "
                 "policy forbids following, or nothing the census can account "
                 "for at all.",
@@ -2192,6 +2242,30 @@ def failure_matrix(walk: Walk, sqlite_unreadable: list[dict],
                 "in-scope content are two decisions and the artifact stopped "
                 "conflating them.",
                 links("depth_shadowed_target"), INSIDE_KEYS, ERROR_SAMPLE),
+            "exclusion_shadowed_target": bucket(
+                True,
+                "A link whose target is under a searched root by longest-prefix "
+                "match, which no walk read, and which one of this census's "
+                "published exclusion rules matches. Same test as "
+                "inside_but_not_visited in every other respect; split from it "
+                "by not_visited_reason == under_exclusion alone. The rule that "
+                "matched is on the record in matched_exclusion, in the same "
+                "three fields the frontier's excluded records carry.",
+                "It withholds for the same reason depth_shadowed_target does: "
+                "the content genuinely was not read and the census cannot speak "
+                "for it. An exclusion bounds where the walk goes; it says "
+                "nothing about what is inside the target, so a target behind "
+                "one is unread for the same kind of reason as a target behind "
+                "depth_max. Reporting one as a gap and the other as a closed "
+                "question would have been an inconsistency, not a distinction. "
+                "What the name adds is the operator instruction: unlike "
+                "depth_shadowed_target, neither raising --depth nor declaring "
+                "the target a root closes this — a declared root is tested by "
+                "the same exclusion rule — so only removing the rule will. The "
+                "frontier record for the same directory is separately in "
+                "excluded, which does not withhold, and the link record names "
+                "it in also_counted_in.",
+                links("exclusion_shadowed_target"), INSIDE_KEYS, ERROR_SAMPLE),
             "unreadable": bucket(
                 True,
                 "An OS error prevented the census from learning what a path is, "
@@ -2297,11 +2371,12 @@ def failure_matrix(walk: Walk, sqlite_unreadable: list[dict],
                 "effective_scope. Declining a directory the artifact says it "
                 "declines is not a failure to cover the declared scope. It is "
                 "separate from depth_limited because the operator instruction "
-                "differs: raising --depth will never bring an excluded "
-                "directory in. As with depth_limited this is a decision not to "
-                "descend, and a link pointing at an excluded target is a "
-                "separate record that does withhold — see P4b, which also "
-                "records that whether it should is unsettled.",
+                "descend. It is separate from depth_limited because the operator "
+                "instruction differs: raising --depth will never bring an "
+                "excluded directory in. As with depth_limited this is a "
+                "decision not to descend, and a link pointing at an excluded "
+                "target is a separate record that does withhold — see "
+                "exclusion_shadowed_target and P4b.",
                 walk.excluded, (), FRONTIER_RETAINED,
                 {"note": FRONTIER_NOTE,
                  "matched_rules": dict(sorted(Counter(
@@ -2651,12 +2726,13 @@ def main() -> int:
             if c["drives_coverage_incomplete"]}
     verified_empty = {name: c["count"] for name, c in matrix["categories"].items()
                       if not c["drives_coverage_incomplete"]}
-    # The fifth link reason has no matrix record, because a question the census
-    # closed is not a failure. It is counted here so that the five reasons
-    # reconcile against len(links) in the artifact rather than in a reader's
-    # head.
+    # One of the seven link reasons has no matrix record, because a question the
+    # census closed is not a failure. It is counted here so that the seven
+    # reasons reconcile against len(links) in the artifact rather than in a
+    # reader's head.
     links_by_reason = {reason: link_count(walk, reason) for reason in (
         "covered_and_visited", "inside_but_not_visited", "depth_shadowed_target",
+        "exclusion_shadowed_target",
         "out_of_declared_scope", "dangling", "unreadable_link")}
     offender_found = bool(offenders)
     coverage_incomplete = any(gaps.values())
@@ -2815,6 +2891,9 @@ def main() -> int:
                                    "and no declared depth bound accounts for it"),
         ("depth_shadowed_target", "!! target inside a searched root that nothing read, "
                                   "stopped by this census's own declared depth_max"),
+        ("exclusion_shadowed_target", "!! target inside a searched root that nothing "
+                                      "read, stopped by one of this census's own "
+                                      "declared exclusion rules"),
         ("out_of_declared_scope", "target outside every searched root — declined by "
                                   "policy, not a gap; declare the target a root to "
                                   "bring it in"),
