@@ -752,12 +752,29 @@ const FakeHost = struct {
         /// says "the host changed between these two looks", which is the whole
         /// shape of a job that reaches its own end during the round trip.
         uses: u32 = std.math.maxInt(u32),
+        /// Take this job's scope lease away from the binary while it waits for
+        /// this reply.
+        ///
+        /// The only deterministic way to reach the window the fail-closed steps
+        /// exist for. The binary takes the lease before it dials and then runs a
+        /// sequence of remote calls; a peer's `--force` landing *between* two of
+        /// them cannot be arranged from outside, but the binary is blocked on
+        /// this socket right now, and that is exactly the same instant.
+        seize: bool = false,
     };
+
+    /// The job whose scope a `seize` rule takes, and who takes it. Fixed rather
+    /// than per-rule: every gate that uses this drives one job called `deploy`,
+    /// and a second knob would be a knob nothing turns.
+    const seized_job = "deploy";
+    const seizing_peer = "01PEEEEEEER0123456789ABCDE";
 
     io: std.Io,
     allocator: std.mem.Allocator,
     home: []u8,
     socket: []u8,
+    /// The fixture's database, borrowed. Only a `seize` rule touches it.
+    db: [:0]const u8,
     server: std.Io.net.Server,
     rules: []Rule,
     thread: std.Thread,
@@ -769,6 +786,21 @@ const FakeHost = struct {
     /// success: a fake that quietly invents replies for calls nobody scripted
     /// turns a gate into a measurement of the fake.
     unscripted: std.atomic.Value(u32),
+    /// Every command the binary sent, in order.
+    ///
+    /// `expectFullyScripted` answers "did anything arrive that we did not
+    /// script"; it cannot answer "was the kill sent", because a `kill-session`
+    /// script also contains `has-session` and would be answered by that rule.
+    /// Only a record of the traffic can say what did *not* reach the host, which
+    /// is the assertion a fail-closed step is worth anything for.
+    seen: std.ArrayList([]u8),
+    seen_lock: std.Io.Mutex,
+    /// Commands that could not be recorded, and seizures that could not be
+    /// performed. Both are reported as gate failures rather than swallowed: a
+    /// dropped record makes `expectNeverSent` pass for the wrong reason, and a
+    /// seizure that did not happen makes the whole window vanish.
+    record_failures: std.atomic.Value(u32),
+    seize_failures: std.atomic.Value(u32),
 
     fn start(f: *Fixture, rules: []Rule) !*FakeHost {
         const home = try std.fmt.allocPrint(f.allocator, "{s}/home", .{f.dir});
@@ -788,11 +820,16 @@ const FakeHost = struct {
             .allocator = f.allocator,
             .home = home,
             .socket = socket,
+            .db = f.db,
             .server = try address.listen(f.io, .{}),
             .rules = rules,
             .thread = undefined,
             .closing = .init(false),
             .unscripted = .init(0),
+            .seen = .empty,
+            .seen_lock = .init,
+            .record_failures = .init(0),
+            .seize_failures = .init(0),
         };
         host.thread = try std.Thread.spawn(.{}, serve, .{host});
         return host;
@@ -831,6 +868,30 @@ const FakeHost = struct {
         return map;
     }
 
+    /// Printed immediately before a traffic assertion's real message.
+    ///
+    /// Every gate that drives the binary to `std.process.exit` leaves the serve
+    /// thread blocked on a socket the child never closed, and std prints an
+    /// `error.Unexpected NTSTATUS=0xc000020d (CONNECTION_RESET)` stack trace
+    /// when that read fails. Those traces are unconditional — they appear on
+    /// passing runs too — but the test runner groups whatever stderr arrives
+    /// during a test into that test's failure block, so a genuine failure here
+    /// arrives underneath forty lines that look exactly like the known noise.
+    ///
+    /// A marker, not a fix: the noise is the child exiting without closing its
+    /// socket, and the exit lives in the CLI. It is deliberately not silenced by
+    /// catching the transport error — a fake host that swallows read failures
+    /// stops being able to tell a divergent conversation from a finished one.
+    fn banner(host: *FakeHost, comptime what: []const u8) void {
+        _ = host;
+        std.debug.print(
+            \\
+            \\--- FakeHost: the real failure follows. Any CONNECTION_RESET traces above are
+            \\--- the child exiting without closing its socket, which happens on green runs too.
+            \\
+        ++ what ++ "\n", .{});
+    }
+
     /// Asserts that every command the binary sent was one this gate scripted.
     ///
     /// Without it a gate can pass for the wrong reason. An unmatched command
@@ -841,9 +902,51 @@ const FakeHost = struct {
     fn expectFullyScripted(host: *FakeHost) !void {
         const missed = host.unscripted.load(.monotonic);
         std.testing.expectEqual(@as(u32, 0), missed) catch |err| {
+            host.banner("--- unscripted traffic:");
             std.debug.print(
                 "{d} command(s) reached the fake host with no rule to answer them\n",
                 .{missed},
+            );
+            return err;
+        };
+    }
+
+    /// Asserts that no command carrying `needle` ever reached the host.
+    ///
+    /// The positive form of a fail-closed step: "it refused" is an exit code,
+    /// which a dozen other faults also produce, and only the traffic says the
+    /// destructive command was never sent.
+    fn expectNeverSent(host: *FakeHost, needle: []const u8) !void {
+        const dropped = host.record_failures.load(.monotonic);
+        std.testing.expectEqual(@as(u32, 0), dropped) catch |err| {
+            host.banner("--- lost traffic records:");
+            std.debug.print(
+                "{d} command(s) reached the fake host and could not be recorded, so this assertion cannot be made\n",
+                .{dropped},
+            );
+            return err;
+        };
+        host.seen_lock.lockUncancelable(host.io);
+        defer host.seen_lock.unlock(host.io);
+        for (host.seen.items) |command| {
+            if (std.mem.indexOf(u8, command, needle) == null) continue;
+            host.banner("--- a step this command was forbidden to take reached the host:");
+            std.debug.print(
+                "a command containing '{s}' reached the host:\n{s}\n",
+                .{ needle, command },
+            );
+            return error.DestructiveCommandWasSent;
+        }
+    }
+
+    /// Asserts that every `seize` rule that fired actually took the lease.
+    fn expectSeized(host: *FakeHost) !void {
+        const failed = host.seize_failures.load(.monotonic);
+        std.testing.expectEqual(@as(u32, 0), failed) catch |err| {
+            host.banner("--- the scripted lease seizure did not happen:");
+            std.debug.print(
+                "{d} scripted lease seizure(s) did not happen, so the window this gate drives never opened\n",
+                .{failed},
             );
             return err;
         };
@@ -865,6 +968,8 @@ const FakeHost = struct {
         host.thread.join();
         host.server.deinit(host.io);
         std.Io.Dir.cwd().deleteFile(host.io, host.socket) catch {};
+        for (host.seen.items) |command| host.allocator.free(command);
+        host.seen.deinit(host.allocator);
         host.allocator.free(host.socket);
         host.allocator.free(host.home);
         host.allocator.destroy(host);
@@ -917,10 +1022,12 @@ const FakeHost = struct {
     }
 
     fn replyTo(host: *FakeHost, command: []const u8) protocol.Response {
+        host.record(command);
         for (host.rules) |*rule| {
             if (rule.uses == 0) continue;
             if (std.mem.indexOf(u8, command, rule.needle) != null) {
                 if (rule.uses != std.math.maxInt(u32)) rule.uses -= 1;
+                if (rule.seize) host.seize();
                 return .{
                     .v = protocol.version,
                     .ok = true,
@@ -935,6 +1042,54 @@ const FakeHost = struct {
             .ok = false,
             .@"error" = "the gate's fake host has no reply scripted for this command",
         };
+    }
+
+    fn record(host: *FakeHost, command: []const u8) void {
+        const copy = host.allocator.dupe(u8, command) catch {
+            _ = host.record_failures.fetchAdd(1, .monotonic);
+            return;
+        };
+        host.seen_lock.lockUncancelable(host.io);
+        defer host.seen_lock.unlock(host.io);
+        host.seen.append(host.allocator, copy) catch {
+            host.allocator.free(copy);
+            _ = host.record_failures.fetchAdd(1, .monotonic);
+        };
+    }
+
+    /// Takes the job scope from the binary, from a second connection to the same
+    /// database, while the binary waits for the reply this is attached to.
+    fn seize(host: *FakeHost) void {
+        host.seizeLease() catch |err| {
+            _ = host.seize_failures.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "the gate's fake host could not take the job lease: {s}\n",
+                .{@errorName(err)},
+            );
+        };
+    }
+
+    fn seizeLease(host: *FakeHost) !void {
+        var store = try Store.open(host.db);
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(host.allocator);
+        defer arena_state.deinit();
+        switch (try Store.leases.takeover(&store, arena_state.allocator(), .{
+            .server_id = 1,
+            .scope = .{ .kind = .job, .key = seized_job },
+            .owner_request_id = seizing_peer,
+            .profile_token = "the-other-session",
+            .owner_label = seized_job,
+            .ttl_secs = 600,
+            .now = try Store.leases.clockSeconds(&store),
+        })) {
+            .taken => {},
+            // Nothing was there to displace, which means the binary was not
+            // holding the scope when this fired — the window this exists to
+            // create never opened, and every assertion after it would be about
+            // a different command.
+            .acquired => return error.NothingWasHoldingTheJobScope,
+        }
     }
 };
 
@@ -1178,6 +1333,11 @@ fn defectArrivesDuringTheKill(fixture_name: []const u8, verb: []const u8) !void 
     // offered, beside `ok: true`.
     try acted.expectSays("--override");
     try acted.expectSaysNot("--from-log");
+    // The reading itself, named on both verbs and in the same words. `job rm`
+    // carries this key for the same reason `job kill` does: `ok: false` says
+    // something went wrong, and only this says a document was there and was
+    // turned down — the one fact a removal's caller can no longer go and check.
+    try acted.expectSays("\"resultRecord\": \"exit_code_out_of_range\"");
 
     var store = try f.open();
     defer store.close();
@@ -1209,4 +1369,432 @@ test "blackbox: `job kill` does not lose a result record that turned up during t
 
 test "blackbox: `job rm` does not report a clean removal over a record it refused" {
     try defectArrivesDuringTheKill("race_rm", "rm");
+}
+
+// The window every fail-closed step exists for, driven end to end: the binary
+// takes the job scope before it dials, and a peer forces it away while the
+// binary is waiting for its first probe to come back.
+//
+// The renewal's *answer* is the whole of it. `holdClaim` used to return `void`
+// and merely print on loss, so this path went on to `kill-session` exactly as
+// if nothing had happened: the layer that exists to stop two sessions acting on
+// one job could not stop anything, because nothing read what it said. The
+// operator saw one line on stderr and a killed job.
+//
+// Asserted on the traffic and not on the exit code. A refusal exits non-zero,
+// and so does a dozen other faults — a fake host with a missing rule among them.
+// Only "no command containing `kill-session` reached the host" says the
+// destructive step did not happen.
+test "blackbox: `job kill` sends nothing to the host once the scope has moved" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "kill_scope_moved");
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01FFFFFFFF0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    // A job still running: no result record, no sentinel in the window. There is
+    // nothing here to settle, so this is the branch whose only next step is the
+    // kill.
+    const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    var rules = [_]FakeHost.Rule{
+        // The first look, and the moment the scope changes hands. Bounded to one
+        // use so a second probe cannot seize a second time and make the peer's
+        // row a different row from the one this gate checks.
+        .{ .needle = probe_split, .stdout = running, .uses = 1, .seize = true },
+        .{ .needle = probe_split, .stdout = running },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var killed = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer killed.deinit(f.allocator);
+
+    // The property, checked before anything else. Every other assertion here is
+    // downstream of it, and an exit code checked first would report a gate
+    // failure in terms of a number rather than in terms of the kill that was
+    // sent.
+    try host.expectSeized();
+    try host.expectNeverSent("kill-session");
+    try host.expectFullyScripted();
+    // Exit 1 and not 75: this command changed nothing, so nothing about the
+    // remote is unknown *because of it*, and re-running once the scope is free
+    // is safe. That distinction is the whole contract of the two codes.
+    try killed.expectCode(1);
+
+    try killed.expectSays("\"action\": \"not_killed\"");
+    try killed.expectSays("\"authority\": \"lapsed\"");
+    try killed.expectSays("\"ok\": false");
+    try killed.expectSays("\"sessionGone\": false");
+    try killed.expectSays("\"cancellationProven\": false");
+    // The keys the other five branches carry, on this one too: a caller gets one
+    // reader for `job kill --json`, not six.
+    try killed.expectSays("\"resultRecord\": ");
+    try killed.expectSays("\"observedAt\": ");
+    try killed.expectSays("\"sessionCleanedUp\": false");
+    try killed.expectSays("--force");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The ledger is exactly where the launch left it: this command settled
+    // nothing, because a step it may not take is not a step it may record having
+    // taken.
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqualStrings("remote_started", op.status.text());
+    // …and so is the row.
+    const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    try t.expectEqualStrings("running", @tagName(row.status));
+
+    // The peer holds the scope and was never handed it back. `Cli.releaseClaim`
+    // runs on this exit path too, and a release matching by scope alone would
+    // have unlocked the winner's work on the loser's way out.
+    const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+    try t.expectEqual(@as(usize, 1), held.len);
+    try t.expectEqualStrings(FakeHost.seizing_peer, held[0].owner_request_id);
+}
+
+// The other half of the rule, on the verb that destroys things: the scope goes
+// while the kill is in flight, so the loss is only discoverable *after* a remote
+// mutation has already happened.
+//
+// Nothing can undo the kill. What can still be refused is everything after it,
+// and `job rm --discard-evidence` has three such steps — delete the log, delete
+// the result record, delete the local row. All three are forbidden here, and the
+// attempt is settled `indeterminate` with `AUTHORITY_LOST` rather than with the
+// `exited`, `cancelled` or clean removal this command set out to write.
+test "blackbox: `job rm --discard-evidence` deletes nothing once the scope has moved" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "rm_scope_moved");
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01GGGGGGGG0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .stdout = running },
+        // The kill goes out under a lease this command still holds — and comes
+        // back after the scope has changed hands. Listed before `has-session`
+        // because `killSession`'s script contains both words.
+        .{ .needle = "kill-session", .exit_code = 0, .uses = 1, .seize = true },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var removed = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "deploy", "--discard-evidence", "--json", "--db", f.db,
+    }, &environ);
+    defer removed.deinit(f.allocator);
+
+    try host.expectSeized();
+    // Both deletions are `rm -f` scripts. Neither was sent, and neither reached
+    // the host under any other name: an unscripted command would have been
+    // counted as well. Checked ahead of the exit code, which a dozen other
+    // faults also move.
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+
+    try removed.expectSays("\"action\": \"not_removed\"");
+    try removed.expectSays("\"rowRemoved\": false");
+    // What actually happened to the evidence, not what `--discard-evidence`
+    // asked for. Reporting the flag here would send an operator looking for a
+    // log that is still sitting on the host.
+    try removed.expectSays("\"evidenceRetained\": true");
+    try removed.expectSays("\"authority\": \"lapsed\"");
+    try removed.expectSays("\"ok\": false");
+    try removed.expectSays("\"outcomeProven\": false");
+    // The reading, on the branch that took nothing. `job rm` deletes the local
+    // row, so this line and the receipt are the only places it survives — and
+    // "there was no document" has to be tellable from "there was one and we
+    // would not read it", which `outcomeProven` (false for both) cannot say.
+    try removed.expectSays("\"resultRecord\": \"absent\"");
+    try removed.expectCode(1);
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The row is still there, which is the local half of "forbid the deletion".
+    try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+
+    // The attempt is settled, and settled as unknown. Not `cancelled`: the pane
+    // went away, but with the scope in somebody else's hands since, "this
+    // command stopped that work and it is gone" is exactly what cannot be said.
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqualStrings("indeterminate", op.status.text());
+
+    // …and the receipt names why, in the code an auditor reads. Without it this
+    // is indistinguishable from the four other ways a kill ends unknown.
+    const rows = try Store.receipts.list(&store, arena, request_id);
+    var terminal_code: ?[]const u8 = null;
+    for (rows) |row| if (row.is_terminal) {
+        terminal_code = row.error_code;
+    };
+    const code = terminal_code orelse return error.RemovalLeftNoTerminalReceipt;
+    try t.expectEqualStrings("AUTHORITY_LOST", code);
+}
+
+// Authority and evidence are different things, and this is the gate that holds
+// them apart on one path.
+//
+// Both arms lose the scope at the same instant — the reply to `kill-session`,
+// the last moment at which nothing can be taken back. They differ in one thing
+// only: whether the second look comes back holding the job's own exit status.
+//
+//   * with a code, the ledger records `exited{7}`. The reading came from a
+//     document at this attempt's own request id, which no peer can write to
+//     without starting a new attempt under a new id, so losing the lease cannot
+//     have made it stale. What the loss costs is the right to *act*, not the
+//     truth of what was already read.
+//   * without one, there is nothing to stand on and the ledger records
+//     `indeterminate` / `AUTHORITY_LOST`.
+//
+// And on both, every claim that rests on the kill having worked is gone:
+// `cancellationProven` false, no `remote_cancel_confirmed`, `ok` false, a
+// non-zero exit. An earlier version downgraded both arms; the point of running
+// them together is that a rule which cannot tell them apart fails one or the
+// other.
+test "blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read" {
+    const t = std.testing;
+
+    // Arm one: the job ended by itself while the kill was in flight, and left
+    // its result record behind.
+    {
+        var f = try Fixture.init(t.allocator, "kill_lost_scope_with_code");
+        defer f.deinit();
+        try f.seedServer();
+
+        const request_id = "01HHHHHHHH0123456789ABCDEF";
+        const sentinel = "__TERMINUS_JOB_7__";
+        try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+        const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+        // The second look: a result record at this attempt's own id, saying 7.
+        const finished = "{\"v\":1,\"requestId\":\"" ++ request_id ++
+            "\",\"exitCode\":7,\"finishedAt\":1750}\n" ++ probe_split ++ "\n12\nbuilding...\n";
+        var rules = [_]FakeHost.Rule{
+            .{ .needle = probe_split, .stdout = running, .uses = 1 },
+            // The kill goes out under a lease we hold and comes back after the
+            // scope has moved. Before `has-session`: the kill script contains
+            // both words.
+            .{ .needle = "kill-session", .exit_code = 0, .uses = 1, .seize = true },
+            .{ .needle = "kill-session", .exit_code = 0 },
+            .{ .needle = probe_split, .stdout = finished },
+            .{ .needle = "has-session", .exit_code = 0 },
+        };
+        var host = try FakeHost.start(&f, &rules);
+        defer host.stop();
+        var environ = try host.environment();
+        defer environ.deinit();
+
+        var killed = try runWithEnvironment(&f, &.{
+            "job", "kill", "box", "deploy", "--json", "--db", f.db,
+        }, &environ);
+        defer killed.deinit(f.allocator);
+
+        try host.expectSeized();
+        // The kill did go out here — that is the premise. What must not have
+        // gone out is anything that destroys evidence.
+        try host.expectNeverSent("rm -f");
+        try host.expectFullyScripted();
+
+        try killed.expectSays("\"action\": \"finished_during_kill\"");
+        // The half that survives.
+        try killed.expectSays("\"exitCode\": 7");
+        try killed.expectSays("\"outcomeProven\": true");
+        // The half that does not.
+        try killed.expectSays("\"cancellationProven\": false");
+        try killed.expectSays("\"authority\": \"lapsed\"");
+        try killed.expectSays("\"ok\": false");
+        // Exit 1, not 75: the outcome is not in doubt, this command's standing
+        // is. A caller that reads 75 goes and reconciles a settled operation.
+        try killed.expectCode(1);
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const op = (try Store.operations.get(&store, arena, request_id)).?;
+        try t.expectEqualStrings("failed", op.status.text());
+
+        // The receipt says the job failed with a real code — not that the
+        // authority went. Downgrading here is what threw the reading away.
+        const rows = try Store.receipts.list(&store, arena, request_id);
+        var terminal_code: ?[]const u8 = null;
+        for (rows) |row| if (row.is_terminal) {
+            terminal_code = row.error_code;
+        };
+        const code = terminal_code orelse return error.KillLeftNoTerminalReceipt;
+        try t.expectEqualStrings("REMOTE_NONZERO_EXIT", code);
+
+        // The row followed the ledger. Two records of one reading disagreeing
+        // is the state this path exists to avoid.
+        const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+        try t.expectEqualStrings("exited", @tagName(row.status));
+    }
+
+    // Arm two: the same loss at the same instant, with nothing to stand on.
+    {
+        var f = try Fixture.init(t.allocator, "kill_lost_scope_no_code");
+        defer f.deinit();
+        try f.seedServer();
+
+        const request_id = "01JJJJJJJJ0123456789ABCDEF";
+        const sentinel = "__TERMINUS_JOB_7__";
+        try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+        const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+        var rules = [_]FakeHost.Rule{
+            .{ .needle = probe_split, .stdout = running, .uses = 1 },
+            .{ .needle = "kill-session", .exit_code = 0, .uses = 1, .seize = true },
+            .{ .needle = "kill-session", .exit_code = 0 },
+            // The second look finds what the first did: nothing.
+            .{ .needle = probe_split, .stdout = running },
+            .{ .needle = "has-session", .exit_code = 0 },
+        };
+        var host = try FakeHost.start(&f, &rules);
+        defer host.stop();
+        var environ = try host.environment();
+        defer environ.deinit();
+
+        var killed = try runWithEnvironment(&f, &.{
+            "job", "kill", "box", "deploy", "--json", "--db", f.db,
+        }, &environ);
+        defer killed.deinit(f.allocator);
+
+        try host.expectSeized();
+        try host.expectNeverSent("rm -f");
+        try host.expectFullyScripted();
+
+        try killed.expectSays("\"authority\": \"lapsed\"");
+        try killed.expectSays("\"cancellationProven\": false");
+        try killed.expectSays("\"outcomeProven\": false");
+        try killed.expectSays("\"exitCode\": null");
+        try killed.expectSays("\"ok\": false");
+        // 75 here, and 1 in the arm above. The pair is the contract: unknown
+        // outcome versus known outcome under a command that may no longer act.
+        try killed.expectCode(75);
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const op = (try Store.operations.get(&store, arena, request_id)).?;
+        try t.expectEqualStrings("indeterminate", op.status.text());
+
+        const rows = try Store.receipts.list(&store, arena, request_id);
+        var terminal_code: ?[]const u8 = null;
+        for (rows) |row| if (row.is_terminal) {
+            terminal_code = row.error_code;
+        };
+        const code = terminal_code orelse return error.KillLeftNoTerminalReceipt;
+        try t.expectEqualStrings("AUTHORITY_LOST", code);
+
+        // The row records that the session was killed, which it was —
+        // `killSession` proved the pane gone in the same round trip that lost
+        // us the lease, and that reading is no staler than arm one's exit code.
+        // The write is a compare-and-set on the row this command read, so a
+        // peer that has already relaunched refuses it rather than losing it.
+        //
+        // What the row does *not* say, and what the ledger above refuses to
+        // say, is that this command established an outcome. Those are the two
+        // different questions the two records answer.
+        const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+        try t.expectEqualStrings("killed", @tagName(row.status));
+    }
+
+    // Arm three: the same rule on the verb that deletes things. `job rm
+    // --discard-evidence` loses the scope on the kill's reply and then reads
+    // the job's own exit status, so the two halves land on one command: the
+    // outcome is recorded, and every destructive step it was about to take is
+    // refused.
+    {
+        var f = try Fixture.init(t.allocator, "rm_lost_scope_with_code");
+        defer f.deinit();
+        try f.seedServer();
+
+        const request_id = "01KKKKKKKK0123456789ABCDEF";
+        const sentinel = "__TERMINUS_JOB_7__";
+        try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+        const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+        const finished = "{\"v\":1,\"requestId\":\"" ++ request_id ++
+            "\",\"exitCode\":7,\"finishedAt\":1750}\n" ++ probe_split ++ "\n12\nbuilding...\n";
+        var rules = [_]FakeHost.Rule{
+            .{ .needle = probe_split, .stdout = running, .uses = 1 },
+            .{ .needle = "kill-session", .exit_code = 0, .uses = 1, .seize = true },
+            .{ .needle = "kill-session", .exit_code = 0 },
+            .{ .needle = probe_split, .stdout = finished },
+            .{ .needle = "has-session", .exit_code = 0 },
+        };
+        var host = try FakeHost.start(&f, &rules);
+        defer host.stop();
+        var environ = try host.environment();
+        defer environ.deinit();
+
+        var removed = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "deploy", "--discard-evidence", "--json", "--db", f.db,
+        }, &environ);
+        defer removed.deinit(f.allocator);
+
+        try host.expectSeized();
+        try host.expectNeverSent("rm -f");
+        try host.expectFullyScripted();
+
+        // Refused as a removal…
+        try removed.expectSays("\"action\": \"not_removed\"");
+        try removed.expectSays("\"rowRemoved\": false");
+        try removed.expectSays("\"evidenceRetained\": true");
+        try removed.expectSays("\"authority\": \"lapsed\"");
+        try removed.expectSays("\"ok\": false");
+        // …and still holding the reading it took on the way. A removal that
+        // refuses is not a removal that forgets what it saw.
+        try removed.expectSays("\"outcomeProven\": true");
+        try removed.expectSays("\"resultRecord\": \"present\"");
+        try removed.expectCode(1);
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const op = (try Store.operations.get(&store, arena, request_id)).?;
+        try t.expectEqualStrings("failed", op.status.text());
+
+        const rows = try Store.receipts.list(&store, arena, request_id);
+        var terminal_code: ?[]const u8 = null;
+        for (rows) |row| if (row.is_terminal) {
+            terminal_code = row.error_code;
+        };
+        const code = terminal_code orelse return error.RemovalLeftNoTerminalReceipt;
+        try t.expectEqualStrings("REMOTE_NONZERO_EXIT", code);
+
+        // The local half of "refused": the row this command was about to
+        // forget is still there for the peer that now owns the name.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+    }
 }

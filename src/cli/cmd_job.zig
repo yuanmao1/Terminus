@@ -826,6 +826,96 @@ const ConflictJson = struct {
     }
 };
 
+/// Everything `job kill --json` says, on every branch it can take.
+///
+/// A named struct with **no defaults**, and that is the substance rather than
+/// tidying: the six branches wrote six anonymous literals with six different key
+/// sets. `conflict` existed on one, `exitCode` / `outcomeProven` / `finishedAt`
+/// / `observedAt` on two, `cacheError` on three, and the branch that had already
+/// found the job finished spelled the same boolean `sessionCleanedUp` that its
+/// four siblings spelled `sessionGone`. An agent parsing this could not write
+/// one reader: whether a key was absent, or present and null, depended on which
+/// path a job it did not control happened to take.
+///
+/// Every field is required, so a new branch cannot be added that omits one and
+/// an existing one cannot quietly drop one — the compiler asks for the value.
+/// Where a branch has nothing to say, it says so explicitly: `null` for the
+/// optionals, whose meaning is "there is no such reading", never "we did not
+/// look".
+const KillJson = struct {
+    ok: bool,
+    /// `killed`, `already_finished`, `finished_during_kill`, or `not_killed`
+    /// when the scope was lost before anything was sent. What happened, not what
+    /// was asked for.
+    action: []const u8,
+    job: []const u8,
+    /// What the ledger holds for the attempt, as a word.
+    status: []const u8,
+    /// The host's own exit status where one was read, whether or not the ledger
+    /// accepted it. Null means no record answered.
+    exitCode: ?i32,
+    /// Whether the ledger backs `status`. Not the same question as
+    /// `cancellationProven`: a job that had already finished has a proven
+    /// outcome and no cancellation at all.
+    outcomeProven: bool,
+    /// The remote's own clock, when a result record carried one. Never our own.
+    finishedAt: ?i64,
+    /// Our clock, at the moment we looked.
+    observedAt: i64,
+    sessionGone: bool,
+    /// The same boolean under the name the `already_finished` branch has always
+    /// used for it. Kept so a reader written against that branch goes on
+    /// working, and published everywhere so it means one thing.
+    sessionCleanedUp: bool,
+    cancellationProven: bool,
+    conflict: ?ConflictJson,
+    resultRecord: []const u8,
+    resultRecordError: ?[]const u8,
+    requestId: ?[]const u8,
+    cacheError: ?[]const u8,
+    /// Whether this command still held the scope lease it took before it
+    /// reached the host: `held`, `lapsed`, or `unreadable`.
+    authority: []const u8,
+    authorityError: ?[]const u8,
+    hint: ?[]const u8,
+};
+
+/// Everything `job rm --json` says, on every branch it can take. Same rule and
+/// same reason as `KillJson`.
+const RemovalJson = struct {
+    ok: bool,
+    /// `removed` or `not_removed`.
+    action: []const u8,
+    job: []const u8,
+    status: []const u8,
+    outcomeProven: bool,
+    rowRemoved: bool,
+    /// Whether the host still holds this job's evidence. What actually happened
+    /// to the log, not what `--discard-evidence` asked for: a removal that lost
+    /// the scope before it deleted anything retains the evidence, and saying
+    /// otherwise would send an operator looking for a file that is still there
+    /// — or, worse, stop them looking for one that is.
+    evidenceRetained: bool,
+    attemptRetained: bool,
+    conflict: ?ConflictJson,
+    /// What the removal's own probe made of the result record, as a stable
+    /// enumeration — `not_requested` when it did not look. Same contract as
+    /// `job kill`'s: non-null on every branch of the verb, refusals included.
+    ///
+    /// `job rm` deletes the local row, so this line and the receipt are the
+    /// only places the reading survives. A caller that has to tell "there was
+    /// no document" from "there was one and we would not read it" cannot get
+    /// that from `outcomeProven`, which is false for both.
+    resultRecord: []const u8,
+    /// Prose about the reading above, for a human. Nothing branches on it.
+    resultRecordError: ?[]const u8,
+    requestId: ?[]const u8,
+    cacheError: ?[]const u8,
+    authority: []const u8,
+    authorityError: ?[]const u8,
+    hint: ?[]const u8,
+};
+
 /// How much of the log's end a state probe reads. Shared with the launch
 /// paths' lazy settlement, so both windows are the same by construction.
 const probe_tail_bytes = Cli.probe_tail_bytes;
@@ -938,13 +1028,16 @@ const RemovalReport = struct {
 fn removalReport(
     cache: Core.execution.CacheResult,
     proven: bool,
-    discard: bool,
+    /// Whether the evidence was actually deleted, not whether
+    /// `--discard-evidence` was passed. A removal that stopped before the delete
+    /// left something a reconcile can still read.
+    evidence_discarded: bool,
     unreconcilable: bool,
 ) RemovalReport {
     const removed = cache == .synced;
     return .{
         .removed = removed,
-        .ok = removed and (proven or (!discard and !unreconcilable)),
+        .ok = removed and (proven or (!evidence_discarded and !unreconcilable)),
         .action = if (removed) "removed" else "not_removed",
     };
 }
@@ -1672,6 +1765,196 @@ fn settledStatus(outcome: Core.Store.receipts.SettleOutcome) Core.Store.op_state
     };
 }
 
+/// The sentence a refused destructive step earns: what was lost, what was not
+/// done, and what to do next.
+///
+/// "Nothing that changes anything" rather than "nothing", because that is what
+/// is true: the probe above it is a read and it did go out. A hint that claimed
+/// the host had not been contacted at all would be a smaller lie than the one
+/// this whole change removes, and still a lie.
+///
+/// `what` is the trailing clause a verb wants to add about its own steps, so
+/// `job rm` can name the three things it did not delete without `job kill`
+/// claiming to have had them.
+fn refusalHint(ctx: *Cli.Ctx, authority: Authority, job_name: []const u8, what: []const u8) []const u8 {
+    return std.fmt.allocPrint(
+        ctx.arena,
+        "{s}; no command that changes anything was sent to the host and nothing local was written, so job '{s}' is exactly as it was. Wait for the other holder to finish and re-run, or re-run with --force to take the scope over{s}",
+        .{ authority.note(ctx, job_name) orelse "the scope lease is not ours", job_name, what },
+    ) catch "this command no longer holds the scope lease for this job; nothing on the host was changed and nothing local was written. Wait, or re-run with --force";
+}
+
+/// Refuses a destructive step this command no longer holds the scope for,
+/// before it is taken.
+///
+/// Reached only from a renewal placed immediately before the step, so at this
+/// point the host has been *read* and nothing more: the probe is a read, and the
+/// `kill-session` this refuses is the first command on either verb's path that
+/// changes anything. The local record is untouched too — no settlement, no cache
+/// write, no deletion — because a step we may not take is not a step we get to
+/// record having taken.
+///
+/// Exit 1 rather than 75. Nothing about the remote is unknown *because of this
+/// command*: it changed nothing, so re-running it once the scope comes free is
+/// safe, which is exactly the distinction the two codes carry.
+///
+/// Two functions rather than one because the two verbs answer with two different
+/// key sets, and a shared emitter would have to pick one of them.
+fn refuseKill(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    job: Store.jobs.Job,
+    attempt: ?Store.job_attempts.Attempt,
+    authority: Authority,
+    probe: Tmux.JobProbe,
+) noreturn {
+    const hint = refusalHint(ctx, authority, job.name, "");
+    switch (ctx.out.format) {
+        .json => ctx.out.json(KillJson{
+            .ok = false,
+            .action = "not_killed",
+            .job = job.name,
+            .status = if (attempt) |a| recordedStatus(ctx, store, a.request_id) else "unknown",
+            // What the probe read, reported because it is a fact about the host
+            // and withholding it would make this branch look like a command that
+            // never looked. `outcomeProven` is false beside it: nothing was
+            // settled here, whatever the record said.
+            .exitCode = probe.exit_code,
+            .outcomeProven = false,
+            .finishedAt = probe.finished_at,
+            .observedAt = ctx.now,
+            .sessionGone = false,
+            .sessionCleanedUp = false,
+            .cancellationProven = false,
+            .conflict = ConflictJson.from(probe.conflict),
+            .resultRecord = probe.sidecar.code(),
+            .resultRecordError = resultRecordError(ctx, probe.sidecar),
+            .requestId = if (attempt) |a| a.request_id else null,
+            .cacheError = null,
+            .authority = authority.code(),
+            .authorityError = authority.note(ctx, job.name),
+            .hint = hint,
+        }) catch {},
+        .human => ctx.out.print(
+            "job '{s}': NOT killed — {s}\n",
+            .{ job.name, hint },
+        ) catch {},
+    }
+    ctx.out.flush() catch {};
+    Cli.releaseClaim();
+    std.process.exit(Cli.exit_code.failure);
+}
+
+fn refuseRemoval(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    job: Store.jobs.Job,
+    attempt: ?Store.job_attempts.Attempt,
+    authority: Authority,
+    probe: Tmux.JobProbe,
+) noreturn {
+    const hint = refusalHint(
+        ctx,
+        authority,
+        job.name,
+        ". Its log, its result record and its local row are all still there",
+    );
+    switch (ctx.out.format) {
+        .json => ctx.out.json(RemovalJson{
+            .ok = false,
+            .action = "not_removed",
+            .job = job.name,
+            .status = if (attempt) |a| recordedStatus(ctx, store, a.request_id) else "unchanged",
+            .outcomeProven = false,
+            .rowRemoved = false,
+            .evidenceRetained = true,
+            .attemptRetained = attempt != null,
+            .conflict = ConflictJson.from(probe.conflict),
+            .resultRecord = probe.sidecar.code(),
+            .resultRecordError = resultRecordError(ctx, probe.sidecar),
+            .requestId = if (attempt) |a| a.request_id else null,
+            .cacheError = null,
+            .authority = authority.code(),
+            .authorityError = authority.note(ctx, job.name),
+            .hint = hint,
+        }) catch {},
+        .human => ctx.out.print(
+            "job '{s}' was NOT removed: {s}\n",
+            .{ job.name, hint },
+        ) catch {},
+    }
+    ctx.out.flush() catch {};
+    Cli.releaseClaim();
+    std.process.exit(Cli.exit_code.failure);
+}
+
+/// Whether a kill may publish `remote_cancel_confirmed` — the one terminal on
+/// this path that both claims a proven outcome and releases the scope barrier.
+///
+/// Four conjuncts, and each one is a different way the claim can be false:
+///
+///   * `can_prove` — this supervisor can establish the process tree is gone at
+///     all. Under the shell supervisor it cannot, so the honest terminal is
+///     `indeterminate` and the operator is told why.
+///   * `session_gone` — `killSession` actually reported the pane absent.
+///   * `!refused` — a second look did not find a result record it had to
+///     decline. The pane went away, but the job left a verdict nobody can read,
+///     so "we stopped it" is not what happened.
+///   * `authority.holds()` — the scope lease was still ours when we looked
+///     after the kill. This is the conjunct the fail-closed pass added, and it
+///     is the one no reading can substitute for: a peer that took the lease may
+///     have relaunched into the name we just made room in, so "the work we
+///     stopped is gone" is a claim about a job somebody else has been free to
+///     touch ever since. Settling `cancelled` on it releases the barrier over
+///     exactly that.
+///
+/// A function rather than an expression at the two sites that need it, because
+/// they must not disagree: the terminal the ledger records and the
+/// `cancellationProven` the caller reads are the same claim. It is also the only
+/// way to gate the `can_prove = true` half of the rule — this build's supervisor
+/// answers `false`, so a truth table is the only place the other three conjuncts
+/// are visible at all.
+fn cancellationProvable(
+    authority: Authority,
+    refused: bool,
+    session_gone: bool,
+    can_prove: bool,
+) bool {
+    return authority.holds() and !refused and session_gone and can_prove;
+}
+
+test cancellationProvable {
+    const t = std.testing;
+    // The whole table, because the point of the predicate is that each conjunct
+    // is load-bearing on its own and none of them is reachable from the others.
+    //
+    // `can_prove = true` in particular cannot be driven through the binary at
+    // all: this build's supervisor is the shell one, whose `pid_proof` is
+    // `.weak`, so `verified_cancellation` answers false and every end-to-end
+    // path reports `cancellationProven: false` no matter what the other three
+    // say. A gate that only drove the CLI would therefore pass with the
+    // authority conjunct deleted — it would be measuring the supervisor.
+    try t.expect(cancellationProvable(.held, false, true, true));
+
+    // The scope moved while we were killing. The pane is gone and the
+    // supervisor could vouch for it, and it still is not a proven
+    // cancellation: whoever holds the lease has been free to relaunch into the
+    // name we just made room in ever since.
+    try t.expect(!cancellationProvable(.lapsed, false, true, true));
+    try t.expect(!cancellationProvable(.{ .unreadable = "SQLiteBusy" }, false, true, true));
+
+    // A verdict was there and was refused. The session stopped; it did not stop
+    // *because of us*.
+    try t.expect(!cancellationProvable(.held, true, true, true));
+
+    // The pane outlived the kill.
+    try t.expect(!cancellationProvable(.held, false, false, true));
+
+    // Nothing can see whether the process tree went with the pane. This is the
+    // one the shipped supervisor actually hits.
+    try t.expect(!cancellationProvable(.held, false, true, false));
+}
+
 /// Stops a job and records what that actually established.
 ///
 /// Not a new operation: a kill settles the attempt already in flight, so the
@@ -1716,7 +1999,10 @@ fn killJob(
     claim: Claim,
 ) !void {
     // The scope was taken in `jobCmd`, before the connection was opened, and
-    // is held from here through the kill to the settlement below.
+    // is held from here through the kill to the settlement below. Every step
+    // that changes the host renews it first and refuses if the renewal says the
+    // scope is no longer ours; `authority` is this command's running answer.
+    var authority: Authority = .held;
     const probe = Tmux.probeTail(
         executor,
         ctx.arena,
@@ -1742,9 +2028,12 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
-        // Held from before the connection to here, and renewed once: this is
-        // the last stretch where losing it would matter.
-        holdClaim(claim, wallClockSeconds(ctx.io));
+        // The renewal that precedes this branch's one destructive step, and the
+        // gate on it. Nothing remote happens between here and the
+        // `kill-session` below — the settlement in between is a local
+        // transaction — so a lease we no longer hold stops this command with the
+        // host untouched and the ledger unwritten.
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
         const settled = settleObserved(
             ctx,
             store,
@@ -1769,18 +2058,28 @@ fn killJob(
         Cli.releaseClaim();
 
         switch (ctx.out.format) {
-            .json => try ctx.out.json(.{
+            .json => try ctx.out.json(KillJson{
                 .ok = false,
                 .action = "killed",
                 .job = job.name,
                 .status = settled.statusText(),
+                // A contradiction has no exit code by construction:
+                // `Tmux.readingOf` refuses to pick a winner, and the two codes
+                // travel in `conflict` instead.
+                .exitCode = null,
+                .outcomeProven = settled.settlement.proves(),
+                .finishedAt = null,
+                .observedAt = ctx.now,
                 .sessionGone = session_gone,
+                .sessionCleanedUp = session_gone,
                 .cancellationProven = false,
                 .conflict = ConflictJson.from(clash),
                 .resultRecord = probe.sidecar.code(),
                 .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
                 .cacheError = cacheError(ctx, job.name, settled.cache),
+                .authority = authority.code(),
+                .authorityError = authority.note(ctx, job.name),
                 .hint = "the two records disagree; settle it by hand with 'terminus request reconcile <request-id> --override'",
             }),
             .human => {
@@ -1815,7 +2114,7 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
-        holdClaim(claim, wallClockSeconds(ctx.io));
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
         const settled = settleObserved(
             ctx,
             store,
@@ -1834,17 +2133,29 @@ fn killJob(
         Cli.releaseClaim();
 
         switch (ctx.out.format) {
-            .json => try ctx.out.json(.{
+            .json => try ctx.out.json(KillJson{
                 .ok = false,
                 .action = "killed",
                 .job = job.name,
                 .status = settled.statusText(),
+                // The declined code is deliberately not published here as
+                // `exitCode`: it is the verdict this branch refused to read, and
+                // a caller reading it out of that key would be taking the very
+                // outcome the refusal exists to withhold.
+                .exitCode = null,
+                .outcomeProven = settled.settlement.proves(),
+                .finishedAt = null,
+                .observedAt = ctx.now,
                 .sessionGone = session_gone,
+                .sessionCleanedUp = session_gone,
                 .cancellationProven = false,
+                .conflict = null,
                 .resultRecord = probe.sidecar.code(),
                 .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
                 .cacheError = cacheError(ctx, job.name, settled.cache),
+                .authority = authority.code(),
+                .authorityError = authority.note(ctx, job.name),
                 // Not `--from-log`: that reconcile reads these same two
                 // records and will refuse for the same reason.
                 .hint = "the result record is unusable, so no mechanical reconcile can settle this; check the host and use 'terminus request reconcile <request-id> --override'",
@@ -1881,7 +2192,7 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
-        holdClaim(claim, wallClockSeconds(ctx.io));
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
         const settled = settleObserved(
             ctx,
             store,
@@ -1923,7 +2234,7 @@ fn killJob(
             null;
 
         switch (ctx.out.format) {
-            .json => try ctx.out.json(.{
+            .json => try ctx.out.json(KillJson{
                 .ok = ok,
                 .action = "already_finished",
                 .job = job.name,
@@ -1932,12 +2243,17 @@ fn killJob(
                 .outcomeProven = proven,
                 .finishedAt = probe.finished_at,
                 .observedAt = ctx.now,
+                .sessionGone = session_gone,
                 .sessionCleanedUp = session_gone,
                 // Nothing was cancelled: the job had already ended on its own.
                 .cancellationProven = false,
+                .conflict = null,
                 .resultRecord = probe.sidecar.code(),
                 .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
+                .cacheError = cacheError(ctx, job.name, settled.cache),
+                .authority = authority.code(),
+                .authorityError = authority.note(ctx, job.name),
                 .hint = hint,
             }),
             .human => {
@@ -1993,6 +2309,12 @@ fn killJob(
     // path, which would delete the record it never read.
     //
     // Hence: kill, prove the session is gone, then look again.
+    //
+    // The renewal comes first, and its answer decides whether the kill happens
+    // at all. This is the branch where a stale claim costs the most: `job kill`
+    // with no outcome in hand is about to stop a pane, and if the scope now
+    // belongs to somebody else that pane may be theirs.
+    if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
     const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);
 
@@ -2000,7 +2322,7 @@ fn killJob(
         finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)
     else
         .{};
-    if (final.upgrade) |after| return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone, claim);
+    if (final.upgrade) |after| return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone, claim, authority);
 
     // The reading this command ends on. The second look happened later and, on
     // the path that matters here, is the only one that saw the document at all
@@ -2017,23 +2339,14 @@ fn killJob(
             Cli.storeFatal(store, err)
     else
         null;
-    const terminal: Core.Store.op_state.Terminal = if (final.refusal) |seen|
-        // Checked ahead of the cancellation, and it outranks it. `killSession`
-        // proving the pane is gone says the session stopped; it says nothing
-        // about *why*, and here the job left a verdict behind while we were
-        // stopping it. Recording `remote_cancel_confirmed` would settle a
-        // proven terminal and release the scope over a document at this
-        // request's own address that we have just declined to read — the one
-        // thing every refused path is forbidden to do.
-        .{ .indeterminate = .{
-            .reason = std.fmt.allocPrint(
-                ctx.arena,
-                "the job's session was killed, and a second look found its result record present and unusable: the sentinel in its log says exit {d}, but {s}. The stronger of the two records cannot be read, so the weaker one cannot be checked against it and its exit status was not read as this job's outcome",
-                .{ seen.declined.sentinel_exit_code, defectSentence(ctx, seen.sidecar) },
-            ) catch "the job's session was killed and its result record is present and unusable, so the exit status in its log was not read as its outcome",
-            .last_observed = if (execution) |e| e.status else .remote_started,
-        } }
-    else if (session_gone and can_prove)
+    // The renewal that precedes the settlement, and the only place a loss that
+    // happened *during* the kill can still be caught. Read before the terminal
+    // is chosen, because it changes which terminal this command is entitled to
+    // write.
+    _ = stillOurs(claim, ctx.io, &authority);
+    const last_observed = if (execution) |e| e.status else .remote_started;
+    const provable = cancellationProvable(authority, final.refusal != null, session_gone, can_prove);
+    const terminal: Core.Store.op_state.Terminal = if (provable)
         .{ .remote_cancel_confirmed = .{
             .pid = null,
             .term_sent = true,
@@ -2041,15 +2354,42 @@ fn killJob(
             .absence_verified_at = ctx.now,
             .verification_method = "supervisor verified the process group is gone",
         } }
+    else if (!authority.holds())
+        // Outranks every reading left below, including a `killSession` that
+        // proved the pane gone. There is no exit code on this branch — the
+        // upgrade path took every reading that carries one — so nothing here
+        // survives a lost lease. What the alternatives would claim is that this
+        // command stopped this job's work and that the work is gone; with the
+        // scope in somebody else's hands since the kill, the second half is
+        // exactly what we cannot say — a peer holding the lease may have
+        // relaunched under this name into the session we just made room in.
+        // Settling `cancelled` would release the scope barrier over that.
+        authority.lostTerminal(ctx, job.name, last_observed)
+    else if (final.refusal) |seen|
+        // Still outranks the cancellation above, through that predicate's
+        // `!refused` conjunct rather than through this arm's position.
+        // `killSession` proving the pane is gone says the session stopped; it
+        // says nothing about *why*, and here the job left a verdict behind
+        // while we were stopping it. Recording `remote_cancel_confirmed` would
+        // settle a proven terminal and release the scope over a document at
+        // this request's own address that we have just declined to read — the
+        // one thing every refused path is forbidden to do.
+        .{ .indeterminate = .{
+            .reason = std.fmt.allocPrint(
+                ctx.arena,
+                "the job's session was killed, and a second look found its result record present and unusable: the sentinel in its log says exit {d}, but {s}. The stronger of the two records cannot be read, so the weaker one cannot be checked against it and its exit status was not read as this job's outcome",
+                .{ seen.declined.sentinel_exit_code, defectSentence(ctx, seen.sidecar) },
+            ) catch "the job's session was killed and its result record is present and unusable, so the exit status in its log was not read as its outcome",
+            .last_observed = last_observed,
+        } }
     else
         .{ .indeterminate = .{
             .reason = if (session_gone)
                 "job session killed, but this supervisor cannot prove the process tree stopped (a daemonized or disowned child survives its pane)"
             else
                 "kill issued but the job session is still present",
-            .last_observed = if (execution) |e| e.status else .remote_started,
+            .last_observed = last_observed,
         } };
-    holdClaim(claim, wallClockSeconds(ctx.io));
     const settled = settleObserved(
         ctx,
         store,
@@ -2064,13 +2404,18 @@ fn killJob(
     Cli.releaseClaim();
     const settled_status = settled.statusText();
 
-    // A refusal is never a proven cancellation. The pane really did go away,
-    // but what this command would be claiming is that it *stopped* the work,
-    // and the record it just refused says the work ended on its own with a
-    // verdict nobody could check.
-    const proven = final.refusal == null and session_gone and can_prove;
+    // The same predicate the terminal above was chosen with, on purpose: what
+    // the ledger recorded and what the caller reads are one claim, so they
+    // cannot drift apart.
+    const proven = provable;
     const cache_error = cacheError(ctx, job.name, settled.cache);
-    const hint: ?[]const u8 = if (final.refusal != null)
+    const hint: ?[]const u8 = if (!authority.holds())
+        std.fmt.allocPrint(
+            ctx.arena,
+            "{s}. The session was already stopped when this was found, so that much did happen; nothing after it was taken — no evidence was deleted and no local row was removed — and the outcome is recorded as unknown. Settle it with 'terminus request reconcile <request-id> --override' once you know who else was acting on this job",
+            .{authority.note(ctx, job.name) orelse "the scope lease is not ours"},
+        ) catch "this command lost the scope lease for this job after stopping its session; the outcome is recorded as unknown"
+    else if (final.refusal != null)
         // Not `--from-log`: that reconcile reads these same two records and
         // will refuse for the same reason this kill did.
         "the result record is unusable, so no mechanical reconcile can settle this; check the host and use 'terminus request reconcile <request-id> --override'"
@@ -2079,21 +2424,34 @@ fn killJob(
     else
         Core.supervisor.Requirement.verified_cancellation.explain();
     switch (ctx.out.format) {
-        .json => try ctx.out.json(.{
+        .json => try ctx.out.json(KillJson{
             .ok = proven and cache_error == null,
             .action = "killed",
             .job = job.name,
             .status = settled_status,
+            .exitCode = null,
+            .outcomeProven = settled.settlement.proves(),
+            .finishedAt = null,
+            .observedAt = ctx.now,
             .sessionGone = session_gone,
+            .sessionCleanedUp = session_gone,
             .cancellationProven = proven,
+            .conflict = null,
             .resultRecord = reading.code(),
             .resultRecordError = resultRecordError(ctx, reading),
             .requestId = if (attempt) |a| a.request_id else null,
             .cacheError = cache_error,
+            .authority = authority.code(),
+            .authorityError = authority.note(ctx, job.name),
             .hint = hint,
         }),
         .human => {
-            if (final.refusal) |seen| {
+            if (!authority.holds()) {
+                try ctx.out.print(
+                    "job '{s}': session killed, then this command found it no longer held the scope lease; the outcome is unknown\n",
+                    .{job.name},
+                );
+            } else if (final.refusal) |seen| {
                 try ctx.out.print(
                     "job '{s}': session killed; its log sentinel says exit {d} but its result record is present and unusable ({s}), so its outcome is unknown\n",
                     .{ job.name, seen.declined.sentinel_exit_code, seen.sidecar.code() },
@@ -2106,6 +2464,11 @@ fn killJob(
                 try ctx.out.print("kill issued for '{s}' but the session is still present\n", .{job.name});
             }
             if (cache_error) |text| try ctx.out.print("  {s}\n", .{text});
+            // The lost-authority sentence carries what was and was not done, and
+            // the line above it only says the session stopped. Printed on that
+            // path alone: the others' hints are already spelled out by the
+            // sentence they follow.
+            if (!authority.holds()) if (hint) |text| try ctx.out.print("  {s}\n", .{text});
         },
     }
     if (!proven) {
@@ -2354,7 +2717,9 @@ test finalProbe {
 /// because the two are answers to different questions: one says the kill was
 /// unnecessary, this says the kill raced with the job and lost. The exit code
 /// is the real one either way, and it is the reason nothing here is
-/// `indeterminate`.
+/// `indeterminate` — including when the scope went with the race. `held`
+/// carries that in, and it changes what this command *claims*, not what it
+/// read.
 fn reportFinishedDuringKill(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -2363,6 +2728,7 @@ fn reportFinishedDuringKill(
     probe: Tmux.JobProbe,
     session_gone: bool,
     claim: Claim,
+    held: Authority,
 ) !void {
     const code = probe.exit_code.?;
     var execution = if (attempt) |a|
@@ -2370,29 +2736,62 @@ fn reportFinishedDuringKill(
             Cli.storeFatal(store, err)
     else
         null;
-    holdClaim(claim, wallClockSeconds(ctx.io));
+    // Reached from after the kill, so this renewal is the one that catches a
+    // loss that happened during it.
+    var authority = held;
+    _ = stillOurs(claim, ctx.io, &authority);
+    // The exit code stands whatever the lease says.
+    //
+    // Authority and evidence are different things. The lease governs what this
+    // command is still allowed to *do*; it says nothing about whether what we
+    // already read is true. This reading came from a result record written at
+    // this attempt's own request id — an address a peer cannot write to without
+    // starting a new attempt under a new id — so it cannot be some later run's
+    // verdict wearing ours. Losing the lease means we may no longer act on this
+    // job. It does not mean the host stopped having ended it with this code.
+    //
+    // What does not survive is every claim that rests on the *kill* having
+    // taken effect: `cancellationProven` stays false (it is false on this path
+    // regardless — the job reached its own end first), `remote_cancel_confirmed`
+    // is never published from here, and nothing is deleted. `ok` still goes
+    // false and the exit code still goes non-zero, because a command that lost
+    // the scope mid-flight is not a command that succeeded.
+    const terminal: Core.Store.op_state.Terminal = .{ .exited = .{ .exit_code = code } };
     const settled = settleObserved(
         ctx,
         store,
         if (execution) |*e| e else null,
         attempt,
-        .{ .exited = .{ .exit_code = code } },
+        terminal,
         .{
             // The host's own clock when it reported one. Null otherwise —
             // the ledger's `finished_at` is a remote reading or nothing.
             .finished_at = probe.finished_at,
             .stdout = .{ .bytes = @intCast(probe.output.len) },
         },
+        // Follows the ledger, and must: the row and the ledger are two records
+        // of one reading, and the state this whole path exists to avoid is the
+        // two of them disagreeing about how the job ended.
         finishSync(job, .exited, code, probe.finished_at orelse ctx.now),
     );
     Cli.releaseClaim();
     const settled_status = settled.statusText();
     const proven = settled.settlement.proves();
     const cache_error = cacheError(ctx, job.name, settled.cache);
+    const hint: ?[]const u8 = if (!authority.holds())
+        std.fmt.allocPrint(
+            ctx.arena,
+            "{s}. The host's own record says this job ended with exit {d}, and that reading stands — it is recorded as the outcome. What is not recorded is anything this kill did: no evidence was deleted and no local row was removed. Check who else was acting on this job before you act on it again",
+            .{ authority.note(ctx, job.name) orelse "the scope lease is not ours", code },
+        ) catch "this command lost the scope lease for this job after reading its exit status; the exit status is recorded, nothing else this command did is"
+    else if (proven)
+        cache_error
+    else
+        "the host holds this job's exit status but the ledger does not; settle it with 'terminus request reconcile <request-id> --from-log'";
 
     switch (ctx.out.format) {
-        .json => try ctx.out.json(.{
-            .ok = proven and cache_error == null,
+        .json => try ctx.out.json(KillJson{
+            .ok = proven and cache_error == null and authority.holds(),
             .action = "finished_during_kill",
             .job = job.name,
             .status = settled_status,
@@ -2401,30 +2800,41 @@ fn reportFinishedDuringKill(
             .finishedAt = probe.finished_at,
             .observedAt = ctx.now,
             .sessionGone = session_gone,
+            .sessionCleanedUp = session_gone,
             // Nothing was cancelled: the job reached its own end first.
             .cancellationProven = false,
+            .conflict = null,
             .resultRecord = probe.sidecar.code(),
             .resultRecordError = resultRecordError(ctx, probe.sidecar),
             .requestId = if (attempt) |a| a.request_id else null,
             .cacheError = cache_error,
-            .hint = if (proven) cache_error else @as(
-                ?[]const u8,
-                "the host holds this job's exit status but the ledger does not; settle it with 'terminus request reconcile <request-id> --from-log'",
-            ),
+            .authority = authority.code(),
+            .authorityError = authority.note(ctx, job.name),
+            .hint = hint,
         }),
         .human => {
-            try ctx.out.print(
-                "job '{s}' finished on its own (exit {d}) while its session was being killed; recorded that, not a cancellation\n",
-                .{ job.name, code },
-            );
+            if (authority.holds())
+                try ctx.out.print(
+                    "job '{s}' finished on its own (exit {d}) while its session was being killed; recorded that, not a cancellation\n",
+                    .{ job.name, code },
+                )
+            else
+                try ctx.out.print(
+                    "job '{s}' finished on its own (exit {d}) while its session was being killed; that exit status is recorded, but this command no longer held the scope lease\n",
+                    .{ job.name, code },
+                );
             if (cache_error) |text| try ctx.out.print("  {s}\n", .{text});
+            if (!authority.holds()) if (hint) |text| try ctx.out.print("  {s}\n", .{text});
         },
     }
     if (!proven) {
         try ctx.out.flush();
         Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
     }
-    if (cache_error != null) {
+    // Not 75: the outcome is not in doubt — the exit code was read and
+    // recorded. What failed is this command's standing to act, which is a
+    // plain failure, and the caller must not read a zero over it.
+    if (cache_error != null or !authority.holds()) {
         try ctx.out.flush();
         std.process.exit(Cli.exit_code.failure);
     }
@@ -2460,8 +2870,11 @@ fn removeJob(
     parsed: *const Cli.Args.Parsed,
 ) !void {
     // The scope was taken in `jobCmd`, before the connection was opened, and
-    // is held through the kill, the evidence decision and the settlement.
+    // is held through the kill, the evidence decision and the settlement. Every
+    // step that destroys something renews it first — this verb has three, and
+    // one renewal at the top would only ever have described the first.
     const discard = parsed.boolean("discard-evidence");
+    var authority: Authority = .held;
 
     // Look before destroying: if the outcome is provable right now, it need
     // never become an override. Re-read after the kill (below), because the
@@ -2477,6 +2890,11 @@ fn removeJob(
 
     // The real boolean, on both branches. `killSession` never touches the log;
     // destroying evidence is a separate act below, gated on this answer.
+    //
+    // Renewed immediately before it, and refused if the scope has moved: this
+    // is the first command on this path that changes anything, and everything
+    // after it is a deletion.
+    if (!stillOurs(claim, ctx.io, &authority)) refuseRemoval(ctx, store, job, attempt, authority, probe);
     const cleared = Tmux.killSession(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);
     if (!cleared) fatal(
@@ -2519,19 +2937,43 @@ fn removeJob(
         break :blk if (final.refusal) |seen| seen.declined else null;
     };
 
+    // What was actually destroyed, which is not the same as what was asked for.
+    // A `--discard-evidence` that lost the scope between the kill and the delete
+    // discards nothing, and reporting `evidenceRetained: false` off the flag
+    // would send an operator looking for a file that is still sitting there.
+    var log_discarded = false;
+    var result_discarded = false;
     if (discard) {
         // Only now, with the session proven gone. A live pane recreates the
         // log through `pipe-pane`, so deleting it under a surviving session
         // would leave a file that quietly comes back holding a partial
         // history starting mid-job.
-        Tmux.removeLog(executor, ctx.arena, session) catch |err|
-            fatal("job '{s}': its session is stopped but its log could not be deleted: {s} ({s}); nothing was removed locally, so the job is still tracked", .{ job.name, executor.errorMessage(), @errorName(err) });
-        // The sidecar is evidence too. Leaving it behind after being told to
-        // discard evidence would make the next `reconcile --from-log` settle
-        // from a file the caller believes is gone. A half-discarded evidence
-        // set must not be reported as a clean removal, so this is fatal.
-        if (attempt) |a| Tmux.removeResult(executor, ctx.arena, a.request_id) catch |err|
-            fatal("job '{s}': its log was deleted but its result record could not be: {s} ({s}); the evidence set is now half gone. Delete {s}.json under ~/.terminus/results by hand, then re-run this command", .{ job.name, executor.errorMessage(), @errorName(err), a.request_id });
+        //
+        // And only while the scope is still ours. The kill above is reversible
+        // in the only sense that matters — the work can be relaunched — and
+        // deleting the log is not, so a claim that has moved on since the kill
+        // stops the command here with the evidence intact.
+        if (stillOurs(claim, ctx.io, &authority)) {
+            Tmux.removeLog(executor, ctx.arena, session) catch |err|
+                fatal("job '{s}': its session is stopped but its log could not be deleted: {s} ({s}); nothing was removed locally, so the job is still tracked", .{ job.name, executor.errorMessage(), @errorName(err) });
+            log_discarded = true;
+            // The sidecar is evidence too. Leaving it behind after being told to
+            // discard evidence would make the next `reconcile --from-log` settle
+            // from a file the caller believes is gone. A half-discarded evidence
+            // set must not be reported as a clean removal, so this is fatal.
+            //
+            // Its own renewal, because it is its own remote deletion. When that
+            // renewal is the one that fails, the set really is half gone — the
+            // record says so below rather than a fatal saying it, because the
+            // ledger still has to be told that this command established nothing.
+            if (attempt) |a| {
+                if (stillOurs(claim, ctx.io, &authority)) {
+                    Tmux.removeResult(executor, ctx.arena, a.request_id) catch |err|
+                        fatal("job '{s}': its log was deleted but its result record could not be: {s} ({s}); the evidence set is now half gone. Delete {s}.json under ~/.terminus/results by hand, then re-run this command", .{ job.name, executor.errorMessage(), @errorName(err), a.request_id });
+                    result_discarded = true;
+                }
+            }
+        }
     }
 
     // The settlement and the deletion are one transaction. Split apart, a
@@ -2550,7 +2992,31 @@ fn removeJob(
             Cli.storeFatal(store, err)
     else
         null;
-    const terminal: Core.Store.op_state.Terminal = if (probe.conflict) |clash|
+    // The renewal before the settlement, and the last chance to notice a loss
+    // that happened during the kill or the re-read.
+    _ = stillOurs(claim, ctx.io, &authority);
+    const terminal: Core.Store.op_state.Terminal = if (probe.exit_code) |code|
+        // First, and above the lost-lease arm on purpose. Authority and
+        // evidence are different things: the lease governs what this command
+        // may still *do*, not whether what it already read is true. This code
+        // came from a record at this attempt's own request id, an address no
+        // peer can write to without starting a new attempt under a new id, so
+        // it cannot be a later run's verdict wearing ours. Losing the lease
+        // means we may not delete anything; it does not mean the host stopped
+        // having ended this job with this code.
+        //
+        // Ahead of the conflict and refusal arms only nominally: `JobProbe`
+        // documents `exit_code` as structurally null whenever either of those
+        // is set, so this cannot outrank them.
+        .{ .exited = .{ .exit_code = code } }
+    else if (!authority.holds())
+        // Outranks the readings left below, which are the ones that describe
+        // what the removal did rather than what the job did. The row is about
+        // to be kept rather than deleted, and those reasons all open with "job
+        // removed" — a receipt saying so beside a surviving row would report a
+        // removal this command refused to perform.
+        authority.lostTerminal(ctx, job.name, if (execution) |e| e.status else .remote_started)
+    else if (probe.conflict) |clash|
         // Two mechanical records contradicting each other is not an outcome,
         // so this stays unproven, exits 75, and the caller owes a reconcile.
         .{ .indeterminate = .{
@@ -2576,17 +3042,14 @@ fn removeJob(
             ) catch "job removed while its result record was present and unusable, so the exit status in its log was not read as its outcome",
             .last_observed = if (execution) |e| e.status else .remote_started,
         } }
-    else if (probe.exit_code) |code|
-        .{ .exited = .{ .exit_code = code } }
     else
         .{ .indeterminate = .{
-            .reason = if (discard)
+            .reason = if (log_discarded)
                 "job removed with --discard-evidence; the log was deleted, so its outcome can no longer be established mechanically"
             else
                 "job removed before its outcome was established; the log is retained for 'request reconcile --from-log'",
             .last_observed = if (execution) |e| e.status else .remote_started,
         } };
-    holdClaim(claim, wallClockSeconds(ctx.io));
     const settled = settleObserved(
         ctx,
         store,
@@ -2603,10 +3066,15 @@ fn removeJob(
             // saying anybody had looked.
             .result_record = resultRecordOf(ctx, reading),
         },
-        .{ .forget = .{
+        // The row is deleted only while the scope is ours. Forgetting a name
+        // this command no longer speaks for is the one local step that cannot
+        // be undone by re-running it — the row is what a later `job status`,
+        // `job kill` or `run --name` reads — and a peer that took the lease may
+        // be relying on it right now.
+        if (authority.holds()) .{ .forget = .{
             .expected = job.removeExpectation(),
             .grounds = .session_proven_gone,
-        } },
+        } } else .none,
     );
     Cli.releaseClaim();
     // `proven` is about the outcome, not about the deletion: it is true only
@@ -2622,13 +3090,40 @@ fn removeJob(
     // did. Telling an operator to run a command that cannot succeed is the
     // pseudo-success this closes.
     const unreconcilable = probe.conflict != null or declined != null;
-    const report = removalReport(settled.cache, proven, discard, unreconcilable);
+    const report = removalReport(settled.cache, proven, log_discarded, unreconcilable);
     const removed = report.removed;
     const settled_status = if (attempt == null) "unchanged" else settled.statusText();
     const cache_error = cacheError(ctx, job.name, settled.cache);
 
     const ok = report.ok;
-    const hint: ?[]const u8 = if (cache_error) |text|
+    // What a removal that lost its scope actually did, stated in full: the
+    // session really was stopped, and each of the three destructive steps after
+    // it either happened before the loss or did not happen at all. An operator
+    // who is told only "refused" does not know which.
+    const stopped_at: []const u8 = if (!log_discarded)
+        "Its session was stopped; nothing was deleted, so its log, its result record and its local row are all still there"
+    else if (!result_discarded and attempt != null)
+        "Its session was stopped and its log was deleted before the loss was found; its result record and its local row were not touched"
+    else
+        "Its session was stopped and its evidence was deleted before the loss was found; its local row was not touched";
+    // …and what it left in the ledger, which is no longer one answer. A real
+    // exit code read before the loss is recorded as the outcome; with no exit
+    // code in hand there is nothing to record and the outcome stays unknown.
+    const outcome_at: []const u8 = if (probe.exit_code) |code|
+        std.fmt.allocPrint(
+            ctx.arena,
+            "the host's own record says it ended with exit {d} and that is recorded as its outcome",
+            .{code},
+        ) catch "its exit status was read before the loss and is recorded as its outcome"
+    else
+        "the outcome is recorded as unknown";
+    const hint: ?[]const u8 = if (!authority.holds())
+        std.fmt.allocPrint(
+            ctx.arena,
+            "{s}. {s}, and {s}. Check who else was acting on this job before you act on it again; settle anything still unknown with 'terminus request reconcile <request-id> --override'",
+            .{ authority.note(ctx, job.name) orelse "the scope lease is not ours", stopped_at, outcome_at },
+        ) catch "this command lost the scope lease for this job, so it stopped short of removing anything"
+    else if (cache_error) |text|
         text
     else if (proven)
         null
@@ -2636,12 +3131,12 @@ fn removeJob(
         "the job's two durable records disagree; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'"
     else if (declined != null)
         "the job's result record is present and unusable, so the exit status in its log could not be checked against it; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'"
-    else if (discard)
+    else if (log_discarded)
         null
     else
         "outcome still unknown; settle it with 'terminus request reconcile <request-id> --from-log'";
     switch (ctx.out.format) {
-        .json => try ctx.out.json(.{
+        .json => try ctx.out.json(RemovalJson{
             .ok = ok,
             // What actually happened to the row, which is the fact this
             // command exists to report. `"removed"` on a row that survived was
@@ -2652,18 +3147,25 @@ fn removeJob(
             .status = settled_status,
             .outcomeProven = proven,
             .rowRemoved = removed,
-            .evidenceRetained = !discard,
+            .evidenceRetained = !log_discarded,
             .attemptRetained = attempt != null,
             .conflict = ConflictJson.from(probe.conflict),
+            // `reading`, not `probe.sidecar`: the same reading the receipt was
+            // written from, so the line and the receipt cannot disagree about
+            // what was on the host.
+            .resultRecord = reading.code(),
+            .resultRecordError = resultRecordError(ctx, reading),
             .requestId = if (attempt) |a| a.request_id else null,
             .cacheError = cache_error,
+            .authority = authority.code(),
+            .authorityError = authority.note(ctx, job.name),
             .hint = hint,
         }),
         .human => {
             if (!removed) {
                 try ctx.out.print(
                     "job '{s}' was NOT removed: {s}\n",
-                    .{ job.name, cache_error orelse "its row is no longer the row this command read" },
+                    .{ job.name, hint orelse cache_error orelse "its row is no longer the row this command read" },
                 );
             } else if (proven) {
                 try ctx.out.print("removed job '{s}' (outcome recorded from its log)\n", .{job.name});
@@ -2677,7 +3179,7 @@ fn removeJob(
                     "removed job '{s}'; its log sentinel says exit {d} but its result record is present and unusable ({s}), so its outcome is unknown\n",
                     .{ job.name, refusal.sentinel_exit_code, reading.code() },
                 );
-            } else if (discard) {
+            } else if (log_discarded) {
                 try ctx.out.print("removed job '{s}' and deleted its log; its outcome can no longer be proven\n", .{job.name});
             } else {
                 try ctx.out.print("removed job '{s}'; outcome unknown, log retained for reconcile\n", .{job.name});
@@ -2687,7 +3189,7 @@ fn removeJob(
             // the discard branch — otherwise `--discard-evidence` on a job
             // whose records disagreed, or whose result record could not be
             // read, never tells the operator that those records are now gone.
-            if (discard and (proven or unreconcilable))
+            if (log_discarded and (proven or unreconcilable))
                 try ctx.out.print("  its log and result record were deleted; nothing can read them again\n", .{});
         },
     }
@@ -3002,15 +3504,103 @@ fn wallClockSeconds(io: std.Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
 }
 
-/// Keeps the claim alive across the remote work, and says so when it is gone.
+/// Whether this command still holds the scope it took before it reached the
+/// host.
 ///
-/// Called once, between the last remote call and the settlement. A claim we no
-/// longer hold means somebody forced their way past us and may be acting on
-/// this job right now — which cannot change what we do next (the kill has
-/// already happened and the ledger must record it) but must not be silent
-/// either. Reported the way `finalProbe` reports a failed re-read: on the way
-/// out, where there is no error to return and no result to withhold.
-fn holdClaim(claim: Claim, now: i64) void {
+/// Three answers and not a bool, because the two failures are different facts
+/// and the report says which one it got. `lapsed` is an answer — the row is not
+/// ours, so another session may be acting on this job right now. `unreadable` is
+/// the absence of one: the store could not be asked, so the question stands
+/// open. Neither is `held`, and that is the whole of the rule every destructive
+/// step below runs under: **a question we could not ask is not a yes.**
+const Authority = union(enum) {
+    held,
+    /// `leases.renew` matched no row: the lease lapsed, or a peer's `--force`
+    /// displaced it.
+    lapsed,
+    /// `leases.renew` could not be performed. Carries `@errorName`, which is
+    /// diagnostic prose and not something a caller may branch on — `code` is.
+    unreadable: []const u8,
+
+    fn holds(a: Authority) bool {
+        return switch (a) {
+            .held => true,
+            .lapsed, .unreadable => false,
+        };
+    }
+
+    /// The machine-readable value, present on every branch of both mutating
+    /// commands.
+    fn code(a: Authority) []const u8 {
+        return switch (a) {
+            .held => "held",
+            .lapsed => "lapsed",
+            .unreadable => "unreadable",
+        };
+    }
+
+    /// The sentence beside it, or null when the claim is still ours. Prose:
+    /// nothing branches on it, which is what `code` is for.
+    fn note(a: Authority, ctx: *Cli.Ctx, job_name: []const u8) ?[]const u8 {
+        return switch (a) {
+            .held => null,
+            .lapsed => std.fmt.allocPrint(
+                ctx.arena,
+                "this command's lease on job '{s}' is no longer held — it lapsed, or another session took it over while the host was being contacted",
+                .{job_name},
+            ) catch "this command's lease on this job is no longer held",
+            .unreadable => |name| std.fmt.allocPrint(
+                ctx.arena,
+                "this command's lease on job '{s}' could not be renewed ({s}), so whether the scope is still ours could not be established",
+                .{ job_name, name },
+            ) catch "this command's lease on this job could not be renewed",
+        };
+    }
+
+    /// The `error_code` a settlement written after the authority was lost
+    /// carries, inside the ordinary `indeterminate` terminal.
+    ///
+    /// Not a terminal of its own. `op_state.Terminal` already has the variant
+    /// for "we cannot establish the remote outcome", and that is exactly what
+    /// this is: the kill went out, and whether anything else has since acted on
+    /// the same job is precisely what we no longer know. The code is what lets a
+    /// reader tell this cause apart from the others in the receipt.
+    const lost_code = "AUTHORITY_LOST";
+
+    /// The terminal a step taken without authority may settle, and the only one
+    /// it may.
+    fn lostTerminal(
+        a: Authority,
+        ctx: *Cli.Ctx,
+        job_name: []const u8,
+        last_observed: Core.Store.op_state.Status,
+    ) Core.Store.op_state.Terminal {
+        return .{ .indeterminate = .{
+            .reason = std.fmt.allocPrint(
+                ctx.arena,
+                "this command stopped job '{s}''s session and then found it no longer held the scope lease it took beforehand ({s}); another session may have acted on the same job in between, so nothing here establishes what happened to the work",
+                .{ job_name, a.code() },
+            ) catch "this command lost the scope lease for this job after stopping its session, so nothing here establishes what happened to the work",
+            .last_observed = last_observed,
+            .error_code = lost_code,
+        } };
+    }
+};
+
+/// Keeps the claim alive across the remote work, and says whether it is still
+/// ours.
+///
+/// The answer is the point. This used to return `void` and merely print on
+/// loss, so every caller renewed and then went on to kill, delete and settle
+/// exactly as if the renewal had succeeded — the layer that exists to stop two
+/// sessions acting on one job could not stop anything, because nothing consumed
+/// what it said. It is now read by `stillOurs`, which is what each destructive
+/// step is gated on.
+///
+/// The diagnostic stays: it names the job on the way past, where a caller that
+/// only reports the machine-readable `Authority.code` still leaves a line in the
+/// log saying which job it was about.
+fn holdClaim(claim: Claim, now: i64) Authority {
     const still_ours = Store.leases.renew(
         claim.store,
         claim.server_id,
@@ -3021,16 +3611,37 @@ fn holdClaim(claim: Claim, now: i64) void {
     ) catch |err| {
         std.debug.print(
             "terminus: could not renew the scope lease for job '{s}': {s}; " ++
-                "recording this command's outcome anyway\n",
+                "this command will not take any step that changes the host or the local record\n",
             .{ claim.job_name, @errorName(err) },
         );
-        return;
+        return .{ .unreadable = @errorName(err) };
     };
-    if (!still_ours) std.debug.print(
+    if (still_ours) return .held;
+    std.debug.print(
         "terminus: this command's lease on job '{s}' is no longer held — it lapsed or was taken over " ++
             "while the host was being contacted, so another session may be acting on the same job\n",
         .{claim.job_name},
     );
+    return .lapsed;
+}
+
+/// Renews the claim immediately before the next step, and says whether that
+/// step may go ahead.
+///
+/// One renewal per step, not one per command. A single renewal at the top
+/// covers the moment it ran and nothing after it: `job rm --discard-evidence`
+/// sends four remote commands and can spend a minute doing it, and the lease it
+/// checked before the first one says nothing about who owns the scope by the
+/// fourth.
+///
+/// `authority` only ever moves one way. Once a renewal has answered that the
+/// scope is not ours the steps after it are forbidden, so there is nothing left
+/// to renew — and asking again would let a later answer overwrite the first
+/// loss, which is the one the report is built from.
+fn stillOurs(claim: Claim, io: std.Io, authority: *Authority) bool {
+    if (!authority.holds()) return false;
+    authority.* = holdClaim(claim, wallClockSeconds(io));
+    return authority.holds();
 }
 
 /// Refuses an attempt that another claim on the same scope makes unsafe.
@@ -3254,7 +3865,10 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
     // be refused by the release below, which is dated from the real clock and
     // may not land before the renewal it follows.
     const renewal = try Store.leases.clockSeconds(&store);
-    holdClaim(ours, renewal);
+    // …and the renewal *answers*, rather than merely printing. The answer is
+    // what every destructive step is gated on; a renewal whose result nobody
+    // reads is the shape this whole layer had before.
+    try t.expect(holdClaim(ours, renewal).holds());
     {
         var stmt = try store.db.prepare(
             "SELECT renewed_at, expires_at FROM leases WHERE owner_request_id = ?1 AND released_at IS NULL",
@@ -4557,4 +5171,295 @@ test "gate: a vanished session does not un-prove an attempt the ledger settled" 
         Store.jobs.Status.killed,
         (try Store.jobs.getByName(&store, arena, 1, "unknown")).?.status,
     );
+}
+
+// The third member of the family, and the one nothing pinned. `applyProbe` has
+// three branches that settle `indeterminate` — a contradiction between the two
+// durable records, a defective record beside a willing sentinel, and a vanished
+// session — and each of them used to hardcode `.unproven` beside the settlement
+// it wrote. Two of the three have gates above. This is the third.
+//
+// The reading it guards is the same one: an attempt the ledger already proved
+// stays proven, whatever a later look finds. A `job status` on a completed job
+// whose result file has since been corrupted, or whose log has been rewritten,
+// reaches this branch — and reporting `outcomeProven: false` and exit 75 there
+// tells an agent not to retry work whose scope is free, under a hint naming
+// `terminus request reconcile <id>`, which fatals on a terminal operation with
+// or without `--override`.
+//
+// What must survive the fix is the other half: on an attempt the ledger holds
+// nothing for, a contradiction really is all there is, it proves nothing, and
+// saying so is what keeps the name reserved. Both arms are below.
+test "gate: a contradiction does not un-prove an attempt the ledger settled" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_conflict_settled");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    const Launched = struct {
+        request_id: []const u8,
+        job: Store.jobs.Job,
+        attempt: ?Store.job_attempts.Attempt,
+    };
+    const launch = struct {
+        fn go(s: *Store, a: std.mem.Allocator, io: std.Io, name: []const u8) !Launched {
+            var e = switch (try Core.execution.begin(s, a, io, .{
+                .server_id = 1,
+                .server_name = "box",
+                .kind = .job,
+                .scope = jobScope(name),
+                .alias = name,
+                .owner_token = "agent",
+                .now = 1000,
+            })) {
+                .ready => |ready| ready,
+                .blocked => return error.ScopeUnexpectedlyBlocked,
+            };
+            e.settled = true;
+            const request_id = try a.dupe(u8, e.id());
+            try Store.operations.advance(s, request_id, .connecting, 1001);
+            try Store.operations.advance(s, request_id, .submitted, 1002);
+            try Store.operations.advance(s, request_id, .remote_started, 1003);
+            _ = try Store.jobs.create(s, 1, name, "make deploy", "__S__", request_id, 1000);
+            if (!try Store.jobs.markStarted(s, request_id)) return error.RowNotReserved;
+            _ = try Store.job_attempts.create(s, .{
+                .request_id = request_id,
+                .server_id = 1,
+                .server_name = "box",
+                .job_name = name,
+                .attempt_no = 1,
+                .sentinel = "__S__",
+                .tmux_session = name,
+                .now = 1000,
+            });
+            const row = (try Store.jobs.getByName(s, a, 1, name)).?;
+            return .{ .request_id = request_id, .job = row, .attempt = attemptOf(s, a, row) };
+        }
+    }.go;
+
+    // Whether the scope this job's name reserves is still barred to a relaunch.
+    const barred = struct {
+        fn check(s: *Store, a: std.mem.Allocator, io: std.Io, name: []const u8) !bool {
+            return switch (try Core.execution.begin(s, a, io, .{
+                .server_id = 1,
+                .server_name = "box",
+                .kind = .job,
+                .scope = jobScope(name),
+                .alias = name,
+                .owner_token = "agent",
+                .now = 6000,
+            })) {
+                .ready => false,
+                .blocked => true,
+            };
+        }
+    }.check;
+
+    // Both durable records answered and they disagree. `readingOf` refuses to
+    // pick a winner, so there is no exit code here and no source — the two codes
+    // travel in `conflict` and nowhere else. Identical in both arms; the only
+    // difference is what the ledger already holds.
+    const clash: Tmux.JobProbe = .{
+        .output = "",
+        .next_cursor = 0,
+        .exit_code = null,
+        .exit_source = .none,
+        .finished_at = null,
+        .sidecar = .present,
+        .session_alive = true,
+        .conflict = .{ .result_exit_code = 7, .sentinel_exit_code = 3 },
+    };
+
+    const proven = try launch(&store, arena, scratch.io, "proven");
+    switch (try Store.receipts.settle(&store, proven.request_id, .{
+        .exited = .{ .exit_code = 0 },
+    }, .{}, 4000)) {
+        .recorded => {},
+        .already_settled => return error.LedgerDidNotSettle,
+    }
+
+    const after = applyProbe(&ctx, &store, proven.job, clash, proven.attempt);
+    try t.expectEqual(Core.Store.op_state.Status.completed, after.status);
+    try t.expectEqual(Settlement.settled, after.settlement);
+    try t.expect(after.settlement.proves());
+    // Exit 0 and no hint: the scope is free and there is nothing to reconcile.
+    try t.expectEqual(Exit.ok, observationExit(after, false));
+    try t.expectEqual(@as(?[]const u8, null), after.hint(&ctx, proven.job.name, proven.attempt));
+    // The contradiction is still reported — it is a fact about the host, and
+    // "this attempt is settled" is not a reason to stop saying that somebody's
+    // two records disagree. It just is not an outcome any more.
+    try t.expectEqual(@as(i32, 7), after.conflict.?.result_exit_code);
+    try t.expectEqual(@as(i32, 3), after.conflict.?.sentinel_exit_code);
+    // Nothing was written on the way through: the ledger already answered, so
+    // the cache finish was skipped and the verdict reported is the one that was
+    // already there.
+    try t.expectEqual(Core.execution.CacheResult.ledger_already_settled, after.cache);
+    try t.expectEqualStrings(
+        "completed",
+        (try Store.operations.get(&store, arena, proven.request_id)).?.status.text(),
+    );
+    try t.expect(!try barred(&store, arena, scratch.io, "proven"));
+    // …and the row is untouched, because a contradiction settles no status into
+    // it: the sync on this branch is `.none`, since writing one would mean
+    // picking one of the two codes.
+    try t.expectEqual(
+        Store.jobs.Status.running,
+        (try Store.jobs.getByName(&store, arena, 1, "proven")).?.status,
+    );
+
+    // The control, and the half of the rule that must survive: the same
+    // contradiction against an attempt the ledger holds nothing for. Here it
+    // really is all there is to go on, it proves nothing, and saying so is what
+    // keeps the name reserved until somebody establishes what happened.
+    const unknown = try launch(&store, arena, scratch.io, "unknown");
+    const still = applyProbe(&ctx, &store, unknown.job, clash, unknown.attempt);
+    try t.expectEqual(Core.Store.op_state.Status.indeterminate, still.status);
+    try t.expectEqual(Settlement.unproven, still.settlement);
+    try t.expectEqual(Exit.indeterminate, observationExit(still, false));
+    try t.expect(still.hint(&ctx, unknown.job.name, unknown.attempt) != null);
+    try t.expectEqualStrings(
+        "indeterminate",
+        (try Store.operations.get(&store, arena, unknown.request_id)).?.status.text(),
+    );
+    try t.expect(try barred(&store, arena, scratch.io, "unknown"));
+}
+
+// What a displaced holder may do on its way out, and it is very little.
+//
+// `job kill` and `job rm` release their claim at every ending — the settlements
+// call `Cli.releaseClaim` directly, and `fail`, `failWithCode`,
+// `failIndeterminate`, `failIndeterminateAfterOutput` and `receiptFatal` all
+// route through it because `std.process.exit` skips defers. A peer's `--force`
+// can land at any point in between, and after it the scope belongs to somebody
+// else. A release matching by scope alone would then hand the new holder's lease
+// away on the old holder's way out: the loser of the takeover unlocking the
+// winner's work.
+//
+// `leases.release` matches on `owner_request_id` *and* `released_at IS NULL`,
+// and `takeover` stamps the displaced row's `released_at` before inserting the
+// new one, so the old holder's release matches nothing. That is the property
+// below, checked from both ends: the peer's row is untouched, and the displaced
+// row keeps `takeover` as its reason rather than being overwritten with
+// `released`.
+test "gate: a displaced holder releases nothing, and its renewal says so" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_displaced_release");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    const started = (try Store.leases.clockSeconds(&store)) - 60;
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = started,
+    };
+
+    // This command takes the scope the way `jobCmd` does, which also registers
+    // it with the process-exit hook.
+    const plain = Cli.parseArgs(&ctx, &.{ "box", "deploy" });
+    const ours = switch (claimJobScope(&ctx, &store, 1, "deploy", &plain)) {
+        .held => |claim| claim,
+        .blocked, .seized => return error.ScopeWasNotFree,
+    };
+
+    // A peer forces its way past us while we are talking to the host.
+    const peer: []const u8 = "01PEEEEEEER0123456789ABCDE";
+    switch (try Store.leases.takeover(&store, arena, .{
+        .server_id = 1,
+        .scope = jobScope("deploy"),
+        .owner_request_id = peer,
+        .profile_token = "the-other-session",
+        .owner_label = "deploy",
+        .ttl_secs = 600,
+        .now = try Store.leases.clockSeconds(&store),
+    })) {
+        .taken => |taken| try t.expectEqualStrings(ours.owner_request_id, taken.from[0].owner_request_id),
+        .acquired => return error.NothingWasDisplaced,
+    }
+
+    // The renewal every destructive step is gated on now answers `lapsed`, and
+    // answers it *without* re-acquiring: a lost lease has to be visible, not
+    // quietly taken back underneath the peer.
+    var authority: Authority = .held;
+    try t.expect(!stillOurs(ours, scratch.io, &authority));
+    try t.expect(authority == .lapsed);
+    try t.expect(!authority.holds());
+    try t.expectEqualStrings("lapsed", authority.code());
+    try t.expect(authority.note(&ctx, "deploy") != null);
+    // A second call does not renew again — there is nothing left to renew, and a
+    // later answer must not overwrite the loss the report is built from.
+    try t.expect(!stillOurs(ours, scratch.io, &authority));
+    try t.expect(authority == .lapsed);
+
+    // The displaced holder's exit path.
+    Cli.releaseClaim();
+
+    // The peer still holds the scope, and its row was never given away.
+    const held = try Store.leases.active(&store, arena, 1, started);
+    try t.expectEqual(@as(usize, 1), held.len);
+    try t.expectEqualStrings(peer, held[0].owner_request_id);
+    {
+        var stmt = try store.db.prepare(
+            "SELECT released_at, release_reason FROM leases WHERE owner_request_id = ?1",
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, peer);
+        try t.expect(try stmt.step());
+        try t.expectEqual(@as(?i64, null), stmt.columnOptInt(0));
+    }
+    // …and our own row still records what actually happened to it. Overwriting
+    // this with `released` would erase the audit chain the takeover wrote.
+    {
+        var stmt = try store.db.prepare(
+            "SELECT release_reason FROM leases WHERE owner_request_id = ?1",
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, ours.owner_request_id);
+        try t.expect(try stmt.step());
+        try t.expectEqualStrings("takeover", stmt.columnText(0));
+    }
+
+    // The control, so this cannot pass by `releaseClaim` having become a
+    // function that never releases anything: the peer, going out through the
+    // same path, does give the scope back.
+    Cli.registerClaim(&store, 1, jobScope("deploy"), peer, "deploy");
+    Cli.releaseClaim();
+    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, started)).len);
 }
