@@ -44,14 +44,19 @@ preceded the drop-and-recreate DDL was an ad-hoc command, not the census in
 this repo's test scratch, and the v11 migration records that in its own
 comment (`src/core/store/migrate.zig:413-418`). The census below was written
 afterwards to make that claim re-runnable, and it has never returned a status
-that would authorise the recut — see §7.0.1. A database no census reached is
+that would authorise the recut — see §7.0.1. What the census covers is now a
+definition it carries rather than a description of what its walker happened to
+do, so "no such row under these roots" can be checked against the definition
+instead of against the code — and as of 2026-08-16 the walk delivers that
+definition inside this repository too, where it previously covered three of the
+six levels it claimed. A database no census reached is
 therefore covered not by an audit but by a refusal:
 `checkBeforeApply` returns `error.CheckpointsWouldBeDropped` for any store
 below v11 that still holds checkpoint rows, and runs before `apply` rather
 than after it, so such a store is refused rather than silently emptied
 (`migrate.zig:759`, refusal at `:790-799`).
 
-### 7.0.1 The store census (read-only, 2026-08-14; re-run 2026-08-15)
+### 7.0.1 The store census (read-only, 2026-08-14; re-run 2026-08-16)
 
 Reproduce with exactly this:
 
@@ -64,19 +69,31 @@ That command exits **2** on this machine, not 0. The exit status carries two
 verdicts and this run fails the second one; both are set out below. The
 corroboration artifact is written regardless, for the reason given there.
 
-The artifact that command writes is at `docs/evidence/store-census.json`.
-Both it and `tools/enumerate_stores.py` were committed in `c979d92`, so this
-section's evidence is reproducible from the repository rather than from one
-machine's shell history, and every number below is in it. The script prints
+It writes two artifacts: `docs/evidence/store-census.json` and
+`docs/evidence/v11-recut-corroboration.json`. Both, and
+`tools/enumerate_stores.py`, are in the repository, so this
+section's evidence is reproducible from it rather than from one
+machine's shell history. Every number this section states about **this run** is
+in one of the two — the counts and the failure matrix in the census,
+`could_not_see` in the corroboration — and where a number comes from somewhere
+else it is labelled: a count from an earlier artifact, a reading from the
+git-ignored `--raw` census, or a measurement taken during the migration
+rehearsal. That distinction used to be a flat promise that every number was in
+the two artifacts, which was never true of the rehearsal's table counts or of
+any of the before/after comparisons. Add `--raw` to the command above to get
+the third file; it is git-ignored, it is the only place the un-coarsened paths
+exist, and it is what a reader needs to turn an opaque segment id back into a
+directory. The script states
 its own scope, which is the point: the first version of this audit was an
 ad-hoc command whose answer — "there is no non-test row anywhere" — was
 unfalsifiable, and wrong in two places besides.
 
 **The committed artifact is deliberately not the whole census.** `--json`
-writes only what the claims here rest on: the two verdicts below, the coverage
+writes only what the claims here rest on: the two verdicts below, the scope
+definition, the failure matrix, the coverage
 numbers, the filesystem effect, and per store its `user_version`, whether it
 has a `transfer_checkpoints` table, and whether that table holds any row
-(`tools/enumerate_stores.py:471-519`). It carries no file sizes, no counts of
+(`tools/enumerate_stores.py:1110-1192`). It carries no file sizes, no counts of
 anybody's servers, keys, memories or facts, and no checkpoint request ids. A
 public repository is the wrong place for a description of the author's
 machine, and the request-id field is the sharper edge: today every row it
@@ -84,18 +101,92 @@ would name is a gate fixture, but the first time this census finds a real
 checkpoint it would commit real request ids to a public repository as a side
 effect of running the audit. `--raw` writes everything the census saw,
 untokenised and including those ids, and defaults to
-`docs/evidence/raw/store-census.raw.json` (`tools/enumerate_stores.py:222`).
+`docs/evidence/raw/store-census.raw.json` (`tools/enumerate_stores.py:312`).
 That file is not fit to commit — it names absolute paths on whichever machine
 ran it — so `docs/evidence/raw/` is ignored wholesale in `.gitignore:10`.
 
-**The scope is part of the claim, so it is stated inside the claim.** Ten
-roots were searched — `%APPDATA%/terminus`, `%TEMP%`, `~/.terminus`,
+**Below the tokenised prefix, every path segment is now an opaque id, because
+tokenisation structurally could not redact them.** `tokenise` rewrites root
+prefixes and emits everything under them as it found it, so the artifacts
+committed at `ad20c26` and after published third-party directory names that no
+environment variable names and no token list can reach: a private GitHub org, a
+private repository name and a PR number, in the `path` of four `unreadable`
+entries and again inside the `OSError` repr embedded in the same entries'
+`error` string. The second copy is the one that makes this structural rather
+than careless — the leak arrived through a field whose subject is an error
+message, and no list of "path fields" would have caught it.
+
+So `coarsen` (`tools/enumerate_stores.py:1004-1044`) runs over the finished
+document, anchored on the tokens rather than on a list of fields, and replaces
+each segment below the prefix with `<seg:` plus the first eight hex digits of
+the SHA-256 of the tokenised path prefix ending at that segment. The recipe is
+published in the artifact as `path_coarsening`
+(`tools/enumerate_stores.py:1057-1096`), so a coarsened entry is checkable
+rather than taken on trust. Four properties are the reason for that shape: the
+same input path yields the same id on every run, so two runs are diffable; the
+id is a digest of the whole prefix rather than of the segment, so a dictionary
+of likely directory names does not invert it; there is one id per level, so the
+depth of a coarsened path is still countable against the depth fields beside
+it; and `<` and `>` are illegal in a Windows path component, so an id can never
+be misread as a directory that exists. Two things stay in plaintext and the
+artifact names both: everything below `<repo>`, which is this repository and is
+already public, and an allow-list of two anchored patterns — `hsperfdata_` and
+`_bazel_` — whose segments are themselves the evidence for what the entry is.
+The declared roots keep every component, or `roots_searched` would be
+unreadable and the scope claim with it. This run's census names **120** distinct
+token-prefixed path strings and **157** distinct segment ids; the plaintext
+behind them is in the `--raw` census and nowhere else. What this costs is real
+and is not hidden: the remedy on an out-of-scope link used to be literally
+actionable from the committed file and now is not, an operator has to read the
+path out of `--raw`, and the store table below can no longer name a store by
+its filename.
+
+**The scope is now a definition the artifact carries, not a description of
+what the walker did.** `effective_scope` states the claim in one sentence —
+every regular file enumerated by a *successful* directory listing at or below
+`depth_max` levels beneath the nearest searched root containing it, minus the
+declared exclusions, never following a reparse point, with content read only
+from files that pass `content_read_rule` — and every term in that sentence is a
+field beside it (`tools/enumerate_stores.py:2360-2470`). A reader checks the
+claim against the definition instead of against the code. That matters because
+the previous version of this section stated the scope in prose while the walker
+did something else, and nothing in the artifact could have revealed the
+difference.
+
+Ten roots were searched — `%APPDATA%/terminus`, `%TEMP%`, `~/.terminus`,
 `~/Desktop`, `~/Downloads`, `~/Documents`, `~/Videos`, `~/Pictures`,
 `~/Music`, and this repo — to a depth of six
 directories below each, skipping `node_modules`, `.git`, `.venv`, `venv`,
 `__pycache__` and `.codegraph` by directory name and `AppData/Local/Google`,
 `AppData/Local/Microsoft`, `AppData/Local/Mozilla`, `playwright_chromium`,
-`pw-apply-profile`, `codex-apply-extension` by path fragment. An eleventh root,
+`pw-apply-profile`, `codex-apply-extension` by path fragment. Both exclusion
+kinds are matched against the whole absolute path, so any ancestor triggers
+them, which is broader than "the directory is named that" and
+`effective_scope.excluded_dir_names_note` says so. A declared search root is
+tested by the same rule and is no longer exempt from it: `collect` used to push
+the root straight onto the stack and apply `exclusion_rule` only to child
+directories, so `--root C:/proj/node_modules` was listed in full while the note
+told the reader that any ancestor triggers the rule — one path in the whole
+census outside the rule the artifact publishes as universal
+(`tools/enumerate_stores.py:1431-1438`). No root on this machine matches an
+exclusion, so no count moved.
+
+The fragments carry a per-fragment hit count, and three of the six —
+`AppData/Local/{Google,Microsoft,Mozilla}` — score **0**. The reason given here
+used to be "no searched root can reach `AppData/Local` at all", and that is
+false: `%TEMP%` **is** `AppData\Local\Temp`, a searched root inside
+`AppData\Local`. What is true is narrower. A fragment matches anywhere in an
+absolute path, so one of those three fires only if some path under a searched
+root spells `AppData/Local/Google` — and the only searched root inside
+`AppData\Local` is `%TEMP%`, which is a *sibling* of those three directories,
+not an ancestor of them. Nothing under it repeats the fragment. The three would
+also have scored 0 had they still been in the directory-name set, where a
+multi-component string can never equal a single path component; that is the bug
+they were moved out of. A list of exclusions published without hit counts
+overstates what the census excludes; on this machine half of it excludes
+nothing.
+
+An eleventh root,
 `%LOCALAPPDATA%/terminus`, does not exist on this machine and was therefore
 **not** searched; the script reports absent roots rather than dropping them, so
 a mistyped `--root` can no longer yield a confident census of somewhere else.
@@ -103,24 +194,133 @@ It does **not** count as a hole. A directory that does not exist contains no
 databases, so that is an empty set the census verified rather than a place it
 failed to look; what does count is an environment variable that was unset,
 because then no path could be formed and nothing is known about where that
-root would have been (`tools/enumerate_stores.py:151-190`).
+root would have been (`tools/enumerate_stores.py:232-275`). The test that
+separates the two is now a raw `os.stat` in a `try`
+(`tools/enumerate_stores.py:2554-2568`) and not `Path.exists()`, which
+swallows `OSError` and would have filed a root that exists and denies access
+as verified-empty. Anything but ENOENT from that stat is `unreadable`, and
+`unreadable` withholds.
 
-**A link is not a directory, and the census now says where each one goes.** A
-reparse point is recorded, resolved, and never walked into
-(`tools/enumerate_stores.py:374-426, 539-619`). Resolving it answers the only question
-that matters — is the target already covered by a declared root? — and that
-answer is the verdict. A target inside a root is a second name for territory
-being read under its first name, and closes. A target that does not exist
-holds nothing, and closes. A target outside every root is a gap, and it is the
-one kind of gap that names its own remedy, because the record carries the
-target. Detection uses Win32's own `IsReparseTagNameSurrogate` bit rather than
-the reparse attribute alone, because OneDrive placeholders, AppExecLink stubs
-and deduplicated files all carry that attribute and are ordinary readable
-files; treating those as links would drop real candidates out of the census,
-which is the same mistake as walking into a junction, pointed the other way.
-Links are stepped over rather than followed, so a junction pointing at its own
-ancestor cannot loop, and directories are visited once however many names
-reach them.
+**`depth_max` is six levels, and every root now counts them from itself.** The
+walk still visits each directory once, but the roots are walked longest-prefix
+first, so the visit that lands on a directory is the one from the nearest
+containing root — the one with the largest remaining budget — and no later walk
+could improve on it (`tools/enumerate_stores.py:2583-2587`). Before this,
+`<repo>` sat at `~/Desktop/drafts/zig/Terminus`, was first reached on
+`~/Desktop`'s walk at depth **3**, and got an effective depth budget of **3**,
+not 6, while `effective_scope.statement` asserted coverage of six levels beneath
+a searched root. A store at `<repo>/a/b/c/d/store.db` was never enumerated and
+the artifact said it was in scope. The previous version of this section recorded
+that as `root_shadowing` and declined to fix it, on the grounds that fixing it
+would change `files_seen`, the store list and possibly the verdicts. It has now
+been fixed, and it changed all three: `files_seen` **98,394 → 110,564**,
+`directories_listed` **14,036 → 20,549**, files sniffed **1,774 → 7,615**,
+SQLite candidates **443 → 453**, Terminus stores **139 → 149**.
+`root_shadowing` survives as the check rather than the confession: it still
+lists which roots are nested, and it now reports `<repo>` first reached at depth
+**0** with an effective budget of **6** of its 6 declared levels, so a
+regression in the walk order shows up there as a number rather than as a
+quietly smaller file count.
+
+Two of those movements need a word, because neither is what it looks like.
+`depth_limited` **fell**, 13,216 → 9,516, and a falling count in a bound
+category is worth explaining rather than pocketing: the frontier moved down
+into the repository, and the directories that now sit on it hold fewer
+subdirectories than the ones that used to. It is not a gap-driving category
+either way. And the store count is the one number here that this section
+should not attribute to the fix. All ten of the extra stores are repo test
+scratch, the five scratch stores the artifact lists individually sit at depth
+**3** below `<repo>` — reachable under the old budget as well as the new one —
+and the paths of the 140 summarised ones are deliberately not published, so
+nothing in either artifact separates "found by the deeper walk" from "created
+by a test run between the two censuses". The test suite creates and deletes
+scratch databases constantly, which is the more likely reading.
+
+What the deeper walk does establish is this: **the offender test ran over the
+whole of the declared scope for the first time, and still found nothing.**
+`offender_found` is false, `stores_outside_repo_scratch` is 4 and
+`checkpoint_rows_outside_repo_scratch` is 0, over a walk that covers three more
+levels of the root most likely to contain a store somebody made and least
+likely to be reached — the repository itself, which was also the one root the
+walk could not reach the bottom of. Had a row turned up down there,
+`offender_found` would have become true and the exit 3.
+
+**A link is never followed, and being inside a root is not the same fact as
+having been read.** A reparse point is recorded, resolved, and stepped over
+(`tools/enumerate_stores.py:659-662, 1527-1736`). Detection uses Win32's own
+`IsReparseTagNameSurrogate` bit rather than the reparse attribute alone,
+because OneDrive placeholders, AppExecLink stubs and deduplicated files all
+carry that attribute and are ordinary readable files; treating those as links
+would drop real candidates out of the census, which is the same mistake as
+walking into a junction, pointed the other way. Links are stepped over rather
+than followed, so a junction pointing at its own ancestor cannot loop, and
+directories are visited once however many names reach them.
+
+What has changed is what resolving a link is taken to prove. Every link record
+now carries `within_declared_root` — is the target inside the territory the
+census declared? — and `actually_visited` — did a walk read that content, at
+that path or any other? — as two separate recorded fields. They used to be one
+field. `covered_by != null` was published as though it meant the bytes had
+been read, and it does not: it means the census *promised* to read them.
+`actually_visited` is answered only from the walk's own record, the set of
+directories whose `os.scandir` returned without raising
+(`tools/enumerate_stores.py:1456`), never from a prefix test, a depth
+calculation or an exclusion test. A file target additionally carries
+`content_read`, because a file that was enumerated is not a file that was
+opened. All nineteen keys are present on all 53 link records with explicit
+nulls, so a consumer can tell "not applicable" from "not asked"; before this
+there were three different shapes on disk and no way to tell them apart.
+
+Root attribution is longest-prefix rather than first-match
+(`tools/enumerate_stores.py:749-758`). First-match named `~/Desktop` as the
+covering root of a target inside this repository, which is true and useless:
+every depth number derived from it was then measured from the wrong place.
+Since per-root depth, the root that reaches a target *first* is the
+longest-prefix root, so `covering_root` and `first_reaching_root` agree on
+every record. Both are still published, because their agreeing is the evidence
+that no root is being walked on another root's leftovers, and a regression in
+the walk order would make them disagree in the artifact rather than silently in
+the code (`tools/enumerate_stores.py:761-772`).
+
+**Both facts are now decided about the path the link actually points at, and
+two bugs in that arithmetic are fixed.** Neither changed a number on this
+machine, and both would have, silently, on a machine one link different.
+
+*A relative target used to be resolved against the wrong directory.*
+`os.readlink` returns the target as stored, and a symlink created with
+`SYMLINK_FLAG_RELATIVE` — `mklink /D link ..\t`, git with `core.symlinks=true`,
+npm, pnpm — stores a relative string. That string resolves against the
+directory holding the link and against nothing else; it was being handed
+straight to `key`, whose `os.path.abspath` resolves it against the *census
+process's* working directory. So `within_declared_root`, `covering_root`, both
+depths, `actually_visited` and `reason` were all decided about a path that does
+not exist, and the category could change by running the tool from a different
+directory. Worse in one specific way: a fabricated target that landed on a
+directory the walk happened to have listed came out `covered_and_visited`,
+which has no `failure_matrix` record at all, so the unread bytes left the
+artifact entirely while the link record asserted they had been read — the
+`covered_by != null` defect re-entering through a different door.
+`resolve_target` (`tools/enumerate_stores.py:676-700`) joins the target to the
+link's own directory and normalises the result, and every link record now
+carries `target` (what the link stores) and `target_resolved` (where that
+points from there) as separate fields. Every link on this machine that yields a
+target string at all — 49 of the 53; the other four are the WinError 1920 ones
+whose `readlink` raises — stores an absolute `\\?\` path, so `target_resolved`
+equals the stripped `target` in all 49 cases and no published number moves.
+
+*A drive-letter root matched nothing.* Membership was `t.startswith(key(root) +
+os.sep)`, and `key(Path("D:/"))` is `d:\`, which already ends in a separator —
+so the test spelled `d:\\` and no path on that drive satisfied it. `--root D:/`
+is the invocation printed in the tool's own docstring, and under it every link
+target on that drive was published as `out_of_declared_scope` — declined by
+policy, not a gap — when it was inside the declared scope and unvisited, which
+is a gap. That is the gap-*removing* direction, in the one category the matrix
+exists to protect, and the same arithmetic made `depth_below` one short. Both
+now go through `key_prefix` (`tools/enumerate_stores.py:716-728`), which
+normalises the trailing separator. Verified directly: `containing_roots(r"D:\proj\archive",
+[Path("D:/")])` returns the root instead of `[]`, `depth_below(Path("D:/"),
+r"D:\a\b")` returns 2 instead of 1, and a sibling root — `~/Desktop2` against
+`~/Desktop` — still correctly returns `[]`.
 
 **`~/Videos`, `~/Pictures` and `~/Music` are declared roots because of that
 rule.** `~/Documents` contains Windows' legacy compatibility junctions
@@ -132,10 +332,15 @@ excusing anything, and the three closed. The published scope grew by three
 directories, which is why it is written down here.
 
 **The link rule shrank the file counts, and what it exposed is a fact about
-the instrument.** `files_seen` fell from 107,567 to **94,189** and files
-sniffed from 6,919 to **1,753** between the previous artifact and this one.
+the instrument.** `files_seen` fell from 107,567 to 94,189 and files
+sniffed from 6,919 to 1,753 between the artifact before the link rule and the
+one after it. (Today's run sees **110,564** and sniffs **7,615**. Those are
+above both earlier numbers, and the reason is per-root depth rather than the
+link rule: the repo now gets its own six levels instead of `~/Desktop`'s
+leftover three. The counts also move run to run because `%TEMP%` and the repo's
+test scratch churn.)
 Nothing that was ever declared stopped being searched. Those ~13,000 files were
-reached *through* links, into `%PROGRAMFILES%/Microsoft/jdk-25`, a bazel output
+reached *through* links, into a JDK under `%PROGRAMFILES%`, a bazel output
 cache and a Codex runtime's `node_modules`. The old walk followed junctions
 silently, because `is_dir(follow_symlinks=False)` reports a junction as a
 directory and `scandir` on a junction opens its target — so every previous run
@@ -145,10 +350,172 @@ the direction that is hardest to notice: the census was over-reaching, not
 under-reaching, so nothing was missing from the output to give it away. Nobody
 could have caught it from the artifact, because the artifact reported the
 roots it intended to search and the counts it got by searching more than that.
-The twenty new gaps are not new territory lost. They are the places the census
-had been entering undeclared, now declined and named. An audit tool whose own
+The twenty records that appeared then are not territory lost. They are the
+places the census had been entering undeclared, now declined and named — and
+as of this run they are named `out_of_declared_scope` and no longer withhold,
+for the reason given below. An audit tool whose own
 scope claim was wrong, and whose output could not reveal it, is exactly the
 kind of thing this document exists to record.
+
+**Every path the walk declined or failed to read now lands in exactly one
+named category.** `failure_matrix` has thirteen of them, each carrying its own
+definition, its own count, a `drives_coverage_incomplete` flag, and its
+entries wherever the entries are themselves evidence; `coverage_incomplete` is `any(count > 0)` over exactly the flagged ones
+(`tools/enumerate_stores.py:2050-2357`, wired at `:2650-2664`). Disjointness is
+by construction rather than by adjudication: every record is produced at one
+decision site and carries that site's `origin`, so `depth_limited` and
+`excluded` hold only walk-frontier records, `inside_but_not_visited`,
+`depth_shadowed_target` and `out_of_declared_scope` hold only link records, and
+`root_unresolvable` and `root_absent` hold only root records.
+
+A *path* may still be named by two records of *different* origin — the four
+`depth_shadowed_target` targets are also, separately, frontier directories
+their parent declined on depth — and the link record says so in
+`also_counted_in`. The matrix used to open by claiming that every path lands in
+exactly one category, which is false for precisely the records that produce
+exit 2, and `also_counted_in` was published on all 53 link records without being
+defined anywhere in either artifact. Both are fixed in the artifact rather than
+here: `what_this_is` now says the rule is about records and that the category
+counts therefore do not sum to a count of distinct paths, and `also_counted_in`
+carries its own definition beside it.
+
+| Category | This run | Withholds | What it is |
+|---|---|---|---|
+| `inside_but_not_visited` | **0** | **yes** | link target inside a searched root that no walk read, and no declared depth bound explains |
+| `depth_shadowed_target` | **4** | **yes** | the same, except this census's own `depth_max` is what stopped it |
+| `unreadable` | **6** | **yes** | an OS error stopped the census learning what a path is, where it points or what it holds |
+| `vanished` | 0 | **yes** | listed, then genuinely gone before it was opened |
+| `path_too_long` | 0 | **yes** | WinError 206 / ENAMETOOLONG; permanent |
+| `not_a_regular_file` | 0 | **yes** | stat succeeded and it is neither link, directory nor regular file |
+| `root_unresolvable` | 0 | **yes** | the variable naming a root was unset; no path could be formed |
+| `out_of_declared_scope` | 20 | no | link target outside every searched root |
+| `depth_limited` | 9,516 | no | a directory below `depth_max` |
+| `excluded` | 268 | no | a directory matching a published exclusion |
+| `dangling` | 19 | no | reparse point whose target does not exist |
+| `not_content_read` | 102,949 | no | enumerated, and failed `content_read_rule` |
+| `root_absent` | 1 | no | declared root whose raw stat said ENOENT |
+
+**`depth_shadowed_target` is new, and it is a split rather than a
+reclassification.** All four records were `inside_but_not_visited` before, they
+still withhold, and the verdict does not move. What the split ends is a
+conflation: `inside_but_not_visited` was carrying two different failures under
+one name. In one, the census's own `depth_max` — published in `effective_scope`
+before the walk starts — is what stopped it, and raising `--depth` past the
+target's depth or declaring the target a root closes it, both of which change
+the declared scope. In the other, no declared bound accounts for the target and
+the walk simply never got there, which is the harder finding and the one that
+says go and look. A reader has to be able to tell "my own declared bound
+stopped me" from "I should have reached this and did not". Both categories
+withhold, because in both the content genuinely was not read; the precedence
+that decides between them is stated in the artifact as P4 and P4a rather than
+left in the code.
+
+`not_visited_reason` is what the split reads, and it was answering `"unknown"`
+for cases the declared scope does account for, then printing "no declared bound
+accounts for it" about them. Three cases and one bug are fixed. The ancestor
+test recognised only
+`reason == 'unreadable'`, so an ancestor that `vanished` or hit
+`path_too_long` — both of them categories this artifact publishes — came out
+unknown; each now has its own reason and its own remedy. An ancestor that is
+itself a reparse point was unknown too, although `link_policy: never_followed`
+is exactly the declared bound that accounts for it; that is now
+`ancestor_is_a_link`. And the ancestor walk stopped at the *covering* root while
+every depth beside it was measured from the *first-reaching* root, so on a
+machine where those differed the ancestors between them were never examined;
+it now stops at the root that owns the budget. Per-root depth makes those two
+roots the same by construction, so that last one is closed twice over
+(`tools/enumerate_stores.py:1604-1736`). All four `not_visited_reason` values
+on this machine are `below_depth_limit`, so none of this moved a number here.
+
+One tension is recorded and not resolved. A link target under a published
+exclusion is `inside_but_not_visited` and withholds, while the excluded
+directory itself does not — and the remedy on the link record tells the
+operator to remove a bound the same artifact publishes as declared scope. The
+precedence list covered `depth_max` only and said nothing about the exclusion
+case; it now states it, as P4b, including that whether declining an exclusion
+should stop the target being a gap — the way declining to leave the declared
+scope already does — is not settled. Nothing on this machine is in that state
+today; the ordinary shape that produces it is a link like
+`%TEMP%\proj\bin -> %TEMP%\proj\node_modules\.bin`, which is what npm and pnpm
+write on Windows.
+
+Four of those categories are new work rather than renamed counters.
+`depth_limited` and `excluded` were a bare `continue` and appeared in no
+number at all (`:1463-1481`); at 9,516 declines against the 20,549
+directories whose listing succeeded, close to a third of the frontier landed
+there silently, and a bound nobody counts is indistinguishable from a bound
+nobody applied. They are published as
+a count and a total, and **no paths at all** — `entries` is empty and
+`entries_truncated` says so. It was a deterministically sorted sample of 50
+each, and that sample was a mistake of exactly the kind this section exists to
+record: those two categories exist in the design only to be *counted*, the
+counts carry the whole claim, the verdict reads no other field of them, and the
+100 sampled records carried none of it — while publishing, into a public
+repository, third-party directory names the tokeniser structurally could not
+redact. Among them were a private GitHub org, a private repository name,
+a PR number and an internal product tree. No count of the strings that sample
+published is quoted here, because there is nothing to check it against: the
+sample was removed before either committed artifact carried a failure matrix at
+all, so it exists in no file in this repository. Coarsening would defeat that
+class of leak today, and the sample is still not restored, because it never
+carried any evidence to begin with. The full lists
+are in the `--raw` census, uncapped, under
+`frontier_depth_limited` and `frontier_excluded`; `excluded` additionally
+publishes `matched_rules`, a per-rule hit count, which is evidence the sample
+never was. `not_content_read` is the same
+branch as `files_size_filtered` given a name (`:1507`), because after being
+told the difference between "enumerated" and "read" a reader must be able to
+find the number 102,949 under a name rather than derive it by subtraction; its
+paths are counted and not retained. `not_a_regular_file` was a second silent
+`continue` that dropped an entry before `files_seen` was incremented, so it
+appeared in no counter and no list; it is 0 on this machine, which is exactly
+when to name a category, before it appears and is mistaken for an arithmetic
+error.
+
+**Every per-path list in both committed files is bounded, and the bound used to
+bound almost nothing.** `ERROR_SAMPLE` is 200 and it capped the failure-matrix
+*view* — while the same records were republished uncapped three more times: in
+the census's own top-level `unexaminable`, `sqlite_unreadable`,
+`not_regular_files` and `links`, and again in the corroboration, which embeds
+the whole census and re-lists the error and link records beside it in
+`could_not_see`. So the cap bounded a view and not the artifact, and the
+committed pair's disclosure surface was unbounded in the number of unreadable
+paths on the machine — the one quantity nobody controls. Every such list now
+goes through the same cap, the counts and the verdicts are still computed over
+the full population, and `record_caps` names each bounded list with its total,
+how many entries were kept and whether it truncated
+(`tools/enumerate_stores.py:1947-1970`). Nothing truncates on this machine: the
+largest list is 53 links.
+
+**Within the error family the most specific verified cause wins, and the only
+gap-removing label has the strictest test.** The order is `path_too_long`,
+then `dangling`, then `vanished`, then `unreadable`
+(`tools/enumerate_stores.py:462-485`), so the vaguest label cannot absorb a
+case that has a name — each of the four prints a different instruction, and
+"re-run when the machine is quiet" is wrong advice for a path that is too long
+and will never close it. `dangling` is the one label that turns a hole into a
+verified empty set, so it is assigned only when a raw `os.lstat` returns *and*
+a raw `os.stat` raises ENOENT specifically. `os.path.exists` and
+`os.path.lexists` are banned from the decision, here and in the root filter,
+because both catch `(OSError, ValueError)` internally and return `False`.
+
+That change moved four records, and it moved them into the red. Four bazel
+convenience links under `~/Documents`, all in one directory, have a `readlink`
+that raises `ValueError` and an `os.stat` that raises **WinError 1920**, "the
+system cannot access the file". The census does not know whether anything is at
+the other end. Under the old test `exists()` swallowed that error, returned
+`False`, and all four were published as `links_dangling` under
+`coverage_verified_empty` — four unknowns laundered into an answer. They are
+now `unreadable` with `origin=link_target`, and they withhold. `dangling`
+therefore fell 23 → **19** and `unreadable` rose 1 → 5, and stands at **6**
+today. Tightening that test can only ever add gaps.
+
+Those four are also the entries that carried the leak coarsening now closes.
+Their directory names spell a private GitHub org, a private repository and a PR
+number, and until this run the committed artifacts published all three — once
+in `path`, and once more inside the `OSError` repr in `error`. They read
+`%USERPROFILE%\Documents\<seg:…>\<seg:…>\<seg:…>\<seg:…>\<seg:…>` now, in both
+fields, and the full paths are in the `--raw` census.
 
 A file counts as a Terminus store when it has the
 `servers`+`keys`+`memories`+`facts` tables, and it becomes a candidate by
@@ -157,39 +524,129 @@ name filter was a hole on its face: a copy can be called anything, and most of
 the SQLite databases under these roots are named something other than `*.db` —
 some of them are called `Login Data`. That breakdown is not in the artifact and
 never has been: the script states it in a docstring
-(`tools/enumerate_stores.py:627-628`) and does not compute it, so it is an
-argument here rather than a number. Of **94,189** files seen, 92,436 were
+(`tools/enumerate_stores.py:1739-1758`) and does not compute it, so it is an
+argument here rather than a number. Of **110,564** files seen, 102,949 were
 rejected on size alone (a whole SQLite database is an exact number of pages, so
-its size is always a non-zero multiple of 512), 1,753 were opened and sniffed —
-one of which could not be read at all and is recorded in `unexaminable` as a
-hole — **443 carry the SQLite header**, and **139 of those are Terminus
-stores**: 9 listed one by one and 130 repo-scratch stores with no checkpoint
-row, summarised. Not one SQLite file refused to open: the 306 "unreadable"
+its size is always a non-zero multiple of 512), 7,615 were opened and sniffed —
+two of which could not be read at all and are recorded under `unreadable` with
+`origin=sniff` — **453 carry the SQLite header**, and **149 of those are
+Terminus stores**: 9 listed one by one and 140 repo-scratch stores with no
+checkpoint row, summarised. Two identities hold in the artifact and are worth
+checking against it: `files_seen` equals `files_size_filtered` plus
+`files_sniffed`, and `files_sniffed` equals `sqlite_candidates` plus
+`non_sqlite_files` plus the two `unreadable` records whose origin is `sniff`.
+Not one SQLite file refused to open: the 306 "unreadable"
 candidates the first census reported were files that are not databases at all,
 which is not evidence of anything. That distinction is kept — a database that
-will not open is a hole and is printed loudly; a file that was never a database
-is merely counted.
+will not open is a hole, is counted under
+`failure_matrix.categories.unreadable.by_origin` with `origin=sqlite_open` and
+is printed loudly; a file that was never a database is merely counted. That
+field is a `Counter` over the origins a run *observed*, so `sqlite_open` has no
+key at all today rather than a key holding 0; the six legal origins — `root`,
+`walk_directory`, `walk_entry`, `sniff`, `sqlite_open`, `link_target` — are
+enumerated in the category's own `definition`, where a reader can find them
+whether or not they fired. This section named that field
+`unreadable_by_origin.sqlite_open` for several revisions, and the tool's own
+docstring named it too. There has never been such a field.
 
 | Store | `user_version` | `transfer_checkpoints` | holds a row |
 |---|---|---|---|
-| `%APPDATA%/terminus/terminus.db` — the real one | **4** | absent | — |
-| `%TEMP%/f0.db`, `%TEMP%/t.db` — empty dev scratch | 11 | yes | no |
-| `%TEMP%/t0.db` — empty dev scratch, table present at version 0 | 0 | yes | no |
+| `%APPDATA%/terminus/<seg:…>` — the real store | **4** | absent | — |
+| 2 × `%TEMP%/<seg:…>` — empty dev scratch | 11 | yes | no |
+| 1 × `%TEMP%/<seg:…>` — empty dev scratch, table present at version 0 | 0 | yes | no |
 | 5 × `<repo>/.zig-cache/tmp/gate_*.db` — gate scratch | 10–11 | yes | **yes** |
-| 130 × `<repo>/.zig-cache/tmp/*.db` — gate scratch, summarised | — | — | no |
+| 140 × `<repo>/.zig-cache/tmp/*.db` — gate scratch, summarised | — | — | no |
+
+The `%APPDATA%` and `%TEMP%` filenames are coarsened, so the table identifies
+those four by root, version and table shape, which is what the artifact
+publishes and what the migration argument turns on; the names are in `--raw`.
+The repo-scratch names are not coarsened, because everything below `<repo>` is
+kept, and they are the evidence for the five checkpoint rows.
 
 Four stores sit outside this repo's test scratch and not one of them holds a
-checkpoint row; 135 are repo scratch and five of those do. The counts move
+checkpoint row; 145 are repo scratch and five of those do. The counts move
 between runs because the test suite creates and deletes scratch databases
-constantly — they now span `user_version` 4 through 12 — and what does not
+constantly — across runs they have spanned `user_version` 4 through 12 — and
+what does not
 move is which side of the scratch boundary a checkpoint row falls on. Stores
 in the scratch that hold no row are summarised as a count rather than listed,
 because a full test run leaves dozens and the only interesting fact about them
 is which hold a row. Every path in the artifact is tokenised (`<repo>`,
-`%TEMP%`, `%APPDATA%`, `%USERPROFILE%`, `<user>`), case-insensitively, because
+`%TEMP%`, `%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`, `%PROGRAMFILES%`,
+`%PROGRAMFILES(X86)%`, `%PROGRAMDATA%`, `<user>`), case-insensitively, because
 a reparse point records its target in whatever case the link was created with
 and a literal match would have redacted only one spelling of the same
-directory.
+directory. The substitution runs over the whole document rather than over a
+list of known path fields (`tools/enumerate_stores.py:880-887`), so the fields
+added by this change — `target_resolved` on every link record among them —
+are covered without anyone having to remember them.
+
+**That last sentence used to be the whole of the guarantee, and it is not one.**
+The tokeniser is an *allow-list* of nine substitutions: a path outside all of
+them is emitted verbatim, and nothing read the document back. `--root D:/data`
+— the invocation printed in the tool's own docstring — put the literal string
+`D:\data` into `effective_scope.roots_declared`, `roots_searched` and the
+corroboration's `asserts.roots_searched`; a junction into `C:\Windows\Temp` or
+a UNC share would land verbatim in a link target with no flag at all. That
+this class of leak had already fired once is recorded in the code: three of the
+nine tokens exist only because a link to a JDK under `%PROGRAMFILES%` was
+spotted in an artifact after the fact. "Add a token once a leak is noticed" is
+not a mechanism.
+
+There is now a detector, and it is the last thing that runs before either
+committed file is written (`tools/enumerate_stores.py:573-639`, enforced at
+`:2473-2513`). Every string in the finished document — values and
+keys, at every depth — is tested for a drive-letter path (`[A-Za-z]:[\\/]`), a
+UNC host, and the account name. On a hit **nothing is written**: the file on
+disk stays as the previous run left it, every offending JSON path is printed,
+and the process exits **65**. It does not "fix" the string by inventing a new
+token, because that would be making a failing check pass by renaming the
+problem. Exit 65 is outside the two-verdict bitmask for the same reason 64 is:
+a redaction failure is not a finding about this machine's stores and must never
+be read as one. Verified by running the documented `--root D:/data` form: **13**
+offending fields named across the two artifacts, neither file written, exit 65.
+Neither committed artifact contains a drive-letter path, a UNC host or the
+account name — that is still one `grep` on each file, and it is now also a
+property the tool cannot violate silently.
+
+The detector runs **twice**, before and after coarsening, and the ordering is
+load-bearing rather than belt and braces. Coarsening replaces a segment with a
+digest, so a segment that carried a violation comes out of it looking clean;
+checking only the coarsened document would report success about a document from
+which the evidence had just been removed. Checking the tokenised document first
+means coarsening can never turn a failing document into a passing one.
+
+**Two ways the redaction could still degrade quietly are closed, and one of
+them by refusing to publish at all.** The `<user>` token was skipped for an
+account name shorter than four characters, because substituting a two- or
+three-letter name would rewrite ordinary words — and `redaction_rules` skipped
+the *matching* test for the same reason, so on such a machine the name was
+neither replaced nor looked for. It was published by exactly the entry this
+census is required to keep producing: `%TEMP%\hsperfdata_<user>` embeds the
+account name in a directory name, and that entry is one of the gaps driving the
+red verdict. Neither substituting nor testing is safe at that length, so
+`account_name_publishable` refuses: no committed artifact is written, the run
+exits 65 like any other redaction failure, and the census verdict is still
+printed, because what failed is the publishing and not the census
+(`tools/enumerate_stores.py:854-875`). Verified by running with `USERNAME=zyk`
+and with `USERNAME` unset: exit 65 both times, and neither destination file
+created.
+
+Separately, `build_path_tokens` skipped a token whose environment variable was
+empty, silently, while `default_roots` derives the home roots from
+`Path.home()`, which does not need the same variable. The two can therefore
+disagree. What that does **not** do is degrade the redaction silently: run with
+`USERPROFILE` unset and `HOMEDRIVE`/`HOMEPATH` set, and the home roots still
+resolve, `%USERPROFILE%` is not built, the paths arrive with a drive letter and
+the output check refuses the write — verified, 44 offending fields, exit 65.
+What it did do was send the operator the wrong way, because the failure names
+the *field* and the advice is "give the location a token in
+`build_path_tokens`" when the token is already there and merely unset. Unbuilt
+tokens are now listed in the run output and named again in the redaction
+failure. They do not change the status by themselves: whether a missing token
+mattered is decided by testing the finished document, not by guessing from the
+environment, and a machine with no `ProgramFiles(x86)` and no link into one has
+nothing wrong with it.
 
 **All five checkpoint rows are gate fixtures, and all five are in this repo's
 test scratch.** Their request ids are `PVSH0000000000000000000000` (three
@@ -223,42 +680,131 @@ was committed (`2f86f89`, 12:47:21 +0800).
 one question — is there a checkpoint row where the recut would destroy it —
 and exit 0 for everything else, including for its own blind spots. It now
 answers two independently, and either one withholds authorisation
-(`tools/enumerate_stores.py:847-876`):
+(`tools/enumerate_stores.py:2661-2664`):
 
-* `offender_found` is **false**. No store outside the repo's `.zig-cache`
+* `offender_found` is **false**, and this run is the first in which that claim
+  is not partly unfalsifiable. No store outside the repo's `.zig-cache`
   scratch holds a checkpoint row: the four such stores are three empty
   `%TEMP%` dev scratch databases and the real store, which has no
-  `transfer_checkpoints` table at all.
-* `coverage_incomplete` is **true**, for 21 paths in two kinds. **Twenty**
-  are links out of the declared roots — bazel convenience symlinks and a JDK
-  toolchain under `%TEMP%` and `~/Desktop` pointing into
-  `%PROGRAMFILES%/Microsoft/jdk-25`, a bazel output cache and a Codex runtime's
-  `node_modules`. **One** is `%TEMP%/hsperfdata_<user>/31172`, held open by a
-  live JVM. Twenty-three dangling links, ten links into searched territory and
-  one absent root are reported alongside these and count for nothing. An
+  `transfer_checkpoints` table at all. Per-root depth put the same test over
+  three more levels of this repository, the one root the walk previously could
+  not reach the bottom of, and nothing turned up there. The
+  claim in the corroboration artifact
+  is derived from the non-scratch stores' row counts rather than written as a
+  literal `0` — a number that cannot come out any other way is not evidence of
+  anything (`tools/enumerate_stores.py:1260-1261`).
+* `coverage_incomplete` is **true**, for **10** paths in two categories.
+  **Four** are `depth_shadowed_target`: bazel install and grpc include
+  junctions under `%TEMP%` whose targets sit at depth 6 below `%TEMP%`, so
+  their parent listed them and nothing ever opened them. **Six** are
+  `unreadable`: two files under `%TEMP%` that would not open for the header
+  sniff (`PermissionError`, errno 13, `origin=sniff`) — one of them a live
+  JVM's `hsperfdata_<user>` perf-data file, the other a `.tmp` a running
+  process holds — and the four WinError 1920
+  links described above (`origin=link_target`). Twenty out-of-scope links,
+  nineteen dangling links, 9,516 depth-limited directories, 268 excluded
+  directories, 102,949 files that failed the content rule and one absent root
+  are reported alongside these and count for nothing. An
   earlier run also recorded two repo scratch databases the test suite deleted
   between being listed and being opened — the only genuine mid-walk
   disappearances this census has ever recorded, and gone from the committed
   run.
 
-The run above therefore exits **2**. The codes are a bitmask: 1 is
+**Twenty entries left `coverage_incomplete`, and eight joined it.** That is
+the whole of the movement from `ad20c26`, and it is worth stating as arithmetic
+because the headline number fell from 21 to 9 and a falling gap count is
+exactly the shape of a check being quietly weakened. The same 53 links are
+classified before and after; not one record was dropped:
+
+| Was, in `ad20c26` | Is now | n | Gap → gap? |
+|---|---|---|---|
+| `target_not_covered` | `out_of_declared_scope` | 20 | gap → **not a gap** |
+| `target_covered` | `covered_and_visited` | 6 | not a gap → not a gap |
+| `target_covered` | `depth_shadowed_target` | 4 | not a gap → **gap** |
+| `dangling` | `unreadable_link` | 4 | not a gap → **gap** |
+| `dangling` | `dangling` | 19 | not a gap → not a gap |
+
+21 − 20 + 8 = 9, and the one path that is not a link — the JVM's `hsperfdata`
+file — is in the 9 throughout. Since then the count has gone 9 → **10**: a
+second `%TEMP%` file was open when this run sniffed it. Nothing was
+reclassified to produce that; it is one more file a running process held.
+The four in the third row were `inside_but_not_visited` in the intervening
+revision and are `depth_shadowed_target` now, which is a split of one gap
+category into two and not a movement across the flag — they withheld before
+and they withhold now.
+
+The one authorised reclassification is `links_to_uncovered_targets`, 20 →
+`out_of_declared_scope`, which no longer withholds. The grounds are narrow:
+the census promised to cover the declared scope, and a name inside that scope
+pointing outside it is the link policy working as declared. Not covering what
+was never promised is not a failure to cover what was promised. **Nothing is
+deleted.** All twenty records are still in `links`, still in the failure
+matrix under their own category, and still in the corroboration artifact's
+`could_not_see`, because unread is unread — dropping them would make
+`does_not_assert[4]`, "that the census saw everything under those roots",
+false. By root token, which is what the artifact publishes and what decides
+scope, their targets are **6** under `%PROGRAMFILES%` and **14** under
+`%USERPROFILE%`; read against `--raw`, the 6 are one JDK installation, 13 of
+the 14 are bazel's output base — `%USERPROFILE%\_bazel_<user>`, which the
+coarsening allow-list keeps legible for exactly this reason — and the
+fourteenth is a Codex runtime's `node_modules` under a cache directory. This
+section called all fourteen a bazel cache, which was wrong by one. All twenty
+are outside every searched root, so nothing in scope leaves with them.
+
+Against that, eight entries moved the other way. `links_target_covered`, 10,
+which used to sit under `coverage_verified_empty`, splits into **6**
+`covered_and_visited` — genuinely closed, the walk read those directories —
+and **4** that are now gaps. Those four were the
+defect: `covered_by != null` was published as though the census had walked
+that content, and it had not. And the tightened `dangling` test moves **4**
+more from `links_dangling` to `unreadable`, as described above. Every other
+change is neutral — new non-gap categories over decisions that were previously
+recorded nowhere, so nothing migrated out of a gap into them — or additive:
+`path_too_long`, `not_a_regular_file`, `root_unresolvable` and the tightened
+root stat can only ever produce more gaps, and all are 0 on this machine
+today.
+
+The run above therefore exits **2**, and now for two independent reasons where
+before there was effectively one. The codes are a bitmask: 1 is
 `offender_found`, 2 is `coverage_incomplete`, 3 is both, and 0 — the only
 status that clears the recut — means "searched everything it set out to
-search, and found no offender" (`tools/enumerate_stores.py:214-217, 1100`). A
+search, and found no offender" (`tools/enumerate_stores.py:299-307, 2940-2941`). A
 usage error exits 64 rather than argparse's default of 2, so a mistyped
 `--root` can never be read as a finding about the filesystem
-(`tools/enumerate_stores.py:249-259`).
+(`tools/enumerate_stores.py:350-360`); a document that fails the redaction
+check exits 65, for the same reason and with the same care not to borrow 2.
 
 **The census has never gone green, and on this machine it cannot.** That is
-the result, not a failure to finish. Of the remaining gaps, one kind closes on
-an idle machine and one does not. The two vanished scratch databases an
-earlier run saw were the test suite's, and are absent with it quiet. The JVM's
-perf-data file is held for that process's lifetime; the *identity* of the
-blocking file has changed on every run — a 786,432-byte `.tmp`, then
-`hsperfdata_<user>/37304`, `/38072`, `/31172` — while the fact of at least one
-has not. And the twenty out-of-scope links are structural: closing them means
+the result, not a failure to finish, and the argument has to account for all
+ten gaps rather than the two most convenient of them. Eight of the ten do not
+depend on any process being alive and reproduce on every run.
+
+The four `depth_shadowed_target` junctions are bazel workspace links under
+`%TEMP%`; the same four paths appear in the artifact committed at `ad20c26`,
+where they were published as `target_covered`. They sit at depth 6 below
+`%TEMP%`, so closing them means either raising `--depth` past 6 or declaring
+their targets roots, both of which change the declared scope — which is the
+whole reason they now have a category that says so in its own definition. The
+four WinError 1920 links under `~/Documents` are stale bazel convenience links
+whose `os.stat` fails the same way every time; they reproduce identically, and
+the only thing that would close them is somebody deleting the links or
+restoring what they point at. Neither set is closed by an idle machine.
+
+The remaining two are the held-open files, and they are the part of this that
+does depend on what is running. The JVM's perf-data file is held for that
+process's lifetime, and the *identity* of the blocking file has changed on
+every run — a 786,432-byte `.tmp`, then `hsperfdata_<user>/37304`, `/38072`,
+`/31172`, and `/31548` in this one, alongside a second `.tmp` — while the fact
+of at least one has not. The two vanished scratch databases an earlier run saw
+were the test suite's, and are absent with it quiet; they are the one gap kind
+that an idle machine does close. Exit 2 does not rest on any of that: the eight
+process-independent gaps carry it on their own.
+
+And the twenty out-of-scope links are structural, though they are not gaps:
+bringing them in means
 declaring a JDK installation and a bazel cache to be places Terminus stores
-live, which they are not. **A census taken on a live workstation cannot
+live, which they are not — which is precisely why they are reported and not
+counted. **A census taken on a live workstation cannot
 authorise a destructive migration.** That is a more useful finding than a
 green light obtained by looking away, and it is why `checkBeforeApply` is the
 guard and this artifact is not.
@@ -273,18 +819,46 @@ on top of it afterwards. Nor would a clean-machine run be worth more, because
 it would prove the wrong machine: the one that might hold an old store is this
 one. The file is named `-corroboration` and not `-clearance` deliberately, and
 it carries its own guards against being misread as fields rather than as prose
-kept elsewhere: `asserts` (the claim, with N, the roots and the date),
+kept elsewhere: `asserts` (the claim, with N, the roots, the date and now the
+whole `effective_scope` object, so "under the declared roots" is a definition
+in the file rather than a phrase),
 `does_not_assert` (not authorisation, not "anywhere", not more than this
 machine, not any moment but the one it ran in, and not that the census saw
-everything), `could_not_see` (all 21 gaps, each with its reason and, for a
+everything), `could_not_see` (the **30** paths the census could not read plus
+the links it declined on scope, each
+with its reason and, for a
 link, its resolved target — facts, with the judgement about whether a JDK
 install or a live JVM's `hsperfdata` file could hold a store left to the
-reader), and `postdates_what_it_corroborates` (the DDL landed in `14c8a2d`;
+reader; not every one of them withholds, and which do is stated one flag per
+category in `census.failure_matrix` rather than implied by being listed here;
+both of its lists are bounded at `census.record_caps.cap`, which they used to
+defeat by republishing the census's records uncapped),
+`not_read_by_declared_rule`
+(**112,752** more: 9,516 depth-limited, 268 excluded, 102,949 that failed the
+content rule, 19 dangling — counted, not listed),
+and `postdates_what_it_corroborates` (the DDL landed in `14c8a2d`;
 the script that produced this was first committed sixteen hours later in
 `0d7ff00`). Regenerate it with `--corroboration`; it is written whatever the
 exit status, because a bounded negative is a finding even when the gate is
 red. **`checkBeforeApply` remains the guard**, and the artifact's own
 `the_guard` field says so.
+
+**`could_not_see` used to call itself "everything the census did not read",
+and it was short by 110,100.** It listed 29 entries; the same artifact's own
+`coverage_verified_empty` reported 13,215 depth-limited directories, 256
+excluded, 96,610 files that failed the content rule and 19 dangling links —
+every one of them equally unread, and `not_content_read.why` conceding the
+enumerated/read distinction in as many words. `does_not_assert[4]` then sent
+the reader to `could_not_see` as *the* measure of what was missed, so the bound
+the corroboration advertised read three and a half orders of magnitude tighter
+than it was. The stated reason for keeping the 20 out-of-scope links in the
+list — "unread is unread" — simply was not applied to the other 110,100. There
+are now two measures and `does_not_assert[4]` names both: `could_not_see` for
+what the census could not read or declined on scope, and
+`not_read_by_declared_rule` for what a bound published in `effective_scope`
+kept it from reading. Neither is a coverage gap it hides — the flags are
+unchanged, the verdict is unchanged — but a reader is no longer handed 29 as
+the size of the blind spot.
 
 **This changes what the census can be said to have cleared, which is
 nothing.** The v11 drop-and-recreate landed in `14c8a2d` at 13:05 on
@@ -306,16 +880,19 @@ and on this record it is not a backstop to the audit — it is the guard.
 **What "read-only" is measured to mean, rather than asserted to mean.** Every
 candidate's `.db`, `-wal` and `-shm` is digested — size, mtime_ns, and SHA-256
 of the file or of its first and last 4 KiB — before the run and again after. In
-the run recorded in that artifact, **1,329** database, `-wal` and `-shm` files
-were digested before and after; **231** `-shm` files changed mtime and nothing
-else changed at all — no `-shm` changed content, no sidecar was created, and
+the run recorded in that artifact, **1,359** database, `-wal` and `-shm` files
+were digested before and after; **241** `-shm` files changed mtime and nothing
+else changed at all — no `-shm` changed content this time, no sidecar was
+created or deleted, and
 **no database file changed in size, mtime or content, and no `-wal` gained a
 byte**. That is the entire
 effect, and `filesystem_effect.contradicting_read_only` is empty. A `mode=ro`
 reader of a WAL-mode database does create an empty `-wal` and a 32 KiB `-shm`
-where none existed, and does move read marks inside an existing `-shm`: an
+where none existed, and does move read marks inside an existing `-shm` — which
+is a content change, and the immediately preceding run recorded exactly one: an
 earlier run of this same script created 85 empty `-wal` and 92 `-shm` sidecars
-that way. "Nothing was written" is therefore true of business data and false
+that way, and later runs had none left to create. "Nothing was written" is therefore true of
+business data and false
 of the filesystem taken literally, and the census cannot tell its own effect
 from a concurrent writer's — which is why it reports the difference instead of
 promising there isn't one. An earlier run of this census, taken while the test
@@ -344,7 +921,7 @@ time anything touches it, creating the table at v6 and replacing it at v11
 with nothing in it. And the migration must still be correct for a store that
 stopped anywhere in v6–v10: two of the nine individually enumerated stores
 are exactly that, both repo scratch at v10, and both hold a fixture row. The
-versions of the 130 summarised scratch stores are not in the artifact. For
+versions of the 140 summarised scratch stores are not in the artifact. For
 those stores the rule is no longer "be correct" but "refuse":
 `checkBeforeApply` returns `error.CheckpointsWouldBeDropped` before any DDL
 runs (`src/core/store/migrate.zig:759`, refusal at `:790-799`).
