@@ -177,20 +177,6 @@ const Claim = struct {
     owner_request_id: []const u8,
     /// For the failure message only.
     job_name: []const u8,
-    /// `ctx.now` as it stood when the claim was taken — the process's *start*
-    /// time, not the acquisition's.
-    ///
-    /// No longer what the release is stamped with, and that is the whole of the
-    /// fix below: it used to be, and since `claimJobScope` stamps the
-    /// acquisition with the same frozen value, every `job kill` and `job rm`
-    /// left a row whose `released_at` equalled its `acquired_at` — a holding
-    /// period of exactly zero seconds, unconditionally — and, after the renewal
-    /// learned to read a fresh clock, a release recorded *before* that renewal.
-    ///
-    /// Kept because removing it means changing `registerClaim`'s signature and
-    /// its one call site lives in `cmd_job.zig`, which another agent holds. It
-    /// is correct for what it says it is; it is simply nothing's input now.
-    now: i64,
 };
 var active_claim: ?Claim = null;
 
@@ -200,7 +186,6 @@ pub fn registerClaim(
     scope: Core.execution.Scope,
     owner_request_id: []const u8,
     job_name: []const u8,
-    now: i64,
 ) void {
     active_claim = .{
         .store = store,
@@ -208,7 +193,6 @@ pub fn registerClaim(
         .scope = scope,
         .owner_request_id = owner_request_id,
         .job_name = job_name,
-        .now = now,
     };
 }
 
@@ -219,16 +203,21 @@ pub fn registerClaim(
 /// matches no row and is left exactly where it is.
 ///
 /// **The release is stamped with the clock as it is now**, read through the
-/// store, and not with the `ctx.now` the claim was registered with. `ctx.now`
-/// is one wall-clock read taken at process start (`main.zig`), and
-/// `claimJobScope` stamps the acquisition with that same frozen value — so a
-/// release stamped from it wrote `released_at == acquired_at` on every
+/// store, and not with the `ctx.now` the claim used to be registered with.
+/// `ctx.now` is one wall-clock read taken at process start (`main.zig`), and
+/// `claimJobScope` used to stamp the acquisition with that same frozen value —
+/// so a release stamped from it wrote `released_at == acquired_at` on every
 /// `job kill` and `job rm`, recording a lease that was held for zero seconds no
 /// matter how long the command actually ran. Once `holdClaim` started renewing
 /// off a fresh clock, the same frozen stamp additionally landed *before* the
 /// renewal that provably preceded it, whenever an integer-second boundary was
 /// crossed in between. `leases.release` now refuses that second shape outright;
 /// this is what stops us handing it one.
+///
+/// Every writer of a lease row now reads a live clock — the acquisition and the
+/// takeover in `claimJobScope`, the renewal in `holdClaim`, and this — so the
+/// claim carries no timestamp of its own at all. There is nothing here to pick
+/// the wrong one from.
 ///
 /// Read through `leases.clockSeconds` rather than `std.Io.Timestamp.now`
 /// because this hook runs from `std.process.exit` paths where the only `io` in
@@ -1110,6 +1099,11 @@ const Scratch = struct {
 // be crossed and no timing luck: `acquired_at` and `released_at` came from one
 // variable, so they could not differ.
 //
+// Both ends have since moved onto live clocks and the claim carries no
+// timestamp at all, so the acquisition below is written by hand: what this gate
+// pins is `releaseClaim`'s stamp, and it has to be able to state the
+// acquisition it is measured against.
+//
 // The gate reconstructs the shape rather than describing it: a claim taken by a
 // process that started a minute ago, renewed thirty seconds in off a fresh
 // clock (what `holdClaim` does today), then released through the real
@@ -1151,7 +1145,7 @@ test "gate: a released claim records the time the scope was actually held" {
         .acquired => {},
         .renewed, .conflict => return error.ClaimDidNotTake,
     }
-    registerClaim(&store, 1, scope, owner, "deploy", start);
+    registerClaim(&store, 1, scope, owner, "deploy");
 
     // `holdClaim`'s renewal, which already reads a fresh clock.
     try t.expect(try Store.leases.renew(&store, 1, scope, owner, 120, start + 30));

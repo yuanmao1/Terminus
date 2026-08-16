@@ -668,6 +668,11 @@ const Settlement = enum {
     /// null`. Reported explicitly rather than dressed up as a settlement,
     /// because "the ledger says so" and "the host says so and the ledger has
     /// never heard of this job" are different claims.
+    ///
+    /// Only available to an observation that recorded *something*. An
+    /// observation whose terminal is `indeterminate` has no host record to
+    /// stand on — that is what it just said — so `settlementOf` gives it
+    /// `unproven` instead.
     no_attempt,
     /// An outcome was observed and the ledger does not hold it: the attempt
     /// was already settled `indeterminate`, it names a request the ledger has
@@ -999,6 +1004,60 @@ fn finishSync(
     } };
 }
 
+/// What the ledger holds for the attempt behind an observation, once that
+/// observation has been recorded.
+///
+/// Three answers rather than an optional status, because two of the three carry
+/// no status and they are not the same fact. A job row that names no attempt has
+/// no operation and nothing holding a scope, so the host's own record is the
+/// whole answer; an attempt naming a request the ledger has never seen is a
+/// dangling reference nobody may read an outcome out of. `Observed.status`
+/// flattens both to null — that is all a *status* can say about them — and this
+/// is the type that keeps them apart long enough to decide the settlement.
+const LedgerAnswer = union(enum) {
+    /// The attempt's status, as the ledger holds it after this observation.
+    status: Core.Store.op_state.Status,
+    /// The job row names no attempt at all.
+    no_attempt,
+    /// The attempt names a request the ledger does not have.
+    unknown_request,
+};
+
+/// What an observation may claim, given the terminal it asked to write and what
+/// the ledger holds afterwards.
+///
+/// The rule lives here, in the one place that has both halves, rather than at
+/// the call sites. Every branch that could establish nothing used to hardcode
+/// `.unproven`, and on an attempt the ledger had already proven — `completed`,
+/// whose evidence was later discarded, or whose tmux session has since gone —
+/// that reported `outcomeProven: false` and exit 75 for work whose scope is
+/// free, under a hint naming `request reconcile <id>`, which fatals on an
+/// already-terminal operation with or without `--override`. The caller was
+/// billed an unknown outcome and handed no way out of it. One branch was fixed
+/// in place and its two siblings were not; repeating the predicate at each site
+/// is the alternative, and it is what produced the two siblings.
+///
+/// The rule is *not* "the ledger wins". When the ledger holds `indeterminate`,
+/// or holds nothing at all, this observation is precisely the thing that should
+/// have settled it and did not, so it stays `unproven`.
+///
+/// Keyed on the terminal, and that is what makes it hard to get wrong from
+/// outside: `indeterminate` is the store's word for "we could not establish what
+/// happened", so a caller asking to write one is a caller that established
+/// nothing, and `no_attempt` — the reading under which the host's record is the
+/// whole answer — is not available to it. A branch that wants to report an
+/// unproven outcome now has to say so in the terminal it writes, where the
+/// receipt records it too, instead of in a field beside it.
+fn settlementOf(terminal: Core.Store.op_state.Terminal, held: LedgerAnswer) Settlement {
+    return switch (held) {
+        .status => |s| if (s == .indeterminate) .unproven else .settled,
+        // Proves nothing whatever this observation saw: there is no operation
+        // here to have settled, only a reference to one that is missing.
+        .unknown_request => .unproven,
+        .no_attempt => if (terminal == .indeterminate) .unproven else .no_attempt,
+    };
+}
+
 /// Settles the attempt behind an observation and syncs its cache row, in one
 /// transaction, and says what the ledger ended up holding.
 ///
@@ -1009,6 +1068,10 @@ fn finishSync(
 /// `completed`, exit 0, no hint, while `operations.unsettledInScope` went on
 /// blocking the next `run --name deploy`. `killJob` and `removeJob` already had
 /// this logic inline; now all five share it.
+///
+/// The settlement it hands back is the answer, not a suggestion: every return
+/// below goes through `settlementOf`, so a caller cannot report an outcome the
+/// ledger does not hold by forgetting to ask what it holds.
 fn settleObserved(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -1036,7 +1099,7 @@ fn settleObserved(
             ) catch |err| Cli.storeFatal(store, err)),
             .forget => |g| resultOf(forgetRow(store, g) catch |err| Cli.storeFatal(store, err)),
         };
-        return .{ .status = null, .settlement = .no_attempt, .cache = cache };
+        return .{ .status = null, .settlement = settlementOf(terminal, .no_attempt), .cache = cache };
     };
 
     if (execution) |e| {
@@ -1045,7 +1108,7 @@ fn settleObserved(
         const status = settled.status();
         return .{
             .status = status,
-            .settlement = if (status == .indeterminate) .unproven else .settled,
+            .settlement = settlementOf(terminal, .{ .status = status }),
             .cache = settled.cache,
         };
     }
@@ -1065,10 +1128,10 @@ fn settleObserved(
         .forget => |g| resultOf(forgetRow(store, g) catch |err| Cli.storeFatal(store, err)),
     };
     const effective = recordedEffective(ctx, store, a.request_id) orelse
-        return .{ .status = null, .settlement = .unproven, .cache = cache };
+        return .{ .status = null, .settlement = settlementOf(terminal, .unknown_request), .cache = cache };
     return .{
         .status = effective,
-        .settlement = if (effective == .indeterminate) .unproven else .settled,
+        .settlement = settlementOf(terminal, .{ .status = effective }),
         .cache = cache,
     };
 }
@@ -1173,9 +1236,10 @@ fn applyProbe(
             // A contradiction is unknown however it was recorded, and the one
             // case where a `no_attempt` reading is still not an answer: two
             // host records disagreeing is not "the host's record is the whole
-            // answer", it is the absence of one.
+            // answer", it is the absence of one. `settlementOf` says so for us,
+            // off the `indeterminate` terminal above.
             .status = settled.status orelse .indeterminate,
-            .settlement = .unproven,
+            .settlement = settled.settlement,
             .exit_code = null,
             .finished_at = null,
             .observed_at = ctx.now,
@@ -1231,15 +1295,17 @@ fn applyProbe(
         // is still reported: it travels out in `resultRecord` /
         // `resultRecordError` on every one of these paths.
         //
-        // Forced to `.unproven` when the ledger holds `indeterminate`, and
-        // when it holds nothing at all. The second is the `no_attempt` case,
-        // where the host's own record would ordinarily be the whole answer and
-        // here is precisely the record that was refused — same reasoning as
-        // the conflict branch above.
-        const held = settled.status orelse .indeterminate;
+        // Still `.unproven` when the ledger holds `indeterminate`, and when it
+        // holds nothing at all. The second is the `no_attempt` case, where the
+        // host's own record would ordinarily be the whole answer and here is
+        // precisely the record that was refused — same reasoning as the
+        // conflict branch above. Both now fall out of `settlementOf` seeing the
+        // `indeterminate` terminal this branch writes, rather than out of a
+        // predicate spelled here; the version spelled here was the fix that its
+        // two siblings did not get.
         return .{
-            .status = held,
-            .settlement = if (held == .indeterminate) .unproven else settled.settlement,
+            .status = settled.status orelse .indeterminate,
+            .settlement = settled.settlement,
             .exit_code = null,
             .finished_at = null,
             .observed_at = ctx.now,
@@ -1324,7 +1390,18 @@ fn applyProbe(
             // A vanished session with no exit status proves nothing whoever
             // owns the attempt, so this is the one branch where `no_attempt`
             // does not make the host's record the answer: there is no record.
-            .settlement = .unproven,
+            // That much `settlementOf` reads off the `indeterminate` terminal
+            // above.
+            //
+            // What it also knows, and what the hardcoded `.unproven` that used
+            // to sit here did not, is that an attempt the ledger already proved
+            // stays proven. This is the likeliest way to reach that: a job the
+            // ledger settled `completed`, whose result record was discarded or
+            // aged out and whose tmux session is long gone, read again by an
+            // ordinary `job status`. Reporting exit 75 there told an agent not
+            // to retry work whose scope was free, and pointed it at a reconcile
+            // that fatals on a terminal operation.
+            .settlement = settled.settlement,
             .exit_code = null,
             // Not `now`. We cannot say when this job finished, and we cannot
             // say that it finished — that is what `indeterminate` means. A
@@ -2803,6 +2880,25 @@ const Claim = struct {
 /// override that took no lease would leave the scope free for a third session
 /// to walk into behind it, and would leave nothing saying whose claim was
 /// broken.
+///
+/// Both writes are stamped with a *fresh* wall clock, not with `ctx.now`. A
+/// lease is the one thing this file writes that is compared against a clock
+/// rather than merely stamped with one, and every other writer of these rows —
+/// `holdClaim`'s renewal, `Cli.releaseClaim`'s release — already reads one. With
+/// `ctx.now` here the acquisition alone was dated at *process start*, which cost
+/// two things. Its TTL began running before the command had opened the store,
+/// resolved the server or minted an id, so a claim advertised as lasting
+/// `ttl_secs` lasted rather less. And a `--force` whose process started before
+/// the incumbent's last renewal, and reached `takeover` after it, handed
+/// `leases.takeover` a stamp older than the row it was displacing —
+/// `error.LeaseTimestampsOutOfOrder`, a refusal, where the operator had asked
+/// for a takeover and was entitled to one. Nothing has been sent at that point,
+/// so it cost a retry rather than an action; it was still our own guard refusing
+/// our own write.
+///
+/// `acquired_at` therefore now means what it says: the moment the scope was
+/// taken. It is no longer the same number as the `created_at` of an operation
+/// row minted by the same command, and nothing reads it as though it were.
 fn claimJobScope(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -2824,7 +2920,10 @@ fn claimJobScope(
             Cli.storeFatal(store, err),
         .owner_label = job_name,
         .ttl_secs = Claim.ttl_secs,
-        .now = ctx.now,
+        // Read here, once, so the acquisition and the takeover below are dated
+        // from the same instant — the one this command actually reached the
+        // lease table at. See the doc comment above for what `ctx.now` cost.
+        .now = wallClockSeconds(ctx.io),
     };
     const claim: Claim = .{
         .store = store,
@@ -2837,7 +2936,7 @@ fn claimJobScope(
     if (parsed.boolean("force")) {
         const taken = Store.leases.takeover(store, ctx.arena, opts) catch |err|
             Cli.storeFatal(store, err);
-        registerClaim(ctx, claim);
+        registerClaim(claim);
         return switch (taken) {
             .acquired => .{ .held = claim },
             .taken => |t| .{ .seized = .{ .claim = claim, .displaced = t.from } },
@@ -2847,7 +2946,7 @@ fn claimJobScope(
     return switch (Store.leases.acquire(store, ctx.arena, opts) catch |err|
         Cli.storeFatal(store, err)) {
         .acquired => blk: {
-            registerClaim(ctx, claim);
+            registerClaim(claim);
             break :blk .{ .held = claim };
         },
         // A freshly minted request id cannot already hold a lease, so this
@@ -2863,14 +2962,13 @@ fn claimJobScope(
     };
 }
 
-fn registerClaim(ctx: *Cli.Ctx, claim: Claim) void {
+fn registerClaim(claim: Claim) void {
     Cli.registerClaim(
         claim.store,
         claim.server_id,
         claim.scope,
         claim.owner_request_id,
         claim.job_name,
-        ctx.now,
     );
 }
 
@@ -2892,6 +2990,13 @@ fn reportClaimBlocked(lease: Store.leases.Lease) noreturn {
 /// already set, so a command that outran its TTL would extend nothing while
 /// reporting that it had — the renewal would be a call that always succeeds and
 /// never does anything.
+///
+/// Every writer of a lease row reads this, not just the renewal: `claimJobScope`
+/// stamps its acquisition and its takeover from it too, and the release reads
+/// the equivalent clock through the store. That is not tidiness — the ordering
+/// guard in `leases.zig` compares those stamps against each other, so a single
+/// writer left on the frozen `ctx.now` is a writer that can be refused by the
+/// row it is writing.
 fn wallClockSeconds(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
@@ -3033,13 +3138,6 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
     var out: Cli.Output = .{ .writer = &discard.writer };
     var environ: std.process.Environ.Map = .init(arena);
     defer environ.deinit();
-    var ctx: Cli.Ctx = .{
-        .io = scratch.io,
-        .arena = arena,
-        .environ = &environ,
-        .out = &out,
-        .now = 5000,
-    };
 
     var store = try Store.open(scratch.path);
     defer store.close();
@@ -3048,12 +3146,30 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
         \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
     );
 
+    // Every timestamp below is dated off the store's own clock, and none of them
+    // is a literal any more. `claimJobScope` stamps its acquisition and its
+    // takeover from a live wall clock now, so a peer lease dated from a small
+    // literal would already be centuries lapsed by the time the command looked
+    // at it: the acquisition would sweep it away and every refusal this gate
+    // asserts would pass vacuously, on a scope nobody held.
+    //
+    // `started` stands for the moment this process began — a minute ago, so the
+    // gate can also say what the acquisition is *not* stamped with.
+    const started = (try Store.leases.clockSeconds(&store)) - 60;
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = started,
+    };
+
     // A peer's live claim on the same job, taken from the same machine. That
     // last part is the whole point: `requireNoForeignLease` compared
     // `policy.ownerToken`, one token per machine, so this lease was never
     // "foreign" and every assertion below passed vacuously — two agents in one
     // checkout killed each other's jobs freely.
-    const profile = try Store.policy.ownerToken(&store, arena, scratch.io, 4000);
+    const profile = try Store.policy.ownerToken(&store, arena, scratch.io, started - 100);
     const peer: []const u8 = "01PEEEEEEER0123456789ABCDE";
     switch (try Store.leases.acquire(&store, arena, .{
         .server_id = 1,
@@ -3061,7 +3177,7 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
         .owner_request_id = peer,
         .profile_token = profile,
         .ttl_secs = 600,
-        .now = 4900,
+        .now = started - 10,
     })) {
         .acquired => {},
         .renewed, .conflict => return error.PeerLeaseDidNotTake,
@@ -3094,7 +3210,7 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
         } else @compileError("killJob must be unreachable without a held Claim");
     }
     // The peer still holds it, so the refusal took nothing away either.
-    try t.expectEqual(@as(usize, 1), (try Store.leases.active(&store, arena, 1, 5000)).len);
+    try t.expectEqual(@as(usize, 1), (try Store.leases.active(&store, arena, 1, started)).len);
 
     // `--force` is an audited takeover, not a way past the lease.
     const forced = Cli.parseArgs(&ctx, &.{ "box", "deploy", "--force" });
@@ -3110,9 +3226,13 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
 
     // A lease was really taken — `--force` did not simply skip the layer — and
     // the displaced row records who took it from whom.
-    const held = try Store.leases.active(&store, arena, 1, 5001);
+    const held = try Store.leases.active(&store, arena, 1, started);
     try t.expectEqual(@as(usize, 1), held.len);
     try t.expectEqualStrings(ours.owner_request_id, held[0].owner_request_id);
+    // Dated when the scope was taken, not when the process started. The sibling
+    // gate below is where that matters; here it is what makes the renewal and
+    // the release beneath it legal at all.
+    try t.expect(held[0].acquired_at > ctx.now);
     {
         var stmt = try store.db.prepare(
             \\SELECT release_reason, superseded_by FROM leases WHERE owner_request_id = ?1
@@ -3124,19 +3244,26 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
         try t.expectEqual(held[0].id, stmt.columnInt(1));
     }
 
-    // Renewed across the remote work, which is what "hold" means: the claim
-    // taken at 5000 would otherwise lapse at 5120 while a slow probe → kill →
+    // Renewed across the remote work, which is what "hold" means: a claim taken
+    // now would otherwise lapse `ttl_secs` from now while a slow probe → kill →
     // settle was still running, and the settlement would land on a scope
     // somebody else was free to take.
-    holdClaim(ours, 5100);
+    //
+    // Off the store's clock, exactly as `holdClaim`'s caller reads one. A stamp
+    // further in the future would extend the expiry more visibly and would then
+    // be refused by the release below, which is dated from the real clock and
+    // may not land before the renewal it follows.
+    const renewal = try Store.leases.clockSeconds(&store);
+    holdClaim(ours, renewal);
     {
         var stmt = try store.db.prepare(
-            "SELECT expires_at FROM leases WHERE owner_request_id = ?1 AND released_at IS NULL",
+            "SELECT renewed_at, expires_at FROM leases WHERE owner_request_id = ?1 AND released_at IS NULL",
         );
         defer stmt.deinit();
         try stmt.bindText(1, ours.owner_request_id);
         try t.expect(try stmt.step());
-        try t.expectEqual(@as(i64, 5100 + 120), stmt.columnInt(0));
+        try t.expectEqual(renewal, stmt.columnInt(0));
+        try t.expectEqual(renewal + Claim.ttl_secs, stmt.columnInt(1));
     }
 
     // Releasing is what every ending does — the settlements call it directly,
@@ -3144,12 +3271,12 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
     // `failIndeterminateAfterOutput` and `receiptFatal` all route through this
     // same function because `std.process.exit` skips defers.
     Cli.releaseClaim();
-    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, 5002)).len);
+    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, started)).len);
 
     // ...and it is idempotent, so a settle that released followed by a fatal
     // exit does not go looking for a second row to give away.
     Cli.releaseClaim();
-    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, 5003)).len);
+    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, started)).len);
 
     // With the scope free, an unrelated invocation takes it cleanly — so the
     // release above really freed it rather than merely stopping the count.
@@ -3164,6 +3291,140 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
         .held, .seized => return error.SecondInvocationSharedAnOwner,
     }
     Cli.releaseClaim();
+}
+
+// The window `--force` used to fall into, and the reason `claimJobScope` reads
+// a clock at all.
+//
+// Two processes, and the forcing one is the *older*: it started a minute ago —
+// a big `job rm`, an operator who took their time at a prompt — while the
+// incumbent has gone on renewing its claim off a fresh clock every time it
+// finishes a remote call. When the forcing process finally reaches `takeover`,
+// the incumbent's `renewed_at` is newer than the forcing process's start time.
+//
+// Stamping the takeover with `ctx.now` handed `leases.takeover` a `released_at`
+// older than the `renewed_at` already on the row it was displacing, which the
+// ordering guard added in the same pass refuses outright:
+// `error.LeaseTimestampsOutOfOrder`, straight into `Cli.storeFatal`. `--force`
+// failed — with the scope still held by the incumbent, the operator's override
+// unperformed, and the reason a guard against *our own* frozen clock. It cost a
+// retry rather than an action, because nothing has been sent to the host at
+// this point, but a retry from the same process would have been refused the
+// same way, every time, for as long as the incumbent kept renewing.
+//
+// The gate is written from the incumbent's side because that is the only side
+// that can be dated exactly: the takeover's own stamp is a live clock read and
+// the assertions below say what it must be *after*, not what it must equal.
+test "gate: --force takes over a lease renewed after the forcing process started" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_force_window");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    // This process started a minute ago; `ctx.now` is that moment and nothing
+    // moves it. Backdated off the store's own clock so the renewal below is in
+    // the past — a fixture dated into the future would be refused by the
+    // ordering guard and would be testing that instead.
+    const started = (try Store.leases.clockSeconds(&store)) - 60;
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = started,
+    };
+
+    // The incumbent: claimed the scope before we started, and renewed it thirty
+    // seconds into our run. Its TTL is long, so it is genuinely still held —
+    // there is something here for `--force` to take.
+    const incumbent: []const u8 = "01INCUMBENT0123456789ABCDE";
+    const scope = jobScope("deploy");
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = scope,
+        .owner_request_id = incumbent,
+        .profile_token = "the-other-session",
+        .owner_label = "deploy",
+        .ttl_secs = 600,
+        .now = started - 10,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.IncumbentLeaseDidNotTake,
+    }
+    const renewed_at = started + 30;
+    try t.expect(try Store.leases.renew(&store, 1, scope, incumbent, 600, renewed_at));
+
+    // Without `--force` this is an ordinary refusal, and it is what says the
+    // incumbent is really in the way rather than lapsed: a takeover that had
+    // nothing to displace would report `.held` and would prove nothing at all.
+    const plain = Cli.parseArgs(&ctx, &.{ "box", "deploy" });
+    switch (claimJobScope(&ctx, &store, 1, "deploy", &plain)) {
+        .blocked => |lease| try t.expectEqualStrings(incumbent, lease.owner_request_id),
+        .held, .seized => return error.IncumbentLeaseWasIgnored,
+    }
+
+    // The override the operator asked for. Stamped from `ctx.now` this reached
+    // `requireForwardStamp(started, started - 10, started + 30)` and died there.
+    const forced = Cli.parseArgs(&ctx, &.{ "box", "deploy", "--force" });
+    const ours = switch (claimJobScope(&ctx, &store, 1, "deploy", &forced)) {
+        .seized => |seizure| blk: {
+            try t.expectEqual(@as(usize, 1), seizure.displaced.len);
+            try t.expectEqualStrings(incumbent, seizure.displaced[0].owner_request_id);
+            break :blk seizure.claim;
+        },
+        .held => return error.ForceFoundNothingToDisplace,
+        .blocked => return error.ForceWasRefused,
+    };
+
+    // Our row is dated after the incumbent's last renewal — which is the whole
+    // property, since a stamp that is not is a stamp the guard rejects — and
+    // after the moment this process started, which is what it used to be.
+    {
+        var stmt = try store.db.prepare(
+            "SELECT acquired_at, expires_at FROM leases WHERE owner_request_id = ?1 AND released_at IS NULL",
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, ours.owner_request_id);
+        try t.expect(try stmt.step());
+        const acquired_at = stmt.columnInt(0);
+        try t.expect(acquired_at >= renewed_at);
+        try t.expect(acquired_at > ctx.now);
+        // …so the TTL an operator is quoted starts when the scope is taken. From
+        // `ctx.now` it started a minute before that, and a `job rm` slower than
+        // its own TTL would have handed the scope away mid-command.
+        try t.expectEqual(acquired_at + Claim.ttl_secs, stmt.columnInt(1));
+    }
+
+    // The displaced row is audited, not merely overwritten: it says it was taken
+    // over, when, and by whom.
+    {
+        var stmt = try store.db.prepare(
+            \\SELECT release_reason, released_at, superseded_by FROM leases WHERE owner_request_id = ?1
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, incumbent);
+        try t.expect(try stmt.step());
+        try t.expectEqualStrings("takeover", stmt.columnText(0));
+        try t.expect(stmt.columnInt(1) >= renewed_at);
+        try t.expect(stmt.columnInt(2) != 0);
+    }
+
+    Cli.releaseClaim();
+    try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, started)).len);
 }
 
 test "gate: an observation the ledger will not accept is not reported as an outcome" {
@@ -4121,5 +4382,179 @@ test "gate: a missing session settles nothing about a row that is still a reserv
     try t.expectEqual(
         Store.jobs.Status.killed,
         (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.status,
+    );
+}
+
+// The sibling of the refused-record rule, on the branch that is easiest to
+// reach: a job the ledger settled long ago, whose tmux session is simply not
+// there any more.
+//
+// Nothing exotic is needed to get here. An attempt settles `completed`; the
+// result record ages out, or the operator ran `job rm --discard-evidence`, or
+// the host was rebooted; the pane is gone with it. Someone then runs
+// `job status`, the probe finds no session and no exit code, and this branch
+// runs. It cannot settle anything — and for an attempt that was never settled
+// that is the honest answer, which is why the branch settles `indeterminate` and
+// goes on holding the scope.
+//
+// What it may not do is *un-settle* an attempt the ledger already proved. The
+// hardcoded `.unproven` that used to sit in this branch reported
+// `outcomeProven: false` and exit 75 for a job that had completed, whose scope
+// was free and which an agent was entitled to retry, under a hint naming
+// `terminus request reconcile <request-id>` — a command that fatals on an
+// already-terminal operation with or without `--override`. An unknown outcome
+// and no way out of it, for work the ledger had a real verdict for.
+test "gate: a vanished session does not un-prove an attempt the ledger settled" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_gone_session_settled");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    // A launch that reached the remote shell and has a recorded attempt, under a
+    // scope of its own so the two arms below are separate operations behind
+    // separate barriers.
+    const Launched = struct {
+        request_id: []const u8,
+        job: Store.jobs.Job,
+        attempt: ?Store.job_attempts.Attempt,
+    };
+    const launch = struct {
+        fn go(s: *Store, a: std.mem.Allocator, io: std.Io, name: []const u8) !Launched {
+            var e = switch (try Core.execution.begin(s, a, io, .{
+                .server_id = 1,
+                .server_name = "box",
+                .kind = .job,
+                .scope = jobScope(name),
+                .alias = name,
+                .owner_token = "agent",
+                .now = 1000,
+            })) {
+                .ready => |ready| ready,
+                .blocked => return error.ScopeUnexpectedlyBlocked,
+            };
+            e.settled = true;
+            const request_id = try a.dupe(u8, e.id());
+            try Store.operations.advance(s, request_id, .connecting, 1001);
+            try Store.operations.advance(s, request_id, .submitted, 1002);
+            try Store.operations.advance(s, request_id, .remote_started, 1003);
+            _ = try Store.jobs.create(s, 1, name, "make deploy", "__S__", request_id, 1000);
+            if (!try Store.jobs.markStarted(s, request_id)) return error.RowNotReserved;
+            _ = try Store.job_attempts.create(s, .{
+                .request_id = request_id,
+                .server_id = 1,
+                .server_name = "box",
+                .job_name = name,
+                .attempt_no = 1,
+                .sentinel = "__S__",
+                .tmux_session = name,
+                .now = 1000,
+            });
+            const row = (try Store.jobs.getByName(s, a, 1, name)).?;
+            return .{ .request_id = request_id, .job = row, .attempt = attemptOf(s, a, row) };
+        }
+    }.go;
+
+    // Whether the scope this job's name reserves is still barred to a relaunch.
+    const barred = struct {
+        fn check(s: *Store, a: std.mem.Allocator, io: std.Io, name: []const u8) !bool {
+            return switch (try Core.execution.begin(s, a, io, .{
+                .server_id = 1,
+                .server_name = "box",
+                .kind = .job,
+                .scope = jobScope(name),
+                .alias = name,
+                .owner_token = "agent",
+                .now = 6000,
+            })) {
+                .ready => false,
+                .blocked => true,
+            };
+        }
+    }.check;
+
+    // No session, no exit status, and nothing at the result record's address —
+    // the shape of a job whose evidence is gone. Identical in both arms; the
+    // only difference is what the ledger already holds.
+    const gone: Tmux.JobProbe = .{
+        .output = "",
+        .next_cursor = 0,
+        .exit_code = null,
+        .exit_source = .none,
+        .finished_at = null,
+        .sidecar = .absent,
+        .session_alive = false,
+    };
+
+    const proven = try launch(&store, arena, scratch.io, "proven");
+    switch (try Store.receipts.settle(&store, proven.request_id, .{
+        .exited = .{ .exit_code = 0 },
+    }, .{}, 4000)) {
+        .recorded => {},
+        .already_settled => return error.LedgerDidNotSettle,
+    }
+
+    const after = applyProbe(&ctx, &store, proven.job, gone, proven.attempt);
+    try t.expectEqual(Core.Store.op_state.Status.completed, after.status);
+    try t.expectEqual(Settlement.settled, after.settlement);
+    try t.expect(after.settlement.proves());
+    // Exit 0, and no hint: there is nothing for the caller to reconcile, and the
+    // sentence that used to be printed named a command that would have refused.
+    try t.expectEqual(Exit.ok, observationExit(after, false));
+    try t.expectEqual(@as(?[]const u8, null), after.hint(&ctx, proven.job.name, proven.attempt));
+    // Nothing was written on the way through — not to the ledger, and not to the
+    // cache row, whose finish was skipped because the ledger had already
+    // answered. The verdict reported is the one that was already there.
+    try t.expectEqual(Core.execution.CacheResult.ledger_already_settled, after.cache);
+    try t.expectEqualStrings(
+        "completed",
+        (try Store.operations.get(&store, arena, proven.request_id)).?.status.text(),
+    );
+    // …and the scope is free, which is the part exit 75 was contradicting.
+    try t.expect(!try barred(&store, arena, scratch.io, "proven"));
+
+    // The control, and the half of the rule that must survive the fix: the same
+    // probe against an attempt the ledger holds nothing for. Here the vanished
+    // session really is all there is to go on, it proves nothing, and saying so
+    // is what keeps the name reserved until somebody establishes what happened.
+    // Not `killed`: a pane also disappears when the command finishes and the
+    // shell exits, or when the host reboots mid-write.
+    const unknown = try launch(&store, arena, scratch.io, "unknown");
+    const still = applyProbe(&ctx, &store, unknown.job, gone, unknown.attempt);
+    try t.expectEqual(Core.Store.op_state.Status.indeterminate, still.status);
+    try t.expectEqual(Settlement.unproven, still.settlement);
+    try t.expectEqual(Exit.indeterminate, observationExit(still, false));
+    try t.expect(still.hint(&ctx, unknown.job.name, unknown.attempt) != null);
+    try t.expectEqualStrings(
+        "indeterminate",
+        (try Store.operations.get(&store, arena, unknown.request_id)).?.status.text(),
+    );
+    try t.expect(try barred(&store, arena, scratch.io, "unknown"));
+    // The legacy row keeps its own vocabulary here: `killed` means "not live,
+    // and no exit code", and it is written because this observation is the one
+    // that settled the attempt.
+    try t.expectEqual(
+        Store.jobs.Status.killed,
+        (try Store.jobs.getByName(&store, arena, 1, "unknown")).?.status,
     );
 }
