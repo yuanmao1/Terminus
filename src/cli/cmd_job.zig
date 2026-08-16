@@ -916,6 +916,373 @@ const RemovalJson = struct {
     hint: ?[]const u8,
 };
 
+// --- The published key sets, held against the structs that emit them --------
+//
+// The two structs above cannot drift from themselves: they have no defaults,
+// so a branch that omits a key does not compile. What can drift is the
+// document. `skill/SKILL.md` publishes both key sets as prose — a count, a
+// never-null list and a nullable list — and prose does not fail to build when
+// somebody adds a field, renames one, or takes a `?` off.
+//
+// So the prose is parsed and held against `@typeInfo`. Nullability is read
+// from the field's type rather than from a list maintained beside it, because
+// a list maintained beside it is one more thing to forget.
+//
+// The parse is a literal read of English, and will break if those paragraphs
+// are reflowed. That is the trade, taken deliberately: a reformat that defeats
+// the check fails the gate rather than quietly checking nothing. Every failure
+// below prints the literal it was looking for, so the repair is to the
+// document — or, if the wording genuinely moved on, to the needle here.
+
+/// The same text `terminus setup` ships, embedded rather than read: the gate
+/// runs wherever the tests run, with no working directory to be wrong about.
+const skill_md = @embedFile("terminus_skill");
+
+const SkillParseError = error{
+    SkillAnchorMissing,
+    SkillCountUnreadable,
+    SkillListUnterminated,
+    SkillParensUnbalanced,
+    SkillCodeSpanUnterminated,
+};
+
+const SkillDriftError = error{SkillKeySetDrifted};
+
+/// Whatever follows `needle` in `hay`, or a loud failure naming it.
+fn skillAfter(hay: []const u8, needle: []const u8, what: []const u8) SkillParseError![]const u8 {
+    const at = std.mem.indexOf(u8, hay, needle) orelse {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: cannot find {s}.
+            \\  looked for the literal: "{s}"
+            \\This gate parses that text to learn what the document claims about the
+            \\--json key sets. If the paragraph was reworded or reflowed, fix the
+            \\needle in src/cli/cmd_job.zig; deleting the gate puts the document back
+            \\to drifting from the structs unnoticed.
+            \\
+        , .{ what, needle });
+        return error.SkillAnchorMissing;
+    };
+    return hay[at + needle.len ..];
+}
+
+/// One list out of the prose: the text after `label`, ending either at `end`
+/// or — when `end` is null — at the first `.` that is outside both parentheses
+/// and code spans.
+///
+/// Parenthetical asides are the reason this is not a plain search for the next
+/// period: the document puts examples in them (`killed`, `removed`) and even a
+/// reference to one key inside the note on another. Those are not entries.
+fn skillSegment(
+    hay: []const u8,
+    label: []const u8,
+    end: ?[]const u8,
+    what: []const u8,
+) SkillParseError![]const u8 {
+    const rest = try skillAfter(hay, label, what);
+    if (end) |needle| {
+        const at = std.mem.indexOf(u8, rest, needle) orelse {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: found {s} but not where it ends.
+                \\  looked for the literal: "{s}"
+                \\
+            , .{ what, needle });
+            return error.SkillListUnterminated;
+        };
+        return rest[0..at];
+    }
+    var depth: usize = 0;
+    var in_code = false;
+    for (rest, 0..) |c, i| {
+        if (c == '`') {
+            in_code = !in_code;
+            continue;
+        }
+        if (in_code) continue;
+        switch (c) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return skillUnbalanced(what, rest);
+                depth -= 1;
+            },
+            '.' => if (depth == 0) return rest[0..i],
+            else => {},
+        }
+    }
+    std.debug.print(
+        \\
+        \\skill/SKILL.md: {s} runs to the end of the file without a sentence-ending
+        \\period outside its parenthetical asides, so the gate cannot tell where the
+        \\list stops.
+        \\
+    , .{what});
+    return error.SkillListUnterminated;
+}
+
+fn skillUnbalanced(what: []const u8, seg: []const u8) SkillParseError {
+    std.debug.print(
+        \\
+        \\skill/SKILL.md: unbalanced parentheses in {s}, so the gate cannot tell the
+        \\entries from the asides.
+        \\  text read: "{s}"
+        \\
+    , .{ what, seg });
+    return error.SkillParensUnbalanced;
+}
+
+/// Every `code span` in `seg` that is not inside a parenthetical aside.
+fn skillEntries(
+    gpa: std.mem.Allocator,
+    seg: []const u8,
+    what: []const u8,
+) (SkillParseError || std.mem.Allocator.Error)![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < seg.len) : (i += 1) {
+        switch (seg[i]) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return skillUnbalanced(what, seg);
+                depth -= 1;
+            },
+            '`' => {
+                const close = std.mem.indexOfScalarPos(u8, seg, i + 1, '`') orelse {
+                    std.debug.print(
+                        \\
+                        \\skill/SKILL.md: an unclosed `code span` in {s}.
+                        \\  text read: "{s}"
+                        \\
+                    , .{ what, seg });
+                    return error.SkillCodeSpanUnterminated;
+                };
+                if (depth == 0) try out.append(gpa, seg[i + 1 .. close]);
+                i = close;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return skillUnbalanced(what, seg);
+    if (out.items.len == 0) {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: {s} is empty — the gate found the label but no `entries`
+            \\after it, which is never right and would otherwise check nothing.
+            \\  text read: "{s}"
+            \\
+        , .{ what, seg });
+        return error.SkillListUnterminated;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn skillHas(list: []const []const u8, entry: []const u8) bool {
+    for (list) |item| if (std.mem.eql(u8, item, entry)) return true;
+    return false;
+}
+
+/// One documented list against the one the code actually has, in both
+/// directions. Both matter: an entry the document invented is as wrong as one
+/// it forgot, and a field whose `?` came or went shows up as one of each.
+fn expectSkillList(
+    what: []const u8,
+    documented: []const []const u8,
+    actual: []const []const u8,
+) SkillDriftError!void {
+    var drifted = false;
+    for (documented) |entry| {
+        if (!skillHas(actual, entry)) {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md lists `{s}` among {s}, and the code has nothing of that
+                \\name there — it was removed, renamed, or moved to the other list.
+                \\
+            , .{ entry, what });
+            drifted = true;
+        }
+    }
+    for (actual) |entry| {
+        if (!skillHas(documented, entry)) {
+            std.debug.print(
+                \\
+                \\The code has `{s}` among {s}, and skill/SKILL.md does not list it there.
+                \\
+            , .{ entry, what });
+            drifted = true;
+        }
+    }
+    if (!drifted and documented.len != actual.len) {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md repeats an entry among {s}: {d} listed for {d} in the code.
+            \\
+        , .{ what, documented.len, actual.len });
+        drifted = true;
+    }
+    if (drifted) return error.SkillKeySetDrifted;
+}
+
+/// Holds one verb's documented key set against the struct that emits it.
+///
+/// `heading` is the line the count lives on, e.g. ``"\n`job kill` — "``, and
+/// the paragraph it opens is everything up to the next blank line.
+fn expectSkillKeySet(
+    gpa: std.mem.Allocator,
+    comptime T: type,
+    heading: []const u8,
+    never_null_what: []const u8,
+    nullable_what: []const u8,
+) !void {
+    const fields = @typeInfo(T).@"struct".fields;
+
+    var never_null: std.ArrayList([]const u8) = .empty;
+    defer never_null.deinit(gpa);
+    var nullable: std.ArrayList([]const u8) = .empty;
+    defer nullable.deinit(gpa);
+    inline for (fields) |f| {
+        // From the type. A hand-kept list of which keys are optional would be
+        // exactly the drift this gate exists to catch.
+        const bucket = if (@typeInfo(f.type) == .optional) &nullable else &never_null;
+        try bucket.append(gpa, f.name);
+    }
+
+    const opened = try skillAfter(skill_md, heading, "the key-set paragraph it opens");
+    const para = opened[0..skillParagraphEnd(opened)];
+    // The needle carries a leading newline so it can only match at the start of
+    // a line; nothing below wants to print it.
+    const line = std.mem.trimStart(u8, heading, "\n");
+
+    const keys_at = std.mem.indexOf(u8, para, " keys.") orelse {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: "{s}" is not followed by "<n> keys.", so the gate cannot
+            \\read the count the document claims.
+            \\
+        , .{line});
+        return error.SkillCountUnreadable;
+    };
+    const claimed = std.fmt.parseInt(usize, para[0..keys_at], 10) catch {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: "{s}" is followed by "{s} keys.", which is not a number.
+            \\
+        , .{ line, para[0..keys_at] });
+        return error.SkillCountUnreadable;
+    };
+    if (claimed != fields.len) {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md says "{s}{d} keys."; the struct has {d} fields.
+            \\
+        , .{ line, claimed, fields.len });
+        return error.SkillKeySetDrifted;
+    }
+
+    const documented_never_null = try skillEntries(
+        gpa,
+        try skillSegment(para, "Never null: ", null, never_null_what),
+        never_null_what,
+    );
+    defer gpa.free(documented_never_null);
+    const documented_nullable = try skillEntries(
+        gpa,
+        try skillSegment(para, "Nullable: ", null, nullable_what),
+        nullable_what,
+    );
+    defer gpa.free(documented_nullable);
+
+    // Both, before either is raised: a field that gained or lost its `?` is
+    // one complaint from each list, and reporting half of that would send the
+    // reader looking for a rename that never happened.
+    const never_null_verdict = expectSkillList(never_null_what, documented_never_null, never_null.items);
+    const nullable_verdict = expectSkillList(nullable_what, documented_nullable, nullable.items);
+    try never_null_verdict;
+    try nullable_verdict;
+}
+
+/// The end of the paragraph starting at `s`: its first blank line, or all of
+/// it. A line of only spaces, tabs or `\r` is blank, so the parse does not
+/// depend on how the checkout wrote its line endings.
+fn skillParagraphEnd(s: []const u8) usize {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, s, i, '\n')) |nl| {
+        var j = nl + 1;
+        while (j < s.len and (s[j] == ' ' or s[j] == '\t' or s[j] == '\r')) j += 1;
+        if (j == s.len or s[j] == '\n') return nl;
+        i = nl + 1;
+    }
+    return s.len;
+}
+
+test "gate: SKILL.md's --json key sets are the ones these structs emit" {
+    const gpa = std.testing.allocator;
+    try expectSkillKeySet(
+        gpa,
+        KillJson,
+        "\n`job kill` — ",
+        "`job kill`'s never-null keys",
+        "`job kill`'s nullable keys",
+    );
+    try expectSkillKeySet(
+        gpa,
+        RemovalJson,
+        "\n`job rm` — ",
+        "`job rm`'s never-null keys",
+        "`job rm`'s nullable keys",
+    );
+}
+
+// `resultRecord`'s values are `@tagName` on `SidecarReading`, so renaming a
+// variant rewrites the published vocabulary from three files away. The split
+// the document draws — three ordinary readings, four that say a document at
+// this attempt's own address could not be used — is `anomalous()`, so that is
+// what it is checked against rather than a transcription of it.
+test "gate: SKILL.md's resultRecord codes are SidecarReading's own tag names" {
+    const gpa = std.testing.allocator;
+
+    var ordinary: std.ArrayList([]const u8) = .empty;
+    defer ordinary.deinit(gpa);
+    var unusable: std.ArrayList([]const u8) = .empty;
+    defer unusable.deinit(gpa);
+    inline for (@typeInfo(Tmux.SidecarReading).@"union".fields) |f| {
+        // A sample payload, only so `anomalous()` can be asked about the tag.
+        const payload: f.type = switch (@typeInfo(f.type)) {
+            .void => {},
+            .int => 0,
+            .pointer => "",
+            else => @compileError(
+                "SidecarReading." ++ f.name ++ " carries a payload this gate cannot" ++
+                    " sample; teach it one rather than dropping the variant from the check",
+            ),
+        };
+        const reading: Tmux.SidecarReading = @unionInit(Tmux.SidecarReading, f.name, payload);
+        const bucket = if (reading.anomalous()) &unusable else &ordinary;
+        try bucket.append(gpa, reading.code());
+    }
+
+    const ordinary_what = "`resultRecord`'s ordinary readings";
+    const unusable_what = "`resultRecord`'s unusable readings";
+    const documented_ordinary = try skillEntries(
+        gpa,
+        try skillSegment(skill_md, "Three are ordinary — ", " — and four say", ordinary_what),
+        ordinary_what,
+    );
+    defer gpa.free(documented_ordinary);
+    const documented_unusable = try skillEntries(
+        gpa,
+        try skillSegment(skill_md, "could not be used: ", null, unusable_what),
+        unusable_what,
+    );
+    defer gpa.free(documented_unusable);
+
+    const ordinary_verdict = expectSkillList(ordinary_what, documented_ordinary, ordinary.items);
+    const unusable_verdict = expectSkillList(unusable_what, documented_unusable, unusable.items);
+    try ordinary_verdict;
+    try unusable_verdict;
+}
+
 /// How much of the log's end a state probe reads. Shared with the launch
 /// paths' lazy settlement, so both windows are the same by construction.
 const probe_tail_bytes = Cli.probe_tail_bytes;
