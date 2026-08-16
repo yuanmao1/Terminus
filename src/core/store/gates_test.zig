@@ -3078,6 +3078,362 @@ test "gate: every kind × evidence cell is decided, and none of them by default"
     }
 }
 
+const TerminalTag = std.meta.Tag(op_state.Terminal);
+
+/// One legal value per terminal variant.
+///
+/// Exhaustive, so a new terminal cannot exist without appearing in the matrix
+/// below. The payloads do not matter to `terminalDescribesKind` — it asks only
+/// what class of claim this is — but they have to be *some* value the union
+/// admits, and each is spelled the way its own producer spells it.
+fn sampleTerminal(tag: TerminalTag) op_state.Terminal {
+    return switch (tag) {
+        .exited => .{ .exited = .{ .exit_code = 0 } },
+        .never_submitted => .{ .never_submitted = .{ .transport_error = "connection refused" } },
+        .remote_deadline => .{ .remote_deadline = .{ .after_ms = 30_000 } },
+        .local_abandon => .{ .local_abandon = .{ .reason = "the operator gave up before dialing" } },
+        .remote_cancel_confirmed => .{ .remote_cancel_confirmed = .{
+            .pid = 4242,
+            .start_token = "boot+4242",
+            .term_sent = true,
+            .kill_sent = false,
+            .absence_verified_at = 900,
+            .verification_method = "kill -0 -4242 => ESRCH",
+        } },
+        .input_accepted => .{ .input_accepted = .{ .bytes = 12, .sha256 = "aabbcc" } },
+        .input_refused => .{ .input_refused = .{ .reason = "the session does not exist" } },
+        .indeterminate => .{ .indeterminate = .{
+            .reason = "the connection dropped",
+            .last_observed = .submitted,
+        } },
+    };
+}
+
+/// The settle-side admissibility matrix, transcribed independently of the
+/// implementation and from the other direction — kind by kind, where
+/// `receipts.terminalDescribesKind` goes terminal by terminal.
+///
+/// Same purpose as `pinnedCell` one axis over: a second statement of the table,
+/// so a cell cannot be widened in `receipts.zig` alone. Both switches are
+/// exhaustive and neither has a default arm, so a new `operations.Kind` or a new
+/// `op_state.Terminal` variant is a compile error in both places until somebody
+/// writes down what may settle what.
+///
+/// The rows are identical for eight of the ten kinds, and that is the finding
+/// rather than a shortcut: until `session_write` existed, every terminal
+/// described every kind and the table said nothing at all. Written out per row
+/// anyway, because a row that agrees with its neighbour by coincidence and a row
+/// that agrees with it by omission look the same once they are collapsed.
+fn pinnedTerminalCell(kind: Store.operations.Kind, tag: TerminalTag) bool {
+    return switch (kind) {
+        // One supervised remote command, with a recorded process identity. It
+        // is judged by an exit status, may be given a remote deadline, and can
+        // be cancelled with verified absence. It types nothing into anybody's
+        // shell.
+        .exec => switch (tag) {
+            .exited,
+            .never_submitted,
+            .remote_deadline,
+            .local_abandon,
+            .remote_cancel_confirmed,
+            .indeterminate,
+            => true,
+            .input_accepted, .input_refused => false,
+        },
+        // Also one supervised remote command, and the shared mechanism is the
+        // trap: `cmd_job` types its launch line into a tmux session exactly as
+        // `write` types the operator's. What a job is judged by is still the
+        // wrapper's exit status, never the terminal's acceptance of the line
+        // that started it.
+        .job => switch (tag) {
+            .exited,
+            .never_submitted,
+            .remote_deadline,
+            .local_abandon,
+            .remote_cancel_confirmed,
+            .indeterminate,
+            => true,
+            .input_accepted, .input_refused => false,
+        },
+        // The row that makes this table non-vacuous. A write runs no command,
+        // so it has no exit status; nothing on the far side of `send-keys`
+        // enforces a deadline; and it starts no process to have confirmed the
+        // absence of. What it has instead is the pair built for it, carrying
+        // the byte count and digest that are the whole of what it established.
+        //
+        // The three attempt-level terminals stay, and they are what keeps the
+        // kind from being wedged: `never_submitted` and `local_abandon` before
+        // anything is handed over, `indeterminate` after — which is exactly the
+        // set `cmd_read_write` reaches for.
+        .session_write => switch (tag) {
+            .input_accepted,
+            .input_refused,
+            .never_submitted,
+            .local_abandon,
+            .indeterminate,
+            => true,
+            .exited, .remote_deadline, .remote_cancel_confirmed => false,
+        },
+        // No producer creates one of these yet, so their process-shaped
+        // terminals are deliberate blanks rather than decisions — refusing them
+        // would delete `completed`, `timed_out` and post-submission `cancelled`
+        // from a kind whose subsystem is built and whose checkpoints require
+        // their owner to settle. `input_accepted` is a decision: a transfer's
+        // verdict is a file at a declared destination, and "a terminal took some
+        // bytes" is not a reading of one.
+        .transfer_push, .transfer_pull, .fetch => switch (tag) {
+            .exited,
+            .never_submitted,
+            .remote_deadline,
+            .local_abandon,
+            .remote_cancel_confirmed,
+            .indeterminate,
+            => true,
+            .input_accepted, .input_refused => false,
+        },
+        // Nothing creates these at all. Same split and for the same reason: the
+        // blanks stay open because a total refusal on this side has no escape
+        // hatch — there is no operator variant in `op_state.Terminal` — so the
+        // first operation of such a kind would be unsettleable and would hold
+        // its scope with no route to `indeterminate` for a reconcile to act on.
+        // Typing into somebody else's shell is still not what any of them does.
+        .tunnel, .plan_phase, .audit, .cleanup => switch (tag) {
+            .exited,
+            .never_submitted,
+            .remote_deadline,
+            .local_abandon,
+            .remote_cancel_confirmed,
+            .indeterminate,
+            => true,
+            .input_accepted, .input_refused => false,
+        },
+    };
+}
+
+test "gate: every kind × terminal cell is decided, and none of them by default" {
+    const t = std.testing;
+
+    // The resolve-side table has a gate of exactly this shape, and this is its
+    // settle-side twin. The axis is more dangerous, not less: a resolution
+    // refused can be brought back with different evidence, and
+    // `operator_override` is admissible everywhere so nothing is ever left with
+    // no way out — while a settlement refused has no such hatch. `settle` is the
+    // sole terminal writer, `op_state.Terminal` has no operator variant, and an
+    // attempt whose only route to an outcome is refused stays live, holds its
+    // scope, and never reaches `indeterminate` for a reconcile to act on.
+    inline for (@typeInfo(Store.operations.Kind).@"enum".fields) |kind_field| {
+        const kind: Store.operations.Kind = @field(Store.operations.Kind, kind_field.name);
+        inline for (@typeInfo(TerminalTag).@"enum".fields) |terminal_field| {
+            const tag: TerminalTag = @field(TerminalTag, terminal_field.name);
+            const got = Store.receipts.terminalDescribesKind(sampleTerminal(tag), kind);
+            const pinned = pinnedTerminalCell(kind, tag);
+            if (got != pinned) {
+                std.debug.print(
+                    "cell {s} x {s}: the store says {}, the pinned matrix says {}\n",
+                    .{ kind_field.name, terminal_field.name, got, pinned },
+                );
+                return error.TerminalMatrixCellChanged;
+            }
+        }
+    }
+
+    for (std.enums.values(Store.operations.Kind)) |kind| {
+        // The three terminals that describe the *attempt* rather than the work.
+        // Every kind admits all three, and this is the property that keeps the
+        // universal give-up path honest: `op_state.terminalForTransportLoss`
+        // builds `never_submitted` or `indeterminate` without being told the
+        // kind, and `Execution.abandon` — through it `Execution.deinit`, the
+        // last resort for a process that returned without deciding — calls it
+        // for every operation there is. A cell refused here would turn "the
+        // process exited without recording an outcome" into a lost receipt.
+        try t.expect(Store.receipts.terminalDescribesKind(sampleTerminal(.never_submitted), kind));
+        try t.expect(Store.receipts.terminalDescribesKind(sampleTerminal(.local_abandon), kind));
+        try t.expect(Store.receipts.terminalDescribesKind(sampleTerminal(.indeterminate), kind));
+
+        // Typing bytes into a shell somebody else is running is one act, and
+        // exactly one kind performs it.
+        const is_write = kind == .session_write;
+        try t.expectEqual(is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.input_accepted), kind));
+        try t.expectEqual(is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.input_refused), kind));
+        // And its complement: an exit status is what every *other* kind is
+        // judged by, and the one it is not judged by is the one that runs no
+        // command. These two lines are the whole of what the `session_write`
+        // commit made non-vacuous.
+        try t.expectEqual(!is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.exited), kind));
+        try t.expectEqual(!is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.remote_deadline), kind));
+        try t.expectEqual(
+            !is_write,
+            Store.receipts.terminalDescribesKind(sampleTerminal(.remote_cancel_confirmed), kind),
+        );
+    }
+
+    // No kind is wedged: for every one of them there is at least one admissible
+    // terminal producing each status it can honestly reach. Stated as a walk
+    // over the statuses rather than as a list of variants, because that is the
+    // thing a refusal actually costs — `exited` is the only route to `completed`
+    // for anything but a write, `remote_deadline` the only route to `timed_out`,
+    // and `remote_cancel_confirmed` the only post-submission route to
+    // `cancelled`, so refusing one of those cells does not narrow how a kind may
+    // be settled, it deletes the outcome.
+    for (std.enums.values(Store.operations.Kind)) |kind| {
+        var reachable = std.EnumSet(op_state.Status).initEmpty();
+        inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
+            const tag: TerminalTag = @field(TerminalTag, field.name);
+            const terminal = sampleTerminal(tag);
+            if (Store.receipts.terminalDescribesKind(terminal, kind)) reachable.insert(terminal.status());
+        }
+        try t.expect(reachable.contains(.completed));
+        try t.expect(reachable.contains(.failed));
+        try t.expect(reachable.contains(.cancelled));
+        try t.expect(reachable.contains(.indeterminate));
+        // The single exception, and it is a status the kind could never have
+        // reached honestly: a write is answered by the terminal it typed into,
+        // and nothing out there enforces a deadline over `send-keys`. A local
+        // deadline expiring is not a timeout (`op_state` rule 2); it is
+        // `indeterminate`, which is admitted above.
+        try t.expectEqual(kind != .session_write, reachable.contains(.timed_out));
+    }
+}
+
+test "gate: a terminal that does not describe this kind of work is refused at settle" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_terminal_kind");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // A write, submitted: the bytes are with the remote and an answer is due.
+    const wr = testId("wrkind");
+    const write_id: []const u8 = &wr;
+    try seedOperationOfKind(&store, write_id, .session_write);
+
+    // An exit status for an operation that ran no command. Every other guard on
+    // this path waves it through — `canTransition(.submitted, .completed)` is
+    // legal, and `canSettle(.submitted, .exited)` is exactly the pairing that
+    // check exists to admit — so the kind is the only thing standing between a
+    // write and a receipt carrying `exit_code = 0` in the column an auditor
+    // reads first.
+    try t.expect(op_state.canTransition(.submitted, .completed));
+    try t.expect(op_state.canSettle(.submitted, .{ .exited = .{ .exit_code = 0 } }));
+    try t.expectError(error.TerminalDoesNotDescribeKind, Store.receipts.settle(
+        &store,
+        write_id,
+        .{ .exited = .{ .exit_code = 0 } },
+        .{},
+        200,
+    ));
+    // A refusal that wrote nothing: no terminal event, and the attempt is still
+    // where it was, so the caller can settle it correctly afterwards.
+    try t.expectEqual(@as(?Store.receipts.TerminalRecord, null), try Store.receipts.terminalOf(&store, write_id));
+    try t.expectEqual(
+        op_state.Status.submitted,
+        (try Store.operations.get(&store, arena, write_id)).?.status,
+    );
+    // Nor did it leave a transaction open behind it.
+    try store.db.exec("BEGIN IMMEDIATE");
+    try store.db.exec("ROLLBACK");
+
+    // The control: the terminal built for this kind of work still settles it,
+    // through the same door, one line later.
+    const delivered = try Store.receipts.settle(&store, write_id, .{
+        .input_accepted = .{ .bytes = 12, .sha256 = "aabbcc" },
+    }, .{}, 210);
+    try t.expectEqual(op_state.Status.completed, delivered.recorded.status);
+
+    // The other direction, because a matrix that only refuses one way is half a
+    // matrix: a terminal's acceptance of typed bytes offered for a command that
+    // was judged by an exit status.
+    const ex = testId("exkind");
+    const exec_id: []const u8 = &ex;
+    try Store.operations.create(&store, .{
+        .request_id = exec_id,
+        .server_id = 1,
+        .server_name = "race",
+        .kind = .exec,
+        .now = 300,
+    });
+    try Store.operations.advance(&store, exec_id, .connecting, 301);
+    try Store.operations.advance(&store, exec_id, .submitted, 302);
+    try t.expectError(error.TerminalDoesNotDescribeKind, Store.receipts.settle(
+        &store,
+        exec_id,
+        .{ .input_accepted = .{ .bytes = 12, .sha256 = "aabbcc" } },
+        .{},
+        310,
+    ));
+    const ran = try Store.receipts.settle(&store, exec_id, .{ .exited = .{ .exit_code = 0 } }, .{}, 311);
+    try t.expectEqual(op_state.Status.completed, ran.recorded.status);
+
+    // The check runs *before* the already-settled branch, and that ordering is
+    // the point rather than an accident. Whether a terminal can describe work of
+    // this kind is a property of the pair alone — it does not depend on who won
+    // a race — so answering it afterwards would report this binary's defect only
+    // to the caller that *lost*, which is the one way to have a bug nobody ever
+    // sees. Both operations above are settled now, and both still name the
+    // mismatch rather than handing back the winner.
+    try t.expectError(error.TerminalDoesNotDescribeKind, Store.receipts.settle(
+        &store,
+        exec_id,
+        .{ .input_refused = .{ .reason = "no such session" } },
+        .{},
+        320,
+    ));
+    switch (try Store.receipts.settle(&store, exec_id, .{ .exited = .{ .exit_code = 1 } }, .{}, 321)) {
+        .already_settled => |winner| try t.expectEqual(op_state.Status.completed, winner.status),
+        .recorded => return error.SettledTwice,
+    }
+}
+
+test "gate: settle refuses an operation kind this binary cannot name" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_settle_kind_unknown");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    const rid = testId("settlekind");
+    const request_id: []const u8 = &rid;
+    try seedOperationOfKind(&store, request_id, .exec);
+
+    // The same refusal `resolve` makes, one writer over, and for the same
+    // reason: `kind` carries no CHECK constraint, so a future version, a hand
+    // edit or a corrupt row can leave anything in it, and a kind this binary
+    // cannot name is one it cannot decide a matrix cell for. Parsed rather than
+    // compared as text — a short unrecognised value is the half that slipped
+    // through on the resolve side, so it is the half checked here.
+    //
+    // This is also what proves `settle` reads the column at all: the terminal
+    // offered is the one every kind that exists admits, so the only thing that
+    // can refuse it is the kind being unreadable.
+    const not_a_kind = "exe";
+    try t.expectError(error.UnknownKind, Store.operations.Kind.parse(not_a_kind));
+    try store.db.exec("UPDATE operations SET kind = '" ++ not_a_kind ++ "'");
+    try t.expectError(error.UnknownOperationKind, Store.receipts.settle(
+        &store,
+        request_id,
+        op_state.terminalForTransportLoss(.submitted, "eof"),
+        .{},
+        200,
+    ));
+
+    // Nothing was written, and the attempt is where it was: a row we refuse to
+    // reason about is not a row we half-settle.
+    try t.expectEqual(@as(?Store.receipts.TerminalRecord, null), try Store.receipts.terminalOf(&store, request_id));
+    try t.expectEqual(
+        op_state.Status.submitted,
+        (try Store.operations.get(&store, arena, request_id)).?.status,
+    );
+    try store.db.exec("BEGIN IMMEDIATE");
+    try store.db.exec("ROLLBACK");
+}
+
 test "gate: a delivered write records what was taken, and no exit status" {
     const t = std.testing;
     var scratch = try Scratch.init(t.allocator, "gate_write_accepted");

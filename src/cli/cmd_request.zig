@@ -365,13 +365,14 @@ fn semanticRefusal(err: Store.receipts.Error, status: []const u8) ?Outcome {
         //
         // The first four are the storage layer failing, and `OutOfMemory` is
         // this process failing; for all five the write may have half-happened
-        // and 76 is exactly right. The last three mean *this binary* called the
-        // wrong writer — a terminal event routed anywhere but `settle`, a
-        // reconcile routed anywhere but `resolve`, or a terminal handed two
-        // detail documents to write into one column. That is our defect, not a
-        // request the caller can restate, and dressing it as a polite refusal
-        // would hide a bug behind a message telling the operator to try
-        // different evidence.
+        // and 76 is exactly right. The last four mean *this binary* called the
+        // wrong writer or built the wrong pair — a terminal event routed
+        // anywhere but `settle`, a reconcile routed anywhere but `resolve`, a
+        // terminal handed two detail documents to write into one column, or a
+        // terminal that does not describe the kind of work the operation is.
+        // That is our defect, not a request the caller can restate, and
+        // dressing it as a polite refusal would hide a bug behind a message
+        // telling the operator to try different evidence.
         error.Sqlite,
         error.Constraint,
         error.WalSetupExhausted,
@@ -380,6 +381,7 @@ fn semanticRefusal(err: Store.receipts.Error, status: []const u8) ?Outcome {
         error.TerminalRequiresSettle,
         error.ReconcileRequiresResolve,
         error.ConflictingTerminalDetail,
+        error.TerminalDoesNotDescribeKind,
         => return null,
 
         inline else => |e| return .{
@@ -688,6 +690,17 @@ const LogEvidence = struct {
     /// answers that cannot both be true" — and the message this command
     /// prints for the first is a lie about the second.
     conflict: ?Tmux.JobProbe.Conflict,
+    /// Set when a defective result record made the log sentinel uncheckable
+    /// and its exit status was declined; carries the code that was declined.
+    ///
+    /// Carried for the reason `conflict` is, and it is the same reason twice:
+    /// without it `exit_code == null` covers "the job left nothing behind" and
+    /// "it left an answer we refused to read", and the sentence this command
+    /// prints for the first is a lie about the second. It is also the flag that
+    /// separates a refusal from a job that is genuinely still running — a
+    /// defective record beside a silent log declines nothing, because there was
+    /// no verdict there to decline.
+    refused: ?Tmux.JobProbe.Refused,
     /// What was at the result sidecar's address, whether or not it answered.
     ///
     /// Carried for the same reason `conflict` is. Without it this command's
@@ -737,6 +750,7 @@ fn readLog(
         .finished_at = probe.finished_at,
         .result_request_id = probe.result_request_id,
         .conflict = probe.conflict,
+        .refused = probe.refused,
         .sidecar = probe.sidecar,
         .session_alive = probe.session_alive,
         .output_bytes = probe.output.len,
@@ -793,6 +807,7 @@ test "M2e gate: reconcile names the record it actually read" {
         .finished_at = 1750000000,
         .result_request_id = doc_rid,
         .conflict = null,
+        .refused = null,
         .sidecar = .present,
         .session_alive = false,
         .output_bytes = 12,
@@ -834,25 +849,57 @@ test "gate: a result record that was there and unusable is not reported as no re
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The job settled from its log sentinel; a document *is* sitting at this
-    // request's own address and could not be used. Both facts are true and
-    // both have to reach the operator — the settlement is what they asked for,
-    // the record is why the next attempt on this host will hit the same thing.
-    const settled_from_log: LogEvidence = .{
+    // What a probe now hands back when a document *is* sitting at this
+    // request's own address and could not be used while the log sentinel was
+    // willing to answer: no exit code, no source, and the declined code
+    // carried separately. `session_alive` is true because that is the ordinary
+    // case — a tmux session outlives the command that ran in it — and it is
+    // exactly what used to turn this into "still running", `ok: true`, exit 0.
+    const refused_reading: LogEvidence = .{
         .alias = "deploy",
         .sentinel = "__TERMINUS_JOB_5__",
-        .exit_code = 3,
-        .source = .log_sentinel,
+        .exit_code = null,
+        .source = .none,
         .finished_at = null,
         .result_request_id = null,
         .conflict = null,
+        .refused = .{ .sentinel_exit_code = 3 },
         .sidecar = .{ .foreign = "01JQXW8ZK4N0RS7T3VYB2MCXYZ" },
-        .session_alive = false,
+        .session_alive = true,
         .output_bytes = 12,
     };
-    const with_note = withSidecarNote(settled_from_log, arena, "exit sentinel found in the job log");
-    try t.expect(std.mem.indexOf(u8, with_note, "exit sentinel found") != null);
-    try t.expect(std.mem.indexOf(u8, with_note, "01JQXW8ZK4N0RS7T3VYB2MCXYZ") != null);
+    const refusal = refusedReason(refused_reading, arena, refused_reading.refused.?);
+    // The declined verdict, the id that turned up in its place, and no
+    // suggestion that anything was missing.
+    try t.expect(std.mem.indexOf(u8, refusal, "exit 3") != null);
+    try t.expect(std.mem.indexOf(u8, refusal, "01JQXW8ZK4N0RS7T3VYB2MCXYZ") != null);
+    try t.expect(std.mem.indexOf(u8, refusal, "no result record") == null);
+    try t.expect(std.mem.indexOf(u8, refusal, "still running") == null);
+
+    // The two sentences it must not be mistaken for, side by side. The first
+    // is what `--from-log` says when the host really did leave nothing behind;
+    // the second is what it said for *this* evidence before the refusal
+    // existed, because a live tmux pane is the ordinary state of a finished
+    // job and liveness was allowed to decide. Both would have been reported
+    // `ok`, and one of them exits 0.
+    const absence = "the job left no exit status behind — no result record and no sentinel in its log";
+    const running = "still running: the job session is alive and has recorded no exit status";
+    try t.expect(!std.mem.eql(u8, refusal, absence));
+    try t.expect(!std.mem.eql(u8, refusal, running));
+    try t.expect(std.mem.indexOf(u8, refusal, "left no exit status") == null);
+    try t.expect(std.mem.indexOf(u8, refusal, "recorded no exit status") == null);
+
+    // A settlement that really did read the sentinel — nothing defective at
+    // the address — still says so, so the refusal above means something.
+    var clean = refused_reading;
+    clean.exit_code = 3;
+    clean.source = .log_sentinel;
+    clean.refused = null;
+    clean.sidecar = .absent;
+    try t.expectEqualStrings(
+        "exit sentinel found in the job log",
+        withSidecarNote(clean, arena, "exit sentinel found in the job log"),
+    );
 
     // Each unusable reading earns its own sentence, and none of them may read
     // as "there is nothing there" — which is the sentence `--from-log` prints
@@ -865,7 +912,7 @@ test "gate: a result record that was there and unusable is not reported as no re
     };
     var sentences: [readings.len][]const u8 = undefined;
     for (readings, 0..) |reading, i| {
-        var e = settled_from_log;
+        var e = refused_reading;
         e.sidecar = reading;
         const note = sidecarNote(e, arena) orelse {
             std.debug.print("unusable reading {s} says nothing\n", .{reading.code()});
@@ -875,7 +922,38 @@ test "gate: a result record that was there and unusable is not reported as no re
         // reading's own name is what an agent branches on.
         try t.expect(std.mem.indexOf(u8, note, "present") != null);
         try t.expect(std.mem.indexOf(u8, note, "no result record") == null);
+        // And the refusal sentence carries that same distinction through to
+        // the ledger's reason, which is the only record that survives.
+        try t.expect(std.mem.indexOf(u8, refusedReason(e, arena, .{ .sentinel_exit_code = 3 }), note) != null);
         sentences[i] = note;
+
+        // The same defect in the state that actually reaches `withSidecarNote`,
+        // which is where the note is *appended* to a sentence rather than
+        // standing on its own: a document at this request's address, a live
+        // session, and a log that said nothing at all. Nothing was refused —
+        // there was no verdict there to refuse — so this attempt really is
+        // reported as still running, `ok: true`, exit 0, and the defect is the
+        // only sign anything is wrong with the host.
+        //
+        // Asserted because the append is otherwise unexercised anywhere in the
+        // suite: `withSidecarNote` could be cut down to `return detail` and
+        // every other case in this file would still pass, while the operator
+        // lost the one mention of an unreadable document on the one path that
+        // reports the job as fine. The state it used to be asserted against —
+        // `source == .log_sentinel` beside an anomalous reading — stopped being
+        // producible when `readingOf` began returning on `defective()` before
+        // it reaches the sentinel, so this replaces it rather than dropping it.
+        var alive = e;
+        alive.refused = null;
+        alive.session_alive = true;
+        const detail = "the job session is still alive and it has recorded no exit status; its outcome is not established yet";
+        const combined = withSidecarNote(alive, arena, detail);
+        try t.expect(std.mem.startsWith(u8, combined, detail));
+        std.testing.expect(combined.len > detail.len) catch |err| {
+            std.debug.print("a live session with a {s} result record reported nothing about it\n", .{reading.code()});
+            return err;
+        };
+        try t.expect(std.mem.indexOf(u8, combined, note) != null);
     }
     // Four situations, four sentences: an operator who cannot tell a
     // wrong-build wrapper from a colliding request id goes to the wrong place.
@@ -885,7 +963,7 @@ test "gate: a result record that was there and unusable is not reported as no re
     // The three ordinary readings say nothing and add nothing, so a clean
     // reconcile keeps the sentence it always had.
     for ([_]Tmux.SidecarReading{ .not_requested, .absent, .present }) |ordinary| {
-        var e = settled_from_log;
+        var e = refused_reading;
         e.sidecar = ordinary;
         try t.expectEqual(@as(?[]const u8, null), sidecarNote(e, arena));
         try t.expectEqualStrings("plain", withSidecarNote(e, arena, "plain"));
@@ -914,6 +992,27 @@ fn sidecarNote(e: LogEvidence, arena: std.mem.Allocator) ?[]const u8 {
 fn withSidecarNote(e: LogEvidence, arena: std.mem.Allocator, detail: []const u8) []const u8 {
     const note = sidecarNote(e, arena) orelse return detail;
     return std.fmt.allocPrint(arena, "{s}. Also: {s}", .{ detail, note }) catch note;
+}
+
+/// What a reconcile can say when a defective result record cost it a verdict.
+///
+/// One sentence shared by both callers so the reason written into the ledger
+/// and the line printed to the operator cannot drift, and so neither can borrow
+/// the "left no exit status behind" wording: the evidence is present, it is on
+/// the host, and it is untrustworthy. That is the opposite of absent and sends
+/// the operator somewhere else entirely.
+///
+/// `refused` is only ever set beside an anomalous reading, so `sidecarNote` has
+/// a sentence here and the `orelse` is an invariant check rather than a
+/// fallback — and it still names the reading, because a reason that dropped it
+/// would say an exit status was declined without saying what declined it.
+fn refusedReason(e: LogEvidence, arena: std.mem.Allocator, declined: Tmux.JobProbe.Refused) []const u8 {
+    const note = sidecarNote(e, arena) orelse e.sidecar.code();
+    return std.fmt.allocPrint(
+        arena,
+        "the sentinel in the job's log says exit {d}, but {s}. The stronger of the two records is unusable, so nothing can check the weaker one and its exit status was not read as this job's outcome",
+        .{ declined.sentinel_exit_code, note },
+    ) catch note;
 }
 
 /// Annotates an already-`indeterminate` attempt with what the job proves.
@@ -949,7 +1048,21 @@ fn resolveFromLog(
         .mechanical = true,
         .status = op.status.text(),
         .result_record = evidence.sidecar.code(),
-        .detail = if (evidence.session_alive)
+        .detail = if (evidence.refused) |declined|
+            // Checked inside the same `orelse` the two absences take, and told
+            // apart from them here. This is not "the job recorded no usable
+            // exit status": it recorded one, in the weaker of its two records,
+            // and this command refused to read it because the stronger record
+            // is sitting at this request's own address in a state that says
+            // something on the host is wrong. Re-reading will not change that,
+            // so the operator is pointed at `--override` rather than at
+            // another `--from-log`.
+            std.fmt.allocPrint(
+                ctx.arena,
+                "{s}. Nothing mechanical can settle this — check the host and use --override",
+                .{refusedReason(evidence, ctx.arena, declined)},
+            ) catch refusedReason(evidence, ctx.arena, declined)
+        else if (evidence.session_alive)
             withSidecarNote(evidence, ctx.arena, "the job session is still alive and it has recorded no exit status; its outcome is not established yet")
         else if (sidecarNote(evidence, ctx.arena)) |note|
             // Not "no result record": there is one, and it is the reason this
@@ -979,12 +1092,16 @@ fn resolveFromLog(
 
 /// Settles an attempt that was never settled at all.
 ///
-/// Four answers, kept strictly apart:
+/// Five answers, kept strictly apart:
 ///
 ///   * the two durable records disagree — settled `indeterminate`, naming both
 ///     codes. This is *not* the "left nothing behind" case and must not borrow
 ///     its message: the evidence is present and untrustworthy, so no later
 ///     mechanical reconcile will do any better either;
+///   * the result record is there and unusable while the log sentinel answered
+///     — settled `indeterminate`, naming the defect and the code it cost. Same
+///     rule as the disagreement, and for the same reason: the stronger record
+///     cannot be read, so the weaker one cannot be checked against it;
 ///   * an exit status is recorded — the job ended and we can say how. Settled
 ///     for real, and the scope is released.
 ///   * no exit status, session alive — the job is running. Nothing is
@@ -1024,6 +1141,38 @@ fn settleFromLog(
             "the job's two durable records disagree: its result file says exit {d}, the sentinel in its log says exit {d}. One of them is wrong and nothing here can say which",
             .{ clash.result_exit_code, clash.sentinel_exit_code },
         ) catch "the job's result file and its log sentinel report different exit codes";
+        _ = execution.settleAttached(.{ .indeterminate = .{
+            .reason = reason,
+            .last_observed = execution.status,
+        } }, .{ .source = .reconcile }) catch |err| Cli.receiptFatal(op.request_id, err, op.status.text());
+        return .{
+            .ok = false,
+            .resolved = null,
+            .mechanical = true,
+            .status = Store.op_state.Status.indeterminate.text(),
+            .result_record = evidence.sidecar.code(),
+            .detail = std.fmt.allocPrint(
+                ctx.arena,
+                "{s}. Recorded as indeterminate, which keeps holding the scope; re-reading the log will not help, so release it with --override once you have checked the host by hand",
+                .{reason},
+            ) catch reason,
+            .exit = .indeterminate,
+        };
+    }
+
+    // A defective result record refuses the same way, and is checked in the
+    // same place and before the session's liveness for the same reason.
+    //
+    // Liveness would otherwise decide it, and it decides it wrongly: a tmux
+    // session outlives the command that ran in it, so a live pane is the
+    // *normal* state of a finished job. This attempt would have been reported
+    // "still running: the job session is alive and has recorded no exit status"
+    // — `ok: true`, exit 0 — for a job whose own log says it exited, whose
+    // result record is unreadable, and which nothing will ever settle
+    // mechanically. Recorded `indeterminate` instead, which keeps holding the
+    // scope until somebody looks at the host.
+    if (evidence.refused) |declined| {
+        const reason = refusedReason(evidence, ctx.arena, declined);
         _ = execution.settleAttached(.{ .indeterminate = .{
             .reason = reason,
             .last_observed = execution.status,

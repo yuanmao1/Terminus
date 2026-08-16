@@ -177,6 +177,19 @@ const Claim = struct {
     owner_request_id: []const u8,
     /// For the failure message only.
     job_name: []const u8,
+    /// `ctx.now` as it stood when the claim was taken — the process's *start*
+    /// time, not the acquisition's.
+    ///
+    /// No longer what the release is stamped with, and that is the whole of the
+    /// fix below: it used to be, and since `claimJobScope` stamps the
+    /// acquisition with the same frozen value, every `job kill` and `job rm`
+    /// left a row whose `released_at` equalled its `acquired_at` — a holding
+    /// period of exactly zero seconds, unconditionally — and, after the renewal
+    /// learned to read a fresh clock, a release recorded *before* that renewal.
+    ///
+    /// Kept because removing it means changing `registerClaim`'s signature and
+    /// its one call site lives in `cmd_job.zig`, which another agent holds. It
+    /// is correct for what it says it is; it is simply nothing's input now.
     now: i64,
 };
 var active_claim: ?Claim = null;
@@ -204,24 +217,71 @@ pub fn registerClaim(
 /// Called at settle by the command itself and from every process-ending path
 /// below. A claim that is no longer ours — a peer took it over with `--force` —
 /// matches no row and is left exactly where it is.
+///
+/// **The release is stamped with the clock as it is now**, read through the
+/// store, and not with the `ctx.now` the claim was registered with. `ctx.now`
+/// is one wall-clock read taken at process start (`main.zig`), and
+/// `claimJobScope` stamps the acquisition with that same frozen value — so a
+/// release stamped from it wrote `released_at == acquired_at` on every
+/// `job kill` and `job rm`, recording a lease that was held for zero seconds no
+/// matter how long the command actually ran. Once `holdClaim` started renewing
+/// off a fresh clock, the same frozen stamp additionally landed *before* the
+/// renewal that provably preceded it, whenever an integer-second boundary was
+/// crossed in between. `leases.release` now refuses that second shape outright;
+/// this is what stops us handing it one.
+///
+/// Read through `leases.clockSeconds` rather than `std.Io.Timestamp.now`
+/// because this hook runs from `std.process.exit` paths where the only `io` in
+/// reach is `active_ctx`'s — a global that `main` alone populates, so every
+/// in-process caller (the gates included) would find it null and need a
+/// fallback, and the only fallback on offer is the frozen stamp this exists to
+/// stop using. See `leases.clockSeconds`.
 pub fn releaseClaim() void {
     const held = active_claim orelse return;
     active_claim = null; // never re-enter
+    const now = Store.leases.clockSeconds(held.store) catch |err| {
+        // Reported, not swallowed, and the claim is deliberately left held: a
+        // release we cannot date is a release we would have to invent a date
+        // for, and an invented one is what this whole change removes.
+        std.debug.print(
+            "terminus: could not read the clock to date the release of the scope lease for job '{s}': {s}; " ++
+                "the claim is left held and will lapse at its TTL\n",
+            .{ held.job_name, @errorName(err) },
+        );
+        return;
+    };
     _ = Store.leases.release(
         held.store,
         held.server_id,
         held.scope,
         held.owner_request_id,
         .released,
-        held.now,
+        now,
     ) catch |err| {
-        // Reported, not swallowed: what is left behind is a scope that refuses
-        // the operator's next attempt on this job until the lease lapses.
-        std.debug.print(
-            "terminus: could not release the scope lease for job '{s}': {s}; " ++
-                "it will block further changes to that job until it expires\n",
-            .{ held.job_name, @errorName(err) },
-        );
+        switch (err) {
+            // The store refused the stamp as contradicting the row's own
+            // history. Distinct from every other failure here on purpose: it
+            // does not mean the database is unreachable and it does not mean
+            // somebody took the claim — it means this machine's clock now reads
+            // earlier than the moment that row was acquired or last renewed, so
+            // either the clock moved backwards under us or something wrote that
+            // row with a time it had no business writing. Left held rather than
+            // forced through.
+            error.LeaseTimestampsOutOfOrder => std.debug.print(
+                "terminus: refused to date the release of the scope lease for job '{s}': the clock now reads " ++
+                    "earlier than the lease's own acquisition or last renewal, so recording it would put that row's " ++
+                    "timestamps out of order; the claim is left held and will lapse at its TTL\n",
+                .{held.job_name},
+            ),
+            // Reported, not swallowed: what is left behind is a scope that
+            // refuses the operator's next attempt on this job until the lease
+            // lapses.
+            else => std.debug.print(
+                "terminus: could not release the scope lease for job '{s}': {s}; " ++
+                    "it will block further changes to that job until it expires\n",
+                .{ held.job_name, @errorName(err) },
+            ),
+        }
     };
 }
 
@@ -482,7 +542,36 @@ pub fn settleProvableBlocker(
         );
         return;
     }
-    const code = probe.exit_code orelse return;
+    const code = probe.exit_code orelse {
+        // The sibling of the conflict arm above, and silent until now. The
+        // blocker correctly stays blocked — absence of evidence never releases
+        // a scope — but an operator whose launch has just been refused was told
+        // nothing about *why* the one thing that could have cleared it did not.
+        // `job status` and `request reconcile` both say this loudly; a caller
+        // who has only ever run `run --name X` sees neither.
+        //
+        // Two shapes, because they send an operator to different places. A
+        // refusal means a record was found at this request's own address and
+        // was defective — a truncated or malformed sidecar, a document naming
+        // somebody else — and the log's own answer was declined rather than
+        // missing, so the code it carried is worth printing. Nothing at all
+        // means the job left no readable end anywhere: it may still be running.
+        if (probe.refused) |declined| {
+            std.debug.print(
+                "terminus: blocking job '{s}' ({s}) has an unreadable result record; its log says it exited {d}, " ++
+                    "but a defective record is not evidence and settling from the log alone would be guessing. " ++
+                    "It stays blocked until reconciled: terminus request reconcile {s}\n",
+                .{ attempt.job_name, op.request_id, declined.sentinel_exit_code, op.request_id },
+            );
+        } else {
+            std.debug.print(
+                "terminus: blocking job '{s}' ({s}) has recorded no exit status yet — no result record and no log " ++
+                    "sentinel — so it may still be running; it stays blocked. Check with 'terminus job status {s}'\n",
+                .{ attempt.job_name, op.request_id, attempt.job_name },
+            );
+        }
+        return;
+    };
 
     var execution = (Core.execution.attach(store, ctx.arena, ctx.io, op.request_id) catch |err| {
         std.debug.print(
@@ -970,6 +1059,123 @@ pub fn stripLoginNoise(arena: std.mem.Allocator, stderr: []const u8) ![]const u8
     }
     const result = out.items;
     return std.mem.trimEnd(u8, result, "\n");
+}
+
+/// Scratch database under `.zig-cache`, the shape the store gates use.
+const Scratch = struct {
+    io: std.Io,
+    threaded: *std.Io.Threaded,
+    path: [:0]u8,
+    allocator: std.mem.Allocator,
+
+    const dir = ".zig-cache/tmp";
+
+    fn init(allocator: std.mem.Allocator, name: []const u8) !Scratch {
+        const threaded = try allocator.create(std.Io.Threaded);
+        threaded.* = .init(allocator, .{});
+        const io = threaded.io();
+        std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        const unique = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ name, std.Thread.getCurrentId() });
+        defer allocator.free(unique);
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.db", .{ dir, unique }, 0);
+        var s: Scratch = .{ .io = io, .threaded = threaded, .path = path, .allocator = allocator };
+        s.removeFiles();
+        return s;
+    }
+
+    fn removeFiles(s: *Scratch) void {
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteFile(s.io, s.path) catch {};
+        for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
+            const side = std.fmt.allocPrint(s.allocator, "{s}{s}", .{ s.path, suffix }) catch return;
+            defer s.allocator.free(side);
+            cwd.deleteFile(s.io, side) catch {};
+        }
+    }
+
+    fn deinit(s: *Scratch) void {
+        s.removeFiles();
+        s.allocator.free(s.path);
+        s.threaded.deinit();
+        s.allocator.destroy(s.threaded);
+    }
+};
+
+// The half of the defect a reader notices, pinned as a number rather than as a
+// property: `job kill` and `job rm` recorded a scope lease held for *exactly
+// zero seconds*, every time, because `registerClaim` froze `ctx.now` — the
+// process's start time, which is also what `claimJobScope` stamped the
+// acquisition with — and `releaseClaim` handed that same value back to
+// `leases.release`. Unlike the reversal, that half needed no clock boundary to
+// be crossed and no timing luck: `acquired_at` and `released_at` came from one
+// variable, so they could not differ.
+//
+// The gate reconstructs the shape rather than describing it: a claim taken by a
+// process that started a minute ago, renewed thirty seconds in off a fresh
+// clock (what `holdClaim` does today), then released through the real
+// `releaseClaim` — the same function `fail`, `failWithCode`,
+// `failIndeterminate`, `failIndeterminateAfterOutput` and `receiptFatal` all
+// route through, because `std.process.exit` skips defers.
+test "gate: a released claim records the time the scope was actually held" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cli_claim_holding_period");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    // A process that started a minute ago. Backdated off the store's own clock
+    // rather than off a literal, so the renewal below stays in the past: a
+    // fixture dated in the *future* would be refused by the ordering guard, and
+    // would be testing that instead.
+    const start = (try Store.leases.clockSeconds(&store)) - 60;
+    const owner: []const u8 = "01CLAIMHOLDER0123456789ABC";
+    const scope: Core.execution.Scope = .{ .kind = .job, .key = "deploy" };
+
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = scope,
+        .owner_request_id = owner,
+        .profile_token = "one-machine",
+        .owner_label = "deploy",
+        .ttl_secs = 120,
+        .now = start,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ClaimDidNotTake,
+    }
+    registerClaim(&store, 1, scope, owner, "deploy", start);
+
+    // `holdClaim`'s renewal, which already reads a fresh clock.
+    try t.expect(try Store.leases.renew(&store, 1, scope, owner, 120, start + 30));
+
+    releaseClaim();
+
+    var stmt = try store.db.prepare(
+        \\SELECT acquired_at, renewed_at, released_at, release_reason FROM leases
+        \\ WHERE owner_request_id = ?1
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, owner);
+    try t.expect(try stmt.step());
+    const acquired_at = stmt.columnInt(0);
+    const renewed_at = stmt.columnInt(1);
+    const released_at = stmt.columnOptInt(2) orelse return error.ClaimWasNotReleased;
+    try t.expectEqualStrings("released", stmt.columnText(3));
+
+    // The whole point: the row says the lease was held for the minute it was
+    // held for. With the release stamped from the frozen `ctx.now` this is 0.
+    try t.expect(released_at - acquired_at >= 60);
+    // ...and the release is not recorded before the renewal that preceded it.
+    // With the frozen stamp this one is negative by thirty seconds.
+    try t.expect(released_at >= renewed_at);
 }
 
 test {

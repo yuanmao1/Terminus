@@ -198,6 +198,16 @@ fn splitProbe(stdout: []const u8) ?ProbeHalves {
 ///
 /// None of the four non-`present` readings settles anything, and that is not
 /// weakened here. What changes is that each of them now says which it is.
+///
+/// Four of the five are *defects* and one is an absence, and the difference
+/// decides an operation's terminal state. `absent` lets the log sentinel
+/// answer, because nothing was written at this address and the sentinel is the
+/// only record there is. The other four forbid the sentinel from answering
+/// either: something wrote a document at an address derived from this
+/// operation's own id and we cannot read it, so the weaker record's agreement
+/// with it cannot be checked, and settling from the weaker record alone would
+/// publish a proven outcome next to evidence we have just refused. See
+/// `defective` and `readingOf`.
 pub const ResultReading = union(enum) {
     /// Nothing at the address. The job predates sidecars, or
     /// `--discard-evidence` took it away. The sentinel path is the answer, and
@@ -231,11 +241,34 @@ pub const ResultReading = union(enum) {
 
     /// The document, when there is a usable one. The only way to a `JobResult`
     /// from here, so a caller cannot reach one down an arm that refused it.
+    ///
+    /// Says nothing about *why* there is no document, and must not be the only
+    /// question a settlement asks. Five arms answer `null` here and they split
+    /// two ways — see `defective`.
     pub fn usable(r: ResultReading) ?JobResult {
         return switch (r) {
             .present => |doc| doc,
             .absent, .malformed, .unknown_schema, .exit_code_out_of_range, .foreign => null,
         };
+    }
+
+    /// Whether something was written at this operation's own address that we
+    /// could not use — as opposed to nothing having been written there at all.
+    ///
+    /// `absent` is the absence of evidence. The other four are evidence that
+    /// something is wrong: a document exists at an address derived from this
+    /// request's id, and it is unreadable, from a schema we do not know,
+    /// carrying an exit code no shell produces, or naming somebody else. An
+    /// operation must not settle on the strength of a weaker record while one
+    /// of those sits beside it, and `usable` alone cannot express that because
+    /// it answers `null` to both categories.
+    ///
+    /// Delegates to `SidecarReading.anomalous` rather than repeating the arm
+    /// list: the line between the two categories is drawn once, and adding a
+    /// reading to either union is a compile error until it is placed on one
+    /// side of it.
+    pub fn defective(r: ResultReading) bool {
+        return r.summary().anomalous();
     }
 
     /// This reading with the document dropped, for carrying on a `JobProbe`.
@@ -642,13 +675,12 @@ fn interpretTail(
     request_id: ?[]const u8,
 ) Error!JobProbe {
     const split = splitProbe(stdout) orelse return error.RemoteFailed;
-    // Read once, reported twice: `doc` is what may settle something, `reading`
-    // is what happened when we looked. They come apart exactly when the
-    // document is there and unusable, which is the case the old `?JobResult`
-    // could not express.
+    // Read once, reported twice: `sidecar` is what may settle something,
+    // `reading` is what happened when we looked. They come apart exactly when
+    // the document is there and unusable, which is the case the old
+    // `?JobResult` could not express.
     const sidecar: ?ResultReading = if (request_id) |id| try parseJobResult(arena, split.result, id) else null;
     const reading: SidecarReading = if (sidecar) |r| r.summary() else .not_requested;
-    const doc: ?JobResult = if (sidecar) |r| r.usable() else null;
 
     // No size line at all. The script emits `0` for a log that does not exist
     // yet, so reaching here means the output was truncated or garbled rather
@@ -657,7 +689,7 @@ fn interpretTail(
     // second record to disagree with it. The same rule is applied anyway so
     // this branch cannot drift away from the one below.
     const newline = std.mem.indexOfScalar(u8, split.rest, '\n') orelse {
-        const only_sidecar = readingOf(doc, null);
+        const only_sidecar = readingOf(sidecar, null);
         return .{
             .output = "",
             .next_cursor = 0,
@@ -666,6 +698,7 @@ fn interpretTail(
             .finished_at = only_sidecar.finished_at,
             .result_request_id = only_sidecar.claimed_request_id,
             .conflict = only_sidecar.conflict,
+            .refused = only_sidecar.refused,
             .sidecar = reading,
             .session_alive = false,
         };
@@ -674,7 +707,7 @@ fn interpretTail(
     const log_size = std.fmt.parseInt(i64, size_text, 10) catch return error.RemoteFailed;
     const cleaned = try stripTerminalNoise(arena, split.rest[newline + 1 ..]);
 
-    const result = readingOf(doc, findSentinel(cleaned, sentinel));
+    const result = readingOf(sidecar, findSentinel(cleaned, sentinel));
 
     return .{
         .output = cleaned,
@@ -684,6 +717,7 @@ fn interpretTail(
         .finished_at = result.finished_at,
         .result_request_id = result.claimed_request_id,
         .conflict = result.conflict,
+        .refused = result.refused,
         .sidecar = reading,
         .session_alive = false,
         .business_result = try findBusinessResult(arena, cleaned),
@@ -847,9 +881,13 @@ test "gate: a corrupt or foreign sidecar is not the same reading as no sidecar" 
     const theirs = "01JQXW8ZK4N0RS7T3VYB2MCXYZ";
 
     // The same log window under five different sidecars. The job's own
-    // sentinel is in the tail, so all five settle from the log — what differs
-    // is what each says about the document at this operation's address, which
-    // is the fact that used to be thrown away.
+    // sentinel is in the tail and says exit 7, so the log is willing to answer
+    // in every one of the five — and only one of them may let it. `absent`
+    // means nothing was written at this address and the sentinel is the only
+    // record there is. The other four mean something *was* written there and
+    // we cannot read it, so the sentinel's agreement with the stronger record
+    // cannot be checked, and settling `failed` from the weaker one alone would
+    // publish a proven outcome standing next to evidence we just refused.
     const tail = "\n40\nwork done\n__TERMINUS_JOB_9__:7\n";
     const cases = [_]struct { doc: []const u8, code: []const u8, anomalous: bool }{
         .{ .doc = "", .code = "absent", .anomalous = false },
@@ -861,13 +899,28 @@ test "gate: a corrupt or foreign sidecar is not the same reading as no sidecar" 
     for (cases) |case| {
         const stdout = try std.fmt.allocPrint(arena, "{s}\n{s}{s}", .{ case.doc, probe_split_marker, tail });
         const probe = try interpretTail(arena, stdout, "__TERMINUS_JOB_9__", mine);
-        // Unchanged: a document we will not read settles nothing, and the log
-        // sentinel is what answers. That is not what this gate protects; the
-        // next two lines are.
-        try t.expectEqual(@as(?i32, 7), probe.exit_code);
-        try t.expectEqual(JobProbe.ExitSource.log_sentinel, probe.exit_source);
         try t.expectEqualStrings(case.code, probe.sidecar.code());
         try t.expectEqual(case.anomalous, probe.sidecar.anomalous());
+        if (case.anomalous) {
+            // The rule: any defective reading refuses to settle. The sentinel
+            // is not promoted to the answer, and the probe is structurally
+            // unable to hand one back — four callers settle from `exit_code`
+            // and only one of them ever looked at the reading beside it.
+            try t.expectEqual(@as(?i32, null), probe.exit_code);
+            try t.expectEqual(JobProbe.ExitSource.none, probe.exit_source);
+            // …and the verdict that was declined travels out, so the
+            // `indeterminate` a caller records can name what it turned down
+            // rather than reading as "the job left nothing behind".
+            try t.expectEqual(@as(i32, 7), probe.refused.?.sentinel_exit_code);
+        } else {
+            // The control, and the half of the rule that is easy to lose:
+            // absence of a document is not a defect. A job launched before
+            // sidecars existed, or one whose evidence was discarded, still
+            // settles from its log exactly as it always did.
+            try t.expectEqual(@as(?i32, 7), probe.exit_code);
+            try t.expectEqual(JobProbe.ExitSource.log_sentinel, probe.exit_source);
+            try t.expectEqual(@as(?JobProbe.Refused, null), probe.refused);
+        }
         // Nothing from a refused document leaks out as this attempt's own: no
         // finish time, and above all no identity for a receipt to quote.
         try t.expectEqual(@as(?i64, null), probe.finished_at);
@@ -880,6 +933,21 @@ test "gate: a corrupt or foreign sidecar is not the same reading as no sidecar" 
         mine,
     )).sidecar.foreign);
 
+    // A defect with no sentinel behind it refuses nothing, because there was
+    // no verdict to refuse. The distinction is load-bearing: the caller that
+    // sees `refused` settles `indeterminate`, and doing that here would end an
+    // operation whose job may still be running — a leftover document from
+    // another request says nothing about whether this one has finished.
+    const no_verdict = try interpretTail(
+        arena,
+        try std.fmt.allocPrint(arena, "{s}\n{s}\n40\nstill building\n", .{ cases[4].doc, probe_split_marker }),
+        "__TERMINUS_JOB_9__",
+        mine,
+    );
+    try t.expectEqual(@as(?i32, null), no_verdict.exit_code);
+    try t.expectEqual(@as(?JobProbe.Refused, null), no_verdict.refused);
+    try t.expect(no_verdict.sidecar.anomalous());
+
     // A probe that was never given a request id did not look, which is a
     // sixth answer and not any of the five above.
     const unasked = try interpretTail(
@@ -890,6 +958,8 @@ test "gate: a corrupt or foreign sidecar is not the same reading as no sidecar" 
     );
     try t.expectEqualStrings("not_requested", unasked.sidecar.code());
     try t.expect(!unasked.sidecar.anomalous());
+    try t.expectEqual(@as(?i32, 7), unasked.exit_code);
+    try t.expectEqual(@as(?JobProbe.Refused, null), unasked.refused);
 
     // The control: a usable document still reads as `present`, so the gate
     // cannot pass by every reading having become an anomaly.
@@ -907,6 +977,7 @@ test "gate: a corrupt or foreign sidecar is not the same reading as no sidecar" 
     try t.expect(!good.sidecar.anomalous());
     try t.expectEqual(JobProbe.ExitSource.result_file, good.exit_source);
     try t.expectEqualStrings(mine, good.result_request_id.?);
+    try t.expectEqual(@as(?JobProbe.Refused, null), good.refused);
 }
 
 test "gate: two mechanical records that disagree settle nothing" {
@@ -978,6 +1049,27 @@ test "gate: the streaming reader applies the same rule as the tail probe" {
     // The caller still gets its output window with the marker trimmed off:
     // what to display is a separate question from what was established.
     try t.expectEqualStrings("work done\n", probe.output);
+
+    // And the refusal rule reaches it too. `job read` fetches the sidecar in a
+    // round trip of its own, so it is a second place the two records meet and
+    // a second place the sentinel could be promoted over a document nobody can
+    // read. The two readers share `readingOf` precisely because they had
+    // already drifted once.
+    const defective = try std.fmt.allocPrint(
+        arena,
+        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":9000,\"finishedAt\":1}}",
+        .{rid},
+    );
+    var streamed = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = window, .stderr = empty } }, // readLog
+        .{ .reply = .{ .exit_code = 0, .stdout = defective, .stderr = empty } }, // readResult
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // isAlive
+    });
+    const refused = try probeJob(streamed.executor(), arena, "j", "__TERMINUS_JOB_9__", rid, 0, 1 << 20);
+    try t.expectEqual(@as(?i32, null), refused.exit_code);
+    try t.expectEqual(JobProbe.ExitSource.none, refused.exit_source);
+    try t.expectEqual(@as(i32, 7), refused.refused.?.sentinel_exit_code);
+    try t.expectEqualStrings("exit_code_out_of_range", refused.sidecar.code());
 }
 
 pub const ReadResult = struct {
@@ -1199,7 +1291,8 @@ pub const JobProbe = struct {
     output: []const u8,
     next_cursor: i64,
     /// Set when the job's end was established: the durable result sidecar was
-    /// there, or (failing that) the sentinel line was still in the window.
+    /// there, or (failing that) the sentinel line was still in the window and
+    /// nothing defective sat at the sidecar's address.
     exit_code: ?i32,
     /// Where `exit_code` came from. A caller writing a receipt has to say
     /// which one it was — "the wrapper's result file said 3" and "we found a
@@ -1228,15 +1321,33 @@ pub const JobProbe = struct {
     /// so a caller is structurally unable to settle from a conflict rather
     /// than merely discouraged from it.
     conflict: ?Conflict = null,
+    /// A document at this request's own address was defective, and the log
+    /// sentinel was willing to answer in its place. Carries the code that was
+    /// turned down.
+    ///
+    /// `exit_code` is null and `exit_source` is `.none` whenever this is set,
+    /// for the reason `conflict` gives: a caller has to be structurally unable
+    /// to settle from a refused reading rather than merely discouraged from it.
+    /// Four callers settle from `exit_code` and only one of them ever checked
+    /// the reading beside it.
+    ///
+    /// Deliberately not derivable from `sidecar.anomalous()` at the caller.
+    /// That predicate is also true of a defective document sitting beside a log
+    /// that said nothing at all, where there is no verdict to decline and the
+    /// job may well still be running — settling that `indeterminate` would end
+    /// an operation whose work is still going. This says a verdict was there
+    /// and was refused, which is the case that must not come out as either a
+    /// proven terminal or "still running".
+    refused: ?Refused = null,
     /// What was at the sidecar's address, whether or not it answered.
     ///
     /// Separate from `exit_source`, which says which record *did* answer. This
     /// says what happened when we looked at the stronger of the two, and it is
     /// the only place four of its five readings exist at all: a document that
     /// would not parse, one from a schema this build does not know, one
-    /// carrying an impossible exit code and one naming another request are
-    /// each `exit_source == .none` with the sentinel then deciding — which
-    /// reads identically to a job that simply never wrote a sidecar.
+    /// carrying an impossible exit code and one naming another request are each
+    /// `exit_source == .none`, and without this they read identically to a job
+    /// that simply never wrote a sidecar.
     ///
     /// Carried so a caller can report which of them it hit. It never settles
     /// anything on its own, and `.foreign`'s payload is a request id belonging
@@ -1251,6 +1362,20 @@ pub const JobProbe = struct {
 
     pub const Conflict = struct {
         result_exit_code: i32,
+        sentinel_exit_code: i32,
+    };
+
+    /// The verdict a defective result record cost the caller.
+    ///
+    /// A struct rather than a bare `?i32` so it reads the same way `Conflict`
+    /// does at every call site, and so a second thing a refusal turns down can
+    /// be added without changing four signatures. Which defect it was is not
+    /// repeated here: `sidecar` already carries it, with its payload.
+    pub const Refused = struct {
+        /// The exit code the log sentinel carried, recorded so a settlement's
+        /// reason can name what it declined. "This job's result record could
+        /// not be read" and "it could not be read, and its log says it exited
+        /// 7" send an operator to different places.
         sentinel_exit_code: i32,
     };
 
@@ -1272,31 +1397,57 @@ pub const JobProbe = struct {
 /// both and then overwrote the sentinel's answer with the sidecar's. Neither
 /// could report a disagreement, and the second one had the contradiction in
 /// hand when it discarded it.
-fn readingOf(sidecar: ?JobResult, from_log: ?SentinelHit) struct {
+///
+/// A defective reading is checked before either record is read, and it stops
+/// the reading here rather than at each caller. The sidecar is the stronger
+/// record; when it is there and unusable, the sentinel's answer cannot be
+/// checked against it, and a sentinel that agreed with a document nobody could
+/// read is not a thing that can be established. Taking the sentinel anyway
+/// settles `completed` or `failed` from the weaker of two records while the
+/// stronger one sits at this operation's own address in a state that says
+/// something on the host is wrong — a colliding request id, a mismatched
+/// wrapper, a truncated write. So nothing is established, and what the
+/// sentinel said travels out as `refused` for the settlement's reason to name.
+///
+/// Takes the whole `ResultReading` rather than the `?JobResult` it used to:
+/// `usable()` answers `null` to both an absence and a defect, so a parameter
+/// of that type cannot tell them apart and every caller was left to draw the
+/// line again. Only one of them ever did.
+fn readingOf(reading: ?ResultReading, from_log: ?SentinelHit) struct {
     exit_code: ?i32 = null,
     exit_source: JobProbe.ExitSource = .none,
     finished_at: ?i64 = null,
     claimed_request_id: ?[]const u8 = null,
     conflict: ?JobProbe.Conflict = null,
+    refused: ?JobProbe.Refused = null,
 } {
-    if (sidecar) |r| {
-        if (from_log) |found| {
-            if (found.exit_code != r.exit_code) return .{ .conflict = .{
-                .result_exit_code = r.exit_code,
-                .sentinel_exit_code = found.exit_code,
-            } };
-        }
-        // Agreement, or the sidecar alone. The sidecar is the stronger record
-        // — a document at an address derived from this operation's own id,
-        // versus a line in an append-only log anything on the host can write
-        // to — so it is what the receipt says it read, and it is the only one
-        // of the two that carries a finish time or an identity.
-        return .{
-            .exit_code = r.exit_code,
-            .exit_source = .result_file,
-            .finished_at = r.finished_at,
-            .claimed_request_id = r.claimed_request_id,
+    if (reading) |r| {
+        if (r.defective()) return .{
+            // Null when the log said nothing either: then there was no verdict
+            // to decline, only two records that are both silent, and the job
+            // may still be running. `refused` means a verdict was available and
+            // was turned down, which is the case that has to end `indeterminate`.
+            .refused = if (from_log) |found| .{ .sentinel_exit_code = found.exit_code } else null,
         };
+        if (r.usable()) |doc| {
+            if (from_log) |found| {
+                if (found.exit_code != doc.exit_code) return .{ .conflict = .{
+                    .result_exit_code = doc.exit_code,
+                    .sentinel_exit_code = found.exit_code,
+                } };
+            }
+            // Agreement, or the sidecar alone. The sidecar is the stronger
+            // record — a document at an address derived from this operation's
+            // own id, versus a line in an append-only log anything on the host
+            // can write to — so it is what the receipt says it read, and it is
+            // the only one of the two that carries a finish time or an identity.
+            return .{
+                .exit_code = doc.exit_code,
+                .exit_source = .result_file,
+                .finished_at = doc.finished_at,
+                .claimed_request_id = doc.claimed_request_id,
+            };
+        }
     }
     if (from_log) |found| return .{ .exit_code = found.exit_code, .exit_source = .log_sentinel };
     return .{};
@@ -1343,10 +1494,9 @@ pub fn probeJob(
     const cleaned = try stripTerminalNoise(arena, chunk.data);
     const sidecar: ?ResultReading = if (request_id) |id| try readResult(executor, arena, id) else null;
     const reading: SidecarReading = if (sidecar) |r| r.summary() else .not_requested;
-    const doc: ?JobResult = if (sidecar) |r| r.usable() else null;
 
     const from_log = findSentinel(cleaned, sentinel);
-    const result = readingOf(doc, from_log);
+    const result = readingOf(sidecar, from_log);
     // Trim the marker out of what the caller shows the user; the window
     // happened to contain it, which is a property of where their cursor was,
     // not of how the job ended. Independent of what the records established:
@@ -1361,6 +1511,7 @@ pub fn probeJob(
         .finished_at = result.finished_at,
         .result_request_id = result.claimed_request_id,
         .conflict = result.conflict,
+        .refused = result.refused,
         .sidecar = reading,
         .session_alive = try isAlive(executor, arena, name),
         .business_result = try findBusinessResult(arena, cleaned),

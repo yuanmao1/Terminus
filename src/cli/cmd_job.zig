@@ -765,19 +765,49 @@ const State = struct {
     /// Deliberately not folded into `hint`. `hint` answers "what does the
     /// operator still owe" — a reconcile, a second look at a row that moved.
     /// This answers "what did we find that we could not use", which is a fact
-    /// about the host rather than a task, and it is reported even on the paths
-    /// that settled cleanly from the log sentinel. Keeping the two apart is
-    /// also what keeps a defective sidecar out of the exit-code decision: it
-    /// is a report, not a refusal.
+    /// about the host rather than a task, and it is reported on every path,
+    /// including the ones where the reading changed nothing because no record
+    /// was willing to answer anyway.
+    ///
+    /// It is not what keeps a defective record out of the exit-code decision.
+    /// It used to be described that way — "a report, not a refusal" — and that
+    /// was the defect: the note travelled beside a `completed` settled from a
+    /// log sentinel while the stronger record sat unreadable at this request's
+    /// own address. The refusal is now `Tmux.JobProbe.refused`, decided where
+    /// the two records are read, and this stayed a report.
     fn sidecarNote(state: State, ctx: *Cli.Ctx) ?[]const u8 {
-        if (!state.sidecar.anomalous()) return null;
-        // Three of the four sentences need an allocation. If one fails we
-        // still name the reading rather than saying nothing — silence would
-        // turn a defective record back into the plain absence this field
-        // exists to tell it apart from.
-        return state.sidecar.describe(ctx.arena) catch state.sidecar.code();
+        return resultRecordError(ctx, state.sidecar);
     }
 };
+
+/// The sentence a defective result record earns, or null when the reading was
+/// one of the three ordinary ones (not looked for, not there, ours).
+///
+/// A free function rather than a method on `State`, because the commands that
+/// never build a `State` — `job kill` and `job rm` — have to answer the same
+/// question for the same JSON field, and two copies of "when is a reading worth
+/// a sentence" would let the field mean one thing under `job status` and
+/// another under `job kill`.
+fn resultRecordError(ctx: *Cli.Ctx, reading: Tmux.SidecarReading) ?[]const u8 {
+    if (!reading.anomalous()) return null;
+    // Three of the four sentences need an allocation. If one fails we still
+    // name the reading rather than saying nothing — silence would turn a
+    // defective record back into the plain absence this exists to tell it
+    // apart from.
+    return reading.describe(ctx.arena) catch reading.code();
+}
+
+/// The same sentence for a caller that is already standing on a refused path
+/// and needs prose rather than an option.
+///
+/// `refused` is only ever set beside an anomalous reading, so the `orelse` is
+/// an invariant check and not a fallback: there is no honest sentence to
+/// substitute if it ever fires, and naming the reading is strictly better than
+/// leaving the reason saying an exit status was declined without saying what
+/// declined it.
+fn defectSentence(ctx: *Cli.Ctx, reading: Tmux.SidecarReading) []const u8 {
+    return resultRecordError(ctx, reading) orelse reading.code();
+}
 
 /// The JSON shape of a `JobProbe.Conflict`. One definition so every command
 /// that can hit a contradiction names its two halves the same way.
@@ -884,10 +914,16 @@ fn conflictText(
 /// Two rules, and the first is the one that was missing. A row that is still
 /// there was not removed — printing `{"action":"removed","ok":true}` after a
 /// DELETE that matched nothing is how `job rm` came to claim it had forgotten
-/// another launcher's running job. The second is unchanged: discarding evidence
-/// converts something that could have been proven into an override the caller
-/// now owes, and a contradiction between the two durable records ends in an
-/// override too, so neither reports `ok`.
+/// another launcher's running job. The second is unchanged in shape: discarding
+/// evidence converts something that could have been proven into an override the
+/// caller now owes, and so does anything that leaves the host's evidence
+/// present but unusable, so neither reports `ok`.
+///
+/// `unreconcilable` covers both shapes of unusable evidence — two durable
+/// records that disagree, and a defective record beside a sentinel that can no
+/// longer be checked against it. They are one parameter because they cost the
+/// caller the same thing: `reconcile --from-log` reads exactly these two
+/// records and refuses both, so only `--override` is left.
 const RemovalReport = struct {
     removed: bool,
     ok: bool,
@@ -898,12 +934,12 @@ fn removalReport(
     cache: Core.execution.CacheResult,
     proven: bool,
     discard: bool,
-    contradicted: bool,
+    unreconcilable: bool,
 ) RemovalReport {
     const removed = cache == .synced;
     return .{
         .removed = removed,
-        .ok = removed and (proven or (!discard and !contradicted)),
+        .ok = removed and (proven or (!discard and !unreconcilable)),
         .action = if (removed) "removed" else "not_removed",
     };
 }
@@ -1089,9 +1125,13 @@ fn resultRecordOf(
 
 /// Turns an observation into a settlement — or into nothing at all.
 ///
-/// Four cases; three of them settle the ledger and the fourth records nothing:
+/// Five cases; four of them settle the ledger and the fifth records nothing:
 ///   * the two durable records disagree — the one case where more evidence
 ///     leaves us less certain. Settled `indeterminate`, naming both codes;
+///   * a defective document sits at this request's own address and the log
+///     sentinel was willing to answer in its place — settled `indeterminate`,
+///     naming the defect and the code that was declined. Not the exit code:
+///     see the branch itself;
 ///   * a record carried an exit code — the job ended, and how. Settled;
 ///   * the session is gone with no exit code — something happened and we
 ///     cannot say what. Settled `indeterminate`, which keeps holding the
@@ -1099,7 +1139,7 @@ fn resultRecordOf(
 ///     and the shell exits, or when the host reboots mid-write;
 ///   * otherwise it is still running, and there is nothing to record.
 ///
-/// What is *reported* in the first three is what the ledger holds afterwards,
+/// What is *reported* in the first four is what the ledger holds afterwards,
 /// which is not always what we set out to write.
 fn applyProbe(
     ctx: *Cli.Ctx,
@@ -1140,6 +1180,69 @@ fn applyProbe(
             .finished_at = null,
             .observed_at = ctx.now,
             .conflict = clash,
+            .sidecar = probe.sidecar,
+            .business_result = probe.business_result,
+            .cache = settled.cache,
+        };
+    }
+
+    // A defective result record refuses to settle, even when the log sentinel
+    // is willing to answer in its place.
+    //
+    // The sentinel's code is not wrong here so much as uncheckable: the
+    // stronger record is sitting at an address derived from this request's own
+    // id, and it is unreadable, from a wrapper of another build, carrying a
+    // code no shell produces, or naming somebody else. We cannot ask whether
+    // the two agree, and settling `completed` or `failed` from the weaker one
+    // alone publishes a proven outcome standing next to evidence we have just
+    // refused. The row is left alone for the same reason the conflict branch
+    // leaves it alone — the sync is `.none` — because writing `exited` into it
+    // would put the very code we declined in front of the next `run --name X`.
+    //
+    // Deliberately keyed on `probe.refused` and not on `probe.sidecar.anomalous()`.
+    // The second is also true of a defective document beside a log that said
+    // nothing at all, where there is no verdict to decline and the job may
+    // still be running — settling that `indeterminate` would end an operation
+    // whose work is still going. That case falls through to the branches below
+    // and is reported by `State.sidecarNote`, which is what it always was.
+    if (probe.refused) |declined| {
+        const defect = defectSentence(ctx, probe.sidecar);
+        const settled = settleObserved(ctx, store, if (execution) |*e| e else null, attempt, .{ .indeterminate = .{
+            .reason = std.fmt.allocPrint(
+                ctx.arena,
+                "the sentinel in this job's log says exit {d}, but {s}. The stronger of the two records is unusable, so nothing can check the weaker one and its exit status was not read as this job's outcome",
+                .{ declined.sentinel_exit_code, defect },
+            ) catch "this job's result record is present and unusable, so the exit status in its log was not read as its outcome",
+            .last_observed = if (execution) |e| e.status else .remote_started,
+        } }, .{ .result_record = resultRecordOf(ctx, probe.sidecar) }, .none);
+        // What the ledger holds once the settlement above has run, not what
+        // this reading established. The two come apart on an attempt that was
+        // already terminal before we looked: `attach` returned null, nothing
+        // was written, and `settleObserved` read the recorded outcome back and
+        // handed over `.settled`.
+        //
+        // Hardcoding `.unproven` here reported that attempt as
+        // `outcomeProven: false`, exit 75, with a hint naming `request
+        // reconcile <request-id>` — a command that fatals on an already
+        // terminal operation, `--override` included, so the caller was billed
+        // an unknown outcome and handed no way out of it. A refused
+        // *re-reading* of an attempt the ledger already proved establishes
+        // nothing new about that attempt and must not un-prove it. The defect
+        // is still reported: it travels out in `resultRecord` /
+        // `resultRecordError` on every one of these paths.
+        //
+        // Forced to `.unproven` when the ledger holds `indeterminate`, and
+        // when it holds nothing at all. The second is the `no_attempt` case,
+        // where the host's own record would ordinarily be the whole answer and
+        // here is precisely the record that was refused — same reasoning as
+        // the conflict branch above.
+        const held = settled.status orelse .indeterminate;
+        return .{
+            .status = held,
+            .settlement = if (held == .indeterminate) .unproven else settled.settlement,
+            .exit_code = null,
+            .finished_at = null,
+            .observed_at = ctx.now,
             .sidecar = probe.sidecar,
             .business_result = probe.business_result,
             .cache = settled.cache,
@@ -1597,6 +1700,8 @@ fn killJob(
                 .sessionGone = session_gone,
                 .cancellationProven = false,
                 .conflict = ConflictJson.from(clash),
+                .resultRecord = probe.sidecar.code(),
+                .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
                 .cacheError = cacheError(ctx, job.name, settled.cache),
                 .hint = "the two records disagree; settle it by hand with 'terminus request reconcile <request-id> --override'",
@@ -1605,6 +1710,72 @@ fn killJob(
                 try ctx.out.print(
                     "job '{s}': session killed, but its result file says exit {d} while its log sentinel says exit {d}; the outcome is unknown\n",
                     .{ job.name, clash.result_exit_code, clash.sentinel_exit_code },
+                );
+                if (cacheError(ctx, job.name, settled.cache)) |text|
+                    try ctx.out.print("  {s}\n", .{text});
+            },
+        }
+        try ctx.out.flush();
+        Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
+    }
+
+    // Same shape as the branch above, and for the same reason: the evidence is
+    // present and untrustworthy, so the kill goes ahead and the outcome does
+    // not. A defective document at this request's own address makes the log
+    // sentinel uncheckable, and `job kill` reporting `already_finished (exit 7)`
+    // on the strength of it would settle a proven terminal from the weaker of
+    // two records while the stronger one says something on the host is wrong.
+    if (probe.refused) |declined| {
+        const defect = defectSentence(ctx, probe.sidecar);
+        const reason = std.fmt.allocPrint(
+            ctx.arena,
+            "kill requested; the sentinel in the job's log says exit {d}, but {s}. The stronger of the two records is unusable, so its exit status was not read as this job's outcome",
+            .{ declined.sentinel_exit_code, defect },
+        ) catch "kill requested, but the job's result record is present and unusable, so the exit status in its log was not read as its outcome";
+
+        var execution = if (attempt) |a|
+            Core.execution.attach(store, ctx.arena, ctx.io, a.request_id) catch |err|
+                Cli.storeFatal(store, err)
+        else
+            null;
+        holdClaim(claim, wallClockSeconds(ctx.io));
+        const settled = settleObserved(
+            ctx,
+            store,
+            if (execution) |*e| e else null,
+            attempt,
+            .{ .indeterminate = .{
+                .reason = reason,
+                .last_observed = if (execution) |e| e.status else .remote_started,
+            } },
+            .{ .result_record = resultRecordOf(ctx, probe.sidecar) },
+            finishSync(job, .killed, null, ctx.now),
+        );
+
+        const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
+            fatalTmux(err, executor, session);
+        Cli.releaseClaim();
+
+        switch (ctx.out.format) {
+            .json => try ctx.out.json(.{
+                .ok = false,
+                .action = "killed",
+                .job = job.name,
+                .status = settled.statusText(),
+                .sessionGone = session_gone,
+                .cancellationProven = false,
+                .resultRecord = probe.sidecar.code(),
+                .resultRecordError = resultRecordError(ctx, probe.sidecar),
+                .requestId = if (attempt) |a| a.request_id else null,
+                .cacheError = cacheError(ctx, job.name, settled.cache),
+                // Not `--from-log`: that reconcile reads these same two
+                // records and will refuse for the same reason.
+                .hint = "the result record is unusable, so no mechanical reconcile can settle this; check the host and use 'terminus request reconcile <request-id> --override'",
+            }),
+            .human => {
+                try ctx.out.print(
+                    "job '{s}': session killed; its log sentinel says exit {d}, but {s} — the outcome is unknown\n",
+                    .{ job.name, declined.sentinel_exit_code, defect },
                 );
                 if (cacheError(ctx, job.name, settled.cache)) |text|
                     try ctx.out.print("  {s}\n", .{text});
@@ -1687,6 +1858,8 @@ fn killJob(
                 .sessionCleanedUp = session_gone,
                 // Nothing was cancelled: the job had already ended on its own.
                 .cancellationProven = false,
+                .resultRecord = probe.sidecar.code(),
+                .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
                 .hint = hint,
             }),
@@ -1746,11 +1919,18 @@ fn killJob(
     const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);
 
-    if (session_gone) {
-        if (finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)) |after| {
-            return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone, claim);
-        }
-    }
+    const final: FinalLook = if (session_gone)
+        finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)
+    else
+        .{};
+    if (final.upgrade) |after| return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone, claim);
+
+    // The reading this command ends on. The second look happened later and, on
+    // the path that matters here, is the only one that saw the document at all
+    // — the job wrote it during the SSH round trip. Reporting the pre-kill
+    // reading instead would put `"resultRecord":"absent"` on a kill that had
+    // just refused to read one.
+    const reading: Tmux.SidecarReading = if (final.refusal) |seen| seen.sidecar else probe.sidecar;
 
     const capability = Core.supervisor.shell_capability;
     const can_prove = Core.supervisor.Requirement.verified_cancellation.satisfiedBy(capability);
@@ -1760,7 +1940,23 @@ fn killJob(
             Cli.storeFatal(store, err)
     else
         null;
-    const terminal: Core.Store.op_state.Terminal = if (session_gone and can_prove)
+    const terminal: Core.Store.op_state.Terminal = if (final.refusal) |seen|
+        // Checked ahead of the cancellation, and it outranks it. `killSession`
+        // proving the pane is gone says the session stopped; it says nothing
+        // about *why*, and here the job left a verdict behind while we were
+        // stopping it. Recording `remote_cancel_confirmed` would settle a
+        // proven terminal and release the scope over a document at this
+        // request's own address that we have just declined to read — the one
+        // thing every refused path is forbidden to do.
+        .{ .indeterminate = .{
+            .reason = std.fmt.allocPrint(
+                ctx.arena,
+                "the job's session was killed, and a second look found its result record present and unusable: the sentinel in its log says exit {d}, but {s}. The stronger of the two records cannot be read, so the weaker one cannot be checked against it and its exit status was not read as this job's outcome",
+                .{ seen.declined.sentinel_exit_code, defectSentence(ctx, seen.sidecar) },
+            ) catch "the job's session was killed and its result record is present and unusable, so the exit status in its log was not read as its outcome",
+            .last_observed = if (execution) |e| e.status else .remote_started,
+        } }
+    else if (session_gone and can_prove)
         .{ .remote_cancel_confirmed = .{
             .pid = null,
             .term_sent = true,
@@ -1783,7 +1979,7 @@ fn killJob(
         if (execution) |*e| e else null,
         attempt,
         terminal,
-        .{},
+        .{ .result_record = resultRecordOf(ctx, reading) },
         finishSync(job, .killed, null, ctx.now),
     );
     // The remote work is done on this branch — the kill and the re-probe are
@@ -1791,8 +1987,20 @@ fn killJob(
     Cli.releaseClaim();
     const settled_status = settled.statusText();
 
-    const proven = session_gone and can_prove;
+    // A refusal is never a proven cancellation. The pane really did go away,
+    // but what this command would be claiming is that it *stopped* the work,
+    // and the record it just refused says the work ended on its own with a
+    // verdict nobody could check.
+    const proven = final.refusal == null and session_gone and can_prove;
     const cache_error = cacheError(ctx, job.name, settled.cache);
+    const hint: ?[]const u8 = if (final.refusal != null)
+        // Not `--from-log`: that reconcile reads these same two records and
+        // will refuse for the same reason this kill did.
+        "the result record is unusable, so no mechanical reconcile can settle this; check the host and use 'terminus request reconcile <request-id> --override'"
+    else if (proven)
+        null
+    else
+        Core.supervisor.Requirement.verified_cancellation.explain();
     switch (ctx.out.format) {
         .json => try ctx.out.json(.{
             .ok = proven and cache_error == null,
@@ -1801,12 +2009,19 @@ fn killJob(
             .status = settled_status,
             .sessionGone = session_gone,
             .cancellationProven = proven,
+            .resultRecord = reading.code(),
+            .resultRecordError = resultRecordError(ctx, reading),
             .requestId = if (attempt) |a| a.request_id else null,
             .cacheError = cache_error,
-            .hint = if (proven) null else @as(?[]const u8, Core.supervisor.Requirement.verified_cancellation.explain()),
+            .hint = hint,
         }),
         .human => {
-            if (proven) {
+            if (final.refusal) |seen| {
+                try ctx.out.print(
+                    "job '{s}': session killed; its log sentinel says exit {d} but its result record is present and unusable ({s}), so its outcome is unknown\n",
+                    .{ job.name, seen.declined.sentinel_exit_code, seen.sidecar.code() },
+                );
+            } else if (proven) {
                 try ctx.out.print("killed job '{s}' (absence verified)\n", .{job.name});
             } else if (session_gone) {
                 try ctx.out.print("job '{s}': session killed, but absence of the process tree is unproven\n", .{job.name});
@@ -1831,15 +2046,40 @@ fn killJob(
 
 /// One last look for an outcome, after the session is proven gone.
 ///
-/// Returns a probe only when it establishes something the first one did not:
-/// an exit code, with no conflict between the two durable records. Everything
+/// Two answers, and they are never both present. `upgrade` is a probe that
+/// establishes something the first one did not: an exit code, with neither
+/// durable record refusing. `refusal` is the opposite finding — a document
+/// turned up at this request's own address between the two looks, it is
+/// unusable, and the log sentinel beside it was willing to answer. Everything
 /// else — a probe that errors, a still-unknown outcome, a fresh disagreement —
-/// returns null and lets the caller fall through to the path it was already
-/// on, which is the conservative one.
+/// leaves both null and lets the caller fall through to the path it was
+/// already on, which is the conservative one.
 ///
 /// Not fatal on error. The kill has already happened; failing here costs only
 /// the chance to *upgrade* the answer, and turning that into a hard failure
 /// would make a flaky read worse than no read.
+const FinalLook = struct {
+    /// A probe good enough to settle from. Structurally never carries a
+    /// refusal or a conflict, so a caller cannot reach one through it.
+    upgrade: ?Tmux.JobProbe = null,
+    /// What the second look refused, when it refused something.
+    ///
+    /// Reported separately instead of by handing back the whole probe. The
+    /// probe would then be a value carrying both a refusal and — in the caller
+    /// that assigns it over the first probe — the power to replace an outcome
+    /// that had already been established, which is exactly the promotion
+    /// `finalProbe` exists to forbid.
+    refusal: ?Refusal = null,
+
+    const Refusal = struct {
+        declined: Tmux.JobProbe.Refused,
+        /// The defect that caused it. Carried alongside because a reason
+        /// naming the declined exit code without naming what declined it sends
+        /// an operator nowhere.
+        sidecar: Tmux.SidecarReading,
+    };
+};
+
 fn finalProbe(
     arena: std.mem.Allocator,
     executor: Core.Executor,
@@ -1847,7 +2087,7 @@ fn finalProbe(
     job_name: []const u8,
     sentinel: []const u8,
     request_id: ?[]const u8,
-) ?Tmux.JobProbe {
+) FinalLook {
     const probe = Tmux.probeTail(
         executor,
         arena,
@@ -1861,18 +2101,32 @@ fn finalProbe(
                 "reporting the cancellation without it\n",
             .{ job_name, @errorName(err) },
         );
-        return null;
+        return .{};
     };
     // A disagreement between the two durable records carries no exit code —
-    // `Tmux.readingOf` refuses to pick a winner — so today the second line
-    // alone would reject this. It is written out anyway because the two say
-    // different things: one is "there is nothing here to upgrade to", the
-    // other is "there is something here and it must not be used". If the
-    // probe ever learns to report a preferred code alongside a conflict, the
-    // first line is what stops that from silently settling a killed job.
-    if (probe.conflict != null) return null;
-    if (probe.exit_code == null) return null;
-    return probe;
+    // `Tmux.readingOf` refuses to pick a winner — and neither does a defective
+    // record beside a sentinel, for the same reason. So today the last line
+    // alone would reject both. They are written out anyway because the three
+    // say different things: one is "there is nothing here to upgrade to", the
+    // others are "there is something here and it must not be used". If the
+    // probe ever learns to report a preferred code alongside a refusal, these
+    // two lines are what stop that from silently settling a killed job.
+    if (probe.conflict != null) return .{};
+    // Rejected as an upgrade and still reported, which is the half that was
+    // missing. Returning a bare null here threw the finding away: the caller
+    // stayed on the pre-kill probe, `unreconcilable` came out false, and
+    // `job rm` printed `{"action":"removed","ok":true}` with a hint naming a
+    // `--from-log` reconcile that reads these same two records and refuses for
+    // the very reason this removal never mentioned. The exit code then depended
+    // only on which of the two probes happened to see the defect first, and the
+    // receipt — the only record that survives a removal — never named the
+    // document at all.
+    if (probe.refused) |declined| return .{ .refusal = .{
+        .declined = declined,
+        .sidecar = probe.sidecar,
+    } };
+    if (probe.exit_code == null) return .{};
+    return .{ .upgrade = probe };
 }
 
 test finalProbe {
@@ -1896,12 +2150,22 @@ test finalProbe {
     const conflicting =
         "{\"v\":1,\"requestId\":\"01ABCDEFGHJKMNPQRSTVWXYZ00\",\"exitCode\":7,\"finishedAt\":1750}\n" ++
         marker ++ "20\n" ++ "__TERMINUS_END_7__:3\n";
+    // The job reached its own end during the round trip and left a document no
+    // shell could have written, with its sentinel still in the window. Not an
+    // upgrade — nothing here may settle — but not nothing either, and the
+    // difference is the whole point: the caller has to be told, or it reports a
+    // clean cancellation over a record it could not read.
+    const defective =
+        "{\"v\":1,\"requestId\":\"01ABCDEFGHJKMNPQRSTVWXYZ00\",\"exitCode\":9000,\"finishedAt\":1750}\n" ++
+        marker ++ "20\n" ++ "__TERMINUS_END_7__:3\n";
 
     const empty = try arena.alloc(u8, 0);
     const Case = struct {
         what: []const u8,
         step: Core.Scripted.Step,
-        upgrades: bool,
+        /// What the second look is allowed to hand back. Exactly one of the
+        /// three, because an upgrade and a refusal must never arrive together.
+        want: enum { upgrade, nothing, refusal },
     };
     const cases = [_]Case{
         .{
@@ -1911,7 +2175,7 @@ test finalProbe {
                 .stdout = try arena.dupe(u8, finished),
                 .stderr = empty,
             } },
-            .upgrades = true,
+            .want = .upgrade,
         },
         .{
             // No outcome to upgrade to. Falling through leaves the caller on
@@ -1922,14 +2186,14 @@ test finalProbe {
                 .stdout = try arena.dupe(u8, unfinished),
                 .stderr = empty,
             } },
-            .upgrades = false,
+            .want = .nothing,
         },
         .{
             // The read failed mid-stream. A kill that already happened must
             // not be reported *better* because we could not look again.
             .what = "a probe that could not be read at all",
             .step = .{ .transport_error = error.ReadFailed },
-            .upgrades = false,
+            .want = .nothing,
         },
         .{
             // Caught today by the missing exit code rather than by the
@@ -1941,7 +2205,16 @@ test finalProbe {
                 .stdout = try arena.dupe(u8, conflicting),
                 .stderr = empty,
             } },
-            .upgrades = false,
+            .want = .nothing,
+        },
+        .{
+            .what = "a result record that turned up defective during the kill",
+            .step = .{ .reply = .{
+                .exit_code = 0,
+                .stdout = try arena.dupe(u8, defective),
+                .stderr = empty,
+            } },
+            .want = .refusal,
         },
     };
 
@@ -1960,13 +2233,40 @@ test finalProbe {
             "__TERMINUS_END_7__",
             "01ABCDEFGHJKMNPQRSTVWXYZ00",
         );
-        if (case.upgrades) {
-            try t.expectEqual(@as(?i32, 7), got.?.exit_code);
-            // The remote clock reading has to survive: it is the only reason
-            // this second look beats settling as a cancellation.
-            try t.expectEqual(@as(?i64, 1750), got.?.finished_at);
-        } else {
-            try t.expect(got == null);
+        switch (case.want) {
+            .upgrade => {
+                try t.expectEqual(@as(?i32, 7), got.upgrade.?.exit_code);
+                // The remote clock reading has to survive: it is the only
+                // reason this second look beats settling as a cancellation.
+                try t.expectEqual(@as(?i64, 1750), got.upgrade.?.finished_at);
+                try t.expectEqual(@as(?FinalLook.Refusal, null), got.refusal);
+            },
+            .nothing => {
+                try t.expectEqual(@as(?Tmux.JobProbe, null), got.upgrade);
+                try t.expectEqual(@as(?FinalLook.Refusal, null), got.refusal);
+            },
+            .refusal => {
+                // Never promoted: the rule `finalProbe` enforces is unchanged,
+                // and a caller that assigned this over its first probe could
+                // settle a killed job from a record nobody could read.
+                std.testing.expectEqual(@as(?Tmux.JobProbe, null), got.upgrade) catch |err| {
+                    std.debug.print("{s} was promoted to an upgrade\n", .{case.what});
+                    return err;
+                };
+                // …and the finding still travels, which is what the caller
+                // needs to stop reporting `ok: true` over it. Named rather than
+                // unwrapped: dropping the refusal is the regression this case
+                // exists for, and a null unwrap kills the test process, so
+                // every gate after it stops running too.
+                const seen = got.refusal orelse {
+                    std.debug.print("{s} was reported as nothing at all\n", .{case.what});
+                    return error.RefusedReadingWasSwallowed;
+                };
+                // Both halves: the verdict that was declined, and the defect
+                // that declined it.
+                try t.expectEqual(@as(i32, 3), seen.declined.sentinel_exit_code);
+                try t.expectEqualStrings("exit_code_out_of_range", seen.sidecar.code());
+            },
         }
     }
 }
@@ -2026,6 +2326,8 @@ fn reportFinishedDuringKill(
             .sessionGone = session_gone,
             // Nothing was cancelled: the job reached its own end first.
             .cancellationProven = false,
+            .resultRecord = probe.sidecar.code(),
+            .resultRecordError = resultRecordError(ctx, probe.sidecar),
             .requestId = if (attempt) |a| a.request_id else null,
             .cacheError = cache_error,
             .hint = if (proven) cache_error else @as(
@@ -2113,7 +2415,32 @@ fn removeJob(
     // meant `--discard-evidence` could delete a receipt written seconds
     // earlier and then settle `indeterminate` for want of it: the command
     // destroys the proof and bills the caller for its absence.
-    if (finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)) |after| probe = after;
+    const final = finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null);
+    if (final.upgrade) |after| probe = after;
+
+    // What is at the result record's address now.
+    //
+    // The second look is the later of the two and, on the path this exists
+    // for, the only one that saw a document at all — the job reached its own
+    // end during the SSH round trip. Kept beside the probe rather than written
+    // into it: a `JobProbe` whose `exit_code` is set while its reading is
+    // defective is a value `readingOf` can never produce, and every caller
+    // downstream is entitled to assume it cannot exist.
+    const reading: Tmux.SidecarReading = if (final.refusal) |seen| seen.sidecar else probe.sidecar;
+
+    // The refusal this removal acts on, from whichever look found one.
+    //
+    // Adopted from the second look only when the first probe established
+    // nothing of its own. An exit code or a contradiction read before the kill
+    // is a fact about this job that a later reading of the other record does
+    // not erase, and letting the refusal displace it would decide the removal
+    // by which of the two probes happened to look first — the same coin flip
+    // this change exists to remove, mirrored. What the second look found still
+    // reaches the receipt through `reading` in every case.
+    const declined: ?Tmux.JobProbe.Refused = probe.refused orelse blk: {
+        if (probe.exit_code != null or probe.conflict != null) break :blk null;
+        break :blk if (final.refusal) |seen| seen.declined else null;
+    };
 
     if (discard) {
         // Only now, with the session proven gone. A live pane recreates the
@@ -2157,6 +2484,21 @@ fn removeJob(
             ) catch "job removed while its result file and its log sentinel reported different exit codes",
             .last_observed = if (execution) |e| e.status else .remote_started,
         } }
+    else if (declined) |refusal|
+        // The other unreconcilable shape, and it ends the same way. A document
+        // at this request's own address is unusable, so the sentinel beside it
+        // cannot be checked and `job rm` must not record `exited` from it. The
+        // reason names the code it declined, because "no outcome was
+        // established" and "an outcome was there and refused" send the operator
+        // to different places and the receipt is the only place that survives.
+        .{ .indeterminate = .{
+            .reason = std.fmt.allocPrint(
+                ctx.arena,
+                "job removed while its result record was unusable: the sentinel in its log says exit {d}, but {s}",
+                .{ refusal.sentinel_exit_code, defectSentence(ctx, reading) },
+            ) catch "job removed while its result record was present and unusable, so the exit status in its log was not read as its outcome",
+            .last_observed = if (execution) |e| e.status else .remote_started,
+        } }
     else if (probe.exit_code) |code|
         .{ .exited = .{ .exit_code = code } }
     else
@@ -2174,7 +2516,16 @@ fn removeJob(
         if (execution) |*e| e else null,
         attempt,
         terminal,
-        .{ .finished_at = probe.finished_at },
+        .{
+            .finished_at = probe.finished_at,
+            // The reading goes into the receipt on every removal path, not
+            // only the refused one. `job rm` deletes the local row, so the
+            // receipt is the only record that outlives the command — and a
+            // removal that never mentions the document the second look read is
+            // how an operator comes to find nothing on the host and no note
+            // saying anybody had looked.
+            .result_record = resultRecordOf(ctx, reading),
+        },
         .{ .forget = .{
             .expected = job.removeExpectation(),
             .grounds = .session_proven_gone,
@@ -2186,7 +2537,15 @@ fn removeJob(
     // `indeterminate` deleted the row just the same, and saying otherwise
     // would turn the unknown into a success.
     const proven = probe.conflict == null and probe.exit_code != null and settled.settlement.proves();
-    const report = removalReport(settled.cache, proven, discard, probe.conflict != null);
+    // Both shapes mean the same thing to the caller: the evidence is on the
+    // host, it is not trustworthy, and re-reading it will not help. `job rm`
+    // used to report a defective record as an ordinary unproven removal —
+    // `ok: true`, exit 0, and a hint naming `reconcile --from-log`, which reads
+    // these same two records and now refuses for the same reason the removal
+    // did. Telling an operator to run a command that cannot succeed is the
+    // pseudo-success this closes.
+    const unreconcilable = probe.conflict != null or declined != null;
+    const report = removalReport(settled.cache, proven, discard, unreconcilable);
     const removed = report.removed;
     const settled_status = if (attempt == null) "unchanged" else settled.statusText();
     const cache_error = cacheError(ctx, job.name, settled.cache);
@@ -2198,6 +2557,8 @@ fn removeJob(
         null
     else if (probe.conflict != null)
         "the job's two durable records disagree; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'"
+    else if (declined != null)
+        "the job's result record is present and unusable, so the exit status in its log could not be checked against it; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'"
     else if (discard)
         null
     else
@@ -2234,17 +2595,22 @@ fn removeJob(
                     "removed job '{s}'; its result file says exit {d} while its log sentinel says exit {d}, so its outcome is unknown\n",
                     .{ job.name, clash.result_exit_code, clash.sentinel_exit_code },
                 );
+            } else if (declined) |refusal| {
+                try ctx.out.print(
+                    "removed job '{s}'; its log sentinel says exit {d} but its result record is present and unusable ({s}), so its outcome is unknown\n",
+                    .{ job.name, refusal.sentinel_exit_code, reading.code() },
+                );
             } else if (discard) {
                 try ctx.out.print("removed job '{s}' and deleted its log; its outcome can no longer be proven\n", .{job.name});
             } else {
                 try ctx.out.print("removed job '{s}'; outcome unknown, log retained for reconcile\n", .{job.name});
             }
-            // A proven or contradictory removal takes an earlier branch, so
+            // A proven or unreconcilable removal takes an earlier branch, so
             // the deletion has to be stated on its own rather than folded into
             // the discard branch — otherwise `--discard-evidence` on a job
-            // with two disagreeing records never tells the operator that the
-            // records it disagreed with are now gone.
-            if (discard and (proven or probe.conflict != null))
+            // whose records disagreed, or whose result record could not be
+            // read, never tells the operator that those records are now gone.
+            if (discard and (proven or unreconcilable))
                 try ctx.out.print("  its log and result record were deleted; nothing can read them again\n", .{});
         },
     }
@@ -3200,6 +3566,277 @@ test "gate: a result record that was there and unusable is not silence" {
         state.sidecarNote(&ctx).?,
         "01JQXW8ZK4N0RS7T3VYB2MCXYZ",
     ) != null);
+}
+
+test "gate: a defective result record settles nothing and goes on holding the scope" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_defective_refuses");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    // A launch that reached the remote shell, under a scope of its own so each
+    // arm below is a separate operation with a separate barrier.
+    const Launched = struct {
+        request_id: []const u8,
+        job: Store.jobs.Job,
+        attempt: ?Store.job_attempts.Attempt,
+    };
+    const launch = struct {
+        fn go(s: *Store, a: std.mem.Allocator, io: std.Io, name: []const u8) !Launched {
+            var e = switch (try Core.execution.begin(s, a, io, .{
+                .server_id = 1,
+                .server_name = "box",
+                .kind = .job,
+                .scope = jobScope(name),
+                .alias = name,
+                .owner_token = "agent",
+                .now = 1000,
+            })) {
+                .ready => |ready| ready,
+                .blocked => return error.ScopeUnexpectedlyBlocked,
+            };
+            e.settled = true;
+            const request_id = try a.dupe(u8, e.id());
+            try Store.operations.advance(s, request_id, .connecting, 1001);
+            try Store.operations.advance(s, request_id, .submitted, 1002);
+            try Store.operations.advance(s, request_id, .remote_started, 1003);
+            _ = try Store.jobs.create(s, 1, name, "make deploy", "__S__", request_id, 1000);
+            if (!try Store.jobs.markStarted(s, request_id)) return error.RowNotReserved;
+            _ = try Store.job_attempts.create(s, .{
+                .request_id = request_id,
+                .server_id = 1,
+                .server_name = "box",
+                .job_name = name,
+                .attempt_no = 1,
+                .sentinel = "__S__",
+                .tmux_session = name,
+                .now = 1000,
+            });
+            const row = (try Store.jobs.getByName(s, a, 1, name)).?;
+            return .{ .request_id = request_id, .job = row, .attempt = attemptOf(s, a, row) };
+        }
+    }.go;
+
+    // Whether the scope this job's name reserves is still barred to a relaunch.
+    const barred = struct {
+        fn check(s: *Store, a: std.mem.Allocator, io: std.Io, name: []const u8) !bool {
+            return switch (try Core.execution.begin(s, a, io, .{
+                .server_id = 1,
+                .server_name = "box",
+                .kind = .job,
+                .scope = jobScope(name),
+                .alias = name,
+                .owner_token = "agent",
+                .now = 6000,
+            })) {
+                .ready => false,
+                .blocked => true,
+            };
+        }
+    }.check;
+
+    // The sentinel says the job succeeded. Chosen deliberately: a regression
+    // that lets a defective record fall through to the log settles `completed`
+    // and releases the scope, which is the loudest wrong answer available and
+    // the one an agent acts on hardest.
+    const declined: Tmux.JobProbe.Refused = .{ .sentinel_exit_code = 0 };
+    const defects = [_]Tmux.SidecarReading{
+        .malformed,
+        .{ .unknown_schema = 7 },
+        .{ .exit_code_out_of_range = 9000 },
+        .{ .foreign = "01JQXW8ZK4N0RS7T3VYB2MCXYZ" },
+    };
+    for (defects, 0..) |reading, i| {
+        const name = try std.fmt.allocPrint(arena, "deploy{d}", .{i});
+        const it = try launch(&store, arena, scratch.io, name);
+        const state = applyProbe(&ctx, &store, it.job, .{
+            .output = "work done\n",
+            .next_cursor = 40,
+            // What `Tmux.readingOf` hands back for this reading: the sentinel's
+            // verdict was declined, so there is no exit code and no source.
+            .exit_code = null,
+            .exit_source = .none,
+            .finished_at = null,
+            .refused = declined,
+            .sidecar = reading,
+            .session_alive = true,
+        }, it.attempt);
+
+        // Not a proven terminal, and not silence either.
+        try t.expectEqual(Core.Store.op_state.Status.indeterminate, state.status);
+        try t.expectEqual(Settlement.unproven, state.settlement);
+        try t.expectEqual(@as(?i64, null), state.exit_code);
+        try t.expectEqualStrings(reading.code(), state.sidecar.code());
+        // 75, not 1: a retry is not available, and an agent branching on the
+        // exit code has to be able to tell that from a command that failed.
+        try t.expectEqual(Exit.indeterminate, observationExit(state, false));
+
+        // The ledger holds the same thing the report claimed.
+        const op = (try Store.operations.get(&store, arena, it.request_id)).?;
+        try t.expectEqual(Core.Store.op_state.Status.indeterminate, op.status);
+
+        // …and the scope is still barred. This is the whole point of settling
+        // `indeterminate` rather than `completed`: the name stays reserved
+        // until somebody establishes what actually happened.
+        try t.expect(try barred(&store, arena, scratch.io, name));
+
+        // The reason names which defect it was and what it cost, so a
+        // reconciler reading the receipt months later knows what it is looking
+        // at. A bare "could not settle" would send it to the same place a job
+        // that left nothing behind does.
+        const rows = try Store.receipts.list(&store, arena, it.request_id);
+        var reason: ?[]const u8 = null;
+        var record: ?[]const u8 = null;
+        for (rows) |row| if (row.is_terminal) {
+            reason = row.transport_error;
+            record = row.detail_json;
+        };
+        try t.expect(std.mem.indexOf(u8, reason.?, "exit 0") != null);
+        try t.expect(std.mem.indexOf(u8, reason.?, "not read as this job's outcome") != null);
+        // The machine-readable half: the reading's own name, and for a
+        // collision the id that turned up in our place.
+        try t.expect(std.mem.indexOf(u8, record.?, reading.code()) != null);
+        if (reading == .foreign)
+            try t.expect(std.mem.indexOf(u8, record.?, "01JQXW8ZK4N0RS7T3VYB2MCXYZ") != null);
+    }
+
+    // The other half of the rule, and the one a hardcoded `.unproven` got
+    // wrong: a refusal is a statement about *this reading*, not a retraction of
+    // what the ledger already holds. Here the attempt was settled `completed`
+    // before anybody looked again — a newer build reading a `v:2` document, a
+    // peer that got there first — and the second look then finds a record it
+    // cannot read. Nothing is written: `attach` returns null on a terminal
+    // attempt, so this is a pure read of the recorded outcome.
+    //
+    // Reporting that as unproven billed the caller exit 75 and a hint naming
+    // `request reconcile <request-id>`, which fatals on an already-terminal
+    // operation with or without `--override` — an unknown outcome and no way
+    // out of it, for an attempt the ledger had proven. The defect is still
+    // reported, through `resultRecord` and `sidecarNote`; what it may not do is
+    // un-prove a settled attempt.
+    const settled_first = try launch(&store, arena, scratch.io, "settled-first");
+    _ = try Store.receipts.settle(&store, settled_first.request_id, .{
+        .exited = .{ .exit_code = 0 },
+    }, .{}, 4000);
+    const after = applyProbe(&ctx, &store, settled_first.job, .{
+        .output = "work done\n",
+        .next_cursor = 40,
+        .exit_code = null,
+        .exit_source = .none,
+        .finished_at = null,
+        .refused = declined,
+        .sidecar = .{ .unknown_schema = 2 },
+        .session_alive = true,
+    }, settled_first.attempt);
+    try t.expectEqual(Core.Store.op_state.Status.completed, after.status);
+    try t.expectEqual(Settlement.settled, after.settlement);
+    try t.expectEqual(Exit.ok, observationExit(after, false));
+    // The reading travels out regardless, so nothing about the host is hidden
+    // by the attempt having been proven earlier.
+    try t.expectEqualStrings("unknown_schema", after.sidecar.code());
+    try t.expect(after.sidecarNote(&ctx) != null);
+    // Nothing was written, so the ledger says exactly what it said before.
+    const held = (try Store.operations.get(&store, arena, settled_first.request_id)).?;
+    try t.expectEqualStrings("completed", held.status.text());
+    try t.expect(!try barred(&store, arena, scratch.io, "settled-first"));
+
+    // The control, and the half of the rule that is easy to lose: `absent` is
+    // not a defect. Same log window, same sentinel, same exit 0 — and because
+    // nothing was written at this request's address there is nothing to refuse,
+    // so the sentinel answers as it always did, the operation settles
+    // `completed`, and the scope is released.
+    const clean = try launch(&store, arena, scratch.io, "clean");
+    const settled = applyProbe(&ctx, &store, clean.job, .{
+        .output = "work done\n",
+        .next_cursor = 40,
+        .exit_code = 0,
+        .exit_source = .log_sentinel,
+        .finished_at = null,
+        .refused = null,
+        .sidecar = .absent,
+        .session_alive = true,
+    }, clean.attempt);
+    try t.expectEqual(Core.Store.op_state.Status.completed, settled.status);
+    try t.expectEqual(Settlement.settled, settled.settlement);
+    try t.expectEqual(@as(?i64, 0), settled.exit_code);
+    try t.expectEqual(Exit.ok, observationExit(settled, false));
+    try t.expect(!try barred(&store, arena, scratch.io, "clean"));
+}
+
+test "gate: a defective record beside a silent log does not settle a running job" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_defective_still_running");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+    _ = try Store.jobs.create(&store, 1, "deploy", "make deploy", "__S__", "01AAAAAAAA0123456789ABCDEF", 1000);
+    try t.expect(try Store.jobs.markStarted(&store, "01AAAAAAAA0123456789ABCDEF"));
+    const job = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+
+    // A leftover document from another request, a live session, and a log that
+    // has not reached any sentinel: the job is still building. `refused` is
+    // null because no verdict was there to decline, and the refusal must key on
+    // that and not on the reading being defective — settling `indeterminate`
+    // here would end an operation whose work is still going, and a foreign
+    // document says nothing whatever about whether *this* job has finished.
+    const state = applyProbe(&ctx, &store, job, .{
+        .output = "building...\n",
+        .next_cursor = 12,
+        .exit_code = null,
+        .exit_source = .none,
+        .finished_at = null,
+        .refused = null,
+        .sidecar = .{ .foreign = "01JQXW8ZK4N0RS7T3VYB2MCXYZ" },
+        .session_alive = true,
+    }, null);
+    try t.expectEqual(Settlement.open, state.settlement);
+    try t.expectEqual(Exit.ok, observationExit(state, false));
+    try t.expectEqual(Store.jobs.Status.running, (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.status);
+    // Still reported, though: the operator is told a document is sitting at
+    // this request's address that nobody can read, which is how they find out
+    // the next attempt will hit it too.
+    try t.expect(std.mem.indexOf(u8, state.sidecarNote(&ctx).?, "01JQXW8ZK4N0RS7T3VYB2MCXYZ") != null);
 }
 
 test "gate: a settlement writes only the row its own launch reserved" {

@@ -11,14 +11,24 @@
 //! be a real, reachable way out — not a string in an error message. It was
 //! exactly that once, which is why it is checked from outside the process.
 //!
-//! What is *not* here: anything needing a remote host. Exit 75 on a lost
+//! What is *not* here: anything needing a real remote host. Exit 75 on a lost
 //! `sendKeys` response, and `--from-log` reading a real sentinel, both need an
 //! SSH endpoint; they belong to the live end-to-end run, not to `zig build
 //! test`, and pretending otherwise with a mock would gate on the mock.
+//!
+//! The one exception is `FakeHost` below, and the line it does not cross is
+//! worth stating: it stands in for the *transport*, never for a decision. Every
+//! rule under test — which record may settle an operation, what the ledger ends
+//! up holding, which exit code comes back, whether the scope is still barred —
+//! is executed by the real binary against a real store. What the fake supplies
+//! is the bytes a host would have sent, which is the one thing `zig build test`
+//! cannot obtain and the one thing none of these gates is asserting about.
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Terminus = @import("Terminus");
 const Store = Terminus.Core.Store;
+const protocol = Terminus.Core.daemon_protocol;
 
 const exe_path = build_options.terminus_exe;
 
@@ -198,6 +208,14 @@ const Run = struct {
 };
 
 fn run(f: *Fixture, argv: []const []const u8) !Run {
+    return runWithEnvironment(f, argv, null);
+}
+
+fn runWithEnvironment(
+    f: *Fixture,
+    argv: []const []const u8,
+    environ: ?*const std.process.Environ.Map,
+) !Run {
     const allocator = f.allocator;
     var full: std.ArrayList([]const u8) = .empty;
     defer full.deinit(allocator);
@@ -206,6 +224,7 @@ fn run(f: *Fixture, argv: []const []const u8) !Run {
 
     const result = try std.process.run(allocator, f.io, .{
         .argv = full.items,
+        .environ_map = environ,
         .stdout_limit = .limited(1 << 20),
         .stderr_limit = .limited(1 << 20),
     });
@@ -490,8 +509,8 @@ test "blackbox: reconcile names the escape hatch instead of leaving a dead end" 
     // attempt would release the scope on top of a process nobody has looked
     // at. The refusal has to route to --from-log, not just say no.
     var override = try run(&f, &.{
-        "request",     "reconcile", in_flight_id, "--override", "looks done to me",
-        "--by",        "operator",  "--resolved", "completed",  "--db",
+        "request", "reconcile", in_flight_id, "--override", "looks done to me",
+        "--by",    "operator",  "--resolved", "completed",  "--db",
         f.db,
     });
     defer override.deinit(f.allocator);
@@ -538,9 +557,9 @@ test "blackbox: an override releases an indeterminate scope and is marked as a d
     try no_owner.expectSays("--by");
 
     var ok = try run(&f, &.{
-        "request",  "reconcile",       in_flight_id, "--override", "ssh'd in; the deploy finished",
-        "--by",     "czykl",           "--resolved", "completed",  "--json",
-        "--db",     f.db,
+        "request", "reconcile", in_flight_id, "--override", "ssh'd in; the deploy finished",
+        "--by",    "czykl",     "--resolved", "completed",  "--json",
+        "--db",    f.db,
     });
     defer ok.deinit(f.allocator);
     try ok.expectCode(0);
@@ -700,4 +719,494 @@ test "blackbox: an unknown outcome is never reported as a plain failure" {
     defer receipt.deinit(f.allocator);
     try receipt.expectCode(0);
     try receipt.expectSays("indeterminate");
+}
+
+/// A stand-in for the local daemon, so a gate can put a chosen result record in
+/// front of the real binary without a remote host.
+///
+/// The binary reaches a host in exactly two ways: the daemon socket, or a
+/// direct SSH connection. The second cannot be produced under `zig build test`
+/// — it needs a listening server and a real key — and the first is a documented
+/// local protocol whose address is derived from the environment. So this binds
+/// that address inside a scratch directory and answers the CLI's own protocol.
+///
+/// Deliberately *not* a way to test the probe's reasoning. The bytes below are
+/// what a host sends; every conclusion drawn from them — the reading, the
+/// refusal, the terminal written to the ledger, the exit code, the scope
+/// barrier — is the binary's, computed by the same code an operator runs. That
+/// is the whole reason these four facts are checked out here rather than in
+/// process: an exit code reachable only through `std.process.exit` and a scope
+/// barrier reachable only through a second command are exactly the two that go
+/// untested from the inside.
+const FakeHost = struct {
+    /// One scripted answer, matched by a substring of the command the binary
+    /// sends. Substrings rather than whole scripts because the scripts carry
+    /// paths and byte counts that are none of a gate's business; what a gate
+    /// means is "the probe" or "the kill".
+    const Rule = struct {
+        needle: []const u8,
+        exit_code: i32 = 0,
+        stdout: []const u8 = "",
+        /// How many times this rule may answer before the next matching one
+        /// takes over. The default answers forever; a bounded one is how a gate
+        /// says "the host changed between these two looks", which is the whole
+        /// shape of a job that reaches its own end during the round trip.
+        uses: u32 = std.math.maxInt(u32),
+    };
+
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []u8,
+    socket: []u8,
+    server: std.Io.net.Server,
+    rules: []Rule,
+    thread: std.Thread,
+    /// Set before the listener is touched, so the serve loop learns it is done
+    /// from a value it owns rather than from a `Server` this thread has already
+    /// invalidated. See `stop`.
+    closing: std.atomic.Value(bool),
+    /// Commands the rules did not cover. Never answered with a plausible
+    /// success: a fake that quietly invents replies for calls nobody scripted
+    /// turns a gate into a measurement of the fake.
+    unscripted: std.atomic.Value(u32),
+
+    fn start(f: *Fixture, rules: []Rule) !*FakeHost {
+        const home = try std.fmt.allocPrint(f.allocator, "{s}/home", .{f.dir});
+        errdefer f.allocator.free(home);
+        const socket_dir = try std.fmt.allocPrint(f.allocator, "{s}/.terminus", .{home});
+        defer f.allocator.free(socket_dir);
+        try std.Io.Dir.cwd().createDirPath(f.io, socket_dir);
+        const socket = try std.fmt.allocPrint(f.allocator, "{s}/daemon.sock", .{socket_dir});
+        errdefer f.allocator.free(socket);
+        std.Io.Dir.cwd().deleteFile(f.io, socket) catch {};
+
+        const address = try std.Io.net.UnixAddress.init(socket);
+        const host = try f.allocator.create(FakeHost);
+        errdefer f.allocator.destroy(host);
+        host.* = .{
+            .io = f.io,
+            .allocator = f.allocator,
+            .home = home,
+            .socket = socket,
+            .server = try address.listen(f.io, .{}),
+            .rules = rules,
+            .thread = undefined,
+            .closing = .init(false),
+            .unscripted = .init(0),
+        };
+        host.thread = try std.Thread.spawn(.{}, serve, .{host});
+        return host;
+    }
+
+    /// The child's environment: this process's own, with the home pointed at
+    /// the scratch directory so the binary looks for its daemon socket there.
+    ///
+    /// A full copy rather than a two-entry map. The child is a real process on
+    /// this machine, and stripping `SystemRoot`, `PATH` and the rest to isolate
+    /// one variable would be gating on an environment nobody has.
+    fn environment(host: *FakeHost) !std.process.Environ.Map {
+        var map = switch (builtin.os.tag) {
+            .windows => try (std.process.Environ{ .block = .global }).createMap(host.allocator),
+            // Not quietly degraded to an empty environment. There is no
+            // portable way to read this process's own environment without the
+            // `std.process.Init` a test does not get, and running the binary
+            // with nothing in its environment would gate on a machine that does
+            // not exist. The daemon transport this stands in for is itself
+            // Windows-only until M5.
+            else => {
+                std.debug.print(
+                    \\
+                    \\this gate points the binary's home at a scratch directory, which needs a
+                    \\snapshot of this process's own environment; only the Windows path is
+                    \\implemented, and the daemon transport it drives is Windows-only until M5.
+                    \\
+                    \\
+                , .{});
+                return error.ScratchHomeNeedsWindows;
+            },
+        };
+        errdefer map.deinit();
+        try map.put("USERPROFILE", host.home);
+        try map.put("HOME", host.home);
+        return map;
+    }
+
+    /// Asserts that every command the binary sent was one this gate scripted.
+    ///
+    /// Without it a gate can pass for the wrong reason. An unmatched command
+    /// comes back as a transport failure, and a command that fails at the
+    /// transport also exits nonzero and prints a refusal — which is precisely
+    /// what several of these gates assert. So a gate that had drifted off the
+    /// path it means to drive would still be green.
+    fn expectFullyScripted(host: *FakeHost) !void {
+        const missed = host.unscripted.load(.monotonic);
+        std.testing.expectEqual(@as(u32, 0), missed) catch |err| {
+            std.debug.print(
+                "{d} command(s) reached the fake host with no rule to answer them\n",
+                .{missed},
+            );
+            return err;
+        };
+    }
+
+    fn stop(host: *FakeHost) void {
+        host.closing.store(true, .release);
+        // One throwaway connection, to return the blocked `accept`. Closing the
+        // listener first instead is what the first version did, and it is a
+        // data race with teeth: `Server.deinit` sets the value to `undefined`,
+        // which in a debug build is a memory pattern, and the serve thread was
+        // still inside `accept` reading the socket handle out of it.
+        if (std.Io.net.UnixAddress.init(host.socket)) |address| {
+            if (address.connect(host.io)) |stream| {
+                var knock = stream;
+                knock.close(host.io);
+            } else |_| {}
+        } else |_| {}
+        host.thread.join();
+        host.server.deinit(host.io);
+        std.Io.Dir.cwd().deleteFile(host.io, host.socket) catch {};
+        host.allocator.free(host.socket);
+        host.allocator.free(host.home);
+        host.allocator.destroy(host);
+    }
+
+    fn serve(host: *FakeHost) void {
+        while (true) {
+            var stream = host.server.accept(host.io) catch return;
+            defer stream.close(host.io);
+            if (host.closing.load(.acquire)) return;
+            host.converse(&stream) catch {};
+        }
+    }
+
+    fn converse(host: *FakeHost, stream: *std.Io.net.Stream) !void {
+        var read_buffer: [1 << 16]u8 = undefined;
+        var reader = stream.reader(host.io, &read_buffer);
+        var write_buffer: [1 << 16]u8 = undefined;
+        var writer = stream.writer(host.io, &write_buffer);
+
+        var arena_state = std.heap.ArenaAllocator.init(host.allocator);
+        defer arena_state.deinit();
+
+        while (true) {
+            // A peer reset here is the ordinary end of a conversation, not a
+            // fault: the exit codes these gates exist to check are reached
+            // through `std.process.exit`, which skips the CLI's own socket
+            // close. Windows reports that as a status std does not map, so a
+            // `zig build test` run prints its trace and returns the error to
+            // this `catch`. Left unsuppressed — turning `std.options`'
+            // unexpected-error tracing off for this binary would hide the whole
+            // class to quieten one known member of it.
+            const line = (reader.interface.takeDelimiter('\n') catch return) orelse return;
+            if (line.len == 0) continue;
+            const request = protocol.parseMessage(protocol.Request, arena_state.allocator(), line) catch {
+                try protocol.writeMessage(&writer.interface, protocol.Response{
+                    .v = protocol.version,
+                    .ok = false,
+                    .@"error" = "the gate's fake host could not parse that request",
+                });
+                continue;
+            };
+            const response: protocol.Response = switch (request.op) {
+                .ping => .{ .v = protocol.version, .ok = true, .pid = 1 },
+                .stop => .{ .v = protocol.version, .ok = true },
+                .exec => host.replyTo(request.command),
+            };
+            try protocol.writeMessage(&writer.interface, response);
+        }
+    }
+
+    fn replyTo(host: *FakeHost, command: []const u8) protocol.Response {
+        for (host.rules) |*rule| {
+            if (rule.uses == 0) continue;
+            if (std.mem.indexOf(u8, command, rule.needle) != null) {
+                if (rule.uses != std.math.maxInt(u32)) rule.uses -= 1;
+                return .{
+                    .v = protocol.version,
+                    .ok = true,
+                    .exitCode = rule.exit_code,
+                    .stdout = rule.stdout,
+                };
+            }
+        }
+        _ = host.unscripted.fetchAdd(1, .monotonic);
+        return .{
+            .v = protocol.version,
+            .ok = false,
+            .@"error" = "the gate's fake host has no reply scripted for this command",
+        };
+    }
+};
+
+/// The remote wrapper's own framing, so a gate states what the host sent rather
+/// than what the parser happens to want.
+const probe_split = "__TERMINUS_PROBE_SPLIT__";
+
+/// A job that reached the remote shell and is still recorded as running, with
+/// the scope its name reserves held by its own operation.
+fn seedRunningJob(f: *Fixture, request_id: []const u8, name: []const u8, sentinel: []const u8) !void {
+    var store = try f.open();
+    defer store.close();
+
+    try Store.operations.create(&store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "box",
+        .kind = .job,
+        .scope_kind = .job,
+        .scope_key = name,
+        .alias = name,
+        .mutating = true,
+        .now = 1000,
+    });
+    try Store.operations.advance(&store, request_id, .connecting, 1001);
+    try Store.operations.advance(&store, request_id, .submitted, 1002);
+    try Store.operations.advance(&store, request_id, .remote_started, 1003);
+    _ = try Store.jobs.create(&store, 1, name, "make deploy", sentinel, request_id, 1002);
+    if (!try Store.jobs.markStarted(&store, request_id)) return error.RowWasNotReserved;
+    const session = try std.fmt.allocPrint(f.allocator, "job-{s}", .{name});
+    defer f.allocator.free(session);
+    _ = try Store.job_attempts.create(&store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "box",
+        .job_name = name,
+        .attempt_no = 1,
+        .sentinel = sentinel,
+        .tmux_session = session,
+        .now = 1003,
+    });
+}
+
+test "blackbox: a defective result record ends `job kill` at 75 with the scope still barred" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "defective_kill");
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01CCCCCCCC0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    // A document at this request's own address carrying an exit status no shell
+    // produces, with the job's own sentinel still in the tail behind it. Both
+    // records are present; the stronger one cannot be read, so the weaker one
+    // cannot be checked against it and nothing here may settle.
+    const probe_output = "{\"v\":1,\"requestId\":\"" ++ request_id ++ "\",\"exitCode\":9000,\"finishedAt\":1750}\n" ++
+        probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":7\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .stdout = probe_output },
+        // The kill goes ahead — the caller asked for the session to stop. What
+        // is refused is reporting it as having established an outcome.
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var killed = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer killed.deinit(f.allocator);
+
+    // The exit code, taken from the process. Every in-process gate on this rule
+    // reads it off a function's return value; this is the only one that proves
+    // the number leaves the binary, and 75 rather than 1 is what tells an agent
+    // a retry is not available.
+    try killed.expectCode(75);
+    // …driven down the path this gate means to drive, rather than tripping over
+    // a command the fake could not answer, which also exits nonzero.
+    try host.expectFullyScripted();
+
+    // The JSON shape: both keys, here and on every other `job kill` branch.
+    // `resultRecord` is the machine enumeration a caller may branch on;
+    // `resultRecordError` is prose it may not.
+    try killed.expectSays("\"resultRecord\": \"exit_code_out_of_range\"");
+    try killed.expectSays("\"resultRecordError\": \"");
+    try killed.expectSays("\"cancellationProven\": false");
+    try killed.expectSays("\"ok\": false");
+    // The hint has to name a command that can actually succeed. `--from-log`
+    // reads these same two records and refuses for the same reason, so pointing
+    // at it would be a dead end wearing the shape of a next step.
+    try killed.expectSays("--override");
+    try killed.expectSaysNot("--from-log");
+
+    // The ledger row, read out of the store rather than out of the report that
+    // claimed it.
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const op = (try Store.operations.get(&store, arena_state.allocator(), request_id)).?;
+        try t.expectEqualStrings("indeterminate", op.status.text());
+    }
+
+    // And the scope is still barred, which is the point of settling
+    // `indeterminate` rather than `completed`: the name stays reserved until
+    // somebody establishes what actually happened. Asserted through a second
+    // command, because that is the only form the barrier takes for a caller.
+    var relaunch = try runWithEnvironment(&f, &.{
+        "run", "box", "--name", "deploy", "--cmd", "make deploy", "--db", f.db,
+    }, &environ);
+    defer relaunch.deinit(f.allocator);
+    try relaunch.expectCode(1);
+    try relaunch.expectSays("refused");
+    try relaunch.expectSays(request_id);
+}
+
+test "blackbox: a job with no result record still settles, exits 0 and frees its scope" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "absent_kill");
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01DDDDDDDD0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    // The control, and the half of the rule that is easy to lose: an absence is
+    // not a defect. Same window, same sentinel, and nothing whatever at the
+    // result record's address — a job launched before sidecars existed, or one
+    // whose evidence was discarded. Without this the gate above would pass just
+    // as happily against a binary that refused every reading there is.
+    const probe_output = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":0\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .stdout = probe_output },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var killed = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer killed.deinit(f.allocator);
+    try killed.expectCode(0);
+    try host.expectFullyScripted();
+    try killed.expectSays("\"ok\": true");
+    try killed.expectSays("\"exitCode\": 0");
+    // The same two keys on a branch that found nothing wrong: `resultRecord`
+    // names the reading even when the reading is "there was nothing there", and
+    // `resultRecordError` is the JSON null saying there is no sentence to read.
+    // A caller gets one key set out of `job kill --json`, not four.
+    try killed.expectSays("\"resultRecord\": \"absent\"");
+    try killed.expectSays("\"resultRecordError\": null");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const op = (try Store.operations.get(&store, arena_state.allocator(), request_id)).?;
+        try t.expectEqualStrings("completed", op.status.text());
+        // Nothing left holding the job scope, which is what "released" means to
+        // whoever launches next.
+        const unsettled = try Store.operations.unsettled(&store, arena_state.allocator(), 1);
+        try t.expectEqual(@as(usize, 0), unsettled.len);
+    }
+
+    // …and a relaunch is not turned away where it stands. It fails at the host
+    // — the fake has no reply scripted for a launch — but it is not refused by
+    // the scope guard, which is the difference this control draws.
+    var relaunch = try runWithEnvironment(&f, &.{
+        "run", "box", "--name", "deploy", "--cmd", "make deploy", "--db", f.db,
+    }, &environ);
+    defer relaunch.deinit(f.allocator);
+    try relaunch.expectSaysNot("refused: request");
+}
+
+/// The race both mutating verbs have to survive: the job reaches its own end
+/// during the SSH round trip, so the command's first probe sees work in
+/// progress and its second — the one taken after the session is proven gone —
+/// sees a document at this request's address that cannot be read.
+///
+/// Which probe happened to see the defect used to decide the exit code, because
+/// the second look reported a refusal by returning nothing at all. `job rm` then
+/// printed `{"action":"removed","ok":true}` and exit 0 with a hint naming a
+/// `--from-log` reconcile that reads these same two records and refuses; `job
+/// kill` exited 75 for an unrelated reason and wrote a receipt that never
+/// mentioned the document. The receipt is the only record that outlives a
+/// removal, so "never mentioned it" means nobody can ever find out.
+fn defectArrivesDuringTheKill(fixture_name: []const u8, verb: []const u8) !void {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, fixture_name);
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01EEEEEEEE0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    const defective = try std.fmt.allocPrint(
+        f.allocator,
+        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":9000,\"finishedAt\":1750}}\n{s}\n20\nwork done\n{s}:7\n",
+        .{ request_id, probe_split, sentinel },
+    );
+    defer f.allocator.free(defective);
+
+    var rules = [_]FakeHost.Rule{
+        // The first look, once: nothing at the address, nothing in the log.
+        .{ .needle = probe_split, .stdout = "\n" ++ probe_split ++ "\n12\nbuilding...\n", .uses = 1 },
+        // Every look after it: the job finished while we were stopping it, and
+        // what it left behind carries an exit status no shell produces.
+        .{ .needle = probe_split, .stdout = defective },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var acted = try runWithEnvironment(&f, &.{
+        "job", verb, "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer acted.deinit(f.allocator);
+
+    try acted.expectCode(75);
+    try host.expectFullyScripted();
+    try acted.expectSays("\"ok\": false");
+    // The hint has to name a command that can succeed. `--from-log` reads the
+    // same two records and refuses for the same reason, so offering it is a
+    // dead end wearing the shape of a next step — and it is what `job rm`
+    // offered, beside `ok: true`.
+    try acted.expectSays("--override");
+    try acted.expectSaysNot("--from-log");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqualStrings("indeterminate", op.status.text());
+
+    // The receipt names both halves: the verdict that was declined, and the
+    // reading that declined it. `job rm` deletes the local row, so this is the
+    // only place either fact still exists afterwards.
+    const rows = try Store.receipts.list(&store, arena, request_id);
+    var terminal_reason: ?[]const u8 = null;
+    var terminal_detail: ?[]const u8 = null;
+    for (rows) |row| if (row.is_terminal) {
+        terminal_reason = row.transport_error;
+        terminal_detail = row.detail_json;
+    };
+    const reason = terminal_reason orelse return error.RemovalLeftNoTerminalReceipt;
+    try t.expect(std.mem.indexOf(u8, reason, "exit 7") != null);
+    try t.expect(std.mem.indexOf(u8, reason, "result record") != null);
+    try t.expect(std.mem.indexOf(u8, terminal_detail.?, "exit_code_out_of_range") != null);
+}
+
+test "blackbox: `job kill` does not lose a result record that turned up during the kill" {
+    try defectArrivesDuringTheKill("race_kill", "kill");
+}
+
+test "blackbox: `job rm` does not report a clean removal over a record it refused" {
+    try defectArrivesDuringTheKill("race_rm", "rm");
 }
