@@ -61,8 +61,11 @@ EOF
 
 **Use `--strict` for deploy/migration scripts** — without it bash keeps
 going after a failed line and only the last line's exit code is reported.
-Staged files are removed after exec and swept daily; single-line commands
-skip staging entirely (no overhead).
+Single-line commands skip staging entirely (no overhead) unless
+`--interpreter` is given, which always stages. Staged files are removed at the
+end of a one-shot `terminus exec`, which is also where the daily sweep of older
+staged files rides — session `exec` and `run` stage without cleaning up, so
+their temp files wait for the next one-shot `exec` to sweep them.
 
 ## Tools missing in non-interactive shells (nvm/pm2/bun)
 
@@ -86,9 +89,11 @@ terminus server ls --json            # what servers exist?
 terminus memory ls <server> --json   # what do I know about it?
 ```
 
-Every `exec --json` response also includes `memoryKeys` — the list of
-memory keys stored for that server. If you see keys you haven't read this
-conversation (e.g. `services`, `deploy`), read them before continuing:
+Every `exec --json` response that reaches the remote also includes `memoryKeys`
+— the list of memory keys stored for that server. (A failed `exec` prints the
+plain `{"ok":false,"error":...}` shape and carries no `memoryKeys`.) If you see
+keys you haven't read this conversation (e.g. `services`, `deploy`), read them
+before continuing:
 
 ```bash
 terminus memory show <server> --key services --json
@@ -140,10 +145,10 @@ terminus exec <server> -- git status          # runs in /srv/app
 # Tracked background job (survives CLI exit; needs tmux)
 terminus run <server> --name build -- npm run build
 # status: submitted | remote_started | completed | failed | indeterminate
-terminus job status <server> build --json     # + exitCode; exits 75 if indeterminate
+terminus job status <server> build --json     # + exitCode; exits 75 when outcomeProven is false
 terminus job read <server> build --from-cursor --json
 terminus job watch <server> build --interval 30s --json  # block until it ends
-terminus job kill <server> build               # exits 75 unless the kill is provable
+terminus job kill <server> build               # 75 if unprovable, 1 if the kill was refused
 terminus job ls <server> --active --limit 20 --json
 
 # Persistent interactive session (requires tmux on the server)
@@ -155,10 +160,10 @@ terminus exec <server>:<name> --json -- docker compose ps
 terminus push <server> ./local-file /remote/path [--mode 755]
 terminus pull <server> /remote/file ./local-path
 # No scp binary on the server (minimal images, OpenSSH 9+)? add --via exec
-# — moves bytes over the plain command channel (needs only base64), any
-# size, md5-verified. Downloads are slow (libssh2 read speed; the scp
-# backend is no faster) but reliable. push/pull auto-fall back to exec if
-# scp is absent.
+# — moves bytes over the plain command channel (needs base64 and md5sum on
+# the host), any size, md5-verified. Downloads are slow (libssh2 read speed;
+# the scp backend is no faster) but reliable. push/pull auto-fall back to exec
+# if scp is absent.
 terminus push <server> ./cfg /etc/app/cfg --via exec
 terminus sync push <server> ./dist /srv/app/dist --exclude node_modules,.git [--dry-run] [--delete]
 terminus sync pull <server> /var/log/myapp ./logs [--exclude *.gz]
@@ -195,11 +200,19 @@ Jobs are still preferred past ~60s: they survive your process dying and
 report status without holding anything open.
 
 Every failure carries `"ok":false` in `--json` mode. Exit 1 is a refusal or a
-proven failure (`{"ok":false,"error":"..."}`); exit 75 means the remote outcome
-could not be established — **never retry that blindly**; exit 76 means the local
-receipt could not be written. Responses include `transport` ("daemon" or
-"direct") and `daemonError` when the connection daemon was skipped — mention it
-if you see repeated fallbacks.
+proven failure; exit 75 means the remote outcome could not be established —
+**never retry that blindly**; exit 76 means the local receipt could not be
+written. A hard failure prints `{"ok":false,"error":"..."}` and nothing else, but
+a refusal a verb owns prints that verb's own full key set with `ok:false` and no
+`error` key — `job kill`'s `"action":"not_killed"` is one — so branch on `ok` and
+the verb's own fields, never on the presence of `error`. `transport` ("daemon" or
+"direct") and `daemonError` appear on the commands that open a connection —
+`run`, `exec`, `doctor`, `server ping`, `write` and `job status` carry both,
+`job watch` carries `transport` only. Mention repeated daemon fallbacks if
+you see them. Purely local commands (`memory`, `fact`, `history`,
+`daemon status`, `import`/`export`) carry neither, `job read`/`job kill`/`job rm`
+and session `read` carry neither, and `push`/`pull`/`sync` are always direct and
+report `backend` instead.
 
 ## Jobs: the reliable way to run long tasks
 
@@ -228,19 +241,35 @@ a process state. The complete set:
 
 | `status` | Meaning |
 |---|---|
-| `submitted`, `remote_started` | still running; no outcome yet |
+| `created`, `connecting`, `submitted` | the launch has not been confirmed on the remote shell yet — a row still in its launch window reads `created` |
+| `remote_started` | running; no outcome yet |
 | `completed` | the command exited 0 |
 | `failed` | the command exited non-zero — `exitCode` says which |
 | `indeterminate` | the outcome could not be established; the command exits 75 |
+| `timed_out`, `cancelled` | only after a human `request reconcile --override` (full form below) |
 
-There is no `running`, `exited` or `killed` in this field — those are the cached
-row labels `job ls` prints from its local snapshot, and matching them against
-`job status` never fires. `ok` is exactly `status != "indeterminate"`.
+There is no `pending`, `running`, `exited` or `killed` in this field — those are
+the four cached row labels `job ls` prints from its local snapshot, and matching
+them against `job status` never fires.
 
-`indeterminate` means the session vanished without recording an exit status, or
-the two durable records disagree. **Do not relaunch the work**: the attempt goes
-on blocking same-scope commands until it is settled with
-`terminus request reconcile <request-id> [--from-log]`.
+`ok` is **not** `status != "indeterminate"`. It is true only when
+`outcomeProven` is true *and* nothing else the command was asked to do was
+refused: a local cache row that could not be brought along, or — on `job read` —
+a cursor that could not advance (`cursorAdvanced:false`), each make `ok` false
+and exit 1 while `status` still reads `completed`. These three verbs report a
+refused cache row only in `hint`; the machine-readable `cacheError` key exists on
+`job kill` / `job rm` only. Branch on `ok` and `outcomeProven`, never on `status`
+alone.
+
+`indeterminate` means one of: the session vanished without recording an exit
+status; the two durable records disagree; the result record is present and
+unusable; or a `job kill` / `job rm` lost its scope lease mid-flight, which is
+recorded as `indeterminate` carrying `error_code: "AUTHORITY_LOST"` — not a
+state of its own. **Do not relaunch the work**: the attempt goes on blocking
+same-scope commands until it is settled with
+`terminus request reconcile <request-id> [--from-log]`, or by hand with
+`--override "<reason>" --by <who> --resolved <completed|failed|timed_out|cancelled>`
+(all three parts are required; a bare `--override` is rejected).
 
 A launch refused by such a blocker will first spend one connection asking the
 host whether that blocker has in fact already finished, and settle it from the
@@ -252,32 +281,83 @@ connection error.
 
 - `exitCode` — the remote exit code, `null` while unknown.
 - `businessResult` — the last `__TERMINUS_RESULT__:<v>` line (see below).
+- `outcomeProven` / `settlement` — whether the ledger actually backs `status`,
+  and which reading it is: `open` (nothing has ended), `settled`, `no_attempt`
+  (the row names no attempt, so the host's own record is the whole answer), or
+  `unproven` (this observation settled nothing — exits 75).
+- `resultRecord` — what was at the result sidecar's address, as a stable word.
+  Three are ordinary — `not_requested` (we did not look), `absent`, `present`
+  (it is there and it is ours) — and four say a document at this attempt's own
+  address could not be used: `malformed`, `unknown_schema`,
+  `exit_code_out_of_range`, `foreign`. `resultRecordError` is the prose beside
+  it, `null` for the three ordinary readings; nothing may branch on its wording.
 - `finishedAt` — a **remote** finish time in unix seconds, taken from the result
   file. `null` unless the host reported its own clock (a sentinel-only outcome
   has no timestamp). Never backfilled with local time.
 - `observedAt` — local unix seconds when we saw the evidence. Not a finish time.
+  `finishedAt` and `observedAt` are on `job status` and `job read` only —
+  `job watch` carries neither.
 - `conflict` — normally `null`; `{"resultExitCode":N,"sentinelExitCode":M}` when
-  the result file and the log sentinel report different exit codes. Then
-  `status` is `indeterminate` and no mechanical reconcile can settle it — it
-  needs `terminus request reconcile <request-id> --override`.
-- Command-specific: `job status` adds `command`, `createdAt`, `server`,
-  `transport`, `daemonError`; `job read` adds `from`, `to`, `data`; `job watch`
-  adds `stillRunning` and `polls`.
+  the result file and the log sentinel report different exit codes. The
+  observation then settles nothing, so `status` reads `indeterminate` and the
+  command exits 75 — unless the ledger had already settled this attempt from
+  earlier evidence, which stands. No mechanical reconcile can settle a live
+  contradiction; it needs
+  `terminus request reconcile <request-id> --override "<reason>" --by <who> --resolved <status>`.
+- Command-specific: `job status` adds `server`, `command`, `createdAt`,
+  `transport`, `daemonError`; `job read` adds `from`, `to`, `data`,
+  `cursorAdvanced` and `cursorError` (on a refused cursor advance `to` stays at
+  `from` — read `cursorAdvanced`, not `to`, to know whether you may move on);
+  `job watch` adds `server`, `stillRunning`, `polls` and `transport`.
 
 **`job ls` is a different shape and a different clock.** It prints the local
-cache, so its `status` holds the cached labels `running`/`exited`/`killed`
-rather than an operation status, and its finish time is `cachedFinishedAt` —
-named apart from `finishedAt` on purpose, because it falls back to local time
-when the host reported none. Use `job status` when the answer matters;
-`job ls` is for looking around.
+cache, so its `status` holds the cached row labels
+`pending`/`running`/`exited`/`killed` rather than an operation status
+(`pending` is a row whose launch has not reached the remote shell yet;
+`--active` shows exactly `pending` and `running`), and its finish time is
+`cachedFinishedAt` — named apart from `finishedAt` on purpose, because it falls
+back to local time when the host reported none. Use `job status` when the answer
+matters; `job ls` is for looking around.
 
 ### Stopping and forgetting jobs
 
+Both verbs hold a scope lease and **renew it immediately before every step that
+changes something** — the kill, each deletion, the settlement. Only a renewal
+that answers "still ours" lets the next step run; a renewal that could not be
+performed at all counts as a loss, not a yes. Both report `authority`
+(`held` | `lapsed` | `unreadable`) and `authorityError` (prose, `null` while
+`held` — branch on `authority`).
+
+- **Lease lost *before* the kill**: nothing is sent to the host and nothing local
+  is written. `action` is `not_killed` / `not_removed`, `ok:false`, and the exit
+  code is **1, not 75** — this command changed nothing, so nothing about the
+  remote is unknown *because of it*, and re-running once the scope frees is safe.
+  The log, the result record and the local row are exactly as they were.
+- **Lease lost *after* the kill**: the session really did stop, and every step
+  after it is forbidden — the pane log, the result sidecar and the local job row
+  are all **kept**. `job rm` reports `rowRemoved:false`, `action:"not_removed"`
+  and exits 1. The ledger records the ordinary `indeterminate` terminal carrying
+  `error_code: "AUTHORITY_LOST"`; there is no `authority_lost` state.
+- **A lost lease costs the claims, not the reading.** An exit code that was
+  actually read still counts: the sidecar is keyed by this attempt's request id,
+  so another holder cannot forge it and a relaunch would be a new attempt under a
+  new id. So `job kill` still records `exited` and still reports that `exitCode`
+  with `"action":"finished_during_kill"`. What downgrades is every claim resting
+  on the kill having landed — `cancellationProven` goes false and the
+  `remote_cancel_confirmed` terminal is never published. `ok` is still false and
+  the exit is 1.
+- **One asymmetry, deliberate.** On a `job kill` that loses the scope with *no*
+  exit code in hand, the local `job ls` row reads `killed` while the ledger reads
+  `indeterminate`/`AUTHORITY_LOST`. The row records that the pane was proven gone
+  in the round trip that stopped it; the ledger records that we can no longer say
+  what happened to the work. That case is still unprovable, so it exits **75**,
+  not 1.
 - `job kill` probes before it kills. If the job had already finished it records
   that outcome and reports `"action":"already_finished"` — the real exit code,
   not a cancellation. Otherwise it kills the session and reports
-  `cancellationProven`, which is **false** with today's shell supervisor: a
-  disowned or `setsid` child outlives its pane, so the kill settles
+  `cancellationProven`, which is **false in every shipped path**: the shell
+  supervisor's `pid_proof` is `weak` and a proven cancellation requires `strong`,
+  because a disowned or `setsid` child outlives its pane. So the kill settles
   `indeterminate` and exits 75 rather than claiming the work stopped. The log is
   never deleted here, so `reconcile --from-log` stays possible.
 - Once the session is confirmed gone, `kill` and `rm` look **once more**. A job
@@ -285,34 +365,81 @@ when the host reported none. Use `job status` when the answer matters;
   a real exit status, and settling it as an unprovable cancellation would throw
   that away. `kill` reports that as `"action":"finished_during_kill"` with the
   job's own exit code; `rm` uses it to settle before it removes anything. A
-  second look that errors, still finds nothing, or turns up a fresh
-  disagreement changes nothing — the cancellation path stands.
-- Two `job kill` outcomes are neither success nor 75. A `conflict` between the
-  result file and the log sentinel reports `"action":"killed"` with `ok:false`
-  and the `conflict` object, and needs `reconcile --override`. And an outcome
-  that *was* proven but whose tmux session survived the kill exits **1**: the
-  next launch under that name would otherwise type into the dead job's shell.
+  second look that errors, still finds nothing, or turns up a fresh disagreement
+  changes nothing — the cancellation path stands. A second look that finds the
+  result record *present and unusable* does change things: nothing may settle
+  from it, `resultRecord` reports the defect, and both verbs send you to
+  `--override` rather than `--from-log`.
+- **`job kill` exit codes.** **0** only when it has something proven and every
+  step it was asked to take happened. **75** whenever the outcome is unknown:
+  the ordinary unprovable cancellation, a lost lease after a kill with no exit
+  code, a `conflict` between the two records (reported as `"action":"killed"`,
+  `ok:false`, with the `conflict` object), an unusable result record, and an
+  `already_finished` or `finished_during_kill` the ledger refused to settle.
+  **1** when the outcome is not in doubt but this command is: a pre-kill lease
+  refusal (`not_killed`), a
+  `finished_during_kill` that lost the lease, a proven outcome whose tmux session
+  survived the kill (the next launch under that name would otherwise type into
+  the dead job's shell), and a settlement whose local row could not be brought
+  along (`cacheError` non-null).
 - `job rm` kills the session first and refuses to delete anything — log, result
-  file, or local row — if the session is still there afterwards. It settles from
-  the probe it took beforehand: with the outcome provable you get
-  `outcomeProven:true`; with the outcome still unknown it removes the job, keeps
-  the log, and returns `ok:true` with a hint to run
-  `reconcile <request-id> --from-log`. A `conflict` exits 75.
-- `job rm --discard-evidence` additionally deletes the pane log and the result
-  file, and only once the session is proven gone. Unless the outcome was already
-  provable from that first probe, discarding is not a success: it exits 75,
-  because it turned something that could have been proven into an override you
-  now owe.
+  file, or local row — if the session is still there afterwards; that refusal is
+  a plain `{"ok":false,"error":"..."}` and exit 1, not a removal record. It
+  settles from the better of its two probes — the one taken beforehand, upgraded
+  by the post-kill look when that is the one that saw the exit status. With the
+  outcome provable you get `outcomeProven:true`; with the outcome still unknown
+  it removes the job, keeps the log, and returns `ok:true` with a hint to run
+  `reconcile <request-id> --from-log`. A `conflict` or an unusable result record
+  removes the row too and exits 75.
+- `job rm --discard-evidence` additionally deletes the pane log and then the
+  result file, each behind its own lease renewal and only once the session is
+  proven gone. Unless the outcome was provable, discarding is not a success: it
+  exits 75, because it turned something that could have been proven into an
+  override you now owe. `evidenceRetained` reports what actually happened to the
+  **log**, not what the flag asked for — a removal that stopped before the delete
+  reports `evidenceRetained:true`.
 - If `tmux` is not runnable on the host, none of these report the session as
   gone — they fail with "tmux is not installed" instead. Absence of the tool is
   not evidence about the job, and nothing is deleted on it.
+
+**The `--json` key sets are fixed and uniform.** Every branch of each verb emits
+every key of its set — the emitter structs have no defaults, so a missing key is
+a compile error rather than a shape you discover at runtime. Absent is never a
+signal; `null` means "there is no such reading", never "we did not look".
+
+`job kill` — 19 keys. Never null: `ok`, `action`
+(`killed` | `already_finished` | `finished_during_kill` | `not_killed`), `job`,
+`status`, `outcomeProven`, `observedAt`, `sessionGone`, `sessionCleanedUp` (the
+same boolean under the older name, published everywhere so it means one thing),
+`cancellationProven`, `resultRecord`, `authority`. Nullable: `exitCode` (null
+when no record answered, and deliberately null on the `conflict` and
+unusable-record branches — those codes must not be read as an outcome),
+`finishedAt`, `conflict`, `requestId` (null when the row names no attempt),
+`resultRecordError`, `cacheError`, `authorityError`, `hint`.
+
+`job rm` — 16 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
+`job`, `status`, `outcomeProven`, `rowRemoved`, `evidenceRetained`,
+`attemptRetained`, `resultRecord`, `authority`. Nullable: `conflict`,
+`requestId`, `resultRecordError`, `cacheError`, `authorityError`, `hint`.
+`resultRecord` / `resultRecordError` are on this verb too — `job rm` deletes the
+local row, so this line and the receipt are the only places the reading survives.
+
+`status` on these two verbs is the ledger's word for the attempt, and it has two
+values `job status` never prints: `"unknown"` (the row names no attempt, or names
+a request the ledger does not have) and, on `job rm`, `"unchanged"`.
+`resultRecordError`, `authorityError`, `cacheError` and `hint` are prose — do not
+match their text. Their *presence* is meaningful only for `cacheError`, where
+non-null is the one signal that the local row was not updated; the other three
+mirror `resultRecord` and `authority`, which you can branch on directly.
 
 ### Waiting on a job and reporting business state
 
 - **Don't poll in a busy loop.** `terminus job watch <server> <name>
   --interval 30s --json` blocks and returns the instant the job reaches a
   terminal state (or after `--max` polls, reported as `stillRunning:true`).
-  `watch` also exits with the job's own exit code when it ended non-zero.
+  `watch` also exits with the job's own exit code when it ended non-zero — but
+  only after the two codes that outrank it: 75 if the outcome could not be
+  established, 1 if the local row could not be brought along.
 - **Exit code ≠ business success.** A job can exit 0 yet fail its actual
   purpose (0 rows migrated, health check red). Have the job print a
   marker line and Terminus surfaces it as `businessResult`, separate from
@@ -328,8 +455,9 @@ when the host reported none. Use `job status` when the answer matters;
 
 ### Recovering a wedged daemon
 
-Every response carries `transport` ("daemon"/"direct") and `daemonError`.
-If the daemon repeatedly errors or a call hangs unusually long:
+`transport` ("daemon"/"direct") and `daemonError` ride on the responses listed
+under "Choosing exec mode" above. If the daemon repeatedly errors or a call hangs
+unusually long:
 
 ```bash
 terminus daemon status --json           # is it up? which pid?
@@ -337,9 +465,11 @@ terminus daemon restart                 # graceful; next call respawns it
 terminus daemon restart --force --json  # hard-kill a wedged daemon by pidfile
 ```
 
-`--force` bypasses the (possibly hung) socket, kills the pid, and clears
-stale files. Remote tmux jobs are unaffected — they live on the server,
-not in the daemon. Commands always fall back to direct SSH meanwhile.
+`--force` still tries the graceful socket stop first, then reads the pidfile,
+kills that pid and deletes the socket and pidfile. (The pid kill is implemented
+on Windows only; elsewhere `--force` amounts to the graceful stop plus the file
+cleanup.) Remote tmux jobs are unaffected — they live on the server, not in the
+daemon. Commands always fall back to direct SSH meanwhile.
 
 ## Memory discipline
 
@@ -353,10 +483,13 @@ not in the daemon. Commands always fall back to direct SSH meanwhile.
 
 ## Setup (once per machine)
 
-**Key requirement (Windows crypto backend): PKCS#1 PEM RSA only** —
-the file must start with `-----BEGIN RSA PRIVATE KEY-----`. OPENSSH-format
-(`ssh-keygen` default since 2018), ed25519, and ECDSA keys are rejected
-with conversion instructions. When in doubt, generate a dedicated key:
+**Key requirement: PKCS#1 PEM RSA only** — the file must start with
+`-----BEGIN RSA PRIVATE KEY-----`. OPENSSH-format (`ssh-keygen` default since
+2018), EC/ECDSA and PKCS#8 keys are rejected before the auth call, with
+conversion instructions. The limit comes from the Windows crypto backend, but
+the check is not OS-gated: it refuses the same formats on every platform (an
+ed25519 key is caught as OPENSSH-format). When in doubt, generate a dedicated
+key:
 
 ```bash
 ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key   # then add .pub to the server
@@ -379,7 +512,9 @@ Passwords: `terminus key add pw --kind password --passphrase '...'`.
 Housekeeping: `server rename/set` change names and connection details in
 place — memories, facts, jobs, and history follow automatically (never
 rm+re-add, that erases accumulated knowledge; `rm` warns and requires
-`--force` when data would be lost).
+`--force` when data would be lost). `--force` covers the cascade only:
+unsettled operations, held leases and resumable transfers refuse the removal
+whether or not you pass it.
 
 ## Moving knowledge between machines
 
