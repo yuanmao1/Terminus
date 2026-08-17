@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -74,6 +75,24 @@ class Result:
     failing_gates: list[str]
     seconds: float
     detail: str = ""
+    # What the build actually said, for every outcome that is not KILLED.
+    #
+    # Kept because the first version of this runner reported `BUILD_ERROR` as the
+    # bare sentence "the mutation does not compile" and discarded the compiler
+    # output — which made a genuine compile error and a wedged build environment
+    # produce byte-identical reports. A 39-entry run failed that way: one real
+    # error, then every later entry `BUILD_ERROR` in 0s, and nothing on record to
+    # say whether the manifest or the machine was at fault. An unexplained
+    # failure is not evidence.
+    build_output: str = ""
+
+
+# A build that fails in under this many seconds did not compile anything. Zig
+# takes tens of seconds to reach a failing test here, so a near-instant failure
+# means the build never really ran — a held cache lock, a killed peer process, a
+# wedged `.zig-cache`. Recorded rather than acted on: the decision to stop is
+# made by re-testing the restored tree, not by a stopwatch.
+INSTANT_FAILURE_SECONDS = 5.0
 
 
 def load(ids: list[str] | None) -> list[Mutation]:
@@ -172,6 +191,45 @@ def restore(mut: Mutation, original: bytes) -> None:
     )
 
 
+def git_out(*args: str) -> str:
+    """A read-only git query. Never a write: this tool must not touch history."""
+    proc = subprocess.run(
+        ["git", *args], cwd=REPO, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else f"<git {args[0]} failed>"
+
+
+def sha256_of(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def provenance() -> dict:
+    """What the run was measured against.
+
+    A bare list of outcomes cannot be re-checked: it does not say which commit it
+    describes, whether the tree was clean, or which manifest produced it. Without
+    those, "39/39 killed" is a number someone has to be taken at their word for.
+    """
+    dirty = git_out("status", "--porcelain")
+    return {
+        "head": git_out("rev-parse", "HEAD"),
+        "head_subject": git_out("log", "-1", "--format=%s"),
+        "tree_clean": dirty == "",
+        "tree_dirty_paths": dirty.splitlines(),
+        "manifest_sha256": sha256_of(MANIFEST),
+        "manifest_entries": len(json.loads(MANIFEST.read_text(encoding="utf-8"))["mutations"]),
+    }
+
+
+def tail_of(output: str, limit: int = 4000) -> str:
+    """The end of the build output, which is where zig puts the reason."""
+    out = output.strip()
+    if len(out) <= limit:
+        return out
+    return "...(truncated)...\n" + out[-limit:]
+
+
 def evaluate(mut: Mutation, zig: str) -> Result:
     started = time.time()
     original = apply(mut)
@@ -188,15 +246,15 @@ def evaluate(mut: Mutation, zig: str) -> Result:
         elapsed = time.time() - started
         if code == 0:
             return Result(mut.id, mut.rule, mut.file, mut.expect_gate, "SURVIVED", [], elapsed,
-                          "every gate passed with the rule removed")
+                          "every gate passed with the rule removed", tail_of(output))
         if not gates:
             return Result(mut.id, mut.rule, mut.file, mut.expect_gate, "BUILD_ERROR", [], elapsed,
                           "the build failed without a failing test: the mutation does not compile, "
-                          "so it proves nothing about the gates")
+                          "so it proves nothing about the gates", tail_of(output))
         if any(mut.expect_gate in g for g in gates):
             return Result(mut.id, mut.rule, mut.file, mut.expect_gate, "KILLED", gates, elapsed)
         return Result(mut.id, mut.rule, mut.file, mut.expect_gate, "WRONG_GATE", gates, elapsed,
-                      "caught, but not by the gate that claims to prove this rule")
+                      "caught, but not by the gate that claims to prove this rule", tail_of(output))
     finally:
         restore(mut, original)
 
@@ -223,7 +281,33 @@ def main() -> int:
 
     zig = find_zig()
     print(f"zig: {zig}")
-    print(f"{len(muts)} mutation(s); each one runs the full gate suite\n")
+
+    before = provenance()
+    print(f"HEAD: {before['head'][:12]}  {before['head_subject']}")
+    print(f"tree: {'clean' if before['tree_clean'] else 'DIRTY -> ' + ', '.join(before['tree_dirty_paths'])}")
+    print(f"manifest: {before['manifest_entries']} entries, sha256 {before['manifest_sha256'][:12]}")
+    if not before["tree_clean"]:
+        sys.exit(
+            "\nthe working tree is not clean, so a mutation cannot be told apart "
+            "from an edit that was already there. Commit or stash first."
+        )
+
+    # Prove the tree is green before mutating it. Every outcome below is a claim
+    # of the form "the suite went red *because* the rule was removed", and that
+    # claim is worthless if the suite was already red — or if the build was never
+    # working on this machine to begin with.
+    print("baseline: building the unmutated tree ... ", end="", flush=True)
+    base_started = time.time()
+    base_code, base_output = run_gates(zig)
+    base_seconds = time.time() - base_started
+    print(f"{'green' if base_code == 0 else 'RED'} ({base_seconds:.0f}s)")
+    if base_code != 0:
+        sys.exit(
+            "\nthe unmutated tree does not pass its own gates, so nothing below "
+            "would measure a mutation.\n\n" + tail_of(base_output)
+        )
+
+    print(f"\n{len(muts)} mutation(s); each one runs the full gate suite\n")
 
     results: list[Result] = []
     for i, mut in enumerate(muts, 1):
@@ -238,18 +322,84 @@ def main() -> int:
                 print(f"      caught by: {', '.join(r.failing_gates)}")
             if r.detail:
                 print(f"      {r.detail}")
+            if r.build_output:
+                print("      --- what the build said ---")
+                for line in r.build_output.splitlines():
+                    print(f"      {line}")
+                print("      ---")
+
+        # A `BUILD_ERROR` says the mutated source did not compile. That is only
+        # believable if the *restored* source still does — and when it does not,
+        # every later entry inherits the breakage and reports `BUILD_ERROR` for a
+        # reason that has nothing to do with its own mutation.
+        #
+        # That is not hypothetical. A 39-entry run produced one real failure and
+        # then 34 consecutive `BUILD_ERROR`s in 0s apiece, and because the
+        # compiler output was discarded there was no way to tell that only the
+        # first was a finding. Re-testing the restored tree turns that silent
+        # cascade into one loud stop, and costs an extra build only on the path
+        # that is already in trouble.
+        if r.outcome == "BUILD_ERROR":
+            print("      re-testing the restored tree ... ", end="", flush=True)
+            back_code, back_output = run_gates(zig)
+            print("green" if back_code == 0 else "STILL RED")
+            if back_code != 0:
+                if args.json:
+                    Path(args.json).write_text(
+                        json.dumps([asdict(x) for x in results], indent=2), encoding="utf-8"
+                    )
+                    print(f"      wrote partial results to {args.json}")
+                sys.exit(
+                    f"\nthe tree still fails after restoring {mut.file}, so the build "
+                    f"environment is broken rather than the mutation.\n"
+                    f"Stopping: every later entry would report BUILD_ERROR for a reason "
+                    f"unrelated to its own mutation, which is how a whole run gets "
+                    f"mistaken for 34 findings.\n"
+                    f"Check for a stale `.zig-cache` lock or a killed peer build, then "
+                    f"re-run.\n\n" + tail_of(back_output)
+                )
+
+    killed = [r for r in results if r.outcome == "KILLED"]
+    bad = [r for r in results if r.outcome != "KILLED"]
 
     if args.json:
+        outcomes: dict[str, int] = {}
+        for r in results:
+            outcomes[r.outcome] = outcomes.get(r.outcome, 0) + 1
+        artifact = {
+            "provenance_before": before,
+            "provenance_after": provenance(),
+            "zig": zig,
+            "zig_version": subprocess.run(
+                [zig, "version"], cwd=REPO, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            ).stdout.strip(),
+            "baseline_green": True,
+            "baseline_seconds": round(base_seconds, 1),
+            "requested_ids": args.id,
+            "totals": {
+                "entries": len(results),
+                "killed": len(killed),
+                "not_killed": len(bad),
+                "by_outcome": outcomes,
+            },
+            "results": [asdict(r) for r in results],
+        }
         Path(args.json).write_text(
-            json.dumps([asdict(r) for r in results], indent=2), encoding="utf-8"
+            json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         print(f"\nwrote {args.json}")
 
-    killed = [r for r in results if r.outcome == "KILLED"]
     print(f"\n{len(killed)}/{len(results)} killed by the gate that claims the rule")
-    bad = [r for r in results if r.outcome != "KILLED"]
     for r in bad:
         print(f"  {r.outcome:<12} {r.id}")
+    after = provenance()
+    if not after["tree_clean"]:
+        print("\nWARNING: the working tree is not clean after the run:")
+        for p in after["tree_dirty_paths"]:
+            print(f"  {p}")
+        print("Every mutation is supposed to be reverted; this means one was not.")
+        return 1
     return 1 if bad else 0
 
 
