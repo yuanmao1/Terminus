@@ -164,7 +164,7 @@
     {
       "id": "M4-still-ours-always",
       "rule": "A renewal that answered `not ours` forbids every destructive step after it.",
-      "file": "src/cli/cmd_job.zig",
+      "file": "src/core/control.zig",
       "find": "    if (!authority.holds()) return false;\n    authority.* = holdClaim(claim, wallClockSeconds(io));\n    return authority.holds();",
       "replace": "    if (!authority.holds()) return true;\n    authority.* = holdClaim(claim, wallClockSeconds(io));\n    return true;",
       "expect_gate": "blackbox: `job kill` sends nothing to the host once the scope has moved"
@@ -190,7 +190,7 @@
       "rule": "A lost lease costs a kill its claims, not the exit code it already read.",
       "file": "src/cli/cmd_job.zig",
       "find": "    const terminal: Core.Store.op_state.Terminal = .{ .exited = .{ .exit_code = code } };",
-      "replace": "    const terminal: Core.Store.op_state.Terminal = if (authority.holds()) .{ .exited = .{ .exit_code = code } } else authority.lostTerminal(ctx, job.name, if (execution) |e| e.status else .remote_started);",
+      "replace": "    const terminal: Core.Store.op_state.Terminal = if (authority.holds()) .{ .exited = .{ .exit_code = code } } else lostTerminal(authority, ctx, job.name, if (execution) |e| e.status else .remote_started);",
       "expect_gate": "blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read"
     },
     {
@@ -198,7 +198,7 @@
       "rule": "`job rm`'s lost-lease terminal sits below the exit-code arm, never above it.",
       "file": "src/cli/cmd_job.zig",
       "find": "    else if (probe.exit_code) |code|",
-      "replace": "    else if (!authority.holds())\n        authority.lostTerminal(ctx, job.name, if (execution) |e| e.status else .remote_started)\n    else if (probe.exit_code) |code|",
+      "replace": "    else if (!authority.holds())\n        lostTerminal(authority, ctx, job.name, if (execution) |e| e.status else .remote_started)\n    else if (probe.exit_code) |code|",
       "expect_gate": "blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read"
     },
     {
@@ -524,7 +524,7 @@
     {
       "id": "M3b-session-rm-renewal-answer",
       "rule": "The renewal's answer is what each destructive step is gated on; a renewal nobody reads is a line on stderr, not a barrier.",
-      "file": "src/cli/cmd_session.zig",
+      "file": "src/core/control.zig",
       "find": "    authority.* = holdClaim(claim, wallClockSeconds(io));\n    return authority.holds();",
       "replace": "    _ = holdClaim(claim, wallClockSeconds(io));\n    return true;",
       "expect_gate": "blackbox: `session rm` deletes nothing once the scope has moved after the kill"

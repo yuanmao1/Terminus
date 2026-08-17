@@ -26,6 +26,17 @@ const Store = Core.Store;
 const Tmux = Core.Tmux;
 const fatalTmux = @import("cmd_exec.zig").fatalTmux;
 
+// The lease-renewal barrier, named here and defined once in
+// `src/core/control.zig`. These are aliases, not a second copy: `job kill`,
+// `job rm` and `session rm` renew through the same `stillOurs`, latch on the
+// same `Authority`, and read the same clock, so a fix to any of them reaches
+// all three (`docs/m3b-job-control.md` §7.6).
+const Control = @import("../core/control.zig");
+const Claim = Control.Claim;
+const Authority = Control.Authority;
+const stillOurs = Control.stillOurs;
+const wallClockSeconds = Control.wallClockSeconds;
+
 const usage =
     \\usage: terminus session <verb> [...]
     \\
@@ -319,7 +330,7 @@ fn removeSession(
             .logDeleted = true,
             .localRow = if (had_row) "removed" else "absent",
             .authority = authority.code(),
-            .authorityError = authority.note(ctx, name),
+            .authorityError = authority.note(ctx.arena, .{ .session = name }),
         }),
         .human => try ctx.out.print("removed session '{s}:{s}'\n", .{ server_name, name }),
     }
@@ -415,7 +426,7 @@ fn refuseSurvivedKill(
         .logDeleted = false,
         .localRow = "kept",
         .authority = authority.code(),
-        .authorityError = authority.note(ctx, session),
+        .authorityError = authority.note(ctx.arena, .{ .session = session }),
         .hint = std.fmt.allocPrint(
             ctx.arena,
             "inspect it with 'tmux attach -t {s}' on the host, then settle the record with 'terminus request reconcile <request-id>' — until it is settled this session's scope stays barred",
@@ -458,7 +469,7 @@ fn refuseBeforeKill(
         .logDeleted = false,
         .localRow = "kept",
         .authority = authority.code(),
-        .authorityError = authority.note(ctx, session),
+        .authorityError = authority.note(ctx.arena, .{ .session = session }),
         .hint = "nothing was sent to the host, so re-running this once the scope is free is safe",
     }, reason);
     // Exit 1, not 75. This command changed nothing, so nothing about the remote
@@ -508,7 +519,7 @@ fn refuseAfterKill(
         .logDeleted = log_deleted,
         .localRow = "kept",
         .authority = authority.code(),
-        .authorityError = authority.note(ctx, session),
+        .authorityError = authority.note(ctx.arena, .{ .session = session }),
         .hint = "the local row and this session's memories were kept; settle the record with 'terminus request reconcile <request-id>'",
     }, reason);
     Cli.releaseClaim();
@@ -601,29 +612,14 @@ test contentionScope {
     try t.expectEqualStrings("job-", contentionScope("job-").key);
 }
 
-/// The scope lease `session rm` holds from before its first remote call until
-/// the local row is gone.
-///
-/// Ownership is the control operation's own `request_id`, minted by
-/// `execution.begin` before anything is sent. That is deliberate on both sides:
-/// `blockerLocked` exempts a lease whose owner is the request id it was handed,
-/// so this command's own claim can never refuse it, and a peer reading the row
-/// finds the operation that took it rather than a token naming this machine.
-const Claim = struct {
-    store: *Store,
-    server_id: i64,
-    scope: Core.execution.Scope,
-    owner_request_id: []const u8,
-    session: []const u8,
-
-    /// Long enough that kill → log → settle never renews in practice, short
-    /// enough that a hard-killed `session rm` does not lock the operator out of
-    /// its own session for long. A claim that outlives its holder is released by
-    /// lapsing, which is the only thing a dead process can do.
-    const ttl_secs: i64 = 120;
-};
-
 /// Takes the scope, after `begin` and before anything is sent.
+///
+/// The `Claim` this returns is `Control.Claim`: ownership is the control
+/// operation's own `request_id`, minted by `execution.begin` before anything is
+/// sent. That is deliberate on both sides — `blockerLocked` exempts a lease
+/// whose owner is the request id it was handed, so this command's own claim can
+/// never refuse it, and a peer reading the row finds the operation that took it
+/// rather than a token naming this machine.
 ///
 /// There is no `--force` here, and the omission is deliberate rather than
 /// pending: a takeover displaces somebody else's claim on a session that is
@@ -642,7 +638,7 @@ fn claimScope(
         .server_id = server_id,
         .scope = contentionScope(session),
         .owner_request_id = owner_request_id,
-        .session = session,
+        .subject = .{ .session = session },
     };
     const outcome = Store.leases.acquire(store, ctx.arena, .{
         .server_id = server_id,
@@ -683,121 +679,6 @@ fn claimScope(
     };
 }
 
-/// Whether this command still holds the scope it took before it reached the
-/// host.
-///
-/// Three answers and not a bool, because the two failures are different facts
-/// and the report says which one it got. `lapsed` is an answer — the row is not
-/// ours, so another session may be acting on this name right now. `unreadable`
-/// is the absence of one: the store could not be asked, so the question stands
-/// open. Neither is `held`, and that is the whole of the rule every destructive
-/// step runs under: **a question we could not ask is not a yes.**
-const Authority = union(enum) {
-    held,
-    /// `leases.renew` matched no row: the lease lapsed, or a peer displaced it.
-    lapsed,
-    /// `leases.renew` could not be performed. Carries `@errorName`, which is
-    /// diagnostic prose and not something a caller may branch on — `code` is.
-    unreadable: []const u8,
-
-    /// The `error_code` a settlement written after the authority was lost
-    /// carries, inside the ordinary `indeterminate` terminal. Not a terminal of
-    /// its own: `op_state` already has the variant for "we cannot establish the
-    /// remote outcome", and the code is what lets a reader tell this cause apart
-    /// from the others on the receipt.
-    const lost_code = "AUTHORITY_LOST";
-
-    fn holds(a: Authority) bool {
-        return switch (a) {
-            .held => true,
-            .lapsed, .unreadable => false,
-        };
-    }
-
-    fn code(a: Authority) []const u8 {
-        return switch (a) {
-            .held => "held",
-            .lapsed => "lapsed",
-            .unreadable => "unreadable",
-        };
-    }
-
-    /// The sentence beside it, or null while the claim is still ours. Prose:
-    /// nothing branches on it, which is what `code` is for.
-    fn note(a: Authority, ctx: *Cli.Ctx, session: []const u8) ?[]const u8 {
-        return switch (a) {
-            .held => null,
-            .lapsed => std.fmt.allocPrint(
-                ctx.arena,
-                "this command's lease on the scope for session '{s}' is no longer held — it lapsed, or another session took it over while the host was being contacted",
-                .{session},
-            ) catch "this command's lease on this session's scope is no longer held",
-            .unreadable => |name| std.fmt.allocPrint(
-                ctx.arena,
-                "this command's lease on the scope for session '{s}' could not be renewed ({s}), so whether the scope is still ours could not be established",
-                .{ session, name },
-            ) catch "this command's lease on this session's scope could not be renewed",
-        };
-    }
-};
-
-/// Wall-clock seconds, as opposed to `ctx.now` — which is the process's start
-/// time and is what every other row this file writes is stamped with.
-///
-/// A lease is the one thing here that is *compared* against a clock rather than
-/// merely stamped with one: `expires_at` decides whether a peer may take the
-/// scope, and `leases.renew` refuses a lease that has already lapsed. Renewing
-/// with `ctx.now` would write back the expiry the acquisition already set, so a
-/// command that outran its TTL would extend nothing while reporting that it had.
-fn wallClockSeconds(io: std.Io) i64 {
-    const ts = std.Io.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
-}
-
-/// Keeps the claim alive across the remote work, and says whether it is still
-/// ours. The answer is the point: a renewal nobody reads is a line on stderr,
-/// not a barrier.
-fn holdClaim(claim: Claim, now: i64) Authority {
-    const still_ours = Store.leases.renew(
-        claim.store,
-        claim.server_id,
-        claim.scope,
-        claim.owner_request_id,
-        Claim.ttl_secs,
-        now,
-    ) catch |err| {
-        std.debug.print(
-            "terminus: could not renew the scope lease for session '{s}': {s}; " ++
-                "this command will not take any step that changes the host or the local record\n",
-            .{ claim.session, @errorName(err) },
-        );
-        return .{ .unreadable = @errorName(err) };
-    };
-    if (still_ours) return .held;
-    std.debug.print(
-        "terminus: this command's lease on the scope for session '{s}' is no longer held — it lapsed or was " ++
-            "taken over while the host was being contacted, so another session may be acting on the same name\n",
-        .{claim.session},
-    );
-    return .lapsed;
-}
-
-/// Renews the claim immediately before the next step, and says whether that step
-/// may go ahead.
-///
-/// One renewal per step, not one per command: a single renewal at the top covers
-/// the moment it ran and nothing after it.
-///
-/// `authority` only ever moves one way. Once a renewal has answered that the
-/// scope is not ours the steps after it are forbidden, so there is nothing left
-/// to renew — and asking again would let a later answer overwrite the first
-/// loss, which is the one the report is built from.
-fn stillOurs(claim: Claim, io: std.Io, authority: *Authority) bool {
-    if (!authority.holds()) return false;
-    authority.* = holdClaim(claim, wallClockSeconds(io));
-    return authority.holds();
-}
-
 // --- Adjacency, held against the source that has to have it -----------------
 //
 // "Renew before the step" is not a property of a function; it is a property of
@@ -809,11 +690,21 @@ fn stillOurs(claim: Claim, io: std.Io, authority: *Authority) bool {
 // deterministic only while the binary is blocked on a socket, and between a
 // renewal and the call it gates there is — by construction, and that is the
 // point — no round trip to block on. So the adjacency is checked where it lives:
-// in the text. `cmd_job.zig` holds the same rule over its own two claim-holding
-// verbs; this is the third destructive verb and it needs its own, because that
-// gate scans `killJob` and `removeJob` and says so.
+// in the text.
+//
+// The scan itself is `Control.renewalsAreAdjacent`, shared with `cmd_job.zig`,
+// because two copies of a line walker and its failure message drift the same
+// way two copies of the barrier would. What stays here is what only this file
+// knows: which of its functions holds a claim, which calls are destructive in
+// it, and how many such sites there are.
 
 /// The calls that change a host, spelled as they are written.
+///
+/// `cmd_job.zig` names a third — `Tmux.removeResult(` — which `removeSession`
+/// does not call. The two lists are deliberately left as each file shipped
+/// them rather than merged into one vocabulary; merging would silently widen
+/// what this gate covers, which is a decision about the rule and not part of
+/// moving it.
 const destructive_remote_calls = [_][]const u8{
     "Tmux.killSession(",
     "Tmux.removeLog(",
@@ -827,61 +718,14 @@ const destructive_remote_call_count = 2;
 /// The one function here that holds a `Claim` while it touches the host.
 const claim_holding_bodies = [_][]const u8{"\nfn removeSession("};
 
-/// A top-level function's text, from its `fn` line to the `}` in column zero
-/// that closes it.
-fn bodyOf(source: []const u8, header: []const u8) error{ FunctionMissing, FunctionUnterminated }![]const u8 {
-    const start = std.mem.indexOf(u8, source, header) orelse return error.FunctionMissing;
-    const rest = source[start + 1 ..];
-    const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.FunctionUnterminated;
-    return rest[0 .. end + 1];
-}
-
 test "gate: `session rm`'s destructive remote calls are renewed on the line above them" {
     const t = std.testing;
-    const source = @embedFile("cmd_session.zig");
-
-    var found: usize = 0;
-    for (claim_holding_bodies) |header| {
-        const body = try bodyOf(source, header);
-        var lines = std.mem.splitScalar(u8, body, '\n');
-        // Every code line seen so far, so the check can look back past the
-        // comments that explain each site — and only past those.
-        var last_code: []const u8 = "";
-        var number: usize = 0;
-        while (lines.next()) |raw| {
-            number += 1;
-            const line = std.mem.trim(u8, raw, " \t\r");
-            const destructive = for (destructive_remote_calls) |call| {
-                if (std.mem.indexOf(u8, line, call) != null) break call;
-            } else null;
-            if (destructive) |call| {
-                found += 1;
-                if (std.mem.indexOf(u8, last_code, "stillOurs(") == null) {
-                    std.debug.print(
-                        \\
-                        \\src/cli/cmd_session.zig: a destructive remote call is not gated on a
-                        \\renewal taken immediately before it.
-                        \\
-                        \\  in:               {s}
-                        \\  line {d} of it:    {s}
-                        \\  the code above it: {s}
-                        \\
-                        \\Every call that changes the host must be preceded — with nothing but
-                        \\comments in between — by a `stillOurs(...)` gate, so that no store
-                        \\transaction, probe or second round trip can sit between the question
-                        \\"is the scope still ours" and the act it authorises. A renewal on the
-                        \\far side of a settlement answers about a moment that has passed, and
-                        \\the peer that took the lease in between now owns the session this
-                        \\`{s}` names.
-                        \\
-                    , .{ header[1..], number, line, last_code, call });
-                    return error.DestructiveCallIsNotAdjacentToItsRenewal;
-                }
-            }
-            if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
-            last_code = line;
-        }
-    }
+    const found = try Control.renewalsAreAdjacent(
+        "src/cli/cmd_session.zig",
+        @embedFile("cmd_session.zig"),
+        &claim_holding_bodies,
+        &destructive_remote_calls,
+    );
     // A scan that matched nothing would have reported nothing. Say how many
     // sites the rule is actually holding.
     try t.expectEqual(@as(usize, destructive_remote_call_count), found);
