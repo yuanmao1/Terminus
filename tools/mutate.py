@@ -312,6 +312,10 @@ def main() -> int:
     ap.add_argument("--id", action="append", help="run only this mutation (repeatable)")
     ap.add_argument("--list", action="store_true", help="print the manifest and exit")
     ap.add_argument("--json", metavar="PATH", help="write results as JSON")
+    ap.add_argument(
+        "--check-anchors", action="store_true",
+        help="verify every `find` still occurs exactly once, and exit; no builds",
+    )
     args = ap.parse_args()
 
     muts = load(args.id)
@@ -320,6 +324,34 @@ def main() -> int:
             print(f"{m.id:<24} {m.file}")
             print(f"{'':<24} rule:  {m.rule}")
             print(f"{'':<24} gate:  {m.expect_gate}")
+        return 0
+
+    if args.check_anchors:
+        # Seconds, no builds, so there is no excuse for skipping it after a
+        # commit that touched an anchored file.
+        #
+        # This exists because a real commit retired a rule's proof without
+        # anyone noticing: `M4-lost-terminal-hoisted`'s anchor occurred once
+        # before `7d2e72a` and zero times after it, and that commit was landed on
+        # a fully green suite. A green suite says the gates pass. It says nothing
+        # about whether the manifest still points at the code those gates guard,
+        # and a mutation whose `find` matches nothing reports NOT_APPLIED — which
+        # only appears if someone runs the ~30-minute full pass.
+        worst = 0
+        for m in muts:
+            n = m.path().read_bytes().decode("utf-8").count(m.find)
+            if n != 1:
+                worst = 1
+                print(f"DRIFTED  {m.id}")
+                print(f"         {m.file}: `find` occurs {n} times, needs exactly 1")
+                print(f"         rule: {m.rule}")
+        if worst:
+            print(
+                f"\nA drifted anchor tests nothing. Re-derive it from current source, "
+                f"then confirm it still goes red: python tools/mutate.py --id <id>"
+            )
+            return 1
+        print(f"{len(muts)} anchor(s) each occur exactly once")
         return 0
 
     zig = find_zig()
