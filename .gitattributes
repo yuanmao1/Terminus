@@ -3,3 +3,15 @@
 # the ones that genuinely are.
 *.zig text eol=lf
 *.zon text eol=lf
+
+# Same reason, for the text `core.autocrlf=true` was still converting. Without
+# these, a file's worktree bytes differ from its committed blob while `git diff`
+# normalises the difference away and reports nothing — so a tool that hashes or
+# byte-compares a file disagrees with version control and cannot be told why.
+# That cost real time twice: `tools/mutate.py` restored source as CRLF and made
+# `cmd_job.zig`'s adjacency gate fail with `FunctionUnterminated` for mutations
+# in unrelated files, and the byte sizes quoted for the evidence artefacts were
+# measured on CRLF worktree copies and so overstated the committed blobs.
+*.json text eol=lf
+*.md text eol=lf
+*.py text eol=lf
