@@ -197,8 +197,8 @@
       "id": "M4-lost-terminal-hoisted",
       "rule": "`job rm`'s lost-lease terminal sits below the exit-code arm, never above it.",
       "file": "src/cli/cmd_job.zig",
-      "find": "    const terminal: Core.Store.op_state.Terminal = if (probe.exit_code) |code|",
-      "replace": "    const terminal: Core.Store.op_state.Terminal = if (!authority.holds())\n        authority.lostTerminal(ctx, job.name, if (execution) |e| e.status else .remote_started)\n    else if (probe.exit_code) |code|",
+      "find": "    else if (probe.exit_code) |code|",
+      "replace": "    else if (!authority.holds())\n        authority.lostTerminal(ctx, job.name, if (execution) |e| e.status else .remote_started)\n    else if (probe.exit_code) |code|",
       "expect_gate": "blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read"
     },
     {
@@ -355,17 +355,17 @@
     },
     {
       "id": "M9-read-error-reaches-the-caller",
-      "rule": "A post-kill `error.ResultUnreadable` is a finding the second look hands back, not an error it swallows into an empty `FinalLook`.",
+      "rule": "A post-kill `error.ResultUnreadable` is told apart from every other probe failure: dropped into the generic arm it would publish `probe_error` and offer a `--from-log` reconcile over a document that will not open.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        if (err == error.ResultUnreadable) return .{ .unreadable = true };\n        std.debug.print(",
-      "replace": "        std.debug.print(",
+      "find": "        if (err == error.ResultUnreadable) return .{ .unreadable = true };\n",
+      "replace": "",
       "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails"
     },
     {
       "id": "M9-read-error-keeps-the-evidence",
       "rule": "`job rm --discard-evidence` deletes neither the pane log nor the result file when the post-kill read of that record failed.",
       "file": "src/cli/cmd_job.zig",
-      "find": "    if (discard and !final.unreadable) {",
+      "find": "    if (discard and !final.blind()) {",
       "replace": "    if (discard) {",
       "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails"
     },
@@ -373,7 +373,7 @@
       "id": "M9-read-error-keeps-the-row",
       "rule": "`job rm` keeps the local row when the post-kill read failed: the row is the last thing pointing at the evidence still on the host.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        if (authority.holds() and !final.unreadable) .{ .forget = .{",
+      "find": "        if (authority.holds() and !final.blind()) .{ .forget = .{",
       "replace": "        if (authority.holds()) .{ .forget = .{",
       "expect_gate": "blackbox: `job rm` keeps the row when the post-kill read of its record fails"
     },
@@ -381,7 +381,7 @@
       "id": "M9-read-error-exits-75",
       "rule": "A `job rm` that kept its row because the post-kill read failed still exits 75, not 1: the outcome is unknown even though nothing was removed.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        if (removed or final.unreadable) Cli.failIndeterminateAfterOutput(",
+      "find": "        if (removed or final.blind()) Cli.failIndeterminateAfterOutput(",
       "replace": "        if (removed) Cli.failIndeterminateAfterOutput(",
       "expect_gate": "blackbox: `job rm` keeps the row when the post-kill read of its record fails"
     },
@@ -399,7 +399,7 @@
       "file": "src/cli/cmd_job.zig",
       "find": "const result_record_read_error = \"read_error\";",
       "replace": "const result_record_read_error = \"absent\";",
-      "expect_gate": "gate: SKILL.md publishes the one resultRecord value that is not a reading"
+      "expect_gate": "gate: SKILL.md publishes the resultRecord values that are not readings"
     },
     {
       "id": "M9-read-error-always",
@@ -408,6 +408,94 @@
       "find": "    unreadable: bool = false,",
       "replace": "    unreadable: bool = true,",
       "expect_gate": "blackbox: `job kill` will not report a cancellation over a record it could not read"
+    },
+    {
+      "id": "M10-probe-error-reaches-the-caller",
+      "rule": "A post-kill probe that never happened is a finding the second look hands back, not an error it prints to stderr and swallows into an empty `FinalLook`.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        return .{ .probe_error = err };",
+      "replace": "        return .{};",
+      "expect_gate": "blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill"
+    },
+    {
+      "id": "M10-probe-error-is-blind",
+      "rule": "A look that never happened counts as no observation of the result record, which is what all three of `job rm`'s destructive steps are gated on.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        return look.unreadable or look.probe_error != null;",
+      "replace": "        return look.unreadable;",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens"
+    },
+    {
+      "id": "M10-probe-error-keeps-the-evidence",
+      "rule": "`job rm --discard-evidence` deletes neither the pane log nor the result file when the look after the kill never happened: the one thing that would make the deletion safe is what it failed to obtain.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    if (discard and !final.blind()) {",
+      "replace": "    if (discard and !final.unreadable) {",
+      "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens"
+    },
+    {
+      "id": "M10-probe-error-keeps-the-row",
+      "rule": "`job rm` keeps the local row when the look after the kill never happened: the row is the last thing pointing at the evidence still on the host.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        if (authority.holds() and !final.blind()) .{ .forget = .{",
+      "replace": "        if (authority.holds() and !final.unreadable) .{ .forget = .{",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens"
+    },
+    {
+      "id": "M10-probe-error-exits-75",
+      "rule": "A `job rm` that kept its row because the look after the kill never happened exits 75, not 1: the outcome is unknown even though nothing was removed, so a blind retry is not available.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        if (removed or final.blind()) Cli.failIndeterminateAfterOutput(",
+      "replace": "        if (removed or final.unreadable) Cli.failIndeterminateAfterOutput(",
+      "expect_gate": "blackbox: `job rm` keeps the row when tmux goes missing after the kill"
+    },
+    {
+      "id": "M10-probe-error-is-its-own-word",
+      "rule": "A look that never happened publishes `probe_error`, never `read_error`: one says a document is at that address and will not open, the other says nothing was read at all, and they send an operator to different places.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    else if (final.probe_error != null)\n        .probe_failed",
+      "replace": "    else if (final.probe_error != null)\n        .read_failed",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens"
+    },
+    {
+      "id": "M10-probe-error-not-the-stale-reading",
+      "rule": "`job rm` publishes the probe failure in both result-record keys, never the pre-kill look's reading — `absent` is the one word that licenses the log sentinel to settle the job by itself.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    const record_keys: RecordKeys = if (final.unreadable)\n        .read_failed\n    else if (final.probe_error != null)\n        .probe_failed\n    else\n        .of(ctx, reading);",
+      "replace": "    const record_keys: RecordKeys = if (final.unreadable)\n        .read_failed\n    else\n        .of(ctx, reading);",
+      "expect_gate": "blackbox: `job rm` keeps the row when tmux goes missing after the kill"
+    },
+    {
+      "id": "M10-probe-error-value-is-published",
+      "rule": "The `resultRecord` word for a look that never happened is its own value, distinct from the read failure's, and `skill/SKILL.md` publishes the word the code actually uses.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "const result_record_probe_error = \"probe_error\";",
+      "replace": "const result_record_probe_error = \"read_error\";",
+      "expect_gate": "gate: SKILL.md publishes the resultRecord values that are not readings"
+    },
+    {
+      "id": "M10-probe-error-sends-you-to-from-log",
+      "rule": "A look that never happened sends the operator to `--from-log`, not `--override`: both durable records are intact, so the reconcile that reads them can succeed once the host answers.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            \"'terminus request reconcile {s} --from-log'\",\n        .{ @errorName(err), id },",
+      "replace": "            \"'terminus request reconcile {s} --override'\",\n        .{ @errorName(err), id },",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens"
+    },
+    {
+      "id": "M10-probe-error-not-on-job-kill",
+      "rule": "`job kill` is unchanged by this rule: it already settles `indeterminate` and exits 75 for a look that never happened, and it publishes the pre-kill reading rather than the second word.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    const record_keys: RecordKeys = if (final.unreadable) .read_failed else .of(ctx, reading);",
+      "replace": "    const record_keys: RecordKeys = if (final.unreadable) .read_failed else if (final.probe_error != null) .probe_failed else .of(ctx, reading);",
+      "expect_gate": "blackbox: `job kill` is unchanged when the look after the kill never happens"
+    },
+    {
+      "id": "M10-probe-error-not-for-a-look-that-happened",
+      "rule": "Discriminating control: a second look that reaches the host and finds nothing is not a look that failed. Called one, every unproven `job rm` would start keeping its row and publishing a fault nobody hit.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    if (probe.exit_code == null) return .{};",
+      "replace": "    if (probe.exit_code == null) return .{ .probe_error = error.RemoteFailed };",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens"
     }
   ]
 }

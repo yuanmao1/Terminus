@@ -289,13 +289,20 @@ connection error.
   Three are ordinary — `not_requested` (we did not look), `absent`, `present`
   (it is there and it is ours) — and four say a document at this attempt's own
   address could not be used: `malformed`, `unknown_schema`,
-  `exit_code_out_of_range`, `foreign`. On `job kill` and `job rm` there is an
-  eighth value, and it is not a reading at all: `read_error` — the look after the
-  kill found a file at that address and the host could not obtain its bytes, so
-  nothing was read and no reading may be assumed. `resultRecordError` is prose
-  beside it, `null` for the three ordinary readings, with one exception: it is a
-  stable value it may branch on: `read_error`. It carries that token on exactly
-  the branch where `resultRecord` says the same word, and nowhere else.
+  `exit_code_out_of_range`, `foreign`. On `job kill` and `job rm` two further
+  values can arrive, and they are not readings at all: `read_error` and
+  `probe_error` — the first says the look after the kill found a file at that
+  address and the host could not obtain its bytes; the second says that look
+  never happened at all, because the round trip failed (a broken channel, a
+  remote failure, a `tmux` that stopped being runnable). Either way nothing was
+  read, so no reading may be assumed — least of all `absent`, the one word that
+  lets the log's sentinel settle the job by itself. `read_error` comes from both
+  verbs; `probe_error` from `job rm` only, because `job kill` already reports
+  that fault as its ordinary unprovable cancellation. `resultRecordError` is
+  prose beside it, `null` for the three ordinary readings, with two exceptions —
+  two stable values it may branch on: `read_error` and `probe_error`. Each
+  arrives on exactly the branch where `resultRecord` says the same word, and
+  nowhere else.
 - `finishedAt` — a **remote** finish time in unix seconds, taken from the result
   file. `null` unless the host reported its own clock (a sentinel-only outcome
   has no timestamp). Never backfilled with local time.
@@ -381,8 +388,15 @@ performed at all counts as a loss, not a yes. Both report `authority`
   `job rm --discard-evidence` alike (`rowRemoved:false`,
   `action:"not_removed"`, `evidenceRetained:true`). A read that failed is not an
   absence, so the log's sentinel is not allowed to settle the job in its place.
-  A second look that fails for some *other* reason — a transport fault, a remote
-  failure — still changes nothing.
+  A second look that could not be taken **at all** — a broken channel, a remote
+  failure, a `tmux` that stopped being runnable between the kill and the look — is
+  the same refusal under the other word: `job rm` and `job rm --discard-evidence`
+  report `probe_error` in both keys, settle `indeterminate`, exit **75** and
+  destroy nothing, and here the next step is `--from-log` rather than
+  `--override`, because both records are still on the host exactly as the job
+  left them. `job kill` is deliberately unchanged by that one: the fault already
+  lands on its ordinary unprovable cancellation, which is `indeterminate` and 75
+  as well.
 - **`job kill` exit codes.** **0** only when it has something proven and every
   step it was asked to take happened. **75** whenever the outcome is unknown:
   the ordinary unprovable cancellation, a lost lease after a kill with no exit
@@ -404,9 +418,11 @@ performed at all counts as a loss, not a yes. Both report `authority`
   outcome provable you get `outcomeProven:true`; with the outcome still unknown
   it removes the job, keeps the log, and returns `ok:true` with a hint to run
   `reconcile <request-id> --from-log`. A `conflict` or an unusable result record
-  removes the row too and exits 75. A result record the post-kill look could not
-  read is the one case where the row is **kept**: `action:"not_removed"`,
-  `rowRemoved:false`, exit 75, and `--override` rather than `--from-log`.
+  removes the row too and exits 75. Two cases **keep** the row: a post-kill look
+  that could not read the result record, and a post-kill look that could not be
+  taken at all. Both report `action:"not_removed"`, `rowRemoved:false` and exit
+  75; the first sends you to `--override` (the document itself will not open), the
+  second to `--from-log` (the documents are intact; the wire was not).
 - `job rm --discard-evidence` additionally deletes the pane log and then the
   result file, each behind its own lease renewal and only once the session is
   proven gone. Unless the outcome was provable, discarding is not a success: it
@@ -414,11 +430,17 @@ performed at all counts as a loss, not a yes. Both report `authority`
   override you now owe. `evidenceRetained` reports what actually happened to the
   **log**, not what the flag asked for — a removal that stopped before the delete
   reports `evidenceRetained:true`. Nothing is deleted at all when the post-kill
-  look could not read the result record: the one thing that would make the
-  deletion safe is what that read failed to obtain.
+  look could not read the result record, or could not be taken at all: the one
+  thing that would make the deletion safe — knowing what that record says — is
+  exactly what both of those failed to obtain.
 - If `tmux` is not runnable on the host, none of these report the session as
-  gone — they fail with "tmux is not installed" instead. Absence of the tool is
-  not evidence about the job, and nothing is deleted on it.
+  gone. Found missing *before* anything has been stopped, the verb fails with
+  "tmux is not installed" and touches nothing. If it goes missing between the kill
+  and the look that has to follow it, that look is where it surfaces: `job kill`
+  settles its ordinary unprovable cancellation, and `job rm` and
+  `job rm --discard-evidence` report `probe_error`, keep the row and exit 75.
+  Absence of the tool is not evidence about the job, and nothing is deleted on it
+  on any of those paths.
 
 **The `--json` key sets are fixed and uniform.** Every branch of each verb emits
 every key of its set — the emitter structs have no defaults, so a missing key is
@@ -446,11 +468,11 @@ local row, so this line and the receipt are the only places the reading survives
 values `job status` never prints: `"unknown"` (the row names no attempt, or names
 a request the ledger does not have) and, on `job rm`, `"unchanged"`.
 `authorityError`, `cacheError` and `hint` are prose — do not match their text.
-`resultRecordError` is prose too, with the single exception named above: the
-token `read_error`, which is stable and always arrives with `resultRecord`
-`read_error`. Presence alone is meaningful only for `cacheError`, where non-null
-is the one signal that the local row was not updated; the others mirror
-`resultRecord` and `authority`, which you can branch on directly.
+`resultRecordError` is prose too, with the exceptions named above: the tokens
+`read_error` and `probe_error`, which are stable and always arrive beside the
+same word in `resultRecord`. Presence alone is meaningful only for `cacheError`,
+where non-null is the one signal that the local row was not updated; the others
+mirror `resultRecord` and `authority`, which you can branch on directly.
 
 ### Waiting on a job and reporting business state
 
