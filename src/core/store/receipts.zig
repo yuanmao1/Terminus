@@ -1618,6 +1618,25 @@ pub const ResolutionEvidence = union(enum) {
 /// perform the act the terminal describes, and does refusing still leave it able
 /// to say what happened to it".
 ///
+/// The three transfer kinds are where that test was applied hardest, and the
+/// result is worth stating up front because a reader will otherwise assume a
+/// mistake: `transfer_push`, `transfer_pull` and `fetch` admit **no business
+/// terminal at all**. `exited`, `remote_deadline` and `remote_cancel_confirmed`
+/// are each refused for them, so `completed` and `timed_out` are unreachable
+/// through `settle`, and `failed` and `cancelled` only before submission. Each
+/// of those three carries a fact about a *process*, and a transfer is judged by
+/// an artifact at a destination it named in advance — a copier that exits 0
+/// having renamed nothing is the case that makes the difference load-bearing.
+/// The second half of the test is satisfied, which is why the refusal is
+/// admissible: `indeterminate` stays open from every in-flight state, and it is
+/// not a dead end here, because `transfers` reads `resolved_status` alongside
+/// `status` (`ownerBlocksScope`, `incumbentBlocksScope`) and `resolve` admits
+/// four readings of a declared destination for exactly these kinds. "We have not
+/// looked yet" then "here is what was at the path" is the whole route, and it is
+/// the honest one. Decided while no producer existed, deliberately, so that
+/// whoever writes one brings a terminal carrying the local effect it observed
+/// rather than inheriting a cell that would take an exit status instead.
+///
 /// Exhaustive in both directions with no `else` anywhere, for the reason
 /// `appliesToKind` has none: a new terminal or a new kind must stop the build
 /// until somebody answers the question for it, rather than inheriting whichever
@@ -1738,32 +1757,74 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             // reachable through the two variants built to carry what a write
             // actually establishes.
             .session_write => false,
-            // Open, and a deliberate blank rather than a decision. Nothing in
-            // this binary creates a transfer operation — `transfers` is
-            // store-side work with no CLI producer — so there is no evidence
-            // chain to answer from, and the honest arguments point both ways: a
-            // transfer's verdict is a digest at a destination it declared in
-            // advance, not an exit code (the argument `appliesToKind` uses to
-            // refuse `supervisor_report` for these kinds), yet the code that
-            // will settle one is the code that will *perform* it, which is not
-            // the same situation as importing a copier's exit status as proof.
+            // Refused, and refused on purpose *before* a producer exists.
             //
-            // What decides it meanwhile is the cost of being wrong in each
-            // direction. `exited` is the only terminal yielding `completed` for
-            // anything that is not a `session_write`, so a refusal here would
-            // not narrow how a transfer may be settled — it would mean a
-            // transfer can never complete, while `transfers`' own state machine
-            // requires the owning operation to settle before a checkpoint can be
-            // adopted or published. That is a wedged subsystem, not a narrowed
-            // one. Left open for the change that writes the producer to answer.
-            .transfer_push, .transfer_pull, .fetch => true,
-            // Open for the same reason with less to say: nothing creates one of
-            // these, nothing settles one, and there is no mechanism to reason
-            // from. A deliberate blank, and specifically *not* the free refusal
-            // it would be in `appliesToKind` — refusing every terminal for a
-            // producerless kind means the first operation of that kind ever
-            // created is unsettleable, holds its scope, and never reaches
-            // `indeterminate` for a reconcile to act on.
+            // A transfer's verdict is a file at a destination it declared in
+            // advance, hashing to the digest it promised. A copier's exit status
+            // is not a reading of that destination and cannot be turned into
+            // one: a copier that wrote to the wrong path, or whose rename never
+            // ran, still exits 0 — the argument `appliesToKind` already uses to
+            // refuse `supervisor_report` for these kinds and `process_probe`
+            // with it. What was left standing until now was the same claim by a
+            // shorter route: `settle` writing `exited` straight onto a transfer,
+            // reaching `completed` past every digest comparison the resolve side
+            // is built to require.
+            //
+            // The objection this overrides, recorded because it is sound as far
+            // as it goes and a future author will re-derive it: `exited` is the
+            // only terminal yielding `completed` for anything that is not a
+            // `session_write`, so refusing here does not narrow how a transfer
+            // may be settled — it removes `completed` from the kind outright,
+            // and `timed_out` and post-submission `cancelled` go with it in the
+            // two arms below. What makes that acceptable rather than a wedge is
+            // that **nothing in this binary creates a transfer operation** —
+            // `transfers` is store-side work, no CLI path constructs one, and
+            // `.fetch` has no HTTP producer either — so there is no flow to
+            // wedge, and holding the cells open until a producer arrives means
+            // the producer inherits a loose contract instead of bringing
+            // evidence. Deciding now costs a hypothetical; deciding later costs
+            // an argument with working code on the other side.
+            //
+            // Nor is the subsystem left without a route to a final answer, which
+            // is the thing the objection was really about. `transfers` does not
+            // require `status` to be a business outcome — `ownerBlocksScope` and
+            // `incumbentBlocksScope` read `status` *and* `resolved_status`, so an
+            // owner that settles `indeterminate` and is then resolved stops
+            // blocking. And `resolve` admits, for exactly these three kinds and
+            // no others, the four readings of a declared destination:
+            // `filesystem_effect` for the digest it promised,
+            // `destination_present_contradicting` for one that disagrees,
+            // `destination_present_unverified` when it declared no digest, and
+            // `destination_absent` at the path it committed to. That is the
+            // artifact evidence this cell is refusing a substitute for, and it
+            // is already built.
+            //
+            // What is genuinely gone until somebody writes it: a transfer cannot
+            // reach `completed` or `timed_out` through `settle` at all, and can
+            // reach `failed` or `cancelled` only before submission, through
+            // `never_submitted` and `local_abandon`. Post-submission the only
+            // terminal a transfer may take is `indeterminate` — which is not a
+            // gap to be filled with one of these three, but the honest reading
+            // of a host we have not looked at yet, and the state a reconcile
+            // acts on. **A producer that wants `completed` back must bring a
+            // terminal whose content is the local effect it observed** — the
+            // destination it wrote, and the digest it read back off that
+            // destination after the rename — not an exit status from the process
+            // that was supposed to produce one. That is a new `op_state.Terminal`
+            // variant and therefore not this change's to make.
+            .transfer_push, .transfer_pull, .fetch => false,
+            // Still open, and the contrast with the arm above is the whole of
+            // the reason. A transfer is refused on a positive argument: its
+            // verdict is a named artifact, and the evidence type that reads one
+            // already exists. Nothing is known about what a `tunnel`,
+            // `plan_phase`, `audit` or `cleanup` is judged by — no producer, no
+            // mechanism, no declared effect — so refusing here would not be a
+            // narrowing, it would be a guess in the opposite direction, and
+            // specifically *not* the free refusal it would be in `appliesToKind`:
+            // refusing every terminal for a producerless kind means the first
+            // operation of that kind ever created is unsettleable, holds its
+            // scope, and never reaches `indeterminate` for a reconcile to act on.
+            // A deliberate blank, to be decided by whichever change builds one.
             .tunnel, .plan_phase, .audit, .cleanup => true,
         },
         // A deadline the *remote* enforced and reported.
@@ -1786,10 +1847,21 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             // kind's vocabulary entirely, and it removes one the kind could
             // never have reached honestly.
             .session_write => false,
-            // Deliberate blanks, as for `exited`: no producer, and refusing
-            // would delete `timed_out` outright from kinds whose remote work has
-            // not been written yet.
-            .transfer_push, .transfer_pull, .fetch => true,
+            // Refused, with the `exited` arm above. A deadline enforced and
+            // reported by the far side is a statement about a *process* the far
+            // side was supervising, and nothing supervises a transfer: there is
+            // no `supervisor.Requirement.remote_deadline` on a copier because
+            // there is no copier. A local deadline expiring while a destination
+            // has not been read is `indeterminate` (`op_state` rule 2), which
+            // stays admissible, and a transfer that really did run out of time
+            // still has to be settled by looking at the path it declared — the
+            // partial is there or it is not, and `timed_out` says neither.
+            //
+            // This removes `timed_out` from the three kinds outright. Accepted
+            // for the reason above: no producer, so nothing loses a route it was
+            // using, and a producer that wants the status back has to bring a
+            // terminal that carries what it observed at the destination.
+            .transfer_push, .transfer_pull, .fetch => false,
             .tunnel, .plan_phase, .audit, .cleanup => true,
         },
         // A remote process was signalled and its absence verified.
@@ -1822,11 +1894,30 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             // before submission is the only window in which a write has anything
             // to abandon.
             .session_write => false,
-            // Deliberate blanks. Not empty ones: `gates_test`'s own fixture
-            // records that this is the state a killed transfer is really left
-            // in, so the first producer has somewhere to start. Refusing would
-            // delete post-submission `cancelled` from these kinds meanwhile.
-            .transfer_push, .transfer_pull, .fetch => true,
+            // Refused, with the two arms above, and the reasoning is one step
+            // sharper here because a confirmed cancellation is a *true* fact
+            // that still settles nothing about the artifact. "The copier is no
+            // longer running, and its absence was verified" is equally true of a
+            // transfer that finished and one that died mid-rename — the exact
+            // sentence `appliesToKind` refuses `process_probe` for these kinds
+            // over, one axis across. Admitting it would release the scope
+            // barrier on the second while its checkpoint went on holding the
+            // destination path against everybody else, and the receipt would say
+            // `cancelled` about an operation whose bytes may all be there.
+            //
+            // The old comment claimed this was "the state a killed transfer is
+            // really left in", crediting a `gates_test` fixture. The fixture says
+            // the opposite where it is specific: a hard-killed transfer settles
+            // `indeterminate`, and the price of that is `terminus request
+            // reconcile <id>` with a reading of the destination attached. That is
+            // the route, and it is the route because a kill is an observation
+            // about a process, not a verdict on a file.
+            //
+            // Post-submission `cancelled` is therefore gone for these three
+            // kinds; before submission it is still reachable through
+            // `local_abandon`, which claims nothing about a destination because
+            // nothing had been sent to one.
+            .transfer_push, .transfer_pull, .fetch => false,
             .tunnel, .plan_phase, .audit, .cleanup => true,
         },
         // A live terminal's answer about bytes it was offered, positive or
@@ -1850,8 +1941,12 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             // A transfer's completion is a file at a destination it declared,
             // with the digest it promised. "A terminal took some bytes" is not a
             // reading of a destination and cannot be turned into one. A refusal
-            // rather than a blank, because the act is simply not theirs, and it
-            // deletes nothing: `exited` stays open above.
+            // because the act is simply not theirs — and now the fourth refusal
+            // in this column rather than the only one: `exited`,
+            // `remote_deadline` and `remote_cancel_confirmed` are refused above
+            // on the same principle, so the row is consistent instead of
+            // refusing the one process-shaped claim a transfer would never have
+            // been offered while admitting the three it would.
             .transfer_push, .transfer_pull, .fetch => false,
             // Refused rather than left blank for the same reason, and the
             // refusal is free: whatever these turn out to do, none of them is

@@ -3119,9 +3119,13 @@ fn sampleTerminal(tag: TerminalTag) op_state.Terminal {
 /// `op_state.Terminal` variant is a compile error in both places until somebody
 /// writes down what may settle what.
 ///
-/// The rows are identical for eight of the ten kinds, and that is the finding
-/// rather than a shortcut: until `session_write` existed, every terminal
-/// described every kind and the table said nothing at all. Written out per row
+/// The table has three distinct rows, and the count is the history: while `exec`
+/// and `job` were the only kinds, every terminal described every kind and this
+/// said nothing at all. `session_write` made it non-vacuous — bytes typed into
+/// somebody else's shell are judged by the terminal's answer, not by an exit
+/// status — and the transfer kinds made it restrictive, by refusing every
+/// process-shaped terminal for work whose verdict is a file at a declared
+/// destination. The remaining six kinds share the third row. Written out per row
 /// anyway, because a row that agrees with its neighbour by coincidence and a row
 /// that agrees with it by omission look the same once they are collapsed.
 fn pinnedTerminalCell(kind: Store.operations.Kind, tag: TerminalTag) bool {
@@ -3174,29 +3178,45 @@ fn pinnedTerminalCell(kind: Store.operations.Kind, tag: TerminalTag) bool {
             => true,
             .exited, .remote_deadline, .remote_cancel_confirmed => false,
         },
-        // No producer creates one of these yet, so their process-shaped
-        // terminals are deliberate blanks rather than decisions — refusing them
-        // would delete `completed`, `timed_out` and post-submission `cancelled`
-        // from a kind whose subsystem is built and whose checkpoints require
-        // their owner to settle. `input_accepted` is a decision: a transfer's
-        // verdict is a file at a declared destination, and "a terminal took some
-        // bytes" is not a reading of one.
+        // The row with no business terminal at all, and the one that stops this
+        // table being "everything except a write". A transfer is judged by an
+        // artifact at a destination it named before it sent a byte. Each of the
+        // three process-shaped terminals carries a fact about a *process*
+        // instead: an exit status (a copier that renamed nothing still exits 0),
+        // a deadline the far side enforced (nothing supervises a copier), or a
+        // verified absence (equally true of one that finished and one that died
+        // mid-rename). None of them may settle what happened to the file, so
+        // `completed` and `timed_out` are unreachable for these kinds and
+        // `failed`/`cancelled` reachable only before submission.
+        //
+        // What keeps that from being a wedge is the resolve side, not this one:
+        // `indeterminate` stays admissible from every in-flight state,
+        // `transfers` reads `resolved_status` beside `status`, and
+        // `appliesToKind` admits four readings of a declared destination for
+        // exactly these three kinds. `input_accepted` is refused on the same
+        // principle as the other three — "a terminal took some bytes" is not a
+        // reading of a destination either.
         .transfer_push, .transfer_pull, .fetch => switch (tag) {
-            .exited,
             .never_submitted,
-            .remote_deadline,
             .local_abandon,
-            .remote_cancel_confirmed,
             .indeterminate,
             => true,
-            .input_accepted, .input_refused => false,
+            .exited,
+            .remote_deadline,
+            .remote_cancel_confirmed,
+            .input_accepted,
+            .input_refused,
+            => false,
         },
-        // Nothing creates these at all. Same split and for the same reason: the
-        // blanks stay open because a total refusal on this side has no escape
-        // hatch — there is no operator variant in `op_state.Terminal` — so the
-        // first operation of such a kind would be unsettleable and would hold
-        // its scope with no route to `indeterminate` for a reconcile to act on.
-        // Typing into somebody else's shell is still not what any of them does.
+        // Nothing creates these at all, and unlike a transfer nothing is known
+        // about what one would be judged by — no declared effect, no evidence
+        // type of their own, so a refusal would be a guess rather than a
+        // narrowing. The blanks stay open, and a total refusal on this side has
+        // no escape hatch: there is no operator variant in `op_state.Terminal`,
+        // so the first operation of such a kind would be unsettleable and would
+        // hold its scope with no route to `indeterminate` for a reconcile to act
+        // on. Typing into somebody else's shell is still not what any of them
+        // does.
         .tunnel, .plan_phase, .audit, .cleanup => switch (tag) {
             .exited,
             .never_submitted,
@@ -3246,6 +3266,12 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         // last resort for a process that returned without deciding — calls it
         // for every operation there is. A cell refused here would turn "the
         // process exited without recording an outcome" into a lost receipt.
+        //
+        // `indeterminate` is load-bearing twice over since the transfer kinds
+        // lost their business terminals: it is the *only* terminal a transfer
+        // may take after submission, so refusing this cell for one of them would
+        // leave it unsettleable, holding its scope forever, and never reaching
+        // the state a reconcile acts on.
         try t.expect(Store.receipts.terminalDescribesKind(sampleTerminal(.never_submitted), kind));
         try t.expect(Store.receipts.terminalDescribesKind(sampleTerminal(.local_abandon), kind));
         try t.expect(Store.receipts.terminalDescribesKind(sampleTerminal(.indeterminate), kind));
@@ -3255,26 +3281,64 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         const is_write = kind == .session_write;
         try t.expectEqual(is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.input_accepted), kind));
         try t.expectEqual(is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.input_refused), kind));
-        // And its complement: an exit status is what every *other* kind is
-        // judged by, and the one it is not judged by is the one that runs no
-        // command. These two lines are the whole of what the `session_write`
-        // commit made non-vacuous.
-        try t.expectEqual(!is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.exited), kind));
-        try t.expectEqual(!is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.remote_deadline), kind));
+
+        // And the complement, which is no longer "everything else". All three
+        // of the terminals below carry a fact about a remote *process* — an exit
+        // status, a deadline that process was held to, the verified absence of
+        // that process — so a kind may admit them only if a process is what it
+        // is judged by. Two kinds are not:
+        //
+        //  * a `session_write` runs no command at all; its verdict is the
+        //    terminal's answer about the bytes, carried by the pair above;
+        //  * a transfer's verdict is an artifact at a destination it declared
+        //    before it sent anything. A copier that wrote to the wrong path or
+        //    whose rename never ran still exits 0, still can be held to a
+        //    deadline, and still can be killed and verified gone — every one of
+        //    those facts is true of a transfer that failed and one that
+        //    succeeded alike, so none of them may settle it.
+        //
+        // Transcribed here as a property of the kind, deliberately without
+        // asking the store, so that widening a cell in `receipts.zig` has to be
+        // argued for twice. Exhaustive, so a new kind stops the build here too.
+        const judged_by_a_remote_process = switch (kind) {
+            .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .session_write, .transfer_push, .transfer_pull, .fetch => false,
+        };
         try t.expectEqual(
-            !is_write,
+            judged_by_a_remote_process,
+            Store.receipts.terminalDescribesKind(sampleTerminal(.exited), kind),
+        );
+        try t.expectEqual(
+            judged_by_a_remote_process,
+            Store.receipts.terminalDescribesKind(sampleTerminal(.remote_deadline), kind),
+        );
+        try t.expectEqual(
+            judged_by_a_remote_process,
             Store.receipts.terminalDescribesKind(sampleTerminal(.remote_cancel_confirmed), kind),
         );
     }
 
-    // No kind is wedged: for every one of them there is at least one admissible
-    // terminal producing each status it can honestly reach. Stated as a walk
-    // over the statuses rather than as a list of variants, because that is the
-    // thing a refusal actually costs — `exited` is the only route to `completed`
-    // for anything but a write, `remote_deadline` the only route to `timed_out`,
-    // and `remote_cancel_confirmed` the only post-submission route to
-    // `cancelled`, so refusing one of those cells does not narrow how a kind may
-    // be settled, it deletes the outcome.
+    // What each kind can and cannot reach, walked over the statuses rather than
+    // the variants, because a status is the thing a refused cell actually costs:
+    // `exited` is the only route to `completed` for anything but a write,
+    // `remote_deadline` the only route to `timed_out`, and
+    // `remote_cancel_confirmed` the only post-submission route to `cancelled`.
+    //
+    // Three statuses are universal and that is what "no kind is wedged" now
+    // means: every kind can record that it failed before submitting
+    // (`never_submitted`), that it was abandoned before submitting
+    // (`local_abandon`), and — the one that matters after submission — that we
+    // do not know (`indeterminate`). A kind that could reach none of them would
+    // hold its scope with no route out at all.
+    //
+    // `completed` and `timed_out` are *not* universal, and the exceptions are
+    // decisions rather than gaps. This is where the transfer refusal is stated
+    // as a consequence instead of as a cell: until a producer exists that brings
+    // a terminal carrying what it read back off the destination, a transfer
+    // cannot be settled `completed` by anything, and it does not need to be —
+    // `indeterminate` plus a reading of the declared destination through
+    // `resolve` is the route, and `transfers` reads `resolved_status` beside
+    // `status`.
     for (std.enums.values(Store.operations.Kind)) |kind| {
         var reachable = std.EnumSet(op_state.Status).initEmpty();
         inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
@@ -3282,16 +3346,25 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
             const terminal = sampleTerminal(tag);
             if (Store.receipts.terminalDescribesKind(terminal, kind)) reachable.insert(terminal.status());
         }
-        try t.expect(reachable.contains(.completed));
         try t.expect(reachable.contains(.failed));
         try t.expect(reachable.contains(.cancelled));
         try t.expect(reachable.contains(.indeterminate));
-        // The single exception, and it is a status the kind could never have
-        // reached honestly: a write is answered by the terminal it typed into,
-        // and nothing out there enforces a deadline over `send-keys`. A local
-        // deadline expiring is not a timeout (`op_state` rule 2); it is
-        // `indeterminate`, which is admitted above.
-        try t.expectEqual(kind != .session_write, reachable.contains(.timed_out));
+
+        const is_transfer = switch (kind) {
+            .transfer_push, .transfer_pull, .fetch => true,
+            .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => false,
+        };
+        // A transfer's completion is a file, and no terminal reads one yet.
+        try t.expectEqual(!is_transfer, reachable.contains(.completed));
+        // `timed_out` needs a deadline something else enforced and reported. A
+        // write has no far side to enforce one and a transfer has no supervisor;
+        // for both, a local deadline expiring is `indeterminate` (`op_state`
+        // rule 2), which is admitted above.
+        const judged_by_a_remote_process = switch (kind) {
+            .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .session_write, .transfer_push, .transfer_pull, .fetch => false,
+        };
+        try t.expectEqual(judged_by_a_remote_process, reachable.contains(.timed_out));
     }
 }
 
@@ -6797,6 +6870,52 @@ fn beginRecovery(store: *Store, arena: std.mem.Allocator, io: std.Io, now: i64) 
     };
 }
 
+/// Takes a transfer attempt out of the way of its scope, by the only route a
+/// transfer has.
+///
+/// The gates that call this are about what may happen *once* the incumbent has
+/// stopped blocking; how it stopped is fixture. They used to get there with
+/// `.exited{1}` — a copier's exit status settling the transfer `failed` — and
+/// `terminalDescribesKind` now refuses exactly that for every transfer kind,
+/// along with `remote_deadline` and `remote_cancel_confirmed`. All three carry a
+/// fact about a *process*, and a transfer is judged by the artifact at the
+/// destination it declared before it sent anything: a copier that wrote to the
+/// wrong path, or whose rename never ran, still exits 0. Even the attempt that
+/// knows perfectly well it ran out of disk has no terminal for saying so —
+/// what it knows is about itself, not about what is now at the destination.
+///
+/// So an attempt interrupted after submission has exactly one terminal left to
+/// it, `indeterminate` — which blocks scope by design, and the price of the rule
+/// is the reconcile below. `transfers` reads `resolved_status` beside `status`
+/// (`ownerBlocksScope`, `incumbentBlocksScope`), so it is the resolution that
+/// lifts the barrier, not the settlement.
+///
+/// The evidence is an override rather than a reading of the destination because
+/// these checkpoints are not parked in `indeterminate_publish` at this point —
+/// against a row in any other state a destination reading is refused with
+/// `publish_not_in_question`, which is its own gate above. An operator who went
+/// and looked is exactly who writes this one.
+fn reconcileDeadTransfer(
+    store: *Store,
+    arena: std.mem.Allocator,
+    request_id: []const u8,
+    last_observed: op_state.Status,
+    reason: []const u8,
+    now: i64,
+) !void {
+    _ = try Store.receipts.settle(
+        store,
+        request_id,
+        op_state.terminalForTransportLoss(last_observed, reason),
+        .{},
+        now,
+    );
+    const outcome = try Store.receipts.resolve(store, arena, request_id, .failed, .{
+        .operator_override = .{ .reason = "checked by hand", .by = "gate" },
+    }, now);
+    if (outcome != .resolved) return error.ReconcileRefusedTheFixture;
+}
+
 test "gate: a checkpoint abandoned mid-verify is recovered to paused, and resumes" {
     const t = std.testing;
     var scratch = try Scratch.init(t.allocator, "gate_recover_verifying");
@@ -6844,9 +6963,11 @@ test "gate: a checkpoint abandoned mid-verify is recovered to paused, and resume
     try t.expectEqual(@as(usize, 0), try countKind(&store, arena, heir.id(), "checkpoint"));
 
     // Establishing what the dead attempt did is the price, and it is the one an
-    // operator already pays for a resume: `request reconcile --from-log` finds
-    // the exit status the job left behind.
-    _ = try Store.receipts.settle(&store, request_id, .{ .exited = .{ .exit_code = 1 } }, .{}, 210);
+    // operator already pays for a resume. For a transfer that price is a
+    // reconcile, not a scavenged exit status: `settle` refuses every
+    // process-shaped terminal here, so the attempt goes `indeterminate` and
+    // somebody has to say what became of the work.
+    try reconcileDeadTransfer(&store, arena, request_id, .remote_started, "the attempt died without reporting", 210);
 
     const became = try heir.recoverCheckpoint(id, request_id);
     try t.expectEqual(Store.transfers.State.paused, became);
@@ -6909,7 +7030,7 @@ test "gate: a digest taken over bytes a resume may discard does not survive the 
     );
     try Store.transfers.recordVerifiedHash(&store, id, request_id, "abc123", 113);
     try t.expectEqualStrings("abc123", (try Store.transfers.get(&store, arena, id)).?.verified_sha256.?);
-    _ = try Store.receipts.settle(&store, request_id, .{ .exited = .{ .exit_code = 1 } }, .{}, 210);
+    try reconcileDeadTransfer(&store, arena, request_id, .remote_started, "the attempt died without reporting", 210);
 
     var heir = try beginRecovery(&store, arena, scratch.io, 200);
     defer heir.deinit();
@@ -6993,7 +7114,9 @@ test "gate: an operation that may still be running cannot have its destination t
 
     // Settling the operation is the price, and it is the same one every other
     // route out of a crashed attempt charges: establish what it did, then act.
-    _ = try Store.receipts.settle(&store, request_id, .{ .exited = .{ .exit_code = 1 } }, .{}, 140);
+    // For a transfer that means `indeterminate` and a reconcile — an exit status
+    // is not a reading of the destination this row is still holding.
+    try reconcileDeadTransfer(&store, arena, request_id, .remote_started, "the attempt died without reporting", 140);
     try locked(&store, Store.transfers.supersedeLocked, .{ &store, id, heir_id, 150 });
     try t.expectEqual(
         Store.transfers.State.superseded,
@@ -7148,7 +7271,7 @@ test "gate: deleting a server does not strand a transfer that still needs a hand
         "/srv/app/sr.bin.part",
         .verifying,
     );
-    _ = try Store.receipts.settle(&store, request_id, .{ .exited = .{ .exit_code = 1 } }, .{}, 210);
+    try reconcileDeadTransfer(&store, arena, request_id, .remote_started, "the attempt died without reporting", 210);
 
     var heir = try beginRecovery(&store, arena, scratch.io, 200);
     defer heir.deinit();
@@ -7172,11 +7295,18 @@ test "gate: deleting a server does not strand a transfer that still needs a hand
     // The way out is the ordinary one — finish the transfer, or fail it and let
     // something supersede it — and then the delete goes through. Nothing here is
     // a `--force`: the two losses are not the same kind.
+    //
+    // "Fail it" is two acts rather than one, and that is the transfer contract
+    // rather than an accident of this fixture. The *row* records what the copier
+    // hit (`failed_no_space`); the *operation* cannot borrow that as its own
+    // verdict, because a full disk is a fact about this end and the question is
+    // what is now at the destination. So the attempt settles `indeterminate` and
+    // a reconcile says the rest.
     try Store.transfers.setState(&store, id, heir.id(), .probing, null, 300);
     try Store.transfers.setState(&store, id, heir.id(), .failed_no_space, "the disk filled", 301);
     try Store.operations.advance(&store, heir.id(), .connecting, 302);
     try Store.operations.advance(&store, heir.id(), .submitted, 303);
-    _ = try Store.receipts.settle(&store, heir.id(), .{ .exited = .{ .exit_code = 1 } }, .{}, 304);
+    try reconcileDeadTransfer(&store, arena, heir.id(), .submitted, "the disk filled and the copier stopped", 304);
 
     const closer = testId("srvclose");
     const closer_id: []const u8 = &closer;
@@ -7553,7 +7683,7 @@ test "gate: a checkpoint abandoned mid-publish is recovered to indeterminate_pub
         "/srv/app/mp.bin.part",
         .publishing,
     );
-    _ = try Store.receipts.settle(&store, request_id, .{ .exited = .{ .exit_code = 1 } }, .{}, 210);
+    try reconcileDeadTransfer(&store, arena, request_id, .remote_started, "the attempt died without reporting", 210);
 
     var heir = try beginRecovery(&store, arena, scratch.io, 200);
     defer heir.deinit();
@@ -7651,7 +7781,7 @@ test "gate: a recovery that fails halfway leaves the row and both trails alone" 
         "/srv/app/hw.bin.part",
         .publishing,
     );
-    _ = try Store.receipts.settle(&store, request_id, .{ .exited = .{ .exit_code = 1 } }, .{}, 210);
+    try reconcileDeadTransfer(&store, arena, request_id, .remote_started, "the attempt died without reporting", 210);
 
     var heir = try beginRecovery(&store, arena, scratch.io, 200);
     defer heir.deinit();
@@ -8635,32 +8765,50 @@ test "gate: a hand-over does not move a transfer to another machine" {
     );
 }
 
-/// Settles `request_id` into `want`, with evidence that legitimately produces
-/// it.
+/// Settles a *transfer* `request_id` into `want`, by a route a transfer really
+/// has.
 ///
-/// All five terminals are reachable from `submitted`, which is also the state a
-/// killed transfer is really left in, so one route serves them all. Exhaustive
-/// over `Status`: a new terminal has to be given a route here rather than
-/// quietly dropping out of the loop below and leaving its arm unproven.
+/// Two of the five terminal statuses have no such route, and saying so out loud
+/// is the point of this fixture rather than an inconvenience of it.
+/// `terminalDescribesKind` refuses `exited`, `remote_deadline` and
+/// `remote_cancel_confirmed` for every transfer kind — each carries a fact about
+/// a process, and a transfer is judged by an artifact at a destination it
+/// declared — so `completed` and `timed_out` cannot be settled at all until a
+/// producer brings a terminal that carries what it read back off that
+/// destination. They are returned as a named error instead of being approximated
+/// with the nearest terminal that would compile, so a caller decides what to do
+/// about a status its subject cannot reach rather than silently proving
+/// something about a different one.
+///
+/// The three that remain each take their own route, from the state that route is
+/// credible in (`op_state.canSettle`):
+///
+///  * `failed` — `never_submitted` from `connecting`: the transport proved the
+///    first byte never left, which is the one failure a transfer can establish
+///    without looking at a destination;
+///  * `cancelled` — `local_abandon` from `connecting`: given up on before
+///    anything was handed over, so there is nothing at the far end to have
+///    claimed anything about;
+///  * `indeterminate` — from `submitted`, and this is the state a killed
+///    transfer is really left in.
+///
+/// Exhaustive over `Status`: a new terminal status has to be given a route here,
+/// or refused here, rather than dropping out of the walk below unproven.
 fn settleInto(store: *Store, request_id: []const u8, comptime want: op_state.Status, now: i64) !void {
-    try Store.operations.advance(store, request_id, .connecting, now);
-    try Store.operations.advance(store, request_id, .submitted, now);
+    // Chosen before anything is advanced, so a refused status leaves the row
+    // exactly where its caller left it.
     const terminal: op_state.Terminal = switch (want) {
-        .completed => .{ .exited = .{ .exit_code = 0 } },
-        .failed => .{ .exited = .{ .exit_code = 1 } },
-        .timed_out => .{ .remote_deadline = .{ .after_ms = 5 } },
-        .cancelled => .{ .remote_cancel_confirmed = .{
-            .term_sent = true,
-            .kill_sent = false,
-            .absence_verified_at = now,
-            .verification_method = "kill -0 => ESRCH",
-        } },
+        .completed, .timed_out => return error.TransferHasNoRouteToThisStatus,
+        .failed => .{ .never_submitted = .{ .transport_error = "connection refused" } },
+        .cancelled => .{ .local_abandon = .{ .reason = "the operator gave up before dialing" } },
         .indeterminate => .{ .indeterminate = .{
             .reason = "the connection dropped",
             .last_observed = .submitted,
         } },
         else => @compileError("not a terminal status: " ++ @tagName(want)),
     };
+    try Store.operations.advance(store, request_id, .connecting, now);
+    if (want == .indeterminate) try Store.operations.advance(store, request_id, .submitted, now);
     _ = try Store.receipts.settle(store, request_id, terminal, .{}, now);
 }
 
@@ -8668,7 +8816,8 @@ fn settleInto(store: *Store, request_id: []const u8, comptime want: op_state.Sta
 ///
 /// Exhaustive over `Status` — through `settleInto` for the terminals — so a new
 /// status has to be given a route rather than dropping silently out of the walk
-/// below and leaving its cell unproven.
+/// below and leaving its cell unproven. Two of them come back refused rather
+/// than driven; `settleInto` says which and why.
 fn driveTo(store: *Store, request_id: []const u8, comptime want: op_state.Status, now: i64) !void {
     switch (want) {
         .created => {},
@@ -8715,6 +8864,28 @@ test "gate: a checkpoint is taken only from an attempt that cannot still be runn
             "/srv/app/" ++ @tagName(status) ++ ".bin",
             "/srv/app/" ++ @tagName(status) ++ ".bin.part",
         );
+
+        // Two statuses a transfer cannot be driven to at all, since
+        // `terminalDescribesKind` stopped letting a process's fate settle an
+        // artifact's: every terminal producing `completed` or `timed_out`
+        // carries a fact about a process, and all three are refused for a
+        // transfer kind. Asserted rather than skipped — the fixture has to
+        // refuse *these two and only these two*, so a later change that hands a
+        // transfer a route to one of them fails here instead of quietly
+        // widening the walk.
+        //
+        // The walk still exercises both answers `blocksScope` can give: both of
+        // the unreachable pair are non-blocking, and `failed` and `cancelled`
+        // below reach that side of the predicate through `never_submitted` and
+        // `local_abandon`.
+        if (comptime status == .completed or status == .timed_out) {
+            try t.expectError(
+                error.TransferHasNoRouteToThisStatus,
+                driveTo(&store, owner_id, status, 140),
+            );
+            try t.expect(!status.blocksScope());
+            continue;
+        }
         try driveTo(&store, owner_id, status, 140);
 
         const taker = testId("tak" ++ @tagName(status));
