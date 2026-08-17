@@ -1,37 +1,33 @@
 {
   "provenance_before": {
-    "head": "a1a86e395d167bfecc17a1e79d93010e401e44ef",
-    "head_subject": "a clean run must not accuse itself, and a porcelain path must not lose a character",
+    "head": "60f177908e2617b55e9acfc0ff2fa5ad62dd5b27",
+    "head_subject": "the arm order that was chosen is now the arm order that is proved",
     "tracked_clean": true,
     "tracked_dirty_paths": [],
-    "untracked_paths": [
-      "docs/evidence/mutation-run.json"
-    ],
-    "manifest_sha256": "99abbaae7305c5a6268b59f23692fcd006e042da408f7500d3d5edf1b8e9528d",
-    "manifest_entries": 39
+    "untracked_paths": [],
+    "manifest_sha256": "29f3d5484ca5cd6559ee99e690d519aaa7937786880c57ef3079c0d3a8b58a4d",
+    "manifest_entries": 58
   },
   "provenance_after": {
-    "head": "a1a86e395d167bfecc17a1e79d93010e401e44ef",
-    "head_subject": "a clean run must not accuse itself, and a porcelain path must not lose a character",
+    "head": "60f177908e2617b55e9acfc0ff2fa5ad62dd5b27",
+    "head_subject": "the arm order that was chosen is now the arm order that is proved",
     "tracked_clean": true,
     "tracked_dirty_paths": [],
-    "untracked_paths": [
-      "docs/evidence/mutation-run.json"
-    ],
-    "manifest_sha256": "99abbaae7305c5a6268b59f23692fcd006e042da408f7500d3d5edf1b8e9528d",
-    "manifest_entries": 39
+    "untracked_paths": [],
+    "manifest_sha256": "29f3d5484ca5cd6559ee99e690d519aaa7937786880c57ef3079c0d3a8b58a4d",
+    "manifest_entries": 58
   },
   "zig": "C:/Program Files (x86)/zig/zig.exe",
   "zig_version": "0.16.0",
   "baseline_green": true,
-  "baseline_seconds": 43.6,
+  "baseline_seconds": 31.0,
   "requested_ids": null,
   "totals": {
-    "entries": 39,
-    "killed": 39,
+    "entries": 58,
+    "killed": 58,
     "not_killed": 0,
     "by_outcome": {
-      "KILLED": 39
+      "KILLED": 58
     }
   },
   "results": [
@@ -45,7 +41,7 @@
         "core.execution_test.test.M4 gate: a delivered write is a delivery, not an outcome",
         "core.store.gates_test.test.gate: the ledger records the time we looked, never a finish time we were not told"
       ],
-      "seconds": 44.50854277610779,
+      "seconds": 42.47909903526306,
       "detail": "",
       "build_output": ""
     },
@@ -58,7 +54,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: a job's exit status cannot settle a transfer"
       ],
-      "seconds": 53.49933218955994,
+      "seconds": 37.8527626991272,
       "detail": "",
       "build_output": ""
     },
@@ -71,7 +67,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: a job's exit status cannot settle a transfer"
       ],
-      "seconds": 44.459333658218384,
+      "seconds": 38.77133274078369,
       "detail": "",
       "build_output": ""
     },
@@ -84,7 +80,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: the digest a transfer will be judged by is declared once, before it sends"
       ],
-      "seconds": 47.10889768600464,
+      "seconds": 43.338077545166016,
       "detail": "",
       "build_output": ""
     },
@@ -97,7 +93,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: the digest a transfer will be judged by is declared once, before it sends"
       ],
-      "seconds": 49.91648030281067,
+      "seconds": 41.96790075302124,
       "detail": "",
       "build_output": ""
     },
@@ -112,7 +108,7 @@
         "core.store.gates_test.test.gate: a checkpoint write that lands on no row is an error, not a success",
         "core.store.gates_test.test.gate: a displaced owner cannot keep writing to a checkpoint it lost"
       ],
-      "seconds": 52.44014549255371,
+      "seconds": 43.327040910720825,
       "detail": "",
       "build_output": ""
     },
@@ -128,7 +124,7 @@
         "core.store.gates_test.test.gate: a displaced owner cannot keep writing to a checkpoint it lost",
         "core.store.gates_test.test.gate: an unchanged offset must carry an unchanged prefix digest"
       ],
-      "seconds": 46.22375202178955,
+      "seconds": 56.09320092201233,
       "detail": "",
       "build_output": ""
     },
@@ -149,7 +145,7 @@
         "core.store.gates_test.test.gate: a displaced owner cannot keep writing to a checkpoint it lost",
         "core.store.gates_test.test.gate: superseding releases a failed destination and destroys nothing"
       ],
-      "seconds": 49.485706090927124,
+      "seconds": 55.785529136657715,
       "detail": "",
       "build_output": ""
     },
@@ -162,7 +158,7 @@
       "failing_gates": [
         "core.store.transfers.test.verifyResume refuses a mismatched partial"
       ],
-      "seconds": 42.29943585395813,
+      "seconds": 83.22827649116516,
       "detail": "",
       "build_output": ""
     },
@@ -175,7 +171,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: one request cannot hold two checkpoints, or two live transfers one destination"
       ],
-      "seconds": 47.2817747592926,
+      "seconds": 42.43784952163696,
       "detail": "",
       "build_output": ""
     },
@@ -188,7 +184,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: a confirmed offset without a prefix hash, or without a source identity, is refused by the schema"
       ],
-      "seconds": 52.434765338897705,
+      "seconds": 45.77365183830261,
       "detail": "",
       "build_output": ""
     },
@@ -201,7 +197,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: a confirmed offset without a prefix hash, or without a source identity, is refused by the schema"
       ],
-      "seconds": 48.63750910758972,
+      "seconds": 41.35343599319458,
       "detail": "",
       "build_output": ""
     },
@@ -212,10 +208,12 @@
       "expect_gate": "cmd_job.decltest.finalProbe",
       "outcome": "KILLED",
       "failing_gates": [
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
         "blackbox.test.blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read",
         "cli.cmd_job.decltest.finalProbe"
       ],
-      "seconds": 46.16498637199402,
+      "seconds": 40.910112380981445,
       "detail": "",
       "build_output": ""
     },
@@ -228,13 +226,18 @@
       "failing_gates": [
         "blackbox.test.blackbox: a job with no result record still settles, exits 0 and frees its scope",
         "blackbox.test.blackbox: a result record the host cannot read stops `job kill` and keeps the scope barred",
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
         "blackbox.test.blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read",
         "blackbox.test.blackbox: a kill on a job that already finished settles, then needs the scope to clean up",
         "cli.cmd_job.test.gate: a defective result record settles nothing and goes on holding the scope",
         "cli.cmd_job.test.gate: a vanished session does not un-prove an attempt the ledger settled",
         "cli.cmd_job.test.gate: a contradiction does not un-prove an attempt the ledger settled"
       ],
-      "seconds": 53.051713705062866,
+      "seconds": 38.00823163986206,
       "detail": "",
       "build_output": ""
     },
@@ -248,7 +251,7 @@
         "cli.cmd_job.test.gate: a job mutation takes the scope before it reaches the host, and --force takes it by audit",
         "cli.cmd_job.test.gate: --force takes over a lease renewed after the forcing process started"
       ],
-      "seconds": 47.733086585998535,
+      "seconds": 40.714603662490845,
       "detail": "",
       "build_output": ""
     },
@@ -267,7 +270,7 @@
         "blackbox.test.blackbox: a kill on a job that already finished settles, then needs the scope to clean up",
         "cli.cmd_job.test.gate: a displaced holder releases nothing, and its renewal says so"
       ],
-      "seconds": 35.64769101142883,
+      "seconds": 37.85807013511658,
       "detail": "",
       "build_output": ""
     },
@@ -285,7 +288,7 @@
         "cli.cmd_job.test.gate: a displaced holder releases nothing, and its renewal says so",
         "core.store.leases.test.gate: a release dated before the row's own history is refused, not written and not clamped"
       ],
-      "seconds": 39.278724193573,
+      "seconds": 46.41122889518738,
       "detail": "",
       "build_output": ""
     },
@@ -299,7 +302,7 @@
         "blackbox.test.blackbox: `job kill` sends nothing to the host once the scope has moved",
         "cli.cmd_job.test.gate: every destructive remote call is renewed on the line above it"
       ],
-      "seconds": 37.25774621963501,
+      "seconds": 38.763580322265625,
       "detail": "",
       "build_output": ""
     },
@@ -312,7 +315,7 @@
       "failing_gates": [
         "blackbox.test.blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read"
       ],
-      "seconds": 40.76338315010071,
+      "seconds": 38.62957310676575,
       "detail": "",
       "build_output": ""
     },
@@ -325,7 +328,7 @@
       "failing_gates": [
         "blackbox.test.blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read"
       ],
-      "seconds": 38.83078932762146,
+      "seconds": 39.187718629837036,
       "detail": "",
       "build_output": ""
     },
@@ -338,7 +341,7 @@
       "failing_gates": [
         "cli.cmd_job.decltest.cancellationProvable"
       ],
-      "seconds": 51.64436888694763,
+      "seconds": 48.3641836643219,
       "detail": "",
       "build_output": ""
     },
@@ -351,7 +354,7 @@
       "failing_gates": [
         "cli.cmd_job.test.gate: SKILL.md's --json key sets are the ones these structs emit"
       ],
-      "seconds": 43.380335569381714,
+      "seconds": 40.49457144737244,
       "detail": "",
       "build_output": ""
     },
@@ -364,7 +367,7 @@
       "failing_gates": [
         "cli.cmd_job.test.gate: SKILL.md's --json key sets are the ones these structs emit"
       ],
-      "seconds": 39.92822861671448,
+      "seconds": 34.30440020561218,
       "detail": "",
       "build_output": ""
     },
@@ -377,7 +380,7 @@
       "failing_gates": [
         "cli.cmd_job.test.gate: SKILL.md's --json key sets are the ones these structs emit"
       ],
-      "seconds": 37.55433464050293,
+      "seconds": 43.565783977508545,
       "detail": "",
       "build_output": ""
     },
@@ -390,7 +393,7 @@
       "failing_gates": [
         "cli.cmd_job.test.gate: SKILL.md's resultRecord codes are SidecarReading's own tag names"
       ],
-      "seconds": 48.13945388793945,
+      "seconds": 40.49923753738403,
       "detail": "",
       "build_output": ""
     },
@@ -404,7 +407,7 @@
         "core.session.Tmux.test.gate: a sidecar that could not be read is not a sidecar that is not there",
         "core.session.Tmux.test.gate: neither reader turns an unreadable result record into an absent one"
       ],
-      "seconds": 42.114370822906494,
+      "seconds": 36.74185037612915,
       "detail": "",
       "build_output": ""
     },
@@ -418,7 +421,7 @@
         "blackbox.test.blackbox: a result record the host cannot read is not a result record that is absent",
         "core.session.Tmux.test.gate: a sidecar that could not be read is not a sidecar that is not there"
       ],
-      "seconds": 65.71872568130493,
+      "seconds": 37.86697340011597,
       "detail": "",
       "build_output": ""
     },
@@ -430,9 +433,18 @@
       "outcome": "KILLED",
       "failing_gates": [
         "blackbox.test.blackbox: a result record the host cannot read stops `job kill` and keeps the scope barred",
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read",
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+        "cli.cmd_job.decltest.finalProbe",
         "core.session.Tmux.test.gate: neither reader turns an unreadable result record into an absent one"
       ],
-      "seconds": 39.02843356132507,
+      "seconds": 37.97649431228638,
       "detail": "",
       "build_output": ""
     },
@@ -443,10 +455,10 @@
       "expect_gate": "gate: neither reader turns an unreadable result record into an absent one",
       "outcome": "KILLED",
       "failing_gates": [
-        "blackbox.test.blackbox: a result record the host cannot read is not a result record that is absent",
-        "core.session.Tmux.test.gate: neither reader turns an unreadable result record into an absent one"
+        "core.session.Tmux.test.gate: neither reader turns an unreadable result record into an absent one",
+        "blackbox.test.blackbox: a result record the host cannot read is not a result record that is absent"
       ],
-      "seconds": 43.92295789718628,
+      "seconds": 119.92285895347595,
       "detail": "",
       "build_output": ""
     },
@@ -463,6 +475,15 @@
         "blackbox.test.blackbox: a result record the host cannot read stops `job kill` and keeps the scope barred",
         "blackbox.test.blackbox: `job kill` does not lose a result record that turned up during the kill",
         "blackbox.test.blackbox: `job rm` does not report a clean removal over a record it refused",
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read",
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job kill` is unchanged when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
         "blackbox.test.blackbox: `job kill` sends nothing to the host once the scope has moved",
         "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing once the scope has moved",
         "blackbox.test.blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read",
@@ -474,7 +495,7 @@
         "core.session.Tmux.test.gate: the streaming reader applies the same rule as the tail probe",
         "core.session.Tmux.test.gate: neither reader turns an unreadable result record into an absent one"
       ],
-      "seconds": 39.9793860912323,
+      "seconds": 72.60148882865906,
       "detail": "",
       "build_output": ""
     },
@@ -487,7 +508,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: every kind × terminal cell is decided, and none of them by default"
       ],
-      "seconds": 41.40660738945007,
+      "seconds": 57.63343358039856,
       "detail": "",
       "build_output": ""
     },
@@ -500,7 +521,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: every kind × terminal cell is decided, and none of them by default"
       ],
-      "seconds": 39.35481929779053,
+      "seconds": 52.678712606430054,
       "detail": "",
       "build_output": ""
     },
@@ -513,7 +534,7 @@
       "failing_gates": [
         "core.store.gates_test.test.gate: every kind × terminal cell is decided, and none of them by default"
       ],
-      "seconds": 39.23458790779114,
+      "seconds": 51.807621240615845,
       "detail": "",
       "build_output": ""
     },
@@ -550,7 +571,7 @@
         "core.store.gates_test.test.gate: a checkpoint is taken only from an attempt that cannot still be running",
         "core.store.gates_test.test.gate: only a settled failure may be superseded"
       ],
-      "seconds": 39.461414098739624,
+      "seconds": 77.96648263931274,
       "detail": "",
       "build_output": ""
     },
@@ -563,7 +584,7 @@
       "failing_gates": [
         "cli.cmd_job.test.gate: every destructive remote call is renewed on the line above it"
       ],
-      "seconds": 35.20011925697327,
+      "seconds": 71.4011778831482,
       "detail": "",
       "build_output": ""
     },
@@ -576,7 +597,7 @@
       "failing_gates": [
         "cli.cmd_job.test.gate: every destructive remote call is renewed on the line above it"
       ],
-      "seconds": 43.45291566848755,
+      "seconds": 66.55909085273743,
       "detail": "",
       "build_output": ""
     },
@@ -589,7 +610,7 @@
       "failing_gates": [
         "cli.cmd_job.test.gate: every destructive remote call is renewed on the line above it"
       ],
-      "seconds": 49.05717325210571,
+      "seconds": 63.30940222740173,
       "detail": "",
       "build_output": ""
     },
@@ -605,7 +626,7 @@
         "blackbox.test.blackbox: a kill on a job that already finished settles, then needs the scope to clean up",
         "cli.cmd_job.test.gate: every destructive remote call is renewed on the line above it"
       ],
-      "seconds": 43.01012945175171,
+      "seconds": 58.09673094749451,
       "detail": "",
       "build_output": ""
     },
@@ -618,7 +639,342 @@
       "failing_gates": [
         "blackbox.test.blackbox: a kill on a job that already finished settles, then needs the scope to clean up"
       ],
-      "seconds": 42.66459059715271,
+      "seconds": 58.77233099937439,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M9-read-error-reaches-the-caller",
+      "rule": "A post-kill `error.ResultUnreadable` is told apart from every other probe failure: dropped into the generic arm it would publish `probe_error` and offer a `--from-log` reconcile over a document that will not open.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read",
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+        "cli.cmd_job.decltest.finalProbe"
+      ],
+      "seconds": 49.265297412872314,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M9-read-error-keeps-the-evidence",
+      "rule": "`job rm --discard-evidence` deletes neither the pane log nor the result file when the post-kill read of that record failed.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 50.9964394569397,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M9-read-error-keeps-the-row",
+      "rule": "`job rm` keeps the local row when the post-kill read failed: the row is the last thing pointing at the evidence still on the host.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 45.20823907852173,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M9-read-error-exits-75",
+      "rule": "A `job rm` that kept its row because the post-kill read failed still exits 75, not 1: the outcome is unknown even though nothing was removed.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 70.03978252410889,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M9-read-error-not-the-stale-reading",
+      "rule": "`job kill` publishes `read_error` for a post-kill read that failed, never the pre-kill look's reading.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job kill` will not report a cancellation over a record it could not read",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read"
+      ],
+      "seconds": 90.67964458465576,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M9-read-error-value-is-not-a-reading",
+      "rule": "The `resultRecord` value for a failed read is not one of `SidecarReading`'s tag names, and `skill/SKILL.md` publishes the word the code actually uses.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "gate: SKILL.md publishes the resultRecord values that are not readings",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read",
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+        "cli.cmd_job.test.gate: SKILL.md publishes the resultRecord values that are not readings"
+      ],
+      "seconds": 68.29041171073914,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M9-read-error-always",
+      "rule": "Discriminating control: a second look that reports every outcome as an unreadable record is caught, so the gates above cannot be passed by a binary that simply stopped settling anything.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job kill` will not report a cancellation over a record it could not read",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job kill` does not lose a result record that turned up during the kill",
+        "blackbox.test.blackbox: `job rm` does not report a clean removal over a record it refused",
+        "blackbox.test.blackbox: `job kill` will not report a cancellation over a record it could not read",
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job kill` is unchanged when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing once the scope has moved",
+        "blackbox.test.blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read",
+        "cli.cmd_job.decltest.finalProbe"
+      ],
+      "seconds": 73.88833355903625,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-reaches-the-caller",
+      "rule": "A post-kill probe that never happened is a finding the second look hands back, not an error it prints to stderr and swallows into an empty `FinalLook`.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+        "cli.cmd_job.decltest.finalProbe"
+      ],
+      "seconds": 63.554163455963135,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-is-blind",
+      "rule": "A look that never happened counts as no observation of the result record, which is what all three of `job rm`'s destructive steps are gated on.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 63.14892840385437,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-keeps-the-evidence",
+      "rule": "`job rm --discard-evidence` deletes neither the pane log nor the result file when the look after the kill never happened: the one thing that would make the deletion safe is what it failed to obtain.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 69.17174506187439,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-keeps-the-row",
+      "rule": "`job rm` keeps the local row when the look after the kill never happened: the row is the last thing pointing at the evidence still on the host.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 61.22793626785278,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-exits-75",
+      "rule": "A `job rm` that kept its row because the look after the kill never happened exits 75, not 1: the outcome is unknown even though nothing was removed, so a blind retry is not available.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 61.53387093544006,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-is-its-own-word",
+      "rule": "A look that never happened publishes `probe_error`, never `read_error`: one says a document is at that address and will not open, the other says nothing was read at all, and they send an operator to different places.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 62.026493072509766,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-not-the-stale-reading",
+      "rule": "`job rm` publishes the probe failure in both result-record keys, never the pre-kill look's reading — `absent` is the one word that licenses the log sentinel to settle the job by itself.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 64.48074674606323,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-value-is-published",
+      "rule": "The `resultRecord` word for a look that never happened is its own value, distinct from the read failure's, and `skill/SKILL.md` publishes the word the code actually uses.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "gate: SKILL.md publishes the resultRecord values that are not readings",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+        "cli.cmd_job.test.gate: SKILL.md publishes the resultRecord values that are not readings"
+      ],
+      "seconds": 94.05375146865845,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-sends-you-to-from-log",
+      "rule": "A look that never happened sends the operator to `--from-log`, not `--override`: both durable records are intact, so the reconcile that reads them can succeed once the host answers.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 65.05128264427185,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-not-on-job-kill",
+      "rule": "`job kill` is unchanged by this rule: it already settles `indeterminate` and exits 75 for a look that never happened, and it publishes the pre-kill reading rather than the second word.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job kill` is unchanged when the look after the kill never happens",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job kill` is unchanged when the look after the kill never happens"
+      ],
+      "seconds": 63.39035511016846,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-outranks-the-exit-code",
+      "rule": "`job rm`'s `probe_error` arm sits above the exit-code arm, so a look that never happened settles `indeterminate` even when the pre-kill look had already read a real exit status: every destructive step was declined, the row and both records are still there, and every arm below opens with \"job removed\". The rejected alternative publishes the pre-kill code and exits 0 over a removal that did not happen.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+      ],
+      "seconds": 57.49506139755249,
+      "detail": "",
+      "build_output": ""
+    },
+    {
+      "id": "M10-probe-error-not-for-a-look-that-happened",
+      "rule": "Discriminating control: a second look that reaches the host and finds nothing is not a look that failed. Called one, every unproven `job rm` would start keeping its row and publishing a fault nobody hit.",
+      "file": "src/cli/cmd_job.zig",
+      "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens",
+      "outcome": "KILLED",
+      "failing_gates": [
+        "blackbox.test.blackbox: `job rm` keeps the row when the post-kill read of its record fails",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails",
+        "blackbox.test.blackbox: `job rm` keeps the row when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm --discard-evidence` destroys nothing when the look after the kill never happens",
+        "blackbox.test.blackbox: `job rm` keeps the row when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing when tmux goes missing after the kill",
+        "blackbox.test.blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed",
+        "blackbox.test.blackbox: `job rm --discard-evidence` deletes nothing once the scope has moved",
+        "cli.cmd_job.decltest.finalProbe"
+      ],
+      "seconds": 67.27044320106506,
       "detail": "",
       "build_output": ""
     }
