@@ -814,6 +814,79 @@ fn defectSentence(ctx: *Cli.Ctx, reading: Tmux.SidecarReading) []const u8 {
     return resultRecordError(ctx, reading) orelse reading.code();
 }
 
+/// The one `resultRecord` value that is not a reading.
+///
+/// `SidecarReading` has seven tags and every one of them is an observation of
+/// the address: we did not look, there is nothing there, there is something
+/// there and here is what is wrong with it. This word says the address could
+/// not be read, which is not an observation of it — so it is deliberately none
+/// of those seven, and least of all `absent`. `absent` is the single reading
+/// that licenses the log sentinel to settle a job by itself, and flattening a
+/// failed read into it is the defect this exists to close.
+///
+/// Published in `resultRecordError` as well, on the one branch that sets it.
+/// The two keys are then incapable of disagreeing, and a reader that only
+/// learned to look at the prose key gets a token rather than a sentence it
+/// would have to match. It is the one value of that key anything may branch on;
+/// see `skill/SKILL.md`, and the gate below that holds the document to it.
+const result_record_read_error = "read_error";
+
+/// The two published result-record keys, decided once for both mutating verbs.
+///
+/// `job kill` and `job rm` answer the same question about the same host, and a
+/// second copy of "which word goes in which key" is how the two came to
+/// disagree about a defective record in the first place.
+const RecordKeys = struct {
+    record: []const u8,
+    note: ?[]const u8,
+
+    fn of(ctx: *Cli.Ctx, reading: Tmux.SidecarReading) RecordKeys {
+        return .{ .record = reading.code(), .note = resultRecordError(ctx, reading) };
+    }
+
+    /// What a post-kill read that failed publishes: the same stable token in
+    /// both keys, and in neither of them a reading nobody made.
+    const read_failed: RecordKeys = .{
+        .record = result_record_read_error,
+        .note = result_record_read_error,
+    };
+};
+
+/// Why a post-kill read failure settles `indeterminate`, in one place.
+///
+/// Both verbs write this into the same ledger, and on `job rm` the receipt is
+/// the only record that outlives the command — so the two may not describe the
+/// same host in different words. Every clause is true of both: neither deletes
+/// anything on this branch, `job kill` because deleting is not something it ever
+/// does and `job rm` because here it is forbidden to.
+fn readFailureReason(ctx: *Cli.Ctx, request_id: ?[]const u8) []const u8 {
+    return std.fmt.allocPrint(
+        ctx.arena,
+        "the job's session was killed, and a second look could not read its result record: the file is at " ++
+            "$HOME/.terminus/results/{s}.json and the host could not obtain its bytes — a permission problem, " ++
+            "an I/O error, or a directory where a file should be. It is not missing, so its absence may not be " ++
+            "assumed and nothing was settled from the job's log; no evidence was deleted and no local row was removed",
+        .{request_id orelse "<request-id>"},
+    ) catch "the job's session was killed and a second look could not read its result record, so nothing here established its outcome and nothing was deleted";
+}
+
+/// Where a post-kill read failure sends the operator.
+///
+/// Not `--from-log`. That reconcile reads this same document through the same
+/// reader and stops at the same read failure, so offering it would be a dead
+/// end wearing the shape of a next step.
+fn readFailureHint(ctx: *Cli.Ctx, request_id: ?[]const u8) []const u8 {
+    const id = request_id orelse "<request-id>";
+    return std.fmt.allocPrint(
+        ctx.arena,
+        "the result record could not be read after the session was stopped, so nothing here could settle this " ++
+            "job and nothing was deleted — the log, the result record and the local row are all still there. " ++
+            "Repair or remove $HOME/.terminus/results/{s}.json on the host, then settle this with " ++
+            "'terminus request reconcile {s} --override'",
+        .{ id, id },
+    ) catch "the result record could not be read after the session was stopped and nothing was deleted; repair or remove it on the host, then settle this with 'terminus request reconcile <request-id> --override'";
+}
+
 /// The JSON shape of a `JobProbe.Conflict`. One definition so every command
 /// that can hit a contradiction names its two halves the same way.
 const ConflictJson = struct {
@@ -1281,6 +1354,56 @@ test "gate: SKILL.md's resultRecord codes are SidecarReading's own tag names" {
     const unusable_verdict = expectSkillList(unusable_what, documented_unusable, unusable.items);
     try ordinary_verdict;
     try unusable_verdict;
+}
+
+// The gate above holds the seven *readings* to their tag names. It says nothing
+// about the eighth value, which is not a reading — and the document's two claims
+// about it are the two that a change here is most likely to leave behind:
+// `resultRecord` may carry a word that is not a `SidecarReading` tag, and
+// `resultRecordError` — described everywhere else as prose nothing may branch on
+// — has exactly one value that is a stable token.
+//
+// Both are checked against the same constant the emitters use, so the word
+// cannot be renamed in the code and left standing in the document, and the
+// collision check keeps a future `SidecarReading` variant from quietly making
+// `resultRecord` ambiguous.
+test "gate: SKILL.md publishes the one resultRecord value that is not a reading" {
+    const gpa = std.testing.allocator;
+    const t = std.testing;
+
+    inline for (@typeInfo(Tmux.SidecarReading).@"union".fields) |f| {
+        if (comptime std.mem.eql(u8, f.name, result_record_read_error)) {
+            std.debug.print(
+                \\
+                \\`SidecarReading` now has a variant named `{s}`, which is the value
+                \\`resultRecord` publishes for "the address could not be read". A caller
+                \\branching on that word can no longer tell an observation of the address
+                \\from a failure to read it. Rename one of the two.
+                \\
+            , .{f.name});
+            return error.ReadErrorCollidesWithAReading;
+        }
+    }
+
+    const value_what = "`resultRecord`'s one non-reading value";
+    const documented_value = try skillEntries(
+        gpa,
+        try skillSegment(skill_md, "not a reading at all: ", null, value_what),
+        value_what,
+    );
+    defer gpa.free(documented_value);
+    try t.expectEqual(@as(usize, 1), documented_value.len);
+    try t.expectEqualStrings(result_record_read_error, documented_value[0]);
+
+    const branch_what = "the one `resultRecordError` value that may be branched on";
+    const documented_branch = try skillEntries(
+        gpa,
+        try skillSegment(skill_md, "stable value it may branch on: ", null, branch_what),
+        branch_what,
+    );
+    defer gpa.free(documented_branch);
+    try t.expectEqual(@as(usize, 1), documented_branch.len);
+    try t.expectEqualStrings(result_record_read_error, documented_branch[0]);
 }
 
 /// `fatalTmux`, plus the one error only a result-record reader can raise.
@@ -2844,6 +2967,14 @@ fn killJob(
     // just refused to read one.
     const reading: Tmux.SidecarReading = if (final.refusal) |seen| seen.sidecar else probe.sidecar;
 
+    // The two result-record keys this command ends on, and on the unreadable
+    // branch they do not come from `reading` at all. The pre-kill look's
+    // `absent` is a true statement about a moment before the kill and a false
+    // one about now, and publishing it is exactly what let a kill over a
+    // document nobody could read report `"resultRecord":"absent"` — the one
+    // word that means the log sentinel is free to settle the job by itself.
+    const record_keys: RecordKeys = if (final.unreadable) .read_failed else .of(ctx, reading);
+
     const capability = Core.supervisor.shell_capability;
     const can_prove = Core.supervisor.Requirement.verified_cancellation.satisfiedBy(capability);
 
@@ -2858,7 +2989,15 @@ fn killJob(
     // write.
     _ = stillOurs(claim, ctx.io, &authority);
     const last_observed = if (execution) |e| e.status else .remote_started;
-    const provable = cancellationProvable(authority, final.refusal != null, session_gone, can_prove);
+    // A second look that refused a verdict and one that could not read the
+    // address at all are the same thing to this predicate: the session stopped,
+    // and nothing here can say the *work* stopped with it.
+    const provable = cancellationProvable(
+        authority,
+        final.refusal != null or final.unreadable,
+        session_gone,
+        can_prove,
+    );
     const terminal: Core.Store.op_state.Terminal = if (provable)
         .{ .remote_cancel_confirmed = .{
             .pid = null,
@@ -2878,6 +3017,20 @@ fn killJob(
         // relaunched under this name into the session we just made room in.
         // Settling `cancelled` would release the scope barrier over that.
         authority.lostTerminal(ctx, job.name, last_observed)
+    else if (final.unreadable)
+        // Worse than the refusal below it, and for the same reason: a refusal at
+        // least knows what is at that address. Here the read failed, so there is
+        // no reading to check the log's sentinel against — and no sentinel
+        // either, because the failure ends the probe script before the log
+        // window is sent. Left to the last arm this settled `indeterminate`
+        // anyway, but for the wrong reason and beside `"resultRecord":"absent"`;
+        // and it would have settled `remote_cancel_confirmed` — releasing the
+        // scope over an unreadable record — the day a supervisor can prove a
+        // process tree is gone.
+        .{ .indeterminate = .{
+            .reason = readFailureReason(ctx, if (attempt) |a| a.request_id else null),
+            .last_observed = last_observed,
+        } }
     else if (final.refusal) |seen|
         // Still outranks the cancellation above, through that predicate's
         // `!refused` conjunct rather than through this arm's position.
@@ -2909,7 +3062,12 @@ fn killJob(
         if (execution) |*e| e else null,
         attempt,
         terminal,
-        .{ .result_record = resultRecordOf(ctx, reading) },
+        // Null on the unreadable branch, and that is the honest value: the field
+        // records what was at this job's result-record address *when it
+        // settled*, and this settlement could not find out. Writing the pre-kill
+        // reading in would put a stale `absent` into the one document that
+        // outlives the command.
+        .{ .result_record = if (final.unreadable) null else resultRecordOf(ctx, reading) },
         finishSync(job, .killed, null, ctx.now),
     );
     // The remote work is done on this branch — the kill and the re-probe are
@@ -2928,6 +3086,8 @@ fn killJob(
             "{s}. The session was already stopped when this was found, so that much did happen; nothing after it was taken — no evidence was deleted and no local row was removed — and the outcome is recorded as unknown. Settle it with 'terminus request reconcile <request-id> --override' once you know who else was acting on this job",
             .{authority.note(ctx, job.name) orelse "the scope lease is not ours"},
         ) catch "this command lost the scope lease for this job after stopping its session; the outcome is recorded as unknown"
+    else if (final.unreadable)
+        readFailureHint(ctx, if (attempt) |a| a.request_id else null)
     else if (final.refusal != null)
         // Not `--from-log`: that reconcile reads these same two records and
         // will refuse for the same reason this kill did.
@@ -2950,8 +3110,8 @@ fn killJob(
             .sessionCleanedUp = session_gone,
             .cancellationProven = proven,
             .conflict = null,
-            .resultRecord = reading.code(),
-            .resultRecordError = resultRecordError(ctx, reading),
+            .resultRecord = record_keys.record,
+            .resultRecordError = record_keys.note,
             .requestId = if (attempt) |a| a.request_id else null,
             .cacheError = cache_error,
             .authority = authority.code(),
@@ -2962,6 +3122,11 @@ fn killJob(
             if (!authority.holds()) {
                 try ctx.out.print(
                     "job '{s}': session killed, then this command found it no longer held the scope lease; the outcome is unknown\n",
+                    .{job.name},
+                );
+            } else if (final.unreadable) {
+                try ctx.out.print(
+                    "job '{s}': session killed; a second look could not read its result record at all, so its outcome is unknown and nothing was deleted\n",
                     .{job.name},
                 );
             } else if (final.refusal) |seen| {
@@ -2979,9 +3144,11 @@ fn killJob(
             if (cache_error) |text| try ctx.out.print("  {s}\n", .{text});
             // The lost-authority sentence carries what was and was not done, and
             // the line above it only says the session stopped. Printed on that
-            // path alone: the others' hints are already spelled out by the
-            // sentence they follow.
-            if (!authority.holds()) if (hint) |text| try ctx.out.print("  {s}\n", .{text});
+            // path alone — plus the unreadable one, whose sentence says the
+            // outcome is unknown without saying where the operator goes next and
+            // which file to look at. The others' hints are already spelled out
+            // by the sentence they follow.
+            if (!authority.holds() or final.unreadable) if (hint) |text| try ctx.out.print("  {s}\n", .{text});
         },
     }
     if (!proven) {
@@ -2999,18 +3166,22 @@ fn killJob(
 
 /// One last look for an outcome, after the session is proven gone.
 ///
-/// Two answers, and they are never both present. `upgrade` is a probe that
-/// establishes something the first one did not: an exit code, with neither
+/// Three answers, and never more than one of them at once. `upgrade` is a probe
+/// that establishes something the first one did not: an exit code, with neither
 /// durable record refusing. `refusal` is the opposite finding — a document
 /// turned up at this request's own address between the two looks, it is
-/// unusable, and the log sentinel beside it was willing to answer. Everything
-/// else — a probe that errors, a still-unknown outcome, a fresh disagreement —
-/// leaves both null and lets the caller fall through to the path it was
-/// already on, which is the conservative one.
+/// unusable, and the log sentinel beside it was willing to answer.
+/// `unreadable` is the third: a document is at that address and the host could
+/// not obtain its bytes, so this look established nothing and cannot even say
+/// what is there. Everything else — a probe that fails for some *other* reason,
+/// a still-unknown outcome, a fresh disagreement — leaves all three empty and
+/// lets the caller fall through to the path it was already on, which is the
+/// conservative one.
 ///
-/// Not fatal on error. The kill has already happened; failing here costs only
-/// the chance to *upgrade* the answer, and turning that into a hard failure
-/// would make a flaky read worse than no read.
+/// Not fatal on any of them. The kill has already happened, so a hard failure
+/// here would cost the caller the report it still owes. That is why `unreadable`
+/// is carried back rather than raised: what the caller has to do with it is
+/// settle `indeterminate`, keep every piece of evidence, and say so.
 const FinalLook = struct {
     /// A probe good enough to settle from. Structurally never carries a
     /// refusal or a conflict, so a caller cannot reach one through it.
@@ -3023,6 +3194,17 @@ const FinalLook = struct {
     /// that had already been established, which is exactly the promotion
     /// `finalProbe` exists to forbid.
     refusal: ?Refusal = null,
+    /// The second look could not read the result record at all.
+    ///
+    /// A bool and not a reading, because there is no reading: `probeTail` raised
+    /// `error.ResultUnreadable`, which means `[ -f "$r" ]` found a file and
+    /// `head` could not obtain its bytes. Answering with a `SidecarReading` —
+    /// any of them — would be inventing an observation this look never made, and
+    /// the one it would naturally be flattened into is `absent`: the single
+    /// reading that lets the log sentinel settle a job on its own. There is no
+    /// sentinel to fall back to either, because the read failure ends the probe
+    /// script before the log window is sent.
+    unreadable: bool = false,
 
     const Refusal = struct {
         declined: Tmux.JobProbe.Refused,
@@ -3049,6 +3231,16 @@ fn finalProbe(
         request_id,
         probe_tail_bytes,
     ) catch |err| {
+        // Reported as a finding, not shrugged off. This is not a read that
+        // failed to arrive: the host answered, and what it said is that a
+        // document is at this attempt's own address and it could not be read.
+        // `.{}` means "there is nothing here to upgrade to" — the caller reports
+        // its cancellation over that, and `job rm --discard-evidence` goes on to
+        // delete the very records that could still have settled the job. The
+        // laundering `922f565` took out of `readResult` and `probeTail` survived
+        // here, in the one path that runs *after* the kill, and on stderr where
+        // a `--json` consumer never sees it.
+        if (err == error.ResultUnreadable) return .{ .unreadable = true };
         std.debug.print(
             "terminus: could not re-read job '{s}' after killing its session: {s}; " ++
                 "reporting the cancellation without it\n",
@@ -3117,8 +3309,8 @@ test finalProbe {
         what: []const u8,
         step: Core.Scripted.Step,
         /// What the second look is allowed to hand back. Exactly one of the
-        /// three, because an upgrade and a refusal must never arrive together.
-        want: enum { upgrade, nothing, refusal },
+        /// four, because no two of them may ever arrive together.
+        want: enum { upgrade, nothing, refusal, unreadable },
     };
     const cases = [_]Case{
         .{
@@ -3144,9 +3336,33 @@ test finalProbe {
         .{
             // The read failed mid-stream. A kill that already happened must
             // not be reported *better* because we could not look again.
+            //
+            // Also the control for the case below it: a transport fault is not
+            // a read failure at the sidecar's address, and widening the new
+            // branch to cover every `probeTail` error would turn a network blip
+            // during a kill into an exit 75. This case is what fails if it is.
             .what = "a probe that could not be read at all",
             .step = .{ .transport_error = error.ReadFailed },
             .want = .nothing,
+        },
+        .{
+            // The host answered, and what it said is that a file is at this
+            // attempt's own address and it could not be read. Exit 44 is
+            // `Tmux`'s `result_unreadable_exit`, which is the only way
+            // `probeTail` raises `error.ResultUnreadable` — spelled as the
+            // number because it is the host's side of the wire, the same way
+            // the black-box gates spell it.
+            //
+            // Not `.nothing`: the caller reports a clean cancellation over
+            // `.nothing`, and `job rm --discard-evidence` deletes the evidence
+            // behind it.
+            .what = "a result record the host could not read after the kill",
+            .step = .{ .reply = .{
+                .exit_code = 44,
+                .stdout = empty,
+                .stderr = empty,
+            } },
+            .want = .unreadable,
         },
         .{
             // Caught today by the missing exit code rather than by the
@@ -3197,6 +3413,14 @@ test finalProbe {
             .nothing => {
                 try t.expectEqual(@as(?Tmux.JobProbe, null), got.upgrade);
                 try t.expectEqual(@as(?FinalLook.Refusal, null), got.refusal);
+                // The third answer is not handed out for a fault that is not
+                // one. Deleting this line is how "any post-kill error settles
+                // indeterminate" gets in by the back door, which is a wider
+                // behaviour change than the rule asks for.
+                std.testing.expect(!got.unreadable) catch |err| {
+                    std.debug.print("{s} was reported as an unreadable record\n", .{case.what});
+                    return err;
+                };
             },
             .refusal => {
                 // Never promoted: the rule `finalProbe` enforces is unchanged,
@@ -3219,6 +3443,18 @@ test finalProbe {
                 // that declined it.
                 try t.expectEqual(@as(i32, 3), seen.declined.sentinel_exit_code);
                 try t.expectEqualStrings("exit_code_out_of_range", seen.sidecar.code());
+            },
+            .unreadable => {
+                // Nothing to settle from, and — the half that was missing — not
+                // silence either. `.{}` here is what let a kill over a document
+                // it could not read report the cancellation as if the address
+                // had been empty.
+                std.testing.expect(got.unreadable) catch |err| {
+                    std.debug.print("{s} was reported as nothing at all\n", .{case.what});
+                    return err;
+                };
+                try t.expectEqual(@as(?Tmux.JobProbe, null), got.upgrade);
+                try t.expectEqual(@as(?FinalLook.Refusal, null), got.refusal);
             },
         }
     }
@@ -3436,6 +3672,14 @@ fn removeJob(
     // downstream is entitled to assume it cannot exist.
     const reading: Tmux.SidecarReading = if (final.refusal) |seen| seen.sidecar else probe.sidecar;
 
+    // The two published result-record keys. On the unreadable branch neither
+    // comes from `reading`: this removal could not find out what is at that
+    // address, and the pre-kill look's answer describes a moment before the
+    // kill. `job rm` deletes the local row on its ordinary paths, so publishing
+    // a stale `absent` here would be the last thing anyone ever heard about the
+    // document.
+    const record_keys: RecordKeys = if (final.unreadable) .read_failed else .of(ctx, reading);
+
     // The refusal this removal acts on, from whichever look found one.
     //
     // Adopted from the second look only when the first probe established
@@ -3456,7 +3700,15 @@ fn removeJob(
     // would send an operator looking for a file that is still sitting there.
     var log_discarded = false;
     var result_discarded = false;
-    if (discard) {
+    // Nothing is destroyed over a read that failed. `--discard-evidence` asks for
+    // the log and the sidecar to go, and the one thing that could make that safe
+    // — knowing what the sidecar said — is exactly what this branch could not
+    // get. Before this guard, `job rm --discard-evidence` deleted both records
+    // and *then* settled `indeterminate` for want of them: it destroyed the only
+    // evidence that could ever settle the job, because it could not read one of
+    // the two. The kill is behind us and cannot be taken back; these two
+    // deletions can still be declined, so they are.
+    if (discard and !final.unreadable) {
         // Only now, with the session proven gone. A live pane recreates the
         // log through `pipe-pane`, so deleting it under a surviving session
         // would leave a file that quietly comes back holding a partial
@@ -3508,8 +3760,21 @@ fn removeJob(
     // The renewal before the settlement, and the last chance to notice a loss
     // that happened during the kill or the re-read.
     _ = stillOurs(claim, ctx.io, &authority);
-    const terminal: Core.Store.op_state.Terminal = if (probe.exit_code) |code|
-        // First, and above the lost-lease arm on purpose. Authority and
+    const terminal: Core.Store.op_state.Terminal = if (final.unreadable)
+        // First, and above the exit-code arm on purpose — the one place in this
+        // file where a reading taken *before* the kill does not stand. The two
+        // observations are of the same file: one says it held an exit status, the
+        // other says the host cannot obtain its bytes. That is a contradiction
+        // about a single document, and nothing here can say which side of the kill
+        // was right, so this settles the way the `conflict` arm below does. It
+        // also has to outrank the arms that open with "job removed", because on
+        // this branch nothing was removed.
+        .{ .indeterminate = .{
+            .reason = readFailureReason(ctx, if (attempt) |a| a.request_id else null),
+            .last_observed = if (execution) |e| e.status else .remote_started,
+        } }
+    else if (probe.exit_code) |code|
+        // Above the lost-lease arm on purpose. Authority and
         // evidence are different things: the lease governs what this command
         // may still *do*, not whether what it already read is true. This code
         // came from a record at this attempt's own request id, an address no
@@ -3576,15 +3841,19 @@ fn removeJob(
             // receipt is the only record that outlives the command — and a
             // removal that never mentions the document the second look read is
             // how an operator comes to find nothing on the host and no note
-            // saying anybody had looked.
-            .result_record = resultRecordOf(ctx, reading),
+            // saying anybody had looked. Null on the unreadable branch alone,
+            // because there the field's question — what was at the address when
+            // this settled — has no answer this command obtained.
+            .result_record = if (final.unreadable) null else resultRecordOf(ctx, reading),
         },
-        // The row is deleted only while the scope is ours. Forgetting a name
-        // this command no longer speaks for is the one local step that cannot
-        // be undone by re-running it — the row is what a later `job status`,
-        // `job kill` or `run --name` reads — and a peer that took the lease may
-        // be relying on it right now.
-        if (authority.holds()) .{ .forget = .{
+        // The row is deleted only while the scope is ours, and never over a read
+        // that failed. Forgetting a name this command no longer speaks for — or
+        // one whose outcome it could not establish because the record it needed
+        // would not open — is the one local step that cannot be undone by
+        // re-running it: the row is what a later `job status`, `job kill` or
+        // `run --name` reads, and it is the last thing pointing at the evidence
+        // still sitting on the host.
+        if (authority.holds() and !final.unreadable) .{ .forget = .{
             .expected = job.removeExpectation(),
             .grounds = .session_proven_gone,
         } } else .none,
@@ -3630,7 +3899,14 @@ fn removeJob(
         ) catch "its exit status was read before the loss and is recorded as its outcome"
     else
         "the outcome is recorded as unknown";
-    const hint: ?[]const u8 = if (!authority.holds())
+    const hint: ?[]const u8 = if (final.unreadable)
+        // First, and for the reason the terminal above is ordered this way: the
+        // ledger's reason and the caller's next step are one claim. `--from-log`
+        // is what this branch used to offer — beside `{"action":"removed","ok":
+        // true}` — and it reads this same document through this same reader, so
+        // it could only ever have stopped where this removal did.
+        readFailureHint(ctx, if (attempt) |a| a.request_id else null)
+    else if (!authority.holds())
         std.fmt.allocPrint(
             ctx.arena,
             "{s}. {s}, and {s}. Check who else was acting on this job before you act on it again; settle anything still unknown with 'terminus request reconcile <request-id> --override'",
@@ -3663,11 +3939,12 @@ fn removeJob(
             .evidenceRetained = !log_discarded,
             .attemptRetained = attempt != null,
             .conflict = ConflictJson.from(probe.conflict),
-            // `reading`, not `probe.sidecar`: the same reading the receipt was
+            // `record_keys`, not `probe.sidecar`: the same answer the receipt was
             // written from, so the line and the receipt cannot disagree about
-            // what was on the host.
-            .resultRecord = reading.code(),
-            .resultRecordError = resultRecordError(ctx, reading),
+            // what was on the host — including when the answer is that nobody
+            // could find out.
+            .resultRecord = record_keys.record,
+            .resultRecordError = record_keys.note,
             .requestId = if (attempt) |a| a.request_id else null,
             .cacheError = cache_error,
             .authority = authority.code(),
@@ -3710,8 +3987,11 @@ fn removeJob(
         try ctx.out.flush();
         // A row that survived is a plain failure and safe to retry: nothing
         // remote is unknown because of it. An unknown *outcome* is not, and
-        // outranks it.
-        if (removed) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
+        // outranks it — and a post-kill read that failed at this attempt's own
+        // address is exactly that, whether or not the row went with it. The row
+        // is deliberately kept there, so `removed` alone would have sent this
+        // out as exit 1 and invited the retry it must not.
+        if (removed or final.unreadable) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
         Cli.exitNow(Cli.exit_code.failure);
     }
 }

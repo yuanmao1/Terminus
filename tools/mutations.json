@@ -352,6 +352,62 @@
       "find": "        // The settlement's renewal. The kill's is below, after the transaction.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);\n",
       "replace": "        // The settlement's renewal. The kill's is below, after the transaction.\n",
       "expect_gate": "blackbox: a kill on a job that already finished settles, then needs the scope to clean up"
+    },
+    {
+      "id": "M9-read-error-reaches-the-caller",
+      "rule": "A post-kill `error.ResultUnreadable` is a finding the second look hands back, not an error it swallows into an empty `FinalLook`.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        if (err == error.ResultUnreadable) return .{ .unreadable = true };\n        std.debug.print(",
+      "replace": "        std.debug.print(",
+      "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails"
+    },
+    {
+      "id": "M9-read-error-keeps-the-evidence",
+      "rule": "`job rm --discard-evidence` deletes neither the pane log nor the result file when the post-kill read of that record failed.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    if (discard and !final.unreadable) {",
+      "replace": "    if (discard) {",
+      "expect_gate": "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill read fails"
+    },
+    {
+      "id": "M9-read-error-keeps-the-row",
+      "rule": "`job rm` keeps the local row when the post-kill read failed: the row is the last thing pointing at the evidence still on the host.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        if (authority.holds() and !final.unreadable) .{ .forget = .{",
+      "replace": "        if (authority.holds()) .{ .forget = .{",
+      "expect_gate": "blackbox: `job rm` keeps the row when the post-kill read of its record fails"
+    },
+    {
+      "id": "M9-read-error-exits-75",
+      "rule": "A `job rm` that kept its row because the post-kill read failed still exits 75, not 1: the outcome is unknown even though nothing was removed.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        if (removed or final.unreadable) Cli.failIndeterminateAfterOutput(",
+      "replace": "        if (removed) Cli.failIndeterminateAfterOutput(",
+      "expect_gate": "blackbox: `job rm` keeps the row when the post-kill read of its record fails"
+    },
+    {
+      "id": "M9-read-error-not-the-stale-reading",
+      "rule": "`job kill` publishes `read_error` for a post-kill read that failed, never the pre-kill look's reading.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    const record_keys: RecordKeys = if (final.unreadable) .read_failed else .of(ctx, reading);\n\n    const capability = Core.supervisor.shell_capability;",
+      "replace": "    const record_keys: RecordKeys = .of(ctx, reading);\n\n    const capability = Core.supervisor.shell_capability;",
+      "expect_gate": "blackbox: `job kill` will not report a cancellation over a record it could not read"
+    },
+    {
+      "id": "M9-read-error-value-is-not-a-reading",
+      "rule": "The `resultRecord` value for a failed read is not one of `SidecarReading`'s tag names, and `skill/SKILL.md` publishes the word the code actually uses.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "const result_record_read_error = \"read_error\";",
+      "replace": "const result_record_read_error = \"absent\";",
+      "expect_gate": "gate: SKILL.md publishes the one resultRecord value that is not a reading"
+    },
+    {
+      "id": "M9-read-error-always",
+      "rule": "Discriminating control: a second look that reports every outcome as an unreadable record is caught, so the gates above cannot be passed by a binary that simply stopped settling anything.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    unreadable: bool = false,",
+      "replace": "    unreadable: bool = true,",
+      "expect_gate": "blackbox: `job kill` will not report a cancellation over a record it could not read"
     }
   ]
 }

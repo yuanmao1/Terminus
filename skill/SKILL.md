@@ -289,8 +289,13 @@ connection error.
   Three are ordinary — `not_requested` (we did not look), `absent`, `present`
   (it is there and it is ours) — and four say a document at this attempt's own
   address could not be used: `malformed`, `unknown_schema`,
-  `exit_code_out_of_range`, `foreign`. `resultRecordError` is the prose beside
-  it, `null` for the three ordinary readings; nothing may branch on its wording.
+  `exit_code_out_of_range`, `foreign`. On `job kill` and `job rm` there is an
+  eighth value, and it is not a reading at all: `read_error` — the look after the
+  kill found a file at that address and the host could not obtain its bytes, so
+  nothing was read and no reading may be assumed. `resultRecordError` is prose
+  beside it, `null` for the three ordinary readings, with one exception: it is a
+  stable value it may branch on: `read_error`. It carries that token on exactly
+  the branch where `resultRecord` says the same word, and nowhere else.
 - `finishedAt` — a **remote** finish time in unix seconds, taken from the result
   file. `null` unless the host reported its own clock (a sentinel-only outcome
   has no timestamp). Never backfilled with local time.
@@ -365,17 +370,26 @@ performed at all counts as a loss, not a yes. Both report `authority`
   a real exit status, and settling it as an unprovable cancellation would throw
   that away. `kill` reports that as `"action":"finished_during_kill"` with the
   job's own exit code; `rm` uses it to settle before it removes anything. A
-  second look that errors, still finds nothing, or turns up a fresh disagreement
-  changes nothing — the cancellation path stands. A second look that finds the
-  result record *present and unusable* does change things: nothing may settle
-  from it, `resultRecord` reports the defect, and both verbs send you to
-  `--override` rather than `--from-log`.
+  second look that still finds nothing, or turns up a fresh disagreement,
+  changes nothing — the cancellation path stands. Two findings do change things.
+  A result record *present and unusable*: nothing may settle from it,
+  `resultRecord` reports the defect, and both verbs send you to `--override`
+  rather than `--from-log`. And a result record the host **could not read** at
+  all: `resultRecord` and `resultRecordError` both read `read_error`, both verbs
+  settle `indeterminate` and exit **75**, and **nothing is destroyed** — the pane
+  log, the result file and the local job row all stay, on `job rm` and on
+  `job rm --discard-evidence` alike (`rowRemoved:false`,
+  `action:"not_removed"`, `evidenceRetained:true`). A read that failed is not an
+  absence, so the log's sentinel is not allowed to settle the job in its place.
+  A second look that fails for some *other* reason — a transport fault, a remote
+  failure — still changes nothing.
 - **`job kill` exit codes.** **0** only when it has something proven and every
   step it was asked to take happened. **75** whenever the outcome is unknown:
   the ordinary unprovable cancellation, a lost lease after a kill with no exit
   code, a `conflict` between the two records (reported as `"action":"killed"`,
-  `ok:false`, with the `conflict` object), an unusable result record, and an
-  `already_finished` or `finished_during_kill` the ledger refused to settle.
+  `ok:false`, with the `conflict` object), an unusable result record, a result
+  record that could not be read after the kill, and an `already_finished` or
+  `finished_during_kill` the ledger refused to settle.
   **1** when the outcome is not in doubt but this command is: a pre-kill lease
   refusal (`not_killed`), a
   `finished_during_kill` that lost the lease, a proven outcome whose tmux session
@@ -390,14 +404,18 @@ performed at all counts as a loss, not a yes. Both report `authority`
   outcome provable you get `outcomeProven:true`; with the outcome still unknown
   it removes the job, keeps the log, and returns `ok:true` with a hint to run
   `reconcile <request-id> --from-log`. A `conflict` or an unusable result record
-  removes the row too and exits 75.
+  removes the row too and exits 75. A result record the post-kill look could not
+  read is the one case where the row is **kept**: `action:"not_removed"`,
+  `rowRemoved:false`, exit 75, and `--override` rather than `--from-log`.
 - `job rm --discard-evidence` additionally deletes the pane log and then the
   result file, each behind its own lease renewal and only once the session is
   proven gone. Unless the outcome was provable, discarding is not a success: it
   exits 75, because it turned something that could have been proven into an
   override you now owe. `evidenceRetained` reports what actually happened to the
   **log**, not what the flag asked for — a removal that stopped before the delete
-  reports `evidenceRetained:true`.
+  reports `evidenceRetained:true`. Nothing is deleted at all when the post-kill
+  look could not read the result record: the one thing that would make the
+  deletion safe is what that read failed to obtain.
 - If `tmux` is not runnable on the host, none of these report the session as
   gone — they fail with "tmux is not installed" instead. Absence of the tool is
   not evidence about the job, and nothing is deleted on it.
@@ -427,10 +445,12 @@ local row, so this line and the receipt are the only places the reading survives
 `status` on these two verbs is the ledger's word for the attempt, and it has two
 values `job status` never prints: `"unknown"` (the row names no attempt, or names
 a request the ledger does not have) and, on `job rm`, `"unchanged"`.
-`resultRecordError`, `authorityError`, `cacheError` and `hint` are prose — do not
-match their text. Their *presence* is meaningful only for `cacheError`, where
-non-null is the one signal that the local row was not updated; the other three
-mirror `resultRecord` and `authority`, which you can branch on directly.
+`authorityError`, `cacheError` and `hint` are prose — do not match their text.
+`resultRecordError` is prose too, with the single exception named above: the
+token `read_error`, which is stable and always arrives with `resultRecord`
+`read_error`. Presence alone is meaningful only for `cacheError`, where non-null
+is the one signal that the local row was not updated; the others mirror
+`resultRecord` and `authority`, which you can branch on directly.
 
 ### Waiting on a job and reporting business state
 
