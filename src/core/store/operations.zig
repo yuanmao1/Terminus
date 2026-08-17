@@ -37,6 +37,29 @@ pub const Kind = enum {
     /// the terminal receipt, what evidence may settle it — is built on that
     /// gap. See `op_state.Terminal.input_accepted`.
     session_write,
+    /// A supervisory act on somebody else's session: stopping it, forgetting
+    /// it, reclaiming it (`docs/m3b-job-control.md` §3.1).
+    ///
+    /// `terminus session rm` is the first and, today, only producer. Until it
+    /// had one of these, a command that killed a remote session, deleted its
+    /// pane log and dropped its local row wrote **nothing** to the ledger —
+    /// five questions with no answer: whether anyone tried, who, when, whether
+    /// it worked, and whether this was the first attempt or the third (§1.2).
+    ///
+    /// Named for the class of act rather than for the verb, and both
+    /// alternatives were considered (§7.1). `job_control` was rejected because
+    /// `session rm` is not a job. One variant per action — `kill_session`,
+    /// `remove_session`, … — was rejected because it multiplies the two
+    /// admissibility matrices in `receipts` by four and stops the action being
+    /// a queryable column; what the operation acted on is carried by `alias`
+    /// today and by the `target_*` columns of §7.2 in v13.
+    ///
+    /// A control operation settles from **its own** evidence — lease held or
+    /// lost, kill sent or withheld, the host's answer — and never from the
+    /// target's. That separation is the whole point: one row used to carry two
+    /// subjects, which is why `fdd1144` had to decide by hand whether a lost
+    /// lease may overwrite a proven exit code (§3.4).
+    control,
     transfer_push,
     transfer_pull,
     fetch,

@@ -1300,6 +1300,7 @@ pub const ResolutionEvidence = union(enum) {
                 .exec,
                 .job,
                 .session_write,
+                .control,
                 .transfer_push,
                 .transfer_pull,
                 .fetch,
@@ -1355,6 +1356,26 @@ pub const ResolutionEvidence = union(enum) {
                 // pane's pid. The pane's pid is not the input's process; that
                 // mistake is the one the `.job` cell above was closed for.
                 .session_write => false,
+                // A control act records no process either, and the reason is
+                // one step sharper than a write's: it has one in *view* and it
+                // is somebody else's. `session rm` sends `tmux kill-session`
+                // and reads `tmux has-session`; the process in that pane
+                // belongs to whoever started the session, and the only thing
+                // this operation ever wrote down about the host is the session
+                // *name* (`operations.alias`). So there is no recorded identity
+                // for a probe to be checked against — `resolve` would refuse
+                // with `evidence_wrong_process` — and recording the pane's pid
+                // to make one available would repeat the `.job` cell's mistake
+                // twice over: a reading of one process settling a different
+                // operation, where the operation is not even about a process.
+                //
+                // What a control operation *is* judged by is whether the thing
+                // it named is gone, and the terminal that carries that reading
+                // is `remote_cancel_confirmed`
+                // (`terminalDescribesKind`) — written at the moment the host
+                // answers, so the only control acts that reach a reconcile are
+                // the ones whose answer was lost.
+                .control => false,
                 // A transfer writes down a destination and a digest, not a
                 // process. "It is no longer running" is equally true of a
                 // transfer that finished and one that died mid-rename, and
@@ -1384,6 +1405,23 @@ pub const ResolutionEvidence = union(enum) {
             // this binary never asked any host to produce.
             .job_result, .job_sentinel => switch (kind) {
                 .job => true,
+                // The cell that says out loud what "control and target settle
+                // independently" (§3.4) means on the evidence axis. A control
+                // act *aimed at a job* — `job kill`, `job rm`, and `session rm`
+                // pointed at `job-<name>` — is settled by what it itself did:
+                // the lease was ours or not, the kill went out or was withheld,
+                // the host said the session was gone or still there. The job's
+                // wrapper documents belong to the job's own attempt, and that
+                // row is where they settle it.
+                //
+                // Admitting them here would be the two-subjects defect
+                // reintroduced on the resolve side: a sidecar saying `exit 0`
+                // would close the *supervisory* operation, reporting that the
+                // removal succeeded on the strength of the removed job having
+                // finished. The two can disagree — a kill that lost its lease
+                // over a job that had already exited is exactly that case — and
+                // `fdd1144` is the commit that had to untangle it by hand.
+                .control => false,
                 .exec,
                 .session_write,
                 .transfer_push,
@@ -1402,7 +1440,7 @@ pub const ResolutionEvidence = union(enum) {
             // arbitrary command did what it was asked.
             .filesystem_effect => switch (kind) {
                 .transfer_push, .transfer_pull, .fetch => true,
-                .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => false,
+                .exec, .job, .session_write, .control, .tunnel, .plan_phase, .audit, .cleanup => false,
             },
             // The same address, read and found empty. Only work that named a
             // destination in advance can be spoken about this way — `resolve`
@@ -1422,7 +1460,15 @@ pub const ResolutionEvidence = union(enum) {
             .destination_present_contradicting,
             => switch (kind) {
                 .transfer_push, .transfer_pull, .fetch => true,
-                .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => false,
+                // A control act names a session, not an address on a
+                // filesystem. "Nothing is at /srv/app/out.bin" is not a
+                // statement about whether a shell was stopped, and the pane log
+                // `session rm` deletes is not a *destination* — nothing declared
+                // in advance that a file there would be what proved the act,
+                // which is the commitment `resolve` compares these readings
+                // against and the reason only a transfer can be spoken about
+                // this way.
+                .exec, .job, .session_write, .control, .tunnel, .plan_phase, .audit, .cleanup => false,
             },
             // A human's decision, and the only variant that is about the
             // *operation* rather than about some mechanism's output — so there
@@ -1481,10 +1527,24 @@ pub const ResolutionEvidence = union(enum) {
             // shape — or a marker the *operator's own input* was asked to
             // echo, since nothing makes an operator type one and a write that
             // did not is exactly the write nobody can settle.
+            //
+            // `control` is the second such kind, and it is reachable for the
+            // same reason: `terminus session rm` creates one every time it runs,
+            // and its own terminal settles it the moment the host answers
+            // `has-session`. The control acts that reach a reconcile are the
+            // ones whose answer was lost, and about those nothing on either host
+            // has anything to say — a session that was killed and a session that
+            // was not look identical from here once the reply is gone, and the
+            // next `tmux has-session` would be a reading of a *name* somebody
+            // else has been free to reuse ever since, not of the incarnation
+            // this act was aimed at. Per-attempt session identity (§4) is what
+            // would make such a reading mean something, and it is not in this
+            // slice.
             .operator_override => switch (kind) {
                 .exec,
                 .job,
                 .session_write,
+                .control,
                 .transfer_push,
                 .transfer_pull,
                 .fetch,
@@ -1637,6 +1697,17 @@ pub const ResolutionEvidence = union(enum) {
 /// whoever writes one brings a terminal carrying the local effect it observed
 /// rather than inheriting a cell that would take an exit status instead.
 ///
+/// `control` is the newest row and the only one whose *single* business terminal
+/// is `remote_cancel_confirmed`. A control act — `terminus session rm` today —
+/// stops a remote session, and the whole of what it can establish is the host's
+/// own answer to "is it gone". It runs no command of the caller's, so `exited`
+/// and `remote_deadline` are refused; it offers no bytes to a terminal, so the
+/// input pair is refused. That leaves `completed` and `timed_out` unreachable for
+/// the kind, exactly as they are for a transfer, and for the same test: refusing
+/// is admissible only because `cancelled` (through the cell it does admit) and
+/// `indeterminate` (through the universal one) are both still reachable, so no
+/// control act is left holding a scope it cannot settle.
+///
 /// Exhaustive in both directions with no `else` anywhere, for the reason
 /// `appliesToKind` has none: a new terminal or a new kind must stop the build
 /// until somebody answers the question for it, rather than inheriting whichever
@@ -1670,6 +1741,7 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             .exec,
             .job,
             .session_write,
+            .control,
             .transfer_push,
             .transfer_pull,
             .fetch,
@@ -1698,6 +1770,7 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             .exec,
             .job,
             .session_write,
+            .control,
             .transfer_push,
             .transfer_pull,
             .fetch,
@@ -1721,6 +1794,7 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             .exec,
             .job,
             .session_write,
+            .control,
             .transfer_push,
             .transfer_pull,
             .fetch,
@@ -1757,6 +1831,30 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             // reachable through the two variants built to carry what a write
             // actually establishes.
             .session_write => false,
+            // Refused, and it is the same mistake as the write's one line up —
+            // which is exactly why it is written out rather than inherited.
+            //
+            // A control act runs no command of the caller's. What `session rm`
+            // sends is `tmux kill-session`, `tmux has-session` and `rm -f`, and
+            // each of those has an exit status of its own: the tempting wrong
+            // answer here is not hypothetical, it is three exit codes sitting in
+            // one function, any of which a driver could hand to `settle`. A
+            // receipt carrying `exit_code = 0` for a session removal would say,
+            // in the column an auditor reads first, that a command the caller
+            // asked for succeeded. None did; a session was stopped. That is the
+            // sentence `7d0898a` had to split `input_accepted` out of `exited`
+            // to stop being written about a write, and a control act is one step
+            // further from a judged command than a write is.
+            //
+            // The cost is real and is stated rather than hidden: `completed` is
+            // unreachable for this kind, because `exited` is the only terminal
+            // that yields it for anything but a write. That is not a wedge,
+            // which is the test a refusal here has to pass — a control act's
+            // success is `remote_cancel_confirmed` below, carrying the reading
+            // that actually established it, and `cancelled` is a settled status
+            // that releases the scope barrier exactly as `completed` would. The
+            // kind loses a word it could not have earned, not an outcome.
+            .control => false,
             // Refused, and refused on purpose *before* a producer exists.
             //
             // A transfer's verdict is a file at a destination it declared in
@@ -1847,6 +1945,14 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             // kind's vocabulary entirely, and it removes one the kind could
             // never have reached honestly.
             .session_write => false,
+            // Refused, for the reason above and one of its own. Nothing on the
+            // far side of `kill-session` enforces a deadline or reports one —
+            // there is no supervisor in a control act, because there is no
+            // process of ours being supervised. And `timed_out` is not an
+            // outcome the act can have: the session it named is gone or it is
+            // not, and a local deadline expiring while the answer is in flight
+            // is `indeterminate` (`op_state` rule 2), which stays admissible.
+            .control => false,
             // Refused, with the `exited` arm above. A deadline enforced and
             // reported by the far side is a statement about a *process* the far
             // side was supervising, and nothing supervises a transfer: there is
@@ -1878,6 +1984,43 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
             // `verified_cancellation`; shell mode never does, and gets
             // `indeterminate` instead.
             .job => true,
+            // **The business terminal of a control act**, and the one cell in
+            // this table that had to be argued from the variant's own text
+            // rather than from a neighbour's.
+            //
+            // `op_state.Terminal.remote_cancel_confirmed` says "a remote process
+            // was signalled *and its absence verified*", and its `pid` is
+            // optional for a reason it spells out: "proof comes at different
+            // granularities: a helper verifies a specific process, while tmux
+            // verifies that the session (and with it the process group) is
+            // gone." That sentence was written about a granularity this kind is
+            // made of. `Tmux.killSession` sends `kill-session` and then asks
+            // `has-session`, and the boolean it returns is the host's own answer
+            // about the session — not an inference, not a local timeout.
+            //
+            // Why the `.job` reservation does not transfer, which is the whole
+            // question. A job's kill may only publish this when the supervisor
+            // can prove the *process tree* is gone, because a job's subject is
+            // the command running in the pane and a disowned or `setsid` child
+            // outlives the pane that launched it — `cmd_job.cancellationProvable`
+            // holds that line and shell mode never satisfies it. A control act's
+            // subject is the **session itself**. `terminus session rm <s>` is not
+            // a claim about anybody's work; it is "stop this shell, delete its
+            // log, forget it", and `has-session` reading absent is a direct
+            // reading of exactly that subject. The gap that forces a job to
+            // `indeterminate` — pane gone, work possibly alive — is not a gap in
+            // this claim, because this claim never reached for the work.
+            //
+            // What the receipt must therefore not say is anything about what was
+            // running inside. That is held in the payload rather than here: the
+            // producer writes `pid = null` (no process was identified) and a
+            // `verification_method` naming the two tmux commands, so a reader
+            // sees the granularity of the proof beside the verdict. A control act
+            // that could not establish the absence has `indeterminate`, and one
+            // that lost its scope lease after the kill has it too — the name it
+            // stopped is one a peer has been free to reuse since, so "it is gone"
+            // stops being this command's to assert.
+            .control => true,
             // A write starts no remote process, so there is nothing for a
             // cancellation to have confirmed the absence of. `Tmux.sendKeys`
             // runs one tmux command and reports nothing about the pane, and the
@@ -1924,6 +2067,22 @@ pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind)
         // negative. `terminus write` performs that act and nothing else does.
         .input_accepted, .input_refused => switch (kind) {
             .session_write => true,
+            // Refused, and this is the trap §7.5 names by its commit number.
+            // A control act stops a session, and one told "the session is gone"
+            // needs a terminal for that — `input_refused` is superficially close
+            // ("the remote answered, and nothing of ours was touched") and its
+            // *name* is about input, which is the only thing that matters here.
+            // `input_accepted`/`input_refused` exist **because** settling a write
+            // as `.exited{0}` put a false word in a receipt where an auditor
+            // reads the exit code first (`7d0898a`); reusing an input-named
+            // terminal for an act that types nothing repeats that mistake one
+            // level up. Nothing in a session removal offers bytes to a terminal,
+            // so there is no answer about bytes to record.
+            //
+            // Free, like the two below: `remote_cancel_confirmed` carries what
+            // a control act does establish, and all three attempt-level
+            // terminals stay open.
+            .control => false,
             // An `exec` or a `job` runs a command and is judged by its exit
             // status. `input_accepted` would settle one `completed` carrying a
             // byte count and no exit code — a command recorded as having

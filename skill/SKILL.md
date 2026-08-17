@@ -155,6 +155,9 @@ terminus job ls <server> --active --limit 20 --json
 terminus session new <server> <name>
 terminus exec <server>:<name> --json -- cd /srv/app   # state persists
 terminus exec <server>:<name> --json -- docker compose ps
+# Kill it + delete its log + forget its memories. Refused while a job or another
+# command holds the session's scope; 1 if refused, never a silent success.
+terminus session rm <server> <name> --json
 
 # File transfer (SCP) — single files or whole directories
 terminus push <server> ./local-file /remote/path [--mode 755]
@@ -473,6 +476,63 @@ a request the ledger does not have) and, on `job rm`, `"unchanged"`.
 same word in `resultRecord`. Presence alone is meaningful only for `cacheError`,
 where non-null is the one signal that the local row was not updated; the others
 mirror `resultRecord` and `authority`, which you can branch on directly.
+
+### Removing a session
+
+`terminus session rm <server> <name>` is destructive three times over: it stops
+the remote shell, deletes that session's pane log, and drops the local row —
+which cascades away every memory attached to that session. It now runs under the
+same discipline as `job kill` / `job rm`: a **control operation** in the ledger,
+a **scope lease**, and a renewal immediately before each step that changes
+something.
+
+- **It contends with a running job.** A job's tmux session is `job-<name>`, and
+  `session ls` shows it under that name, so `session rm web job-deploy` is aimed
+  at the same shell `job kill web deploy` is. That removal is now **refused**
+  while the job is unsettled — nothing is sent to the host and the job's row,
+  log and result record are untouched. The refusal names the blocking request id;
+  settle it (`terminus request reconcile <id>`) or use `job kill` / `job rm`,
+  which are the verbs for a job.
+  A user session named exactly `deploy` contends with job `deploy` for the same
+  reason. That is deliberate over-refusal: a wait costs a wait, and the other
+  mistake destroys a shell.
+- **The order is the safety, and it has not changed.** The kill is *proven*
+  before anything is deleted — and the log is deleted only after that proof,
+  because a live pane recreates its log through `pipe-pane` and a log deleted
+  under a surviving session comes back holding a partial history.
+  If the host still reports the session present after the kill, **nothing** is
+  removed — not the log, not the local row — and the record says so: status
+  `indeterminate` with `error_code:"SESSION_SURVIVED_KILL"`, exit **75**. It is
+  75 rather than 1 because that record blocks this session's scope until you
+  reconcile it, so a plain "retry" would walk into a refusal. Go and look
+  (`tmux attach -t t-<name>`), then `terminus request reconcile <request-id>`.
+- **Lease lost *before* the kill**: nothing is sent, nothing local is written.
+  `action:"not_removed"`, `sessionGone:false`, `localRow:"kept"`, and the exit
+  code is **1, not 75** — this command changed nothing, so re-running once the
+  scope frees is safe. The ledger records `failed`.
+- **Lease lost *after* the kill**: the session really did stop, and every step
+  after it is declined — the pane log and the local row (with its memories) are
+  both **kept**. `action:"not_removed"`, `logDeleted` reports which side of the
+  log the loss fell on, `localRow:"kept"`, exit 1. The ledger records the
+  ordinary `indeterminate` terminal carrying `error_code:"AUTHORITY_LOST"`.
+- **The receipt never carries an exit code.** A removal runs no command of
+  yours; what it establishes is that the session is gone, and that is what the
+  ledger holds — status `cancelled`, evidence `remote_cancel_confirmed`, with the
+  tmux commands that proved it named on the receipt. It does **not** claim that
+  anything running inside that shell stopped: a process that daemonized,
+  `disown`ed or ran under `setsid` outlives the session, and nothing here says
+  otherwise.
+- There is no `--force`. A takeover would displace somebody's claim on a shell
+  about to be destroyed along with its memories; wait the lease out (120s).
+
+`session rm --json` — 11 keys, every branch emitting all of them. Never null:
+`ok`, `action` (`removed` | `not_removed`), `session`, `server`, `requestId`,
+`status`, `sessionGone`, `logDeleted`, `localRow`
+(`removed` | `absent` | `kept`), `authority` (`held` | `lapsed` | `unreadable`).
+Nullable: `authorityError`, `hint` — both prose, do not match their text.
+`localRow:"absent"` is not a failure: it means this machine had no metadata row
+for the session, which is ordinary for a session that was started outside
+Terminus, and the *session* was still proven gone.
 
 ### Waiting on a job and reporting business state
 

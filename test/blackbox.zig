@@ -945,8 +945,38 @@ const FakeHost = struct {
     /// seizure that did not happen makes the whole window vanish.
     record_failures: std.atomic.Value(u32),
     seize_failures: std.atomic.Value(u32),
+    /// Take the scope lease while answering the daemon *version handshake*,
+    /// before any command has been sent.
+    ///
+    /// `Rule.seize` cannot reach this window, and the reason is structural: a
+    /// rule fires when a command arrives, so by then that command has already
+    /// been sent — which is exactly the fact the rule is used to assert about a
+    /// kill. A verb whose *first* remote call is destructive therefore has no
+    /// round trip on which "the scope moved before anything was sent" can be
+    /// arranged, and `session rm` is that verb: there is nothing to probe, so
+    /// `kill-session` goes out first.
+    ///
+    /// The handshake is the round trip that exists anyway. `DaemonClient.acquire`
+    /// pings to check the protocol version before `cli.connect` returns, and the
+    /// binary takes its operation and its lease *before* it dials — so a peer
+    /// taking the scope here lands after the claim and before the first command,
+    /// which is the window itself. Fires once: `acquire` pings once per
+    /// connection, and a second seizure would displace the peer's own row and
+    /// make the assertions afterwards about a different lease.
+    seize_on_ping: bool,
+    seized_on_ping: std.atomic.Value(bool),
 
     fn start(f: *Fixture, rules: []Rule) !*FakeHost {
+        return startWith(f, rules, false);
+    }
+
+    /// `start`, plus a lease seizure on the version handshake. See
+    /// `seize_on_ping`.
+    fn startSeizingOnHandshake(f: *Fixture, rules: []Rule) !*FakeHost {
+        return startWith(f, rules, true);
+    }
+
+    fn startWith(f: *Fixture, rules: []Rule, seize_on_ping: bool) !*FakeHost {
         const home = try std.fmt.allocPrint(f.allocator, "{s}/home", .{f.dir});
         errdefer f.allocator.free(home);
         const socket_dir = try std.fmt.allocPrint(f.allocator, "{s}/.terminus", .{home});
@@ -974,6 +1004,8 @@ const FakeHost = struct {
             .seen_lock = .init,
             .record_failures = .init(0),
             .seize_failures = .init(0),
+            .seize_on_ping = seize_on_ping,
+            .seized_on_ping = .init(false),
         };
         host.thread = try std.Thread.spawn(.{}, serve, .{host});
         return host;
@@ -1208,7 +1240,13 @@ const FakeHost = struct {
                 continue;
             };
             const response: protocol.Response = switch (request.op) {
-                .ping => .{ .v = protocol.version, .ok = true, .pid = 1 },
+                .ping => blk: {
+                    // Before the reply, not after: the binary is blocked on this
+                    // socket right now, and the whole point is that the scope
+                    // changes hands while it waits.
+                    if (host.seize_on_ping and !host.seized_on_ping.swap(true, .monotonic)) host.seize();
+                    break :blk .{ .v = protocol.version, .ok = true, .pid = 1 };
+                },
                 .stop => .{ .v = protocol.version, .ok = true },
                 .exec => host.replyTo(request.command),
             };
@@ -3262,4 +3300,538 @@ test "blackbox: a kill on a job that already finished settles, then needs the sc
         .code = 0,
         .settled = "completed",
     });
+}
+
+// --- `session rm`: the destructive verb that had no authority at all --------
+//
+// `docs/m3b-job-control.md` §1.2. Until now this command killed a remote
+// session, deleted its pane log and dropped the local row — cascading that
+// session's memories — with no lease, no operation and no scope guard. The five
+// gates below are the four questions §2.1 asks, driven through the real binary
+// and asserted from the store and from the host's own traffic rather than from
+// stdout.
+//
+// The traffic assertions come *first* in every one of them, before any exit
+// code. A refusal exits non-zero and so does a dozen other faults — a missing
+// rule among them — so only "no command containing `kill-session` reached the
+// host" says the destructive step did not happen, and a gate that reported the
+// number instead would name the wrong thing when it regressed.
+
+/// A local metadata row for a session, as `session new` leaves one behind.
+fn seedSessionRow(f: *Fixture, name: []const u8) !void {
+    var store = try f.open();
+    defer store.close();
+    _ = try Store.sessions.ensure(&store, 1, name, 1000);
+}
+
+/// A peer's live claim on a scope, taken before the binary runs.
+fn seedPeerLease(f: *Fixture, scope_key: []const u8, owner: []const u8) !void {
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(f.allocator);
+    defer arena_state.deinit();
+    switch (try Store.leases.acquire(&store, arena_state.allocator(), .{
+        .server_id = 1,
+        .scope = .{ .kind = .job, .key = scope_key },
+        .owner_request_id = owner,
+        .profile_token = "the-other-session",
+        .owner_label = scope_key,
+        .ttl_secs = 600,
+        .now = try Store.leases.clockSeconds(&store),
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.PeerLeaseDidNotTake,
+    }
+}
+
+/// The terminal receipt's `error_code`, or null when nothing terminal was
+/// written. Named rather than unwrapped: "no terminal at all" and "a terminal
+/// with no code" are different findings, and a null unwrap ends the process so
+/// every gate after it stops running too.
+fn terminalErrorCode(
+    store: *Store,
+    arena: std.mem.Allocator,
+    request_id: []const u8,
+) !?[]const u8 {
+    const rows = try Store.receipts.list(store, arena, request_id);
+    for (rows) |row| if (row.is_terminal) return row.error_code orelse "";
+    return null;
+}
+
+// The discriminating control, and it is not decoration: every other gate here
+// asserts an *absence*, and an absence is also what a binary that refused every
+// removal unconditionally would produce. This one insists the same fixture still
+// kills, still deletes, still exits 0 — and, the half that is new, that the act
+// is now in the ledger.
+test "blackbox: an uncontended `session rm` still removes, and now records a control operation" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_ok");
+    defer f.deinit();
+    try f.seedServer();
+    try seedSessionRow(&f, "shell");
+
+    var rules = [_]FakeHost.Rule{
+        // `killSession`'s script carries both words, so the kill rule has to be
+        // listed ahead of anything matching `has-session`.
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var removed = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer removed.deinit(f.allocator);
+
+    // Both destructive steps really went out, in the order the proof requires:
+    // the kill first, and the log only after it.
+    try host.expectSent("kill-session");
+    try host.expectSent("rm -f");
+    try host.expectFullyScripted();
+    try removed.expectCode(0);
+    try removed.expectSays("\"action\": \"removed\"");
+    try removed.expectSays("\"sessionGone\": true");
+    try removed.expectSays("\"logDeleted\": true");
+    try removed.expectSays("\"localRow\": \"removed\"");
+    try removed.expectSays("\"authority\": \"held\"");
+    try removed.expectSays("\"authorityError\": null");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The ledger entry this verb never had. Found by the name it acted on, then
+    // re-read by request id — because "queryable by request id" is the property,
+    // and an alias is a convenience handle that names get reused under.
+    const by_alias = (try Store.operations.latestByAlias(&store, arena, 1, "shell")) orelse
+        return error.RemovalRecordedNoOperation;
+    try t.expectEqualStrings("control", by_alias.kind);
+    const op = (try Store.operations.get(&store, arena, by_alias.request_id)).?;
+
+    // Settled, and settled as what was actually established: the host answered
+    // that the session is gone. Not `completed` — no command of the caller's ran
+    // and none was judged, and `terminalDescribesKind` refuses `exited` for this
+    // kind so that no exit code can appear in the column an auditor reads first.
+    try t.expectEqualStrings("cancelled", op.status.text());
+    try t.expect(!op.status.blocksScope());
+    const terminal = (try Store.receipts.terminalOf(&store, op.request_id)) orelse
+        return error.RemovalLeftNoTerminalReceipt;
+    try t.expectEqualStrings("cancelled", terminal.status.text());
+
+    // The local row went with it, and the scope was handed back.
+    try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
+    const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+    try t.expectEqual(@as(usize, 0), held.len);
+}
+
+// Question 2 of §2.1, in its cheapest form: somebody else's claim is already on
+// the scope when the command starts. `execution.begin` runs before the
+// connection is opened, so this is refused without a socket ever being opened —
+// the strongest form of "nothing was sent" available.
+test "blackbox: `session rm` is refused while a peer holds the session's scope" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_leased");
+    defer f.deinit();
+    try f.seedServer();
+    try seedSessionRow(&f, "shell");
+    const peer = "01QQQQQQQQ0123456789ABCDEF";
+    try seedPeerLease(&f, "shell", peer);
+
+    // Scripted anyway, so a regression that sent them is caught by
+    // `expectNeverSent` naming the command rather than by the fake counting an
+    // unscripted request.
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var refused = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer refused.deinit(f.allocator);
+
+    try host.expectNeverSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+    try refused.expectCode(1);
+    try refused.expectSays(peer);
+    try refused.expectSays("nothing was sent to the host");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The row is exactly where it was, and so are its memories.
+    try t.expect((try Store.sessions.idByName(&store, 1, "shell")) != null);
+    // …and the refusal came from the arm this gate names. Two arms produce a
+    // refusal that says "nothing was sent to the host" — `execution.begin`'s
+    // lease check, before a socket exists, and the acquisition a few lines later
+    // that catches a peer arriving in between — and the message alone cannot
+    // tell them apart. `begin` refuses *before* it inserts, so the absence of an
+    // operation row is what pins this to the earlier one; the later arm would
+    // have left a `failed` attempt behind.
+    try t.expectEqual(
+        @as(?Store.operations.Operation, null),
+        try Store.operations.latestByAlias(&store, arena, 1, "shell"),
+    );
+    // The peer's claim was neither displaced nor handed back on the way out: a
+    // release matching by scope alone would unlock the winner's work on the
+    // loser's exit.
+    const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+    try t.expectEqual(@as(usize, 1), held.len);
+    try t.expectEqualStrings(peer, held[0].owner_request_id);
+}
+
+// The scope moves *after* this command took it and *before* its first
+// destructive call — the window the fail-closed renewal above the kill exists
+// for. `session rm` has nothing to probe, so `kill-session` is its first remote
+// command and no `Rule.seize` can land ahead of it; the seizure therefore rides
+// the daemon version handshake, which is the one round trip between the claim
+// and the kill. See `FakeHost.seize_on_ping`.
+test "blackbox: `session rm` sends nothing once the scope has moved before the kill" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_moved_before");
+    defer f.deinit();
+    try f.seedServer();
+    // Named for the scope the fake host's peer takes, so the seizure lands on
+    // this command's own claim.
+    try seedSessionRow(&f, FakeHost.seized_job);
+
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.startSeizingOnHandshake(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var refused = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", FakeHost.seized_job, "--json", "--db", f.db,
+    }, &environ);
+    defer refused.deinit(f.allocator);
+
+    // The window really opened, and then nothing destructive crossed it.
+    try host.expectSeized();
+    try host.expectNeverSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+    // Exit 1 and not 75: this command changed nothing, so nothing about the
+    // remote is unknown *because of it*, and re-running once the scope is free
+    // is safe. That distinction is the whole contract of the two codes.
+    try refused.expectCode(1);
+    try refused.expectSays("\"action\": \"not_removed\"");
+    try refused.expectSays("\"authority\": \"lapsed\"");
+    try refused.expectSays("\"sessionGone\": false");
+    try refused.expectSays("\"logDeleted\": false");
+    try refused.expectSays("\"localRow\": \"kept\"");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try t.expect((try Store.sessions.idByName(&store, 1, FakeHost.seized_job)) != null);
+
+    // Settled `failed`, and that word is earned rather than convenient: the
+    // renewal sits before `submitted`, so the attempt is still at `connecting`
+    // when the loss is found and `never_submitted` — "the command the caller
+    // asked for did not run" — is admissible. Had the renewal been on the far
+    // side of `submitted`, the only terminal left would have been
+    // `indeterminate`, which would have gone on blocking the scope over a kill
+    // that was never sent.
+    const op = (try Store.operations.latestByAlias(&store, arena, 1, FakeHost.seized_job)) orelse
+        return error.RefusalRecordedNoOperation;
+    try t.expectEqualStrings("control", op.kind);
+    try t.expectEqualStrings("failed", op.status.text());
+    try t.expect(!op.status.blocksScope());
+
+    // And the peer still holds the scope.
+    const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+    try t.expectEqual(@as(usize, 1), held.len);
+    try t.expectEqualStrings(FakeHost.seizing_peer, held[0].owner_request_id);
+}
+
+// The other half of the rule: the scope goes while the kill is in flight, so the
+// loss is only discoverable after a remote mutation has already happened.
+//
+// Nothing can undo the kill. What can still be refused is everything after it —
+// the pane log, and the local row whose delete cascades this session's memories
+// — and both are. The operation settles `indeterminate` carrying
+// `AUTHORITY_LOST` rather than the proven cancellation it set out to write:
+// `has-session` really did report the session absent, but the peer holding the
+// lease has been free to create a session under that name ever since, so "it is
+// gone" stopped being this command's to assert.
+test "blackbox: `session rm` deletes nothing once the scope has moved after the kill" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_moved_after");
+    defer f.deinit();
+    try f.seedServer();
+    try seedSessionRow(&f, FakeHost.seized_job);
+
+    var rules = [_]FakeHost.Rule{
+        // The kill goes out under a lease this command still holds — and comes
+        // back after the scope has changed hands.
+        .{ .needle = "kill-session", .exit_code = 0, .uses = 1, .seize = true },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var refused = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", FakeHost.seized_job, "--json", "--db", f.db,
+    }, &environ);
+    defer refused.deinit(f.allocator);
+
+    try host.expectSeized();
+    // The kill happened; the deletion did not.
+    try host.expectSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+    try refused.expectCode(1);
+    try refused.expectSays("\"action\": \"not_removed\"");
+    try refused.expectSays("\"authority\": \"lapsed\"");
+    try refused.expectSays("\"sessionGone\": true");
+    try refused.expectSays("\"logDeleted\": false");
+    try refused.expectSays("\"localRow\": \"kept\"");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The local half of "forbid the deletion": the row, and with it this
+    // session's memories, are still there.
+    try t.expect((try Store.sessions.idByName(&store, 1, FakeHost.seized_job)) != null);
+
+    const op = (try Store.operations.latestByAlias(&store, arena, 1, FakeHost.seized_job)) orelse
+        return error.RefusalRecordedNoOperation;
+    try t.expectEqualStrings("control", op.kind);
+    try t.expectEqualStrings("indeterminate", op.status.text());
+    // …and the receipt names why, in the code an auditor reads. Without it this
+    // is indistinguishable from every other way a removal ends unknown.
+    const code = (try terminalErrorCode(&store, arena, op.request_id)) orelse
+        return error.RemovalLeftNoTerminalReceipt;
+    try t.expectEqualStrings("AUTHORITY_LOST", code);
+}
+
+// The third renewal, and the only gate that reaches it. The scope survives the
+// kill and goes during the *log deletion's* round trip, so the last thing in
+// front of the command is the local row — and deleting that row cascades this
+// session's memories away (`sessions.remove`), which is the one destruction here
+// that no remote command can be re-run to undo.
+//
+// A renewal covering only the two remote calls would let this through: both of
+// them are behind us and both succeeded. The row is kept anyway, and the receipt
+// says the removal did not happen.
+test "blackbox: `session rm` keeps the local row when the scope moves during the log deletion" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_moved_at_log");
+    defer f.deinit();
+    try f.seedServer();
+    try seedSessionRow(&f, FakeHost.seized_job);
+
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "kill-session", .exit_code = 0 },
+        // The log deletion goes out under a lease this command still holds, and
+        // comes back after the scope has changed hands.
+        .{ .needle = "rm -f", .exit_code = 0, .uses = 1, .seize = true },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var refused = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", FakeHost.seized_job, "--json", "--db", f.db,
+    }, &environ);
+    defer refused.deinit(f.allocator);
+
+    try host.expectSeized();
+    // Both remote steps happened — this is not the "nothing was sent" case, and
+    // the report must not read like it.
+    try host.expectSent("kill-session");
+    try host.expectSent("rm -f");
+    try host.expectFullyScripted();
+    try refused.expectCode(1);
+    try refused.expectSays("\"action\": \"not_removed\"");
+    try refused.expectSays("\"sessionGone\": true");
+    try refused.expectSays("\"logDeleted\": true");
+    try refused.expectSays("\"localRow\": \"kept\"");
+    try refused.expectSays("\"authority\": \"lapsed\"");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The row, and this session's memories with it.
+    try t.expect((try Store.sessions.idByName(&store, 1, FakeHost.seized_job)) != null);
+
+    const op = (try Store.operations.latestByAlias(&store, arena, 1, FakeHost.seized_job)) orelse
+        return error.RefusalRecordedNoOperation;
+    try t.expectEqualStrings("indeterminate", op.status.text());
+    const code = (try terminalErrorCode(&store, arena, op.request_id)) orelse
+        return error.RemovalLeftNoTerminalReceipt;
+    try t.expectEqualStrings("AUTHORITY_LOST", code);
+}
+
+// The oldest rule in this verb, now that it has a ledger to record itself in:
+// the kill is *proven* before anything is deleted. A local row dropped for a
+// session still on the host orphans it — invisible to `session ls`'s local half,
+// while `Tmux.ensure` treats the surviving session as ready — so the next
+// command under that name lands in the shell this one claimed to have removed.
+//
+// The settlement is the new half. `remote_cancel_confirmed` is the one thing
+// this outcome may not claim, and there is no proven-failure terminal for a
+// control act after submission, so it records `indeterminate` — and says which
+// unknown it is, in the code beside it.
+test "blackbox: `session rm` deletes nothing when the session survives the kill" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_survived");
+    defer f.deinit();
+    try f.seedServer();
+    try seedSessionRow(&f, "shell");
+
+    var rules = [_]FakeHost.Rule{
+        // `killSession`'s script exits 1 when `has-session` still finds it: the
+        // host was asked, and answered that the session is still there.
+        .{ .needle = "kill-session", .exit_code = 1 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var refused = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer refused.deinit(f.allocator);
+
+    // The kill was sent — this is not a refusal that withheld it — and the log
+    // deletion was not.
+    try host.expectSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+    // 75, not 1: the record now blocks this session's scope until it is
+    // reconciled, so "plain failure, retry" would send a caller into a refusal.
+    try refused.expectCode(75);
+    try refused.expectSays("\"action\": \"not_removed\"");
+    try refused.expectSays("\"sessionGone\": false");
+    try refused.expectSays("\"logDeleted\": false");
+    try refused.expectSays("\"localRow\": \"kept\"");
+    // The lease was never lost on this path; what stopped the command is the
+    // host's answer, and the report must not blame the wrong barrier.
+    try refused.expectSays("\"authority\": \"held\"");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Neither the row nor its memories went anywhere.
+    try t.expect((try Store.sessions.idByName(&store, 1, "shell")) != null);
+
+    const op = (try Store.operations.latestByAlias(&store, arena, 1, "shell")) orelse
+        return error.RefusalRecordedNoOperation;
+    try t.expectEqualStrings("control", op.kind);
+    try t.expectEqualStrings("indeterminate", op.status.text());
+    // Its own code, so this is distinguishable from a lost lease — the two send
+    // an operator to completely different places.
+    const code = (try terminalErrorCode(&store, arena, op.request_id)) orelse
+        return error.RemovalLeftNoTerminalReceipt;
+    try t.expectEqualStrings("SESSION_SURVIVED_KILL", code);
+
+    // And the scope was handed back even though the act failed: a claim held by
+    // a process that has exited would lock the operator out for its whole TTL.
+    const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+    try t.expectEqual(@as(usize, 0), held.len);
+}
+
+// **The gate this whole slice exists for** (§1.2). A job's tmux session is
+// `job-<name>`, and `Tmux.list` strips the `t-` prefix, so a running job shows
+// up in `session ls` as `job-deploy`. `session rm box job-deploy` is aimed at
+// exactly the shell `job kill box deploy` is aimed at — and it used to take no
+// lease, contend with nothing and write nothing, so it killed the job outright
+// while the job's own barrier never saw it.
+//
+// It now contends. The job holds an unsettled writer on `.job:"deploy"`, the
+// removal's contention key is the logical thing that session belongs to, and the
+// two overlap — so the refusal happens before a socket is opened.
+test "blackbox: `session rm` on a running job's session is refused and leaves the job intact" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_running_job");
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01JJJJJJJJ0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var refused = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "job-deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer refused.deinit(f.allocator);
+
+    // The kill named first, and before the exit code: a regression here is "a
+    // running job's shell was killed", not "the number was 0".
+    try host.expectNeverSent("kill-session");
+    // The job's pane log is the other thing `session rm` destroys, and it is the
+    // record `reconcile --from-log` settles the job from.
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+    try refused.expectCode(1);
+    try refused.expectSays(request_id);
+    try refused.expectSays("nothing was sent to the host");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The job's own row survived, still running.
+    const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    try t.expectEqualStrings("running", @tagName(row.status));
+    // …and so did its attempt: nothing settled it, and nothing here may. A
+    // refusal that wrote onto the *target's* ledger would be the two-subjects
+    // defect of §1.1, one verb over.
+    const job_op = (try Store.operations.get(&store, arena, request_id)).?;
+    try t.expectEqualStrings("remote_started", job_op.status.text());
+    // No control operation was created either: `begin` refuses before it
+    // inserts, so a blocked removal leaves no `created` row behind for somebody
+    // to reconcile.
+    try t.expectEqual(
+        @as(?Store.operations.Operation, null),
+        try Store.operations.latestByAlias(&store, arena, 1, "job-deploy"),
+    );
 }

@@ -2964,6 +2964,25 @@ fn pinnedCell(kind: Store.operations.Kind, tag: EvidenceTag) bool {
             .destination_present_contradicting,
             => false,
         },
+        // A supervisory act on somebody else's session: `session rm` stops one,
+        // deletes its pane log and forgets its local row. It records no process
+        // (the pid in that pane is the session owner's, not this command's), no
+        // sentinel and no sidecar — those belong to the job it may be pointed
+        // at, and that job's own attempt is where they settle. It declares no
+        // destination. What it knew before it sent anything is a session name,
+        // and nothing mechanical is a reading of a name.
+        .control => switch (tag) {
+            .operator_override => true,
+            .supervisor_report,
+            .process_probe,
+            .job_sentinel,
+            .job_result,
+            .filesystem_effect,
+            .destination_absent,
+            .destination_present_unverified,
+            .destination_present_contradicting,
+            => false,
+        },
         // A transfer's outcome is a fact about a file at a declared
         // destination — that it is there and right, that it is there and
         // wrong, that it is there and uncheckable, or that it is not there.
@@ -3059,22 +3078,23 @@ test "gate: every kind × evidence cell is decided, and none of them by default"
         // Every kind keeps its escape hatch. A kind with no admissible
         // evidence at all would hold its scope forever with no way out, which
         // is the trap `request reconcile` exists to prevent — and with the two
-        // refusals above, five of the ten kinds now have this as their only
+        // refusals above, six of the eleven kinds now have this as their only
         // admissible evidence.
         try t.expect(sampleEvidence(.operator_override).appliesToKind(kind));
     }
 
-    // The newest of those five, stated as its own claim because it is the only
-    // one that is reachable today: `terminus write` creates a `session_write`
-    // every time it runs, while nothing in this binary creates a `tunnel`, a
+    // Two of those six are reachable today rather than waiting on a producer,
+    // and they are stated as their own claim for that reason: `terminus write`
+    // creates a `session_write` every time it runs and `terminus session rm`
+    // creates a `control`, while nothing in this binary creates a `tunnel`, a
     // `plan_phase`, an `audit` or a `cleanup`. So this is not "no producer has
-    // been built yet" — it is that a write records nothing a later mechanism
-    // could be a reading of, and the only writes that ever reach a reconcile
-    // are the ones whose answer was lost.
+    // been built yet" — it is that neither of the two records anything a later
+    // mechanism could be a reading of, and the only attempts of either kind that
+    // ever reach a reconcile are the ones whose answer was lost.
     inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
         const tag: EvidenceTag = @field(EvidenceTag, field.name);
-        const admissible = sampleEvidence(tag).appliesToKind(.session_write);
-        try t.expectEqual(tag == .operator_override, admissible);
+        try t.expectEqual(tag == .operator_override, sampleEvidence(tag).appliesToKind(.session_write));
+        try t.expectEqual(tag == .operator_override, sampleEvidence(tag).appliesToKind(.control));
     }
 }
 
@@ -3119,15 +3139,17 @@ fn sampleTerminal(tag: TerminalTag) op_state.Terminal {
 /// `op_state.Terminal` variant is a compile error in both places until somebody
 /// writes down what may settle what.
 ///
-/// The table has three distinct rows, and the count is the history: while `exec`
+/// The table has four distinct rows, and the count is the history: while `exec`
 /// and `job` were the only kinds, every terminal described every kind and this
 /// said nothing at all. `session_write` made it non-vacuous — bytes typed into
 /// somebody else's shell are judged by the terminal's answer, not by an exit
-/// status — and the transfer kinds made it restrictive, by refusing every
+/// status — the transfer kinds made it restrictive, by refusing every
 /// process-shaped terminal for work whose verdict is a file at a declared
-/// destination. The remaining six kinds share the third row. Written out per row
-/// anyway, because a row that agrees with its neighbour by coincidence and a row
-/// that agrees with it by omission look the same once they are collapsed.
+/// destination, and `control` made it narrow in a third direction: an act whose
+/// only claim is that the thing it named is gone. The remaining six kinds share
+/// the fourth row. Written out per row anyway, because a row that agrees with its
+/// neighbour by coincidence and a row that agrees with it by omission look the
+/// same once they are collapsed.
 fn pinnedTerminalCell(kind: Store.operations.Kind, tag: TerminalTag) bool {
     return switch (kind) {
         // One supervised remote command, with a recorded process identity. It
@@ -3177,6 +3199,30 @@ fn pinnedTerminalCell(kind: Store.operations.Kind, tag: TerminalTag) bool {
             .indeterminate,
             => true,
             .exited, .remote_deadline, .remote_cancel_confirmed => false,
+        },
+        // The newest row, and the only one whose whole business vocabulary is a
+        // single cell. A control act stops a remote session and reads the host's
+        // own answer about whether it is gone — `tmux kill-session` then `tmux
+        // has-session`, which is the session-granularity proof
+        // `remote_cancel_confirmed` documents its optional `pid` for. It runs no
+        // command of the caller's, so there is no exit status to be judged by
+        // and no far side enforcing a deadline; it offers no bytes to a
+        // terminal, so the input pair describes a different act entirely — and
+        // reaching for the input-named one because it happens to mean "the
+        // remote answered and nothing was touched" is the mistake `7d0898a`
+        // already paid for, one level down.
+        //
+        // So `completed` and `timed_out` are unreachable here, as they are for a
+        // transfer. The kind is not wedged, which is the only thing that makes
+        // that admissible: `cancelled` through the cell it admits, and the three
+        // attempt-level terminals underneath it.
+        .control => switch (tag) {
+            .remote_cancel_confirmed,
+            .never_submitted,
+            .local_abandon,
+            .indeterminate,
+            => true,
+            .exited, .remote_deadline, .input_accepted, .input_refused => false,
         },
         // The row with no business terminal at all, and the one that stops this
         // table being "everything except a write". A transfer is judged by an
@@ -3282,38 +3328,51 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         try t.expectEqual(is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.input_accepted), kind));
         try t.expectEqual(is_write, Store.receipts.terminalDescribesKind(sampleTerminal(.input_refused), kind));
 
-        // And the complement, which is no longer "everything else". All three
-        // of the terminals below carry a fact about a remote *process* — an exit
-        // status, a deadline that process was held to, the verified absence of
-        // that process — so a kind may admit them only if a process is what it
-        // is judged by. Two kinds are not:
+        // And the complement, which is no longer "everything else" and is no
+        // longer one predicate either. The three terminals below all carry a
+        // fact about something remote, but they do not all carry a fact about
+        // the same thing, and `control` is the kind that forced them apart:
         //
-        //  * a `session_write` runs no command at all; its verdict is the
-        //    terminal's answer about the bytes, carried by the pair above;
-        //  * a transfer's verdict is an artifact at a destination it declared
-        //    before it sent anything. A copier that wrote to the wrong path or
-        //    whose rename never ran still exits 0, still can be held to a
-        //    deadline, and still can be killed and verified gone — every one of
-        //    those facts is true of a transfer that failed and one that
-        //    succeeded alike, so none of them may settle it.
+        //  * `exited` and `remote_deadline` are about a *command this binary
+        //    asked the host to run* — its status, and a deadline the far side
+        //    held it to. A kind may admit them only if such a command is what it
+        //    is judged by. A `session_write` runs none; a transfer's verdict is
+        //    an artifact at a destination it declared, and a copier that wrote
+        //    to the wrong path or whose rename never ran still exits 0 and can
+        //    still be held to a deadline; a control act runs three tmux
+        //    invocations of its own and is judged by none of their exit codes —
+        //    settling one with a tmux client's status is the same false word in
+        //    the same column that `input_accepted` had to be split out to stop.
+        //  * `remote_cancel_confirmed` is about a remote *thing being gone*,
+        //    verified. That is a wider set by exactly one: a control act's whole
+        //    subject is whether the session it named is still there, and
+        //    `tmux has-session` is a direct reading of it — the granularity the
+        //    variant's optional `pid` is documented for. A transfer is still
+        //    refused ("no longer running" is equally true of one that finished
+        //    and one that died mid-rename) and a write still is (it starts
+        //    nothing whose absence could be confirmed).
         //
-        // Transcribed here as a property of the kind, deliberately without
+        // Transcribed here as properties of the kind, deliberately without
         // asking the store, so that widening a cell in `receipts.zig` has to be
         // argued for twice. Exhaustive, so a new kind stops the build here too.
-        const judged_by_a_remote_process = switch (kind) {
+        const judged_by_a_command_it_asked_for = switch (kind) {
             .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .session_write, .control, .transfer_push, .transfer_pull, .fetch => false,
+        };
+        const stops_a_remote_thing = switch (kind) {
+            .exec, .job, .control, .tunnel, .plan_phase, .audit, .cleanup => true,
             .session_write, .transfer_push, .transfer_pull, .fetch => false,
         };
         try t.expectEqual(
-            judged_by_a_remote_process,
+            judged_by_a_command_it_asked_for,
             Store.receipts.terminalDescribesKind(sampleTerminal(.exited), kind),
         );
         try t.expectEqual(
-            judged_by_a_remote_process,
+            judged_by_a_command_it_asked_for,
             Store.receipts.terminalDescribesKind(sampleTerminal(.remote_deadline), kind),
         );
         try t.expectEqual(
-            judged_by_a_remote_process,
+            stops_a_remote_thing,
             Store.receipts.terminalDescribesKind(sampleTerminal(.remote_cancel_confirmed), kind),
         );
     }
@@ -3350,21 +3409,27 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         try t.expect(reachable.contains(.cancelled));
         try t.expect(reachable.contains(.indeterminate));
 
-        const is_transfer = switch (kind) {
-            .transfer_push, .transfer_pull, .fetch => true,
-            .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => false,
+        // `completed` needs a command this binary asked for to have ended well,
+        // and two kinds have no such command: a transfer's completion is a file
+        // and no terminal reads one yet, and a control act's success is the
+        // absence of the session it named — recorded as `cancelled`, carrying
+        // the reading that established it, rather than as a `completed` nothing
+        // judged. Both refusals cost a word, not an outcome.
+        const reaches_completed = switch (kind) {
+            .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .control, .transfer_push, .transfer_pull, .fetch => false,
         };
-        // A transfer's completion is a file, and no terminal reads one yet.
-        try t.expectEqual(!is_transfer, reachable.contains(.completed));
+        try t.expectEqual(reaches_completed, reachable.contains(.completed));
         // `timed_out` needs a deadline something else enforced and reported. A
-        // write has no far side to enforce one and a transfer has no supervisor;
-        // for both, a local deadline expiring is `indeterminate` (`op_state`
-        // rule 2), which is admitted above.
-        const judged_by_a_remote_process = switch (kind) {
+        // write has no far side to enforce one, a transfer has no supervisor,
+        // and a control act supervises nothing of its own; for all three, a
+        // local deadline expiring is `indeterminate` (`op_state` rule 2), which
+        // is admitted above.
+        const judged_by_a_command_it_asked_for = switch (kind) {
             .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => true,
-            .session_write, .transfer_push, .transfer_pull, .fetch => false,
+            .session_write, .control, .transfer_push, .transfer_pull, .fetch => false,
         };
-        try t.expectEqual(judged_by_a_remote_process, reachable.contains(.timed_out));
+        try t.expectEqual(judged_by_a_command_it_asked_for, reachable.contains(.timed_out));
     }
 }
 

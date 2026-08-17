@@ -309,8 +309,8 @@
       "id": "M7-transfer-indeterminate",
       "rule": "`indeterminate` stays admissible for every kind, so a refused transfer cannot wedge.",
       "file": "src/core/store/receipts.zig",
-      "find": "        .indeterminate => switch (kind) {\n            .exec,\n            .job,\n            .session_write,\n            .transfer_push,",
-      "replace": "        .indeterminate => switch (kind) {\n            .transfer_push => false,\n            .exec,\n            .job,\n            .session_write,",
+      "find": "        .indeterminate => switch (kind) {\n            .exec,\n            .job,\n            .session_write,\n            .control,\n            .transfer_push,",
+      "replace": "        .indeterminate => switch (kind) {\n            .transfer_push => false,\n            .exec,\n            .job,\n            .session_write,\n            .control,",
       "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
@@ -504,6 +504,94 @@
       "find": "    if (probe.exit_code == null) return .{};",
       "replace": "    if (probe.exit_code == null) return .{ .probe_error = error.RemoteFailed };",
       "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens"
+    },
+    {
+      "id": "M3b-session-rm-control-op",
+      "rule": "`session rm` records its own control operation, so a destructive remote mutation is never absent from the ledger.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "        .kind = .control,\n",
+      "replace": "        .kind = .exec,\n",
+      "expect_gate": "blackbox: an uncontended `session rm` still removes, and now records a control operation"
+    },
+    {
+      "id": "M3b-session-rm-lease-scope",
+      "rule": "The lease `session rm` holds is on the session's own contention scope, not on some other scope it could hold uncontested.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "        .scope = claim.scope,\n",
+      "replace": "        .scope = .{ .kind = .path, .key = session },\n",
+      "expect_gate": "blackbox: `session rm` deletes nothing once the scope has moved after the kill"
+    },
+    {
+      "id": "M3b-session-rm-renewal-answer",
+      "rule": "The renewal's answer is what each destructive step is gated on; a renewal nobody reads is a line on stderr, not a barrier.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    authority.* = holdClaim(claim, wallClockSeconds(io));\n    return authority.holds();",
+      "replace": "    _ = holdClaim(claim, wallClockSeconds(io));\n    return true;",
+      "expect_gate": "blackbox: `session rm` deletes nothing once the scope has moved after the kill"
+    },
+    {
+      "id": "M3b-session-rm-kill-renewal",
+      "rule": "The scope lease is renewed on the line immediately above `session rm`'s kill, with nothing in between.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseBeforeKill(ctx, &execution, server_name, name, authority);\n    const gone = Tmux.killSession(",
+      "replace": "    const gone = Tmux.killSession(",
+      "expect_gate": "gate: `session rm`'s destructive remote calls are renewed on the line above them"
+    },
+    {
+      "id": "M3b-session-rm-log-renewal",
+      "rule": "The pane log is deleted only under a lease renewed immediately above the deletion; a scope lost during the kill forbids it.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, false);\n",
+      "replace": "",
+      "expect_gate": "blackbox: `session rm` deletes nothing once the scope has moved after the kill"
+    },
+    {
+      "id": "M3b-session-rm-row-renewal",
+      "rule": "The local session row - and the memories its delete cascades - is kept when the scope moves during the log deletion.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, true);\n",
+      "replace": "",
+      "expect_gate": "blackbox: `session rm` keeps the local row when the scope moves during the log deletion"
+    },
+    {
+      "id": "M3b-session-rm-contends-with-job",
+      "rule": "A session named `job-<x>` contends on job `<x>`'s scope, so `session rm` can no longer kill a running job's shell with nothing seeing it.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    if (std.mem.startsWith(u8, name, job_prefix) and name.len > job_prefix.len)\n        return .{ .kind = .job, .key = name[job_prefix.len..] };\n",
+      "replace": "    if (std.mem.startsWith(u8, name, job_prefix) and name.len > job_prefix.len)\n        return .{ .kind = .job, .key = name };\n",
+      "expect_gate": "blackbox: `session rm` on a running job's session is refused and leaves the job intact"
+    },
+    {
+      "id": "M3b-control-terminal-exited",
+      "rule": "A control operation may not be settled with an exit status: no command of the caller's ran, and `exit_code` is the column an auditor reads first.",
+      "file": "src/core/store/receipts.zig",
+      "find": "            // kind loses a word it could not have earned, not an outcome.\n            .control => false,",
+      "replace": "            // kind loses a word it could not have earned, not an outcome.\n            .control => true,",
+      "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
+    },
+    {
+      "id": "M3b-control-terminal-indeterminate",
+      "rule": "`indeterminate` describes a control operation: a kind with no admissible terminal is unsettleable and holds its scope forever.",
+      "file": "src/core/store/receipts.zig",
+      "find": "        .indeterminate => switch (kind) {\n            .exec,\n            .job,\n            .session_write,\n            .control,\n",
+      "replace": "        .indeterminate => switch (kind) {\n            .control => false,\n            .exec,\n            .job,\n            .session_write,\n",
+      "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
+    },
+    {
+      "id": "M3b-session-rm-proof-before-delete",
+      "rule": "`session rm` proves the kill before it deletes anything; a session the host still reports present loses neither its log nor its local row.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    if (!gone) refuseSurvivedKill(ctx, &execution, server_name, name, authority);\n",
+      "replace": "    _ = gone;\n",
+      "expect_gate": "blackbox: `session rm` deletes nothing when the session survives the kill"
+    },
+    {
+      "id": "M3b-session-rm-is-a-mutation",
+      "rule": "`session rm` declares itself a mutation, so an overlapping claim refuses it instead of merely warning it.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "        .kind = .control,\n        .scope = contentionScope(name),\n        .alias = name,\n        .owner_token = owner_token,\n",
+      "replace": "        .kind = .control,\n        .scope = contentionScope(name),\n        .alias = name,\n        .mutating = false,\n        .owner_token = owner_token,\n",
+      "expect_gate": "blackbox: `session rm` is refused while a peer holds the session's scope"
     }
   ]
 }
