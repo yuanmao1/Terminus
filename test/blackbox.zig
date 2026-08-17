@@ -2343,6 +2343,276 @@ test "blackbox: `job kill` is unchanged when the look after the kill never happe
     try t.expectEqualStrings("indeterminate", op.status.text());
 }
 
+// The ordering the arms of `removeJob`'s settlement are in, and the price it
+// charges, pinned because it is decided rather than because it is obvious.
+//
+// The arms run `unreadable` -> `probe_error` -> `probe.exit_code` ->
+// `!authority.holds()`. So a `job rm` on a job that had already reached its own
+// end *before* the kill — the pre-kill look read its result record and holds a
+// real exit status — settles `indeterminate` and exits 75 when the look after the
+// kill breaks on the wire, rather than settling the code it read and exiting 0.
+//
+// The two arms above the exit code are above it for different reasons, and only
+// one of them carries a contradiction. `unreadable` is two observations of a
+// single document: one says it held an exit status, the other says the host cannot
+// obtain its bytes, and nothing here can say which side of the kill was right.
+// `probe_error` makes no claim about the document at all — the round trip broke —
+// and it outranks the exit code because this verb's purpose is deletion. Every
+// destructive step below the kill was declined, so the row, the log and the
+// sidecar are all still there, and the arms beneath this one open with "job
+// removed": a receipt saying so beside a surviving row would report a removal this
+// command refused to perform. That is a choice, not a deduction, and the
+// alternative — publish the exit code and report the broken look beside it — was
+// the one the programmer rejected.
+//
+// The cost is real and deliberate: a caller who could have been told exit 7 is
+// told "unknown" instead. It is not *lost*, and that is what the whole ordering
+// rests on. Nothing was deleted, so both durable records are sitting on the host
+// exactly as the job left them, and the hint names `reconcile --from-log` — the
+// one reconcile that reads that same intact sidecar and settles the real code.
+// `--override` is not offered, because nothing here needs a human's decision.
+//
+// Three legs on one fixture, one verb with one set of flags, differing only in
+// what the host says to the look after the kill. Without the last two, every
+// assertion below would hold just as well against a binary that had started
+// calling every removal unknown, or one that had collapsed the two blind
+// findings into a single word.
+test "blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "finished_then_probe_failed");
+    defer f.deinit();
+    try f.seedServer();
+
+    const sentinel = "__TERMINUS_JOB_7__";
+
+    // The job this gate is about: over before the kill, and the look that had to
+    // follow the kill fails at the transport.
+    const deploy_id = "01TTTTTTTT0123456789ABCDEF";
+    try seedRunningJob(&f, deploy_id, "deploy", sentinel);
+
+    // Control one, for the arm directly above. The same already-finished job, and
+    // a post-kill look that *did* reach the address and could not read what is at
+    // it. That is still `read_error`, and it still sends the operator to
+    // `--override` — `--from-log` reads the document that would not open. Collapse
+    // the two words and the leg above is measuring one branch twice.
+    const salvage_id = "01VVVVVVVV0123456789ABCDEF";
+    try seedRunningJob(&f, salvage_id, "salvage", sentinel);
+
+    // Control two, for the arm directly below, and the one that decides whether
+    // this gate is about a failure path at all. The same already-finished job, and
+    // a post-kill look that works: it reaches the address, finds nothing at it and
+    // no sentinel in the window behind it, so it has nothing to hand back. The
+    // exit status this removal settles can therefore only be the one the *pre-kill*
+    // look read.
+    //
+    // Deliberately not a second look that carries the code again. That returns
+    // through `finalProbe`'s upgrade arm, which is read before any failure arm and
+    // replaces the pre-kill probe wholesale — so it would prove the post-kill
+    // reading is honoured and say nothing about the one this gate is about. It is
+    // the same trap `job kill`'s settling control fell into.
+    const release_id = "01WWWWWWWW0123456789ABCDEF";
+    try seedRunningJob(&f, release_id, "release", sentinel);
+
+    // A first look that finds the job already over: its own result record, at its
+    // own request id, reporting 7. Non-zero on purpose — `exited{0}` is what a
+    // dropped exit code and half the defaults in the file look like, and 7 is
+    // not — with no sentinel in the log window, so the record is the only thing
+    // that established it.
+    const finished_deploy = "{\"v\":1,\"requestId\":\"" ++ deploy_id ++
+        "\",\"exitCode\":7,\"finishedAt\":1750}\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    const finished_salvage = "{\"v\":1,\"requestId\":\"" ++ salvage_id ++
+        "\",\"exitCode\":7,\"finishedAt\":1750}\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    const finished_release = "{\"v\":1,\"requestId\":\"" ++ release_id ++
+        "\",\"exitCode\":7,\"finishedAt\":1750}\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    // …and a look that reached the address and found nothing at it, with no
+    // sentinel behind it either: readable, and with nothing to report.
+    const nothing_there = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+
+    // Keyed by the log path each probe script carries, because all three jobs'
+    // probes contain the split marker and this gate needs them answered
+    // differently in one conversation. `rm -f` is first so a deletion is never
+    // answered by a probe rule that happens to name the same log — that is what
+    // makes `expectNeverSent` an assertion about the binary rather than about the
+    // fake — and `kill-session` is next because that script carries `has-session`
+    // too.
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "rm -f", .exit_code = 0 },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        // `deploy`: finished, then a probe script that reports failure, which is
+        // `error.RemoteFailed`. Any non-zero status that is not `44` does it; `44`
+        // is the one code that means "the record is there and would not open" and
+        // is the next job's business. Unbounded on purpose — nothing after this
+        // should depend on how many round trips the rest of the command spends.
+        .{ .needle = "job-deploy.log", .stdout = finished_deploy, .uses = 1 },
+        .{ .needle = "job-deploy.log", .exit_code = 2 },
+        // `salvage`: finished, then `44` — a file is at this attempt's address and
+        // `head` could not obtain its bytes.
+        .{ .needle = "job-salvage.log", .stdout = finished_salvage, .uses = 1 },
+        .{ .needle = "job-salvage.log", .exit_code = 44 },
+        // `release`: finished, then a look that worked and found nothing.
+        .{ .needle = "job-release.log", .stdout = finished_release, .uses = 1 },
+        .{ .needle = "job-release.log", .stdout = nothing_there },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    // `--discard-evidence` on all three, so the two `expectNeverSent` calls below
+    // are about a deletion this command was *asked* to perform and declined, and
+    // so the third leg's `expectSent` is the same command doing it when it may.
+    {
+        var acted = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "deploy", "--discard-evidence", "--json", "--db", f.db,
+        }, &environ);
+        defer acted.deinit(f.allocator);
+
+        // The traffic first, and the forbidden command before any number: a
+        // regression that starts destroying evidence here has to read as `rm -f`
+        // reaching the host, not as an exit code that moved. The kill did go out —
+        // this is not a command that stopped short of it.
+        try host.expectSent("kill-session");
+        try host.expectNeverSent("rm -f");
+        try host.expectFullyScripted();
+
+        // 75, and neither 0 nor 1. 0 is what the rejected ordering returns here,
+        // and 1 would invite the blind retry an unknown outcome must not.
+        try acted.expectCode(75);
+
+        // The two words, in the only place a `--json` consumer can see them, and
+        // never the pre-kill look's own reading: `present` here would say this
+        // command knows what is at that address after the kill, which is exactly
+        // what it does not.
+        try acted.expectSays("\"resultRecord\": \"probe_error\"");
+        try acted.expectSays("\"resultRecordError\": \"probe_error\"");
+        try acted.expectSaysNot("\"resultRecord\": \"present\"");
+        try acted.expectSaysNot("read_error");
+        // Where the caller is sent, and it is the half of this rule that makes the
+        // withheld exit code recoverable rather than lost: both records are intact,
+        // so the reconcile that reads them settles the real 7 once the host answers
+        // again. `--override` would be asking a human to decide something no human
+        // has to.
+        try acted.expectSays("--from-log");
+        try acted.expectSaysNot("--override");
+        try acted.expectSays("failed with RemoteFailed");
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Out of the store, not parsed out of stdout. `indeterminate`, which is
+        // what `exited{7}` is not: the rejected ordering settles this attempt
+        // `failed`.
+        const op = (try Store.operations.get(&store, arena, deploy_id)).?;
+        try t.expectEqualStrings("indeterminate", op.status.text());
+
+        // …and said again where it cannot be a coincidence of one enum tag. A
+        // terminal receipt for `exited{7}` carries the code itself and
+        // `REMOTE_NONZERO_EXIT`; this one carries neither.
+        const rows = try Store.receipts.list(&store, arena, deploy_id);
+        var terminal: ?Store.receipts.Row = null;
+        for (rows) |row| if (row.is_terminal) {
+            terminal = row;
+        };
+        const receipt = terminal orelse return error.RemovalLeftNoTerminalReceipt;
+        try t.expectEqual(@as(?i64, null), receipt.exit_code);
+        try t.expectEqualStrings("INDETERMINATE", receipt.error_code orelse
+            return error.TerminalReceiptCarriedNoErrorCode);
+        // The ledger's own sentence names the fault and the claim. The receipt is
+        // what an operator reads weeks later, and "unknown" without saying why
+        // sends them back to a host they cannot tell apart from a host with a
+        // broken result file.
+        const reason = receipt.transport_error orelse
+            return error.TerminalReceiptCarriedNoReason;
+        try t.expect(std.mem.indexOf(u8, reason, "RemoteFailed") != null);
+        try t.expect(std.mem.indexOf(u8, reason, "no evidence was deleted") != null);
+
+        // The row survives on the verb that exists to delete it. It is the last
+        // thing pointing at the log and the sidecar still sitting on the host.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+    }
+
+    // Control one. Same fixture, same verb, same flags, same already-finished job —
+    // and a post-kill look that reached the address and could not read the document
+    // there. Two words, two next steps: if this has become `probe_error` a caller
+    // can no longer tell a file it must repair from a wire it must retry.
+    {
+        var unreadable = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "salvage", "--discard-evidence", "--json", "--db", f.db,
+        }, &environ);
+        defer unreadable.deinit(f.allocator);
+
+        try host.expectNeverSent("rm -f");
+        try host.expectFullyScripted();
+        try unreadable.expectCode(75);
+        try unreadable.expectSays("\"resultRecord\": \"read_error\"");
+        try unreadable.expectSays("\"resultRecordError\": \"read_error\"");
+        try unreadable.expectSaysNot("probe_error");
+        try unreadable.expectSays("--override");
+        try unreadable.expectSaysNot("--from-log");
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const op = (try Store.operations.get(&store, arena, salvage_id)).?;
+        try t.expectEqualStrings("indeterminate", op.status.text());
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "salvage")) != null);
+    }
+
+    // Control two. The same already-finished job under the same command, with a
+    // post-kill look that worked: the exit status the pre-kill look read is
+    // published, the row is forgotten, the evidence this leg was told to discard is
+    // discarded, and the command exits 0. This is what the leg above gives up, and
+    // stating it here is the difference between a rule and a binary that stopped
+    // settling anything.
+    {
+        var settled = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "release", "--discard-evidence", "--json", "--db", f.db,
+        }, &environ);
+        defer settled.deinit(f.allocator);
+
+        try host.expectFullyScripted();
+        // The positive counterpart of the two absences above: this command really
+        // does delete when it may, so their absence is a decision rather than a
+        // binary that had stopped sending anything.
+        try host.expectSent("rm -f");
+        try settled.expectCode(0);
+        try settled.expectSays("\"ok\": true");
+        try settled.expectSays("\"outcomeProven\": true");
+        try settled.expectSaysNot("probe_error");
+        try settled.expectSaysNot("read_error");
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // `failed` is the status of `exited{7}`, and the receipt carries the code
+        // itself — the same reading the leg above deliberately withholds.
+        const op = (try Store.operations.get(&store, arena, release_id)).?;
+        try t.expectEqualStrings("failed", op.status.text());
+        const rows = try Store.receipts.list(&store, arena, release_id);
+        var terminal: ?Store.receipts.Row = null;
+        for (rows) |row| if (row.is_terminal) {
+            terminal = row;
+        };
+        const receipt = terminal orelse return error.RemovalLeftNoTerminalReceipt;
+        try t.expectEqual(@as(?i64, 7), receipt.exit_code);
+        try t.expectEqualStrings("REMOTE_NONZERO_EXIT", receipt.error_code orelse
+            return error.TerminalReceiptCarriedNoErrorCode);
+
+        // …and the row really is gone, which is the other thing the leg above
+        // refuses to do.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "release")) == null);
+    }
+}
+
 // The window every fail-closed step exists for, driven end to end: the binary
 // takes the job scope before it dials, and a peer forces it away while the
 // binary is waiting for its first probe to come back.

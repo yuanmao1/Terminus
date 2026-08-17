@@ -490,6 +490,14 @@
       "expect_gate": "blackbox: `job kill` is unchanged when the look after the kill never happens"
     },
     {
+      "id": "M10-probe-error-outranks-the-exit-code",
+      "rule": "`job rm`'s `probe_error` arm sits above the exit-code arm, so a look that never happened settles `indeterminate` even when the pre-kill look had already read a real exit status: every destructive step was declined, the row and both records are still there, and every arm below opens with \"job removed\". The rejected alternative publishes the pre-kill code and exits 0 over a removal that did not happen.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    else if (final.probe_error) |err|\n        // The other blind branch, and above the exit-code arm for a different",
+      "replace": "    else if (probe.exit_code) |code|\n        .{ .exited = .{ .exit_code = code } }\n    else if (final.probe_error) |err|\n        // The other blind branch, and above the exit-code arm for a different",
+      "expect_gate": "blackbox: `job rm` settles indeterminate over an exit code read before a post-kill look that failed"
+    },
+    {
       "id": "M10-probe-error-not-for-a-look-that-happened",
       "rule": "Discriminating control: a second look that reaches the host and finds nothing is not a look that failed. Called one, every unproven `job rm` would start keeping its row and publishing a fault nobody hit.",
       "file": "src/cli/cmd_job.zig",
