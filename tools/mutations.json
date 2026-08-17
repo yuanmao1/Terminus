@@ -90,6 +90,22 @@
       "expect_gate": "gate: a checkpoint write that lands on no row is an error, not a success"
     },
     {
+      "id": "M3-checkpoint-fail-loud-offset",
+      "rule": "A checkpoint UPDATE that matches no row is an error, not a success — confirmOffset carries its own guard and can regress independently of the other two sites.",
+      "file": "src/core/store/transfers.zig",
+      "find": "    if (store.db.changes() != 0) return;\n\n    const row = try ownedRow(store, id, owner_request_id);\n    if (!row.state.acceptsOffset()) return error.IllegalCheckpointTransition;",
+      "replace": "    if (store.db.changes() >= 0) return;\n\n    const row = try ownedRow(store, id, owner_request_id);\n    if (!row.state.acceptsOffset()) return error.IllegalCheckpointTransition;",
+      "expect_gate": "gate: a checkpoint write that lands on no row is an error, not a success"
+    },
+    {
+      "id": "M3-checkpoint-fail-loud-transition",
+      "rule": "A checkpoint UPDATE that matches no row is an error, not a success — transitionLocked, reached through setState, carries its own guard and can regress independently.",
+      "file": "src/core/store/transfers.zig",
+      "find": "    if (store.db.changes() != 0) return;\n\n    // Existence and ownership come back under their own names. What is left is",
+      "replace": "    if (store.db.changes() >= 0) return;\n\n    // Existence and ownership come back under their own names. What is left is",
+      "expect_gate": "gate: a checkpoint write that lands on no row is an error, not a success"
+    },
+    {
       "id": "M3-prefix-proof",
       "rule": "A resume from a non-zero offset requires both the recorded and the observed prefix hash.",
       "file": "src/core/store/transfers.zig",
