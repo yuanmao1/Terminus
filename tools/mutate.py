@@ -465,9 +465,17 @@ def main() -> int:
     for r in bad:
         print(f"  {r.outcome:<12} {r.id}")
     after = provenance()
-    if not after["tracked_clean"]:
+    # The `--json` artifact is this run's own output, so its being modified is
+    # the tool working, not a mutation left behind. Excluded by path rather than
+    # by tracked-vs-untracked: the first version of this check ignored untracked
+    # files, which held only until the artifact was committed — after that,
+    # rewriting it was a *tracked* modification and a clean 58/58 run again
+    # accused itself of leaving a mutation applied.
+    wrote = {Path(args.json).as_posix()} if args.json else set()
+    left_behind = [p for p in after["tracked_dirty_paths"] if p not in wrote]
+    if left_behind:
         print("\nWARNING: tracked files are modified after the run:")
-        for p in after["tracked_dirty_paths"]:
+        for p in left_behind:
             print(f"  {p}")
         print("Every mutation is supposed to be reverted; this means one was not.")
         return 1
