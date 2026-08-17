@@ -252,6 +252,19 @@ def provenance() -> dict:
     }
 
 
+def write_json(path: str, payload) -> None:
+    """Writes the artifact with LF endings, byte-exactly.
+
+    `Path.write_text` translates newlines on Windows, so the first artifact this
+    tool produced landed CRLF while its committed blob is LF under
+    `*.json text eol=lf` — the file on disk therefore disagreed with the file in
+    the repository, which is the exact drift this repo spent several commits
+    eliminating. A run that reports on line-ending discipline must not violate it.
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + chr(10)
+    Path(path).write_bytes(text.encode("utf-8"))
+
+
 def tail_of(output: str, limit: int = 4000) -> str:
     """The end of the build output, which is where zig puts the reason."""
     out = output.strip()
@@ -375,9 +388,7 @@ def main() -> int:
             print("green" if back_code == 0 else "STILL RED")
             if back_code != 0:
                 if args.json:
-                    Path(args.json).write_text(
-                        json.dumps([asdict(x) for x in results], indent=2), encoding="utf-8"
-                    )
+                    write_json(args.json, [asdict(x) for x in results])
                     print(f"      wrote partial results to {args.json}")
                 sys.exit(
                     f"\nthe tree still fails after restoring {mut.file}, so the build "
@@ -415,9 +426,7 @@ def main() -> int:
             },
             "results": [asdict(r) for r in results],
         }
-        Path(args.json).write_text(
-            json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        write_json(args.json, artifact)
         print(f"\nwrote {args.json}")
 
     print(f"\n{len(killed)}/{len(results)} killed by the gate that claims the rule")
