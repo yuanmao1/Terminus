@@ -616,10 +616,63 @@ against the row just read (`:213-228`). Neither changes.
 
 ---
 
-## 7. Open — the programmer's decision
+## 7. Decided — with the options kept as the rationale
 
-Nothing in this section is settled. Each item has options, costs and a
-recommendation.
+**These were delegated to the Commander on 2026-08-18 and are now decided.** The
+options below each item are kept, because a decision whose alternatives have been
+deleted cannot be re-examined.
+
+| | decision | departs from the recommendation below? |
+|---|---|---|
+| 7.1 | `control` | no |
+| 7.2 | three columns on `operations`: `target_kind`, `target_key`, `target_request` | no |
+| 7.3 | yes, `session new` gets an operation | no |
+| 7.4 | refuse `--force` past an `indeterminate` overlap | no |
+| 7.5 | **a new `Terminal` variant**, not `input_refused` | **yes** |
+| 7.6 | a new `src/core/control.zig` | no (took (c) of (b)/(c)) |
+| 7.7 | **`retention_rules`**, not a delete in the launch path | **yes** |
+| 7.8 | one row per physical session | no |
+| 7.9 | no incarnation for user sessions in M3b | no |
+| 7.10 | `.session:"job-<name>"` only | no |
+| 7.11 | on the control operation where a kill happened, otherwise none | no |
+
+Two departures, both for the same reason — the repo has repeatedly paid for
+putting a convenient word in a durable place.
+
+**7.5.** Reusing `input_refused` is rejected. `input_accepted` and
+`input_refused` exist *because* settling a write as `.exited{0}` wrote a false
+word into a receipt where an auditor reads the exit code first (`7d0898a`).
+Reusing an input-named terminal for a session identity mismatch repeats that
+mistake one level up. The build stopping in `terminalDescribesKind` for every
+kind is the forcing function, not the cost. `(c)` stays rejected for the reason
+given: a mismatch is proven, and recording a proof as an unknown leaves a scope
+blocked.
+
+**7.7.** Deleting the previous attempt's log in `job run` is rejected because it
+misreads what per-attempt naming already buys. Once each attempt owns its log
+path, §1.6's corruption — appending to the previous attempt's log and then
+reading it from cursor 0 — is gone. What remains is disk growth alone. Paying for
+that with a new destructive site in the launch path means new authority, new
+failure modes, and a change to the asserted site count of the "renewed on the
+line above" gate — poor value for a housekeeping problem `retention_rules`
+(`migrate.zig:350`) already exists to solve.
+
+### Implementation order, decided
+
+The first slice is the one with **no migration at all**: `session rm` and
+`session new` get a `control` operation and a lease on the **existing** `.job`
+scope. That closes §1.2 — a destructive remote mutation running with no ledger
+entry, able to kill a running job's shell — without waiting for v13.
+
+It is available today because `operations.kind` is bare `TEXT`
+(`migrate.zig:110`), `leases` already speaks `.job` (`migrate.zig:565`), and
+`alias` already carries session names (`cmd_exec.zig:86`). The `target_*` columns
+of 7.2 and the `.session` scope of §5 follow in v13, and §1.3's scope-vocabulary
+hole closes with them — not before, since fixing it *is* the scope change.
+
+---
+
+## 7a. The options, as reasoned at the time
 
 **7.1 The `Kind` variant's name.** (a) `job_control` — matches the M3b brief,
 but `session rm` is not a job. (b) `control` — accurate across all four
