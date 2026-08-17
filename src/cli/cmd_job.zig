@@ -2244,6 +2244,93 @@ fn refuseKill(
     Cli.exitNow(Cli.exit_code.failure);
 }
 
+/// Refuses the kill on one of the three branches that has already settled.
+///
+/// Those branches record what the probe read *before* they clean the session
+/// up, because neither record depends on the kill: the contradiction, the
+/// unusable result record and the exit status are all facts the probe
+/// established, and a kill cannot make them truer. That leaves a store
+/// transaction sitting between the renewal and the `kill-session`, and a
+/// renewal on the far side of a settlement describes a moment that has passed.
+/// So the kill carries its own renewal immediately before it, and this is what
+/// a loss discovered there costs.
+///
+/// Two things are true at once here, and the receipt says both. The settlement
+/// is written and stays written: nothing about a lease makes a reading false,
+/// so `status` and `outcomeProven` carry the ledger's real answer rather than
+/// the blanks `refuseKill` publishes, and rolling it back would throw away an
+/// observation of the host that nothing else recorded. The kill did *not* go
+/// out, so `action` is `not_killed` and every claim resting on the session
+/// having stopped — `sessionGone`, `sessionCleanedUp`, `cancellationProven` —
+/// is false.
+///
+/// `refuseKill` cannot be reused for it. Its hint says nothing local was
+/// written, which on this path is precisely wrong, and its `status` is read
+/// back off the ledger rather than being the settlement this command just made.
+///
+/// The exit code follows the settlement, not the refusal. An attempt left
+/// `indeterminate` needs a reconcile and earns 75 — the same code the branch
+/// exits with when it is *not* refused — while a proven outcome needs none and
+/// earns 1. Reporting 1 for an indeterminate settlement would tell a script the
+/// state was untouched, and the state is the one thing that did change.
+fn refuseKillAfterSettlement(
+    ctx: *Cli.Ctx,
+    job: Store.jobs.Job,
+    attempt: ?Store.job_attempts.Attempt,
+    authority: Authority,
+    probe: Tmux.JobProbe,
+    settled: Observed,
+) noreturn {
+    const proven = settled.settlement.proves();
+    const hint = std.fmt.allocPrint(
+        ctx.arena,
+        "{s}; what this command had already read was recorded — the attempt is {s} — but the kill was never sent: no command that changes anything reached the host, so job '{s}''s session may still be there and none of its evidence was deleted. Find out who else is acting on this job, then re-run once the scope is free, or re-run with --force to take the scope over",
+        .{
+            authority.note(ctx, job.name) orelse "the scope lease is not ours",
+            settled.statusText(),
+            job.name,
+        },
+    ) catch "this command recorded what it had read and then found it no longer held the scope lease for this job; the kill was not sent and nothing was deleted. Wait, or re-run with --force";
+    switch (ctx.out.format) {
+        .json => ctx.out.json(KillJson{
+            .ok = false,
+            .action = "not_killed",
+            .job = job.name,
+            // The settlement this command just wrote, not a re-read: these are
+            // the two halves of one report and a second look could disagree
+            // with the first.
+            .status = settled.statusText(),
+            .exitCode = probe.exit_code,
+            .outcomeProven = proven,
+            .finishedAt = probe.finished_at,
+            .observedAt = ctx.now,
+            // The kill was not sent, so nothing here knows the session stopped
+            // — and on this path something else may own it.
+            .sessionGone = false,
+            .sessionCleanedUp = false,
+            .cancellationProven = false,
+            .conflict = ConflictJson.from(probe.conflict),
+            .resultRecord = probe.sidecar.code(),
+            .resultRecordError = resultRecordError(ctx, probe.sidecar),
+            .requestId = if (attempt) |a| a.request_id else null,
+            .cacheError = cacheError(ctx, job.name, settled.cache),
+            .authority = authority.code(),
+            .authorityError = authority.note(ctx, job.name),
+            .hint = hint,
+        }) catch {},
+        .human => ctx.out.print(
+            "job '{s}': NOT killed — {s}\n",
+            .{ job.name, hint },
+        ) catch {},
+    }
+    ctx.out.flush() catch {};
+    // `failIndeterminateAfterOutput` releases the claim itself; the proven arm
+    // has to do it on the way past.
+    if (!proven) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
+    Cli.releaseClaim();
+    Cli.exitNow(Cli.exit_code.failure);
+}
+
 fn refuseRemoval(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -2427,11 +2514,14 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
-        // The renewal that precedes this branch's one destructive step, and the
-        // gate on it. Nothing remote happens between here and the
-        // `kill-session` below — the settlement in between is a local
-        // transaction — so a lease we no longer hold stops this command with the
-        // host untouched and the ledger unwritten.
+        // The renewal that precedes the settlement, and the gate on it. A
+        // settlement is a claim about this job written under this command's
+        // name, so it is not a step a command that has lost the scope may take
+        // either: refused here, the host is untouched and the ledger unwritten.
+        //
+        // It is *not* the renewal the kill runs under. The transaction below
+        // sits between the two, and this answer is stale by all of it — see the
+        // renewal immediately above the `kill-session`.
         if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
         const settled = settleObserved(
             ctx,
@@ -2449,6 +2539,17 @@ fn killJob(
         // Still killed: the caller asked for the session to stop, and both
         // records claim the command already returned. What is refused is
         // reporting the kill as if it had established an outcome.
+        //
+        // The renewal the kill itself runs under, with nothing between it and
+        // the command it gates: no store work, no probe, no second round trip.
+        // The one above is on the far side of a settlement, and a peer's
+        // `--force` landing inside that transaction would leave this command
+        // sending `kill-session` by name at a session the new holder may
+        // already own. That is not closed by this — the host still acts on the
+        // kill some interval after the renewal answered, and only a session
+        // identity the host itself can check would close it — but it is the
+        // narrowest this side can make the window.
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
         // The kill is on the far side of the settlement on this branch, so the
@@ -2513,6 +2614,8 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
+        // The settlement's renewal. The kill has its own, below: the
+        // transaction between them is long enough for the scope to move.
         if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
         const settled = settleObserved(
             ctx,
@@ -2527,6 +2630,10 @@ fn killJob(
             finishSync(job, .killed, null, ctx.now),
         );
 
+        // Adjacent to the kill for the same reason as the branch above: this is
+        // the last moment at which a `kill-session` aimed by name at a session a
+        // peer may now own can still be withheld.
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
         Cli.releaseClaim();
@@ -2591,6 +2698,7 @@ fn killJob(
                 Cli.storeFatal(store, err)
         else
             null;
+        // The settlement's renewal. The kill's is below, after the transaction.
         if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
         const settled = settleObserved(
             ctx,
@@ -2607,6 +2715,12 @@ fn killJob(
         const settled_status = settled.statusText();
         const proven = settled.settlement.proves();
 
+        // The kill's own renewal. The outcome is already recorded and stays
+        // recorded — the exit status came from a document at this attempt's own
+        // request id and a lease says nothing about whether it is true — but the
+        // cleanup is a remote mutation like any other, and a session this
+        // command no longer has the scope for is not one it may stop.
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
         Cli.releaseClaim();
@@ -4041,6 +4155,107 @@ fn stillOurs(claim: Claim, io: std.Io, authority: *Authority) bool {
     if (!authority.holds()) return false;
     authority.* = holdClaim(claim, wallClockSeconds(io));
     return authority.holds();
+}
+
+// --- Adjacency, held against the source that has to have it -----------------
+//
+// "Renew before the step" is not a property of a function; it is a property of
+// where the call sits. `stillOurs` cannot enforce it, and no type can: a
+// renewal three statements and a store transaction above a `kill-session` type
+// checks exactly as well as one on the line above it, and answers a different
+// question. That was the defect — three branches renewed, settled, and then
+// killed on an answer a whole transaction old, so a peer's `--force` landing
+// inside the transaction left this command sending `kill-session` *by name* at
+// a session the new holder may already own.
+//
+// The end-to-end gates cannot reach that window. `FakeHost.Rule.seize` is
+// deterministic only while the binary is blocked on the socket, and between a
+// renewal and the call it gates there is — by construction, and that is the
+// point — no round trip to block on. So the adjacency is checked where it
+// lives: in the text.
+//
+// This does not replace the traffic gates. They prove the refusal is real and
+// reports honestly; this proves there is nothing between the question and the
+// act. Deleting any one of the seven renewals that sit on those lines fails
+// here, naming the function and the line.
+
+/// The calls that change a host, spelled as they are written.
+const destructive_remote_calls = [_][]const u8{
+    "Tmux.killSession(",
+    "Tmux.removeLog(",
+    "Tmux.removeResult(",
+};
+
+/// How many of them the two claim-holding verbs make. Asserted so a scan that
+/// found nothing — a renamed function, a body delimiter that moved — fails
+/// instead of passing over an empty region.
+const destructive_remote_call_count = 7;
+
+/// The two functions that hold a `Claim` while they touch the host. The one
+/// other `killSession` in this file — `runCmd` clearing a leftover session
+/// before it reuses the name — runs under a reservation and never takes a
+/// lease, so it has no renewal to be adjacent to and is not this rule's
+/// business.
+const claim_holding_bodies = [_][]const u8{ "\nfn killJob(", "\nfn removeJob(" };
+
+/// A top-level function's text, from its `fn` line to the `}` in column zero
+/// that closes it.
+fn bodyOf(source: []const u8, header: []const u8) error{ FunctionMissing, FunctionUnterminated }![]const u8 {
+    const start = std.mem.indexOf(u8, source, header) orelse return error.FunctionMissing;
+    const rest = source[start + 1 ..];
+    const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.FunctionUnterminated;
+    return rest[0 .. end + 1];
+}
+
+test "gate: every destructive remote call is renewed on the line above it" {
+    const t = std.testing;
+    const source = @embedFile("cmd_job.zig");
+
+    var found: usize = 0;
+    for (claim_holding_bodies) |header| {
+        const body = try bodyOf(source, header);
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        // Every code line seen so far, so the check can look back past the
+        // comments that explain each site — and only past those.
+        var last_code: []const u8 = "";
+        var number: usize = 0;
+        while (lines.next()) |raw| {
+            number += 1;
+            const line = std.mem.trim(u8, raw, " \t\r");
+            const destructive = for (destructive_remote_calls) |call| {
+                if (std.mem.indexOf(u8, line, call) != null) break call;
+            } else null;
+            if (destructive) |call| {
+                found += 1;
+                if (std.mem.indexOf(u8, last_code, "stillOurs(") == null) {
+                    std.debug.print(
+                        \\
+                        \\src/cli/cmd_job.zig: a destructive remote call is not gated on a renewal
+                        \\taken immediately before it.
+                        \\
+                        \\  in:               {s}
+                        \\  line {d} of it:    {s}
+                        \\  the code above it: {s}
+                        \\
+                        \\Every call that changes the host must be preceded — with nothing but
+                        \\comments in between — by a `stillOurs(...)` gate, so that no store
+                        \\transaction, probe or second round trip can sit between the question
+                        \\"is the scope still ours" and the act it authorises. A renewal on the
+                        \\far side of a settlement answers about a moment that has passed, and
+                        \\the peer that took the lease in between now owns the session this
+                        \\`{s}` names.
+                        \\
+                    , .{ header[1..], number, line, last_code, call });
+                    return error.DestructiveCallIsNotAdjacentToItsRenewal;
+                }
+            }
+            if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
+            last_code = line;
+        }
+    }
+    // A scan that matched nothing would have reported nothing. Say how many
+    // sites the rule is actually holding.
+    try t.expectEqual(@as(usize, destructive_remote_call_count), found);
 }
 
 /// Refuses an attempt that another claim on the same scope makes unsafe.

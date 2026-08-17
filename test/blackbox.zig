@@ -1095,6 +1095,36 @@ const FakeHost = struct {
         }
     }
 
+    /// Asserts that a command carrying `needle` did reach the host.
+    ///
+    /// The other half of `expectNeverSent`, and not decoration. A refusal gate
+    /// asserts an absence, and an absence is what a binary that lost its way
+    /// before the branch under test — or refused every kill unconditionally —
+    /// also produces. Only a paired run that insists the same fixture *does*
+    /// send the kill tells those two apart.
+    fn expectSent(host: *FakeHost, needle: []const u8) !void {
+        const dropped = host.record_failures.load(.monotonic);
+        std.testing.expectEqual(@as(u32, 0), dropped) catch |err| {
+            host.banner("--- lost traffic records:");
+            std.debug.print(
+                "{d} command(s) reached the fake host and could not be recorded, so this assertion cannot be made\n",
+                .{dropped},
+            );
+            return err;
+        };
+        host.seen_lock.lockUncancelable(host.io);
+        defer host.seen_lock.unlock(host.io);
+        for (host.seen.items) |command| {
+            if (std.mem.indexOf(u8, command, needle) != null) return;
+        }
+        host.banner("--- a step this command was supposed to take never reached the host:");
+        std.debug.print(
+            "no command containing '{s}' reached the host; {d} command(s) did\n",
+            .{ needle, host.seen.items.len },
+        );
+        return error.ExpectedCommandWasNotSent;
+    }
+
     /// Asserts that every `seize` rule that fired actually took the lease.
     fn expectSeized(host: *FakeHost) !void {
         const failed = host.seize_failures.load(.monotonic);
@@ -2066,4 +2096,227 @@ test "blackbox: a lost scope costs `job kill` and `job rm` their claims, not the
         // forget is still there for the peer that now owns the name.
         try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
     }
+}
+
+/// One of the three `job kill` branches that write their settlement before they
+/// clean the session up.
+///
+/// All three reach the host, read something the ledger can be told about — a
+/// contradiction between the two durable records, a result record that is
+/// present and unusable, or an exit status the job simply left behind — and
+/// record it *before* sending `kill-session`, because the settlement describes
+/// what the probe saw and nothing about it depends on the kill. That order is
+/// why each of them carries two renewals rather than one: a store transaction
+/// sits between the answer and the act, and a peer's `--force` landing inside
+/// it would leave the command sending `kill-session` *by name* at a session the
+/// new holder owns.
+///
+/// Each branch is driven twice on identical scripts, differing in one thing:
+/// whether the scope is taken while the binary is blocked on the probe's reply.
+/// The pair is the point — a gate that only ever refuses is green against a
+/// binary that refuses every kill there is, and a gate that only ever kills is
+/// green against the defect these exist for.
+///
+/// What the pair does *not* reach is the window between the settlement and the
+/// kill. `FakeHost.Rule.seize` is deterministic only while the binary is
+/// blocked on this socket, and between a renewal and the call it gates there
+/// is, by construction, nothing to block on: no round trip, and therefore no
+/// instant an outside agent can be scheduled into. The adjacency of those two
+/// lines is held instead by a gate in `src/cli/cmd_job.zig` that reads the
+/// source — see "every destructive remote call is renewed on the line above
+/// it".
+const KillBranch = struct {
+    /// Names the two scratch fixtures this drives.
+    name: []const u8,
+    request_id: []const u8,
+    /// The probe reply that puts `job kill` on this branch.
+    probe: []const u8,
+    /// A substring of the JSON that only this branch's reading produces.
+    /// Asserted on both runs so three fixtures cannot silently collapse onto
+    /// one branch and report it three times.
+    marker: []const u8,
+    /// What the run nobody interferes with calls what it did, and exits with.
+    action: []const u8,
+    code: u8,
+    /// The ledger's own word for the attempt after that run, read out of the
+    /// store rather than out of the report that claimed it.
+    settled: []const u8,
+};
+
+const kill_branch_sentinel = "__TERMINUS_JOB_7__";
+
+fn killBranchRefusesAScopeItHasLost(branch: KillBranch) !void {
+    const t = std.testing;
+    const fixture_name = try std.fmt.allocPrint(t.allocator, "{s}_seized", .{branch.name});
+    defer t.allocator.free(fixture_name);
+    var f = try Fixture.init(t.allocator, fixture_name);
+    defer f.deinit();
+    try f.seedServer();
+    try seedRunningJob(&f, branch.request_id, "deploy", kill_branch_sentinel);
+
+    var rules = [_]FakeHost.Rule{
+        // The first look, and the moment the scope changes hands. Bounded to
+        // one use so a second look cannot seize again and make the peer's row a
+        // different row from the one this checks.
+        .{ .needle = probe_split, .stdout = branch.probe, .uses = 1, .seize = true },
+        .{ .needle = probe_split, .stdout = branch.probe },
+        // No `kill-session` rule on purpose. One that was sent still gets
+        // recorded, and `expectNeverSent` below reports it in those words
+        // instead of as traffic the fake could not answer.
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var killed = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer killed.deinit(f.allocator);
+
+    // The property, ahead of everything downstream of it. An exit code checked
+    // first would name a number; this names the kill.
+    try host.expectSeized();
+    try host.expectNeverSent("kill-session");
+    try host.expectFullyScripted();
+    // Exit 1 rather than 75: this command changed nothing, so nothing about the
+    // remote is unknown because of it and a retry is safe once the scope frees.
+    try killed.expectCode(1);
+
+    try killed.expectSays("\"action\": \"not_killed\"");
+    try killed.expectSays("\"authority\": \"lapsed\"");
+    try killed.expectSays("\"ok\": false");
+    try killed.expectSays("\"sessionGone\": false");
+    try killed.expectSays("\"cancellationProven\": false");
+    // …on the branch this fixture means to drive, and not another one.
+    try killed.expectSays(branch.marker);
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Nothing was settled. A step this command may not take is not a step it
+    // gets to record having taken, and every one of these branches was about to
+    // write a terminal.
+    const op = (try Store.operations.get(&store, arena, branch.request_id)).?;
+    try t.expectEqualStrings("remote_started", op.status.text());
+    const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    try t.expectEqualStrings("running", @tagName(row.status));
+
+    // The peer still holds the scope: the loser's exit did not hand it back.
+    const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+    try t.expectEqual(@as(usize, 1), held.len);
+    try t.expectEqualStrings(FakeHost.seizing_peer, held[0].owner_request_id);
+}
+
+fn killBranchStillKillsWhatItHolds(branch: KillBranch) !void {
+    const t = std.testing;
+    const fixture_name = try std.fmt.allocPrint(t.allocator, "{s}_held", .{branch.name});
+    defer t.allocator.free(fixture_name);
+    var f = try Fixture.init(t.allocator, fixture_name);
+    defer f.deinit();
+    try f.seedServer();
+    try seedRunningJob(&f, branch.request_id, "deploy", kill_branch_sentinel);
+
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .stdout = branch.probe },
+        // Before `has-session`: the kill's script contains both words.
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var killed = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer killed.deinit(f.allocator);
+
+    // The discriminating half: with nobody taking the scope, the second
+    // renewal answers `held` and the kill goes out exactly as it did before.
+    // A renewal that refused its own command would show up here and nowhere
+    // else — the refusal gate above would still be green.
+    try host.expectSent("kill-session");
+    try host.expectFullyScripted();
+    try killed.expectCode(branch.code);
+    try killed.expectSays(branch.action);
+    try killed.expectSays(branch.marker);
+    try killed.expectSays("\"authority\": \"held\"");
+    try killed.expectSays("\"authorityError\": null");
+    try killed.expectSays("\"sessionGone\": true");
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const op = (try Store.operations.get(&store, arena, branch.request_id)).?;
+    try t.expectEqualStrings(branch.settled, op.status.text());
+
+    // And the claim went back. Two renewals per branch push `expires_at`
+    // further out than one did; what must not change is that the command still
+    // gives the scope up when it is done with it.
+    const still_held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+    try t.expectEqual(@as(usize, 0), still_held.len);
+}
+
+fn killBranchSettlesThenCleansUp(branch: KillBranch) !void {
+    try killBranchRefusesAScopeItHasLost(branch);
+    try killBranchStillKillsWhatItHolds(branch);
+}
+
+test "blackbox: a kill that found the two records disagreeing settles, then needs the scope to clean up" {
+    const request_id = "01MMMMMMMM0123456789ABCDEF";
+    try killBranchSettlesThenCleansUp(.{
+        .name = "kill_conflict",
+        .request_id = request_id,
+        // Both records readable, and they do not agree: the result file says 3,
+        // the sentinel in the log says 7. One of them is wrong and nothing here
+        // can say which, so the settlement is `indeterminate` and the kill is
+        // the cleanup the caller asked for.
+        .probe = "{\"v\":1,\"requestId\":\"" ++ request_id ++ "\",\"exitCode\":3,\"finishedAt\":1750}\n" ++
+            probe_split ++ "\n20\nwork done\n" ++ kill_branch_sentinel ++ ":7\n",
+        .marker = "\"resultExitCode\": 3",
+        .action = "\"action\": \"killed\"",
+        .code = 75,
+        .settled = "indeterminate",
+    });
+}
+
+test "blackbox: a kill over an unusable result record settles, then needs the scope to clean up" {
+    const request_id = "01NNNNNNNN0123456789ABCDEF";
+    try killBranchSettlesThenCleansUp(.{
+        .name = "kill_refused",
+        .request_id = request_id,
+        // A document at this request's own address carrying an exit status no
+        // shell produces, with the job's own sentinel behind it. The stronger
+        // record is unusable, so the weaker one cannot be checked against it.
+        .probe = "{\"v\":1,\"requestId\":\"" ++ request_id ++ "\",\"exitCode\":9000,\"finishedAt\":1750}\n" ++
+            probe_split ++ "\n20\nwork done\n" ++ kill_branch_sentinel ++ ":7\n",
+        .marker = "\"resultRecord\": \"exit_code_out_of_range\"",
+        .action = "\"action\": \"killed\"",
+        .code = 75,
+        .settled = "indeterminate",
+    });
+}
+
+test "blackbox: a kill on a job that already finished settles, then needs the scope to clean up" {
+    try killBranchSettlesThenCleansUp(.{
+        .name = "kill_finished",
+        .request_id = "01PPPPPPPP0123456789ABCDEF",
+        // Nothing at the result record's address and the job's own sentinel in
+        // the tail: the outcome was there before this command was run, and the
+        // kill is cleanup.
+        .probe = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ kill_branch_sentinel ++ ":0\n",
+        .marker = "\"resultRecord\": \"absent\"",
+        .action = "\"action\": \"already_finished\"",
+        .code = 0,
+        .settled = "completed",
+    });
 }
