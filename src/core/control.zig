@@ -15,9 +15,10 @@
 //! stale cleanup and `write --force` are all queued to need the same thing,
 //! so this is where it lives (`docs/m3b-job-control.md` §2.3, §7.6).
 //!
-//! **What is shared here is the machinery, not the words.** The two verbs that
-//! use it today say different things in their diagnostics, and this file
-//! preserves both wordings verbatim rather than picking one — see `Subject`.
+//! **What is shared here is the machinery and, since the wordings were
+//! reconciled, the words as well.** Every sentence the two verbs print names
+//! *the scope for* the subject rather than the subject itself, because for
+//! `session rm` those are not the same string — see `Subject`.
 //! Nothing here decides *when* a verb renews: that is the call site's business,
 //! and `renewalsAreAdjacent` is what holds it to it.
 const std = @import("std");
@@ -26,14 +27,20 @@ const execution = @import("execution.zig");
 
 /// The thing a claim is over, and the noun its diagnostics use for it.
 ///
-/// One tag per verb family, because the two families word the same fact
-/// differently and always have: `job kill` says "job 'deploy'", `session rm`
-/// says "the scope for session 'web'" in some sentences and "session 'web'" in
-/// others, and their fallback prose differs again. Those texts reach an
-/// operator — `authorityError` in JSON, stderr in the log — so this extraction
-/// keeps them byte for byte instead of unifying them. Which of the two
-/// wordings a third verb should adopt, or whether they should converge at all,
-/// is a decision for the programmer and not for a refactor.
+/// One tag per verb family, because the noun differs — `job kill` is about a
+/// job, `session rm` about a session — and nothing else about the sentences
+/// does. Every one of them names *the scope for* the subject rather than the
+/// subject itself.
+///
+/// That is truthfulness rather than tidiness. `session rm`'s contention key is
+/// *derived*: `contentionScope` maps a session named `job-deploy` onto the
+/// scope `.job:deploy`, so a message that says "session 'job-deploy'" can name
+/// a different string from the one actually locked. Naming the scope is
+/// accurate for both verbs; naming the subject is accurate for jobs by
+/// coincidence. The two families used to word this differently — "job
+/// 'deploy'" against "the scope for session 'web'", and `session rm` was not
+/// even consistent with itself across its three sentences — and this file
+/// preserved both verbatim until the choice was made. This is that choice.
 ///
 /// Prose only. `Authority.code` is the machine-readable value, and nothing
 /// branches on which tag this is except the sentences below.
@@ -139,18 +146,18 @@ pub const Authority = union(enum) {
 
     /// The sentence beside it, or null while the claim is still ours.
     ///
-    /// Prose: nothing branches on it, which is what `code` is for. The two
-    /// subjects word it differently and each wording is the one that verb
-    /// shipped — see `Subject`.
+    /// Prose: nothing branches on it, which is what `code` is for. Both
+    /// subjects word it the same way apart from the noun, and both name the
+    /// scope rather than the thing that was typed — see `Subject`.
     pub fn note(a: Authority, arena: std.mem.Allocator, subject: Subject) ?[]const u8 {
         return switch (a) {
             .held => null,
             .lapsed => switch (subject) {
                 .job => |n| std.fmt.allocPrint(
                     arena,
-                    "this command's lease on job '{s}' is no longer held — it lapsed, or another session took it over while the host was being contacted",
+                    "this command's lease on the scope for job '{s}' is no longer held — it lapsed, or another session took it over while the host was being contacted",
                     .{n},
-                ) catch "this command's lease on this job is no longer held",
+                ) catch "this command's lease on this job's scope is no longer held",
                 .session => |n| std.fmt.allocPrint(
                     arena,
                     "this command's lease on the scope for session '{s}' is no longer held — it lapsed, or another session took it over while the host was being contacted",
@@ -160,9 +167,9 @@ pub const Authority = union(enum) {
             .unreadable => |err_name| switch (subject) {
                 .job => |n| std.fmt.allocPrint(
                     arena,
-                    "this command's lease on job '{s}' could not be renewed ({s}), so whether the scope is still ours could not be established",
+                    "this command's lease on the scope for job '{s}' could not be renewed ({s}), so whether the scope is still ours could not be established",
                     .{ n, err_name },
-                ) catch "this command's lease on this job could not be renewed",
+                ) catch "this command's lease on this job's scope could not be renewed",
                 .session => |n| std.fmt.allocPrint(
                     arena,
                     "this command's lease on the scope for session '{s}' could not be renewed ({s}), so whether the scope is still ours could not be established",
@@ -218,12 +225,12 @@ pub fn holdClaim(claim: Claim, now: i64) Authority {
     ) catch |err| {
         switch (claim.subject) {
             .job => |n| std.debug.print(
-                "terminus: could not renew the scope lease for job '{s}': {s}; " ++
+                "terminus: could not renew the lease on the scope for job '{s}': {s}; " ++
                     "this command will not take any step that changes the host or the local record\n",
                 .{ n, @errorName(err) },
             ),
             .session => |n| std.debug.print(
-                "terminus: could not renew the scope lease for session '{s}': {s}; " ++
+                "terminus: could not renew the lease on the scope for session '{s}': {s}; " ++
                     "this command will not take any step that changes the host or the local record\n",
                 .{ n, @errorName(err) },
             ),
@@ -233,13 +240,13 @@ pub fn holdClaim(claim: Claim, now: i64) Authority {
     if (still_ours) return .held;
     switch (claim.subject) {
         .job => |n| std.debug.print(
-            "terminus: this command's lease on job '{s}' is no longer held — it lapsed or was taken over " ++
-                "while the host was being contacted, so another session may be acting on the same job\n",
+            "terminus: this command's lease on the scope for job '{s}' is no longer held — it lapsed or was " ++
+                "taken over while the host was being contacted, so another session may be acting on the same scope\n",
             .{n},
         ),
         .session => |n| std.debug.print(
             "terminus: this command's lease on the scope for session '{s}' is no longer held — it lapsed or was " ++
-                "taken over while the host was being contacted, so another session may be acting on the same name\n",
+                "taken over while the host was being contacted, so another session may be acting on the same scope\n",
             .{n},
         ),
     }
@@ -284,10 +291,11 @@ pub fn stillOurs(claim: Claim, io: std.Io, authority: *Authority) bool {
 //
 // The *scan* is here, once, because it was the duplicated part: two copies of a
 // line walker, a comment-skipping look-back and a failure message is exactly
-// the drift this file exists to remove. What stays with each verb is what only
-// that verb knows — which of its functions hold a claim, which calls are
-// destructive in it, and how many such sites it has — so each caller keeps its
-// own gate, its own asserted count, and its own name in a failure report.
+// the drift this file exists to remove. So is the vocabulary of destructive
+// calls it scans for. What stays with each verb is what only that verb knows —
+// which of its functions hold a claim, and how many such sites it has — so each
+// caller keeps its own gate, its own asserted count, and its own name in a
+// failure report.
 //
 // This does not replace the traffic gates. They prove the refusal is real and
 // reports honestly; this proves there is nothing between the question and the
@@ -309,9 +317,25 @@ pub fn bodyOf(source: []const u8, header: []const u8) error{ FunctionMissing, Fu
     return rest[0 .. end + 1];
 }
 
-/// Checks that every destructive call in `bodies` is preceded, with nothing but
-/// comments in between, by a `stillOurs(...)` renewal — and returns how many
-/// such calls it saw.
+/// The calls that change a host, spelled as they are written.
+///
+/// One list, for every verb that holds a claim. There used to be two: this one,
+/// which lived in `cmd_job.zig`, and a copy in `cmd_session.zig` without
+/// `Tmux.removeResult(` — kept apart on the grounds that merging them would
+/// silently widen what the session gate covered. Widening it is the point:
+/// `removeSession` makes no `Tmux.removeResult(` call today, so one list
+/// changes neither asserted count, and the day that verb grows one the rule is
+/// already holding it. A vocabulary each file keeps privately is the drift this
+/// file exists to remove.
+pub const destructive_remote_calls = [_][]const u8{
+    "Tmux.killSession(",
+    "Tmux.removeLog(",
+    "Tmux.removeResult(",
+};
+
+/// Checks that every `destructive_remote_calls` call in `bodies` is preceded,
+/// with nothing but comments in between, by a `stillOurs(...)` renewal — and
+/// returns how many such calls it saw.
 ///
 /// The count is returned rather than asserted here so that each caller states
 /// its own, next to the functions it is about. A scan that matched nothing
@@ -322,7 +346,6 @@ pub fn renewalsAreAdjacent(
     file: []const u8,
     source: []const u8,
     bodies: []const []const u8,
-    calls: []const []const u8,
 ) error{ FunctionMissing, FunctionUnterminated, DestructiveCallIsNotAdjacentToItsRenewal }!usize {
     var found: usize = 0;
     for (bodies) |header| {
@@ -335,7 +358,7 @@ pub fn renewalsAreAdjacent(
         while (lines.next()) |raw| {
             number += 1;
             const line = std.mem.trim(u8, raw, " \t\r");
-            const destructive = for (calls) |call| {
+            const destructive = for (destructive_remote_calls) |call| {
                 if (std.mem.indexOf(u8, line, call) != null) break call;
             } else null;
             if (destructive) |call| {

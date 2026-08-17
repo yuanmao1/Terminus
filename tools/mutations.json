@@ -170,6 +170,14 @@
       "expect_gate": "blackbox: `job kill` sends nothing to the host once the scope has moved"
     },
     {
+      "id": "M4-authority-latch",
+      "rule": "A renewal that answered anything but `held` is the answer the command keeps: a later renewal may not put a lost authority back to `held`.",
+      "file": "src/core/control.zig",
+      "find": "    if (!authority.holds()) return false;\n",
+      "replace": "",
+      "expect_gate": "gate: an authority lost once stays lost, even when the scope becomes renewable again"
+    },
+    {
       "id": "M4-release-any-owner",
       "rule": "A displaced holder may not release the lease its successor now holds.",
       "file": "src/core/store/leases.zig",

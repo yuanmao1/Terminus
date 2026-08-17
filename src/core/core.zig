@@ -10,6 +10,8 @@ pub const transfer = @import("transfer.zig");
 pub const supervisor = @import("supervisor.zig");
 /// The execution boundary: every remote side effect goes through it.
 pub const execution = @import("execution.zig");
+/// The lease-renewal barrier every destructive verb renews through.
+pub const control = @import("control.zig");
 pub const Scripted = @import("exec.zig").Scripted;
 
 test {

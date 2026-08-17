@@ -4520,27 +4520,15 @@ fn lostTerminal(
 //
 // The scan itself is `Control.renewalsAreAdjacent`, shared with
 // `cmd_session.zig`: two copies of a line walker, a comment-skipping look-back
-// and a failure message drift the same way two copies of the barrier would.
-// What stays here is what only this file knows — which of its functions hold a
-// claim, which calls are destructive in them, and how many such sites there
-// are.
+// and a failure message drift the same way two copies of the barrier would. So
+// does the list of calls it looks for, which is now
+// `Control.destructive_remote_calls`. What stays here is what only this file
+// knows — which of its functions hold a claim, and how many destructive sites
+// there are in them.
 
-/// The calls that change a host, spelled as they are written.
-///
-/// `cmd_session.zig` names two of these three; `Tmux.removeResult(` has no
-/// caller in `removeSession`. The lists are deliberately left as each file
-/// shipped them rather than merged into one vocabulary, because merging would
-/// widen what the other gate covers — a decision about the rule, not part of
-/// moving it.
-const destructive_remote_calls = [_][]const u8{
-    "Tmux.killSession(",
-    "Tmux.removeLog(",
-    "Tmux.removeResult(",
-};
-
-/// How many of them the two claim-holding verbs make. Asserted so a scan that
-/// found nothing — a renamed function, a body delimiter that moved — fails
-/// instead of passing over an empty region.
+/// How many `Control.destructive_remote_calls` the two claim-holding verbs
+/// make. Asserted so a scan that found nothing — a renamed function, a body
+/// delimiter that moved — fails instead of passing over an empty region.
 const destructive_remote_call_count = 7;
 
 /// The two functions that hold a `Claim` while they touch the host. The one
@@ -4556,7 +4544,6 @@ test "gate: every destructive remote call is renewed on the line above it" {
         "src/cli/cmd_job.zig",
         @embedFile("cmd_job.zig"),
         &claim_holding_bodies,
-        &destructive_remote_calls,
     );
     // A scan that matched nothing would have reported nothing. Say how many
     // sites the rule is actually holding.
@@ -6381,4 +6368,131 @@ test "gate: a displaced holder releases nothing, and its renewal says so" {
     Cli.registerClaim(&store, 1, jobScope("deploy"), peer, "deploy");
     Cli.releaseClaim();
     try t.expectEqual(@as(usize, 0), (try Store.leases.active(&store, arena, 1, started)).len);
+}
+
+// A renewal that failed is a fact about this command, and later good news does
+// not undo it.
+//
+// `stillOurs` opens by refusing to renew at all once `authority` is anything
+// but `held`. That line is the latch, and it is load-bearing: several call
+// sites are `_ = stillOurs(claim, ctx.io, &authority);`, whose only job is to
+// bring the report up to date before it is printed. `unreadable` there means
+// the renewal could not be *performed* — the store could not be asked, so the
+// question stands open. Drop the latch and a later call re-asks; a store that
+// has meanwhile become answerable says yes, and the command publishes
+// `authority: held` on a branch where a renewal had already failed. A command
+// misreporting its own standing is the class of defect this whole barrier
+// exists to prevent.
+//
+// The sibling gate above cannot see this rule. Once a peer holds the scope
+// every later renewal answers `lapsed` anyway, so a latched `stillOurs` and an
+// unlatched one agree on every call — which is why removing the line left the
+// suite green. Telling them apart needs a renewal that fails and a later one
+// that succeeds, and that is what this builds: the same claim, the same store,
+// answered `unreadable` and then answerable again.
+test "gate: an authority lost once stays lost, even when the scope becomes renewable again" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_authority_latch");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    const ours: Claim = .{
+        .store = &store,
+        .server_id = 1,
+        .scope = jobScope("deploy"),
+        .owner_request_id = "01LATCHHHHH0123456789ABCDE",
+        .subject = .{ .job = "deploy" },
+    };
+
+    // The scope is ours, on a row stamped from a clock two minutes ahead of the
+    // one the renewal will read — an NTP step back, a resumed VM. A lease row's
+    // own timestamps may never go backwards, so `leases.renew` refuses to write
+    // this stamp rather than quietly clamping it, and the renewal is not
+    // performed at all.
+    const skewed = wallClockSeconds(scratch.io) + 120;
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = jobScope("deploy"),
+        .owner_request_id = ours.owner_request_id,
+        .profile_token = "this-machine",
+        .owner_label = "deploy",
+        .ttl_secs = 600,
+        .now = skewed,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ScopeWasNotFree,
+    }
+
+    // Not `lapsed`: nobody took anything. The question could not be put, which
+    // is a different answer and is reported as one.
+    var authority: Authority = .held;
+    try t.expect(!stillOurs(ours, scratch.io, &authority));
+    try t.expectEqualStrings("unreadable", authority.code());
+    try t.expectEqualStrings("LeaseTimestampsOutOfOrder", switch (authority) {
+        .unreadable => |err_name| err_name,
+        else => return error.RenewalDidNotFailUnreadably,
+    });
+
+    // Now the condition clears: the skewed row is given back and the scope is
+    // taken again with a stamp this command's own clock is not behind. Nothing
+    // about the command changed — same claim, same owner, same scope — only the
+    // store's ability to answer it.
+    try t.expect(try Store.leases.release(
+        &store,
+        1,
+        jobScope("deploy"),
+        ours.owner_request_id,
+        .released,
+        skewed + 1,
+    ));
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = jobScope("deploy"),
+        .owner_request_id = ours.owner_request_id,
+        .profile_token = "this-machine",
+        .owner_label = "deploy",
+        .ttl_secs = 600,
+        .now = wallClockSeconds(scratch.io),
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ScopeWasNotFreeAfterItsRelease,
+    }
+
+    // The control. `holdClaim` is the unlatched half — it asks the store every
+    // time — so this proves the renewal underneath really does succeed now, and
+    // that what follows is about the latch rather than about a store still
+    // refusing to answer.
+    try t.expect(holdClaim(ours, wallClockSeconds(scratch.io)).holds());
+
+    // ...and the answer the report is built from is still the one that failed.
+    if (stillOurs(ours, scratch.io, &authority) or authority.holds()) {
+        std.debug.print(
+            \\
+            \\a renewal that could not be performed was undone by a later one that could.
+            \\
+            \\  authority after the failed renewal: unreadable
+            \\  authority after this call:          {s}
+            \\
+            \\`stillOurs` latches: its first line refuses to renew again once the
+            \\authority is anything but `held`. Without it the question is re-asked, and
+            \\a store that has since become answerable says yes — so a command whose
+            \\renewal failed goes on to report `authority: held`, and the call sites that
+            \\renew only to keep the report honest (`_ = stillOurs(...)`) publish a
+            \\standing this command never recovered. Authority moves one way.
+            \\
+        , .{authority.code()});
+        return error.LostAuthorityWasSilentlyRecovered;
+    }
+    // The prose beside the code says the same thing, because that is what
+    // `authorityError` carries to the caller.
+    try t.expect(authority.note(arena, .{ .job = "deploy" }) != null);
 }

@@ -694,25 +694,16 @@ fn claimScope(
 //
 // The scan itself is `Control.renewalsAreAdjacent`, shared with `cmd_job.zig`,
 // because two copies of a line walker and its failure message drift the same
-// way two copies of the barrier would. What stays here is what only this file
-// knows: which of its functions holds a claim, which calls are destructive in
-// it, and how many such sites there are.
+// way two copies of the barrier would. So does the list of calls it looks for,
+// which is now `Control.destructive_remote_calls` — it names one call
+// (`Tmux.removeResult(`) that `removeSession` does not make today, which
+// changes no count here and holds the rule for the day it does. What stays here
+// is what only this file knows: which of its functions holds a claim, and how
+// many destructive sites it has.
 
-/// The calls that change a host, spelled as they are written.
-///
-/// `cmd_job.zig` names a third — `Tmux.removeResult(` — which `removeSession`
-/// does not call. The two lists are deliberately left as each file shipped
-/// them rather than merged into one vocabulary; merging would silently widen
-/// what this gate covers, which is a decision about the rule and not part of
-/// moving it.
-const destructive_remote_calls = [_][]const u8{
-    "Tmux.killSession(",
-    "Tmux.removeLog(",
-};
-
-/// How many of them this file's claim-holding verb makes. Asserted so a scan
-/// that found nothing — a renamed function, a body delimiter that moved — fails
-/// instead of passing over an empty region.
+/// How many `Control.destructive_remote_calls` this file's claim-holding verb
+/// makes. Asserted so a scan that found nothing — a renamed function, a body
+/// delimiter that moved — fails instead of passing over an empty region.
 const destructive_remote_call_count = 2;
 
 /// The one function here that holds a `Claim` while it touches the host.
@@ -724,7 +715,6 @@ test "gate: `session rm`'s destructive remote calls are renewed on the line abov
         "src/cli/cmd_session.zig",
         @embedFile("cmd_session.zig"),
         &claim_holding_bodies,
-        &destructive_remote_calls,
     );
     // A scan that matched nothing would have reported nothing. Say how many
     // sites the rule is actually holding.
