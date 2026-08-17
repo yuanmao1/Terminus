@@ -45,6 +45,36 @@ pub const Error = Ssh.ExecError || error{
     /// `indeterminate`. That is the honest reading of an answer that was cut
     /// short: we asked, something came back, and it does not say anything.
     TruncatedResponse,
+    /// A result sidecar is at this request's own address and the host could
+    /// not read it. Not "there is no result" — the opposite: something is
+    /// there, and the one reader that could have said what it is came back
+    /// empty-handed.
+    ///
+    /// Its own member, and deliberately not a `ResultReading`. The readers
+    /// used to run `head -c N "$r" | tr -d '\n'`, and a POSIX pipeline exits
+    /// with the status of its *last* command — so `tr` succeeded whenever
+    /// `head` failed on a permission error, an I/O error, or a directory where
+    /// a file was expected. The script exited 0 with no output, and no output
+    /// is the documented spelling of `absent`. A read failure was therefore
+    /// indistinguishable from the absence of evidence, and `absent` is the one
+    /// reading that lets the log sentinel settle the operation on its own:
+    /// a defect at this address was being laundered into a licence to settle
+    /// from the weaker record.
+    ///
+    /// An error rather than a fifth defective reading because the two unions
+    /// that would have to carry one — `ResultReading` and `SidecarReading` —
+    /// publish their tag names into `skill/SKILL.md` and into
+    /// `receipts.ResultRecordReading`, and neither could be touched by the
+    /// change that found this. See the note on `result_unreadable_exit`: an
+    /// error settles nothing and licenses nothing, which is the property that
+    /// mattered; what it costs is the 75 a defective reading earns, because a
+    /// caller that never receives a probe cannot settle `indeterminate` from
+    /// one.
+    ///
+    /// Adding this variant forces no caller to change, for the reason
+    /// `TruncatedResponse` gives above: nothing switches exhaustively on
+    /// `Tmux.Error`.
+    ResultUnreadable,
     CommandTimeout,
 };
 
@@ -160,9 +190,58 @@ pub fn jobLaunchLine(
 /// unbounded transfer.
 const max_result_bytes: i64 = 4096;
 
+/// The exit status both sidecar readers use for "the file is at this address
+/// and we could not read it".
+///
+/// A status of its own, not folded into the 1 that `head` itself returns: 1 is
+/// also what any other command in these scripts answers when it fails, and a
+/// reader that cannot tell "the result record would not open" from "something
+/// else in the script went wrong" has to report the vaguer of the two.
+///
+/// Chosen out of the same private range as `ensure`'s 41/42 and `sendKeys`'
+/// 43. Nothing on the host produces it: `head` exits 0 or 1, and the shell
+/// answers 126/127 for a command it cannot run.
+const result_unreadable_exit: i32 = 44;
+
+/// The script `readResult` runs, and the one the black-box gate executes
+/// through a real POSIX shell.
+///
+/// Public and separate from `readResult` because reading generated shell text
+/// is not the same as knowing what it does — and what this text does under a
+/// failing `head` is the whole point of it. The gate needs the exact bytes the
+/// binary sends, not a transcription of them.
+///
+/// Three exits, and they are three different facts:
+///   * 0 with no output — nothing at the address. `absent`;
+///   * 0 with output — the document, for `parseJobResult` to judge;
+///   * `result_unreadable_exit` — the file is there and `head` could not read
+///     it. No pipeline: `head` writes straight to stdout, so its status is the
+///     script's status. The newline squeezing `tr -d '\n'` used to do is done
+///     in Zig now, because `tr` in that position was what threw the status
+///     away.
+pub fn resultReadScript(arena: Allocator, request_id: []const u8) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(arena,
+        \\r={s}/{s}.json
+        \\[ -f "$r" ] || exit 0
+        \\head -c {d} "$r" || exit {d}
+    , .{ result_dir, request_id, max_result_bytes, result_unreadable_exit });
+}
+
 /// Separates the sidecar document from the log window in a probe's output.
-/// The sidecar is squeezed onto a single line by `tr -d '\n'`, so a
-/// line-start match on this marker cannot land inside it.
+///
+/// The sidecar used to be squeezed onto a single line by `tr -d '\n'`, which
+/// made a line-start match on this marker provably unable to land inside it.
+/// That `tr` is gone — it was the last command of a pipeline, so it answered 0
+/// for a `head` that had failed, and a read failure came back as an absence.
+/// What is left is weaker and says so: a sidecar carrying a line that is
+/// exactly this marker splits in the wrong place.
+///
+/// It fails closed rather than quietly. The prefix before the false marker is
+/// judged by `parseJobResult`, which reads a partial document as `malformed` —
+/// a defect that settles nothing — and the remainder is then parsed as the
+/// log's byte count, which is not a number, so the probe ends in
+/// `error.RemoteFailed`. No outcome can be established through that path,
+/// which is the property the `tr` was protecting.
 const probe_split_marker = "__TERMINUS_PROBE_SPLIT__";
 
 const ProbeHalves = struct {
@@ -314,7 +393,7 @@ pub const SidecarReading = union(enum) {
     /// Whether this reading is something an operator has to be told about.
     ///
     /// "We did not look", "it is not there" and "it is there and it is ours"
-    /// are the three ordinary answers. The other three each mean somebody
+    /// are the three ordinary answers. The other four each mean somebody
     /// wrote a document at this operation's own address that we could not use,
     /// which is never routine.
     pub fn anomalous(r: SidecarReading) bool {
@@ -328,7 +407,7 @@ pub const SidecarReading = union(enum) {
     /// wrong to report.
     ///
     /// One sentence per reading rather than a shared "could not read the
-    /// result record": which of the three it is decides what happens next —
+    /// result record": which of the four it is decides what happens next —
     /// check the remote wrapper's build, or go and find out why two
     /// operations are writing to one address.
     pub fn describe(r: SidecarReading, arena: Allocator) Allocator.Error!?[]const u8 {
@@ -441,15 +520,79 @@ pub fn removeResult(executor: Executor, arena: Allocator, request_id: []const u8
 /// exit prints a line and silence therefore means the answer never arrived —
 /// the difference is in the two scripts, not in how hard each reader is
 /// willing to look.
+///
+/// What makes that safe is that empty output now has exactly one cause. It
+/// used to have two: `head -c N "$r" | tr -d '\n'` exits with `tr`'s status, so
+/// a `head` that could not open the file left the script exiting 0 with
+/// nothing on stdout — the same answer a missing file gives. A defect at this
+/// operation's own address was read as the absence of evidence, and `absent` is
+/// the one reading that lets the log sentinel settle the operation alone. See
+/// `resultReadScript` and `error.ResultUnreadable`.
 pub fn readResult(executor: Executor, arena: Allocator, request_id: []const u8) Error!ResultReading {
-    const script = try std.fmt.allocPrint(arena,
-        \\r={s}/{s}.json
-        \\[ -f "$r" ] || exit 0
-        \\head -c {d} "$r" | tr -d '\n'
-    , .{ result_dir, request_id, max_result_bytes });
-    const result = try run(executor, arena, script);
+    const result = try run(executor, arena, try resultReadScript(arena, request_id));
+    if (result.exit_code == result_unreadable_exit) return error.ResultUnreadable;
     if (result.exit_code != 0) return error.RemoteFailed;
     return try parseJobResult(arena, result.stdout, request_id);
+}
+
+test "gate: a sidecar that could not be read is not a sidecar that is not there" {
+    const t = std.testing;
+    const Scripted = @import("../exec.zig").Scripted;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+    const rid = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+
+    // The failure the old pipeline could not express. `head` could not open a
+    // file that is demonstrably there — `[ -f "$r" ]` passed — so the script
+    // exits with its own status and no output. Under `| tr -d '\n'` this was
+    // exit 0 with no output, which is the documented spelling of `absent`, and
+    // `absent` is the single reading that lets the log sentinel settle an
+    // operation on its own.
+    var unreadable = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = result_unreadable_exit, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectError(error.ResultUnreadable, readResult(unreadable.executor(), arena, rid));
+
+    // Two halves, and both are needed: the reader has to honour the status,
+    // and the script has to be able to produce it. Asserting only the mapping
+    // would pass with the pipeline put back, which is where the bug was.
+    try t.expect(std.mem.indexOf(u8, unreadable.seen.items[0], "tr -d") == null);
+    try t.expect(std.mem.indexOf(u8, unreadable.seen.items[0], " | ") == null);
+    try t.expect(std.mem.indexOf(u8, unreadable.seen.items[0], "exit 44") != null);
+
+    // The control that keeps the fix from being "refuse everything": a file
+    // that really is not there still reads as `absent`, which is what lets a
+    // pre-sidecar job settle from its log.
+    var missing = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectEqualStrings("absent", (try readResult(missing.executor(), arena, rid)).summary().code());
+
+    // …and a document that is there is still read.
+    var present = Scripted.init(arena, &.{
+        .{ .reply = .{
+            .exit_code = 0,
+            .stdout = try std.fmt.allocPrint(
+                arena,
+                "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":3,\"finishedAt\":1750000000}}",
+                .{rid},
+            ),
+            .stderr = empty,
+        } },
+    });
+    const doc = (try readResult(present.executor(), arena, rid)).usable() orelse
+        return error.TestExpectedResult;
+    try t.expectEqual(@as(i32, 3), doc.exit_code);
+
+    // A remote that failed for some other reason is still told apart from one
+    // that could not read this file: `RemoteFailed` says the script ran and
+    // reported failure, `ResultUnreadable` names which failure.
+    var broken = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 1, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectError(error.RemoteFailed, readResult(broken.executor(), arena, rid));
 }
 
 /// Creates the session if absent (idempotent) and starts output logging.
@@ -610,6 +753,53 @@ pub fn sendKeys(executor: Executor, arena: Allocator, name: []const u8, input: [
     }
 }
 
+/// The script `probeTail` runs, and the one the black-box gate executes
+/// through a real POSIX shell.
+///
+/// Public for the reason `resultReadScript` is: this text carries the same
+/// sidecar read, and what it does under a failing `head` is not something to
+/// take on trust from reading it.
+///
+/// The sidecar read is a brace group and not a pipeline. `head -c N "$r" | tr
+/// -d '\n'` exits with `tr`'s status, so a `head` that could not open a file
+/// `[ -f "$r" ]` had just found came back as exit 0 with no output — which the
+/// parser spells `absent`, and `absent` is the one reading that lets the log
+/// sentinel settle the operation by itself. Braces rather than parentheses so
+/// the `exit` ends the script and not a subshell that the rest of the script
+/// then carries on past.
+///
+/// The read failure ends the script, which costs the log window. That is the
+/// trade named on `error.ResultUnreadable`: the caller gets no reading at all
+/// rather than a probe with a hole in it, and so cannot settle from the
+/// sentinel this round trip never delivered.
+///
+/// Empty `r` when there is no request to look up: `[ -f "" ]` is false, so the
+/// framing stays identical and the parser has one shape to handle.
+pub fn probeScript(
+    arena: Allocator,
+    name: []const u8,
+    request_id: ?[]const u8,
+    tail_bytes: i64,
+) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(arena,
+        \\r={s}
+        \\[ -f "$r" ] && {{ head -c {d} "$r" || exit {d}; }}
+        \\echo
+        \\echo {s}
+        \\f={s}
+        \\[ -f "$f" ] || {{ echo 0; exit 0; }}
+        \\wc -c < "$f"
+        \\tail -c {d} "$f"
+    , .{
+        if (request_id) |id| try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ result_dir, id }) else "",
+        max_result_bytes,
+        result_unreadable_exit,
+        probe_split_marker,
+        try logPath(arena, name),
+        tail_bytes,
+    });
+}
+
 /// State probe: reads the durable result sidecar and the *end* of the log,
 /// in one round trip.
 ///
@@ -636,26 +826,8 @@ pub fn probeTail(
     request_id: ?[]const u8,
     tail_bytes: i64,
 ) Error!JobProbe {
-    const path = try logPath(arena, name);
-    // Empty `r` when there is no request to look up: `[ -f "" ]` is false, so
-    // the framing stays identical and the parser has one shape to handle.
-    const script = try std.fmt.allocPrint(arena,
-        \\r={s}
-        \\[ -f "$r" ] && head -c {d} "$r" | tr -d '\n'
-        \\echo
-        \\echo {s}
-        \\f={s}
-        \\[ -f "$f" ] || {{ echo 0; exit 0; }}
-        \\wc -c < "$f"
-        \\tail -c {d} "$f"
-    , .{
-        if (request_id) |id| try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ result_dir, id }) else "",
-        max_result_bytes,
-        probe_split_marker,
-        path,
-        tail_bytes,
-    });
-    const result = try run(executor, arena, script);
+    const result = try run(executor, arena, try probeScript(arena, name, request_id, tail_bytes));
+    if (result.exit_code == result_unreadable_exit) return error.ResultUnreadable;
     if (result.exit_code != 0) return error.RemoteFailed;
 
     var probe = try interpretTail(arena, result.stdout, sentinel, request_id);
@@ -1070,6 +1242,76 @@ test "gate: the streaming reader applies the same rule as the tail probe" {
     try t.expectEqual(JobProbe.ExitSource.none, refused.exit_source);
     try t.expectEqual(@as(i32, 7), refused.refused.?.sentinel_exit_code);
     try t.expectEqualStrings("exit_code_out_of_range", refused.sidecar.code());
+}
+
+test "gate: neither reader turns an unreadable result record into an absent one" {
+    const t = std.testing;
+    const Scripted = @import("../exec.zig").Scripted;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rid = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+    const empty = try arena.alloc(u8, 0);
+    // A log window whose sentinel says the job exited 7. Both readers would be
+    // willing to settle `failed` from it — and neither may, because the
+    // stronger record is at this request's own address and could not be read,
+    // so the sentinel's agreement with it cannot be checked.
+    const window = try std.fmt.allocPrint(arena, "40\nwork done\n__TERMINUS_JOB_9__:7\n", .{});
+
+    // The tail probe reads both records in one round trip, so its script
+    // carries the sidecar read and the log read together. The read failure
+    // ends the script, which costs the window — and buys the refusal.
+    var tail = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = result_unreadable_exit, .stdout = empty, .stderr = empty } },
+    });
+    try t.expectError(
+        error.ResultUnreadable,
+        probeTail(tail.executor(), arena, "j", "__TERMINUS_JOB_9__", rid, 1 << 10),
+    );
+    try t.expect(std.mem.indexOf(u8, tail.seen.items[0], "tr -d") == null);
+    try t.expect(std.mem.indexOf(u8, tail.seen.items[0], " | ") == null);
+    // Braces, not parentheses: `( ... || exit 44 )` ends a subshell and lets
+    // the script carry on to print the marker, which is the laundering again
+    // with an extra layer.
+    try t.expect(std.mem.indexOf(u8, tail.seen.items[0], "{ head -c") != null);
+
+    // The streaming reader fetches the sidecar in a round trip of its own, so
+    // it is a second place the failure could have been read as an absence.
+    var streamed = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = window, .stderr = empty } }, // readLog
+        .{ .reply = .{ .exit_code = result_unreadable_exit, .stdout = empty, .stderr = empty } }, // readResult
+    });
+    try t.expectError(
+        error.ResultUnreadable,
+        probeJob(streamed.executor(), arena, "j", "__TERMINUS_JOB_9__", rid, 0, 1 << 20),
+    );
+
+    // The control both readers have to keep passing: nothing at the address is
+    // still an absence, and the sentinel still settles the job from it. This is
+    // what makes the two refusals above mean something other than "these
+    // readers refuse everything".
+    var absent_tail = Scripted.init(arena, &.{
+        .{ .reply = .{
+            .exit_code = 0,
+            .stdout = try std.fmt.allocPrint(arena, "\n{s}\n{s}", .{ probe_split_marker, window }),
+            .stderr = empty,
+        } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // isAlive
+    });
+    const settled = try probeTail(absent_tail.executor(), arena, "j", "__TERMINUS_JOB_9__", rid, 1 << 10);
+    try t.expectEqual(@as(?i32, 7), settled.exit_code);
+    try t.expectEqual(JobProbe.ExitSource.log_sentinel, settled.exit_source);
+    try t.expectEqualStrings("absent", settled.sidecar.code());
+
+    var absent_stream = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = window, .stderr = empty } }, // readLog
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // readResult
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // isAlive
+    });
+    const streamed_settled = try probeJob(absent_stream.executor(), arena, "j", "__TERMINUS_JOB_9__", rid, 0, 1 << 20);
+    try t.expectEqual(@as(?i32, 7), streamed_settled.exit_code);
+    try t.expectEqualStrings("absent", streamed_settled.sidecar.code());
 }
 
 pub const ReadResult = struct {

@@ -545,7 +545,7 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             },
             .failure => {
                 try ctx.out.flush();
-                std.process.exit(Cli.exit_code.failure);
+                Cli.exitNow(Cli.exit_code.failure);
             },
         }
     } else if (std.mem.eql(u8, verb, "read")) {
@@ -576,7 +576,7 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 "the remote's answer for job '{s}' was cut short before its size line, so nothing was read and the cursor has not moved; this is a broken read, not an empty log. Re-run it",
                 .{job.name},
             ),
-            else => fatalTmux(err, executor, session),
+            else => fatalProbe(err, executor, session, job.name, if (attempt) |a| a.request_id else null),
         };
         // A refused cursor advance is a failure of this command's contract:
         // the caller asked for the bytes after its position *and* for that
@@ -636,7 +636,7 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             },
             .failure => {
                 try ctx.out.flush();
-                std.process.exit(Cli.exit_code.failure);
+                Cli.exitNow(Cli.exit_code.failure);
             },
         }
     } else if (std.mem.eql(u8, verb, "watch")) {
@@ -1283,6 +1283,38 @@ test "gate: SKILL.md's resultRecord codes are SidecarReading's own tag names" {
     try unusable_verdict;
 }
 
+/// `fatalTmux`, plus the one error only a result-record reader can raise.
+///
+/// `error.ResultUnreadable` means a document is at this attempt's own address
+/// on the host and the reader could not obtain its bytes. Left to
+/// `fatalTmux`'s catch-all it arrives as "remote tmux operation failed", which
+/// sends an operator to the session and to tmux — and neither is where the
+/// problem is.
+///
+/// Every probe that can raise it runs *before* this command changes anything
+/// on the host, so the sentence may say so: nothing was sent, nothing was
+/// settled, and the job's scope is exactly as it was. That is what makes exit
+/// 1 the honest code here rather than 75 — "we do not know" would be a claim
+/// about an operation this command never touched.
+fn fatalProbe(
+    err: anyerror,
+    executor: Core.Executor,
+    session: []const u8,
+    job_name: []const u8,
+    request_id: ?[]const u8,
+) noreturn {
+    if (err != error.ResultUnreadable) fatalTmux(err, executor, session);
+    fatal(
+        "cannot read the result record for job '{s}' on the host: the file is at " ++
+            "$HOME/.terminus/results/{s}.json and the host could not read it — a permission " ++
+            "problem, an I/O error, or a directory where a file should be. It is not missing, " ++
+            "so its absence may not be assumed and nothing here was settled from the job's log " ++
+            "alone. Nothing was sent to the host and this job's scope is unchanged; repair or " ++
+            "remove that file on the host and run this again",
+        .{ job_name, request_id orelse "<request-id>" },
+    );
+}
+
 /// How much of the log's end a state probe reads. Shared with the launch
 /// paths' lazy settlement, so both windows are the same by construction.
 const probe_tail_bytes = Cli.probe_tail_bytes;
@@ -1309,7 +1341,7 @@ fn refresh(
         job.sentinel,
         if (attempt) |a| a.request_id else null,
         probe_tail_bytes,
-    ) catch |err| fatalTmux(err, executor, session);
+    ) catch |err| fatalProbe(err, executor, session, job.name, if (attempt) |a| a.request_id else null);
     if (attempt) |a| {
         Store.job_attempts.recordProbe(store, a.request_id, .{
             .probe_cursor = probe.next_cursor,
@@ -2085,13 +2117,13 @@ fn watchJob(
         // produces for a job that exited cleanly.
         .failure => {
             try ctx.out.flush();
-            std.process.exit(Cli.exit_code.failure);
+            Cli.exitNow(Cli.exit_code.failure);
         },
     }
     if (state.exit_code) |code| {
         if (code != 0) {
             try ctx.out.flush();
-            std.process.exit(@intCast(std.math.clamp(code, 1, 255)));
+            Cli.exitNow(@intCast(std.math.clamp(code, 1, 255)));
         }
     }
 }
@@ -2209,7 +2241,7 @@ fn refuseKill(
     }
     ctx.out.flush() catch {};
     Cli.releaseClaim();
-    std.process.exit(Cli.exit_code.failure);
+    Cli.exitNow(Cli.exit_code.failure);
 }
 
 fn refuseRemoval(
@@ -2252,7 +2284,7 @@ fn refuseRemoval(
     }
     ctx.out.flush() catch {};
     Cli.releaseClaim();
-    std.process.exit(Cli.exit_code.failure);
+    Cli.exitNow(Cli.exit_code.failure);
 }
 
 /// Whether a kill may publish `remote_cancel_confirmed` — the one terminal on
@@ -2377,7 +2409,7 @@ fn killJob(
         job.sentinel,
         if (attempt) |a| a.request_id else null,
         probe_tail_bytes,
-    ) catch |err| fatalTmux(err, executor, session);
+    ) catch |err| fatalProbe(err, executor, session, job.name, if (attempt) |a| a.request_id else null);
 
     if (probe.conflict) |clash| {
         const reason = std.fmt.allocPrint(
@@ -2659,7 +2691,7 @@ fn killJob(
             },
             .failure => {
                 try ctx.out.flush();
-                std.process.exit(Cli.exit_code.failure);
+                Cli.exitNow(Cli.exit_code.failure);
             },
         }
         return;
@@ -2847,7 +2879,7 @@ fn killJob(
     // refusing the next launch, and nothing else will explain why.
     if (cache_error != null) {
         try ctx.out.flush();
-        std.process.exit(Cli.exit_code.failure);
+        Cli.exitNow(Cli.exit_code.failure);
     }
 }
 
@@ -3203,7 +3235,7 @@ fn reportFinishedDuringKill(
     // plain failure, and the caller must not read a zero over it.
     if (cache_error != null or !authority.holds()) {
         try ctx.out.flush();
-        std.process.exit(Cli.exit_code.failure);
+        Cli.exitNow(Cli.exit_code.failure);
     }
 }
 
@@ -3253,7 +3285,7 @@ fn removeJob(
         job.sentinel,
         if (attempt) |a| a.request_id else null,
         probe_tail_bytes,
-    ) catch |err| fatalTmux(err, executor, session);
+    ) catch |err| fatalProbe(err, executor, session, job.name, if (attempt) |a| a.request_id else null);
 
     // The real boolean, on both branches. `killSession` never touches the log;
     // destroying evidence is a separate act below, gated on this answer.
@@ -3566,7 +3598,7 @@ fn removeJob(
         // remote is unknown because of it. An unknown *outcome* is not, and
         // outranks it.
         if (removed) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
-        std.process.exit(Cli.exit_code.failure);
+        Cli.exitNow(Cli.exit_code.failure);
     }
 }
 

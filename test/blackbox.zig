@@ -409,6 +409,150 @@ test "blackbox: a job records its exit status where later output cannot bury it"
     }
 }
 
+test "blackbox: a result record the host cannot read is not a result record that is absent" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "unreadable_sidecar");
+    defer f.deinit();
+
+    // The third script this file runs through a real POSIX shell, and for the
+    // same reason as the other two: what `readResult`'s text does under a
+    // failing `head` is the whole of its contract, and reading the text is not
+    // knowing it.
+    //
+    // The text used to end `head -c N "$r" | tr -d '\n'`. A POSIX pipeline
+    // exits with the status of its *last* command, so `tr` answered 0 for
+    // every `head` that could not open the file — and the script's own
+    // documentation says exit 0 with no output means the record is absent.
+    // Absence is the one reading that lets the job's log sentinel settle the
+    // operation by itself, so a defect at this attempt's own address was being
+    // turned into a licence to settle from the weaker record.
+    //
+    // The failure is injected as a shell function, not as a broken file. What
+    // has to be established is that `head`'s status reaches the script's
+    // status; a `chmod` that Windows may not honour, or a directory (which
+    // `[ -f ]` rejects before `head` is ever reached), would each test
+    // something else. The shell is real and the script is the exact text the
+    // binary sends.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const request_id = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+    const document = "{\"v\":1,\"requestId\":\"" ++ request_id ++ "\",\"exitCode\":3,\"finishedAt\":1750}";
+    const script = try Terminus.Core.Tmux.resultReadScript(arena, request_id);
+
+    // `HOME=.` keeps `$HOME/.terminus/results` inside the scratch directory: a
+    // test must never read or write the real home.
+    const preamble = "HOME=.\nexport HOME\n";
+    const cases = [_]struct {
+        what: []const u8,
+        inject: []const u8,
+        write_document: bool,
+        code: u8,
+        stdout: []const u8,
+    }{
+        // The bug. The file is there, `[ -f "$r" ]` passes, and the read of it
+        // fails: the script has to say so in its exit status, because its only
+        // other channel — stdout — is empty on this path and empty is taken to
+        // mean the file was not there at all.
+        .{ .what = "an unreadable record", .inject = "head() { return 1; }\n", .write_document = true, .code = 44, .stdout = "" },
+        // The two controls, without which the gate would pass against a script
+        // that refuses everything, or one that never runs.
+        .{ .what = "a readable record", .inject = "", .write_document = true, .code = 0, .stdout = document },
+        .{ .what = "no record at all", .inject = "", .write_document = false, .code = 0, .stdout = "" },
+    };
+
+    const results_dir = try std.fmt.allocPrint(arena, "{s}/.terminus/results", .{f.dir});
+    try std.Io.Dir.cwd().createDirPath(f.io, results_dir);
+    const doc_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ results_dir, request_id });
+
+    for (cases, 0..) |case, i| {
+        std.Io.Dir.cwd().deleteFile(f.io, doc_path) catch {};
+        if (case.write_document)
+            try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = doc_path, .data = document });
+
+        const name = try std.fmt.allocPrint(arena, "read_result_{d}.sh", .{i});
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ f.dir, name });
+        try std.Io.Dir.cwd().writeFile(f.io, .{
+            .sub_path = path,
+            .data = try std.fmt.allocPrint(arena, "{s}{s}{s}\n", .{ preamble, case.inject, script }),
+        });
+        defer std.Io.Dir.cwd().deleteFile(f.io, path) catch {};
+
+        const result = try runPosixShell(arena, f.io, name, .{ .path = f.dir });
+        const code: u8 = switch (result.term) {
+            .exited => |c| c,
+            else => return error.ShellDidNotExitNormally,
+        };
+        std.testing.expectEqual(case.code, code) catch |err| {
+            std.debug.print(
+                "{s}: the sidecar read script exited {d}, wanted {d}\n--- script ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",
+                .{ case.what, code, case.code, script, result.stdout, result.stderr },
+            );
+            return err;
+        };
+        std.testing.expectEqualStrings(case.stdout, result.stdout) catch |err| {
+            std.debug.print("{s}: unexpected stdout\n", .{case.what});
+            return err;
+        };
+    }
+
+    // The two answers a caller has to be able to tell apart both came back
+    // with no output at all. Only the status separates them, which is exactly
+    // what the pipeline was throwing away.
+    try t.expectEqualStrings("", cases[0].stdout);
+    try t.expectEqualStrings("", cases[2].stdout);
+    try t.expect(cases[0].code != cases[2].code);
+
+    // The same read, in the other reader. `probeTail` fetches the record and a
+    // tail of the log in one round trip, so its sidecar read sits in the middle
+    // of a script that goes on to print a marker, a byte count and a window —
+    // and an `exit` that ended only a subshell would let all of that be printed
+    // anyway, which is the pipeline's failure with an extra layer on it.
+    const logs_dir = try std.fmt.allocPrint(arena, "{s}/.terminus/logs", .{f.dir});
+    try std.Io.Dir.cwd().createDirPath(f.io, logs_dir);
+    try std.Io.Dir.cwd().writeFile(f.io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/j.log", .{logs_dir}),
+        .data = "work done\n",
+    });
+    try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = doc_path, .data = document });
+
+    const probe_script = try Terminus.Core.Tmux.probeScript(arena, "j", request_id, 4096);
+    for ([_]struct { what: []const u8, inject: []const u8, code: u8, marker: bool }{
+        .{ .what = "an unreadable record", .inject = "head() { return 1; }\n", .code = 44, .marker = false },
+        .{ .what = "a readable record", .inject = "", .code = 0, .marker = true },
+    }, 0..) |case, i| {
+        const name = try std.fmt.allocPrint(arena, "probe_{d}.sh", .{i});
+        try std.Io.Dir.cwd().writeFile(f.io, .{
+            .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ f.dir, name }),
+            .data = try std.fmt.allocPrint(arena, "{s}{s}{s}\n", .{ preamble, case.inject, probe_script }),
+        });
+        const result = try runPosixShell(arena, f.io, name, .{ .path = f.dir });
+        const code: u8 = switch (result.term) {
+            .exited => |c| c,
+            else => return error.ShellDidNotExitNormally,
+        };
+        std.testing.expectEqual(case.code, code) catch |err| {
+            std.debug.print(
+                "{s}: the probe script exited {d}, wanted {d}\n--- script ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",
+                .{ case.what, code, case.code, probe_script, result.stdout, result.stderr },
+            );
+            return err;
+        };
+        // The failing read must take the whole script with it. Reaching the
+        // marker means the reader is handed a framed answer whose sidecar half
+        // is empty — the absence this exists to stop the failure from becoming.
+        const reached_marker = std.mem.indexOf(u8, result.stdout, probe_split) != null;
+        std.testing.expectEqual(case.marker, reached_marker) catch |err| {
+            std.debug.print(
+                "{s}: the split marker was {s} in the probe's output\n--- stdout ---\n{s}\n",
+                .{ case.what, if (reached_marker) "present" else "absent", result.stdout },
+            );
+            return err;
+        };
+    }
+}
+
 /// A job-name reservation left behind by a launcher that did not finish,
 /// with its owning attempt parked at `status`.
 fn seedReservation(f: *Fixture, request_id: []const u8, name: []const u8, status: []const u8) !void {
@@ -870,26 +1014,38 @@ const FakeHost = struct {
 
     /// Printed immediately before a traffic assertion's real message.
     ///
-    /// Every gate that drives the binary to `std.process.exit` leaves the serve
-    /// thread blocked on a socket the child never closed, and std prints an
-    /// `error.Unexpected NTSTATUS=0xc000020d (CONNECTION_RESET)` stack trace
-    /// when that read fails. Those traces are unconditional — they appear on
-    /// passing runs too — but the test runner groups whatever stderr arrives
-    /// during a test into that test's failure block, so a genuine failure here
-    /// arrives underneath forty lines that look exactly like the known noise.
+    /// The test runner groups whatever stderr arrives during a test into that
+    /// test's block, so an assertion's own message can end up well below
+    /// anything else the run printed. This says where it starts.
     ///
-    /// A marker, not a fix: the noise is the child exiting without closing its
-    /// socket, and the exit lives in the CLI. It is deliberately not silenced by
-    /// catching the transport error — a fake host that swallows read failures
-    /// stops being able to tell a divergent conversation from a finished one.
+    /// It used to carry a disclaimer as well: every gate that drove the binary
+    /// to `std.process.exit` left this thread blocked on a socket the child
+    /// never closed, and std printed an `error.Unexpected NTSTATUS=0xc000020d
+    /// (CONNECTION_RESET)` trace for the read that then failed — on green runs
+    /// as much as failing ones, which is what made the disclaimer necessary and
+    /// what made a real transport failure here unreadable. The binary closes
+    /// that socket now, on every exit it has, so those traces are gone rather
+    /// than excused. One appearing again is a finding, not the weather.
     fn banner(host: *FakeHost, comptime what: []const u8) void {
         _ = host;
+        std.debug.print("\n--- FakeHost: the real failure follows.\n" ++ what ++ "\n", .{});
+    }
+
+    /// A read that failed rather than a conversation that ended.
+    ///
+    /// Reported, and named. Every conversation these gates drive now ends with
+    /// the client closing its socket, so this cannot fire on a healthy run —
+    /// which is exactly what makes printing it worth anything. The bare `catch
+    /// return` it replaces left the fake unable to tell a conversation that
+    /// broke from one that finished, and scored both as a clean end.
+    fn conversationBroke(host: *FakeHost, err: anyerror) void {
+        host.banner("--- the fake host's connection to the binary failed mid-conversation:");
         std.debug.print(
-            \\
-            \\--- FakeHost: the real failure follows. Any CONNECTION_RESET traces above are
-            \\--- the child exiting without closing its socket, which happens on green runs too.
-            \\
-        ++ what ++ "\n", .{});
+            "reading the next request failed with {s}: the binary did not close this " ++
+                "connection, it broke. Whatever this gate asserts afterwards is about a " ++
+                "conversation that never finished\n",
+            .{@errorName(err)},
+        );
     }
 
     /// Asserts that every command the binary sent was one this gate scripted.
@@ -994,15 +1150,24 @@ const FakeHost = struct {
         defer arena_state.deinit();
 
         while (true) {
-            // A peer reset here is the ordinary end of a conversation, not a
-            // fault: the exit codes these gates exist to check are reached
-            // through `std.process.exit`, which skips the CLI's own socket
-            // close. Windows reports that as a status std does not map, so a
-            // `zig build test` run prints its trace and returns the error to
-            // this `catch`. Left unsuppressed — turning `std.options`'
-            // unexpected-error tracing off for this binary would hide the whole
-            // class to quieten one known member of it.
-            const line = (reader.interface.takeDelimiter('\n') catch return) orelse return;
+            // End of file is the ordinary end of a conversation: the client
+            // finished and closed its socket, which every exit in the binary
+            // now does — see `Cli.closeDaemonSocket`. Nothing to report.
+            //
+            // Anything else is a fault and says so. It used to be swallowed by
+            // a bare `catch return`, because the client did *not* close its
+            // socket: `std.process.exit` skipped the close, Windows delivered
+            // the abrupt teardown here as a reset, and std printed a trace for
+            // it — on green runs as much as failing ones, so the only way to
+            // keep the run readable was to ignore the whole class. Now that a
+            // finished client arrives as an EOF, a read that fails is a read
+            // that failed, and reporting it is the difference between a gate
+            // that noticed the conversation diverged and one that scored it as
+            // complete.
+            const line = (reader.interface.takeDelimiter('\n') catch |err| {
+                host.conversationBroke(err);
+                return err;
+            }) orelse return;
             if (line.len == 0) continue;
             const request = protocol.parseMessage(protocol.Request, arena_state.allocator(), line) catch {
                 try protocol.writeMessage(&writer.interface, protocol.Response{
@@ -1274,6 +1439,110 @@ test "blackbox: a job with no result record still settles, exits 0 and frees its
     }, &environ);
     defer relaunch.deinit(f.allocator);
     try relaunch.expectSaysNot("refused: request");
+}
+
+test "blackbox: a result record the host cannot read stops `job kill` and keeps the scope barred" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "unreadable_kill");
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01FFFFFFFF0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    // Three commands against one host, and the only thing that changes between
+    // the first two and the third is whether the result record could be read.
+    // That is the whole discrimination this gate exists to make, and running it
+    // on one fixture is what stops it from being two unrelated observations.
+    //
+    // The probe answers `result_unreadable_exit` twice: once for `job kill`,
+    // once for the lazy read the refused relaunch does of its blocker. Then it
+    // starts answering with an absent record and the job's own sentinel, which
+    // is the reading a job launched before result records existed produces.
+    const readable = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":0\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .exit_code = 44, .uses = 2 },
+        .{ .needle = probe_split, .stdout = readable },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var stopped = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer stopped.deinit(f.allocator);
+
+    // Exit 1 and not 0. Under the old pipeline this same reply — a script that
+    // exited without printing the document — reached the reader as exit 0 with
+    // no output, which it reads as "there is no result record"; the sentinel in
+    // the window then settled the job `completed` and freed its name.
+    //
+    // Exit 1 and not 75 for a reason worth stating: this probe runs before the
+    // command has sent anything, so nothing about the job is newly unknown.
+    // 75 is the code for "the remote effect may or may not have happened", and
+    // claiming it here would forbid a retry that is perfectly safe.
+    try stopped.expectCode(1);
+    try host.expectFullyScripted();
+    // The sentence has to send the operator to the file, not to tmux.
+    try stopped.expectSays("result record");
+    try stopped.expectSays(".terminus/results/" ++ request_id ++ ".json");
+    try stopped.expectSays("could not read it");
+    // …and it must not claim the record is gone. "Absent" is the reading this
+    // whole change exists to stop the failure being mistaken for.
+    try stopped.expectSaysNot("no result record");
+
+    // Nothing was settled and nothing was sent: the ledger row is exactly where
+    // the fixture left it, read out of the store rather than out of the report.
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const op = (try Store.operations.get(&store, arena_state.allocator(), request_id)).?;
+        try t.expectEqualStrings("remote_started", op.status.text());
+    }
+    try host.expectNeverSent("kill-session");
+
+    // The barrier, in the only form it takes for a caller. The blocker is still
+    // unsettled, the lazy read that a launch does of it hits the same
+    // unreadable record and declines to clear it, and the launch is refused.
+    var relaunch = try runWithEnvironment(&f, &.{
+        "run", "box", "--name", "deploy", "--cmd", "make deploy", "--db", f.db,
+    }, &environ);
+    defer relaunch.deinit(f.allocator);
+    try relaunch.expectCode(1);
+    try relaunch.expectSays("refused");
+    try relaunch.expectSays(request_id);
+    try host.expectFullyScripted();
+
+    // The control, on the same fixture and the same verb: once the record can
+    // be read and turns out to be genuinely absent, the sentinel settles the
+    // job, the command exits 0 and the name is free again. Without this the
+    // gate above would pass just as happily against a binary that refused every
+    // sidecar there is.
+    var settled = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer settled.deinit(f.allocator);
+    try settled.expectCode(0);
+    try host.expectFullyScripted();
+    try settled.expectSays("\"resultRecord\": \"absent\"");
+    try settled.expectSays("\"exitCode\": 0");
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const op = (try Store.operations.get(&store, arena_state.allocator(), request_id)).?;
+        try t.expectEqualStrings("completed", op.status.text());
+        const unsettled = try Store.operations.unsettled(&store, arena_state.allocator(), 1);
+        try t.expectEqual(@as(usize, 0), unsettled.len);
+    }
 }
 
 /// The race both mutating verbs have to survive: the job reaches its own end

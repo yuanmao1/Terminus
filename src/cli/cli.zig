@@ -32,9 +32,63 @@ pub fn setActiveCtx(ctx: *Ctx) void {
     active_ctx = ctx;
 }
 
+/// The daemon socket this command is talking over, if it is talking over one.
+///
+/// `std.process.exit` skips defers, so `Connection.deinit` never runs on any of
+/// the fatal paths below: the process dies with the socket still open and the
+/// OS tears it down abruptly. The peer — the daemon, or the black-box gates'
+/// stand-in for it — is sitting in a read at that moment, and on Windows an
+/// abrupt teardown surfaces there as `STATUS_CONNECTION_RESET`, which std maps
+/// to `error.Unexpected` and prints a stack trace for at the point the error is
+/// created. Catching it at the peer does not suppress the trace, and the peer
+/// cannot substitute its own read: the socket is an AFD handle std opened, and
+/// std's Windows path maps three statuses and routes every other one through
+/// `unexpectedStatus`. So the trace can only be prevented here, by the side
+/// that owns the close.
+///
+/// A client that has finished is not a fault, and it should not arrive at the
+/// other end looking like one — on a green run least of all, where the trace is
+/// indistinguishable from a real transport failure.
+///
+/// Held by value rather than as a pointer to the caller's `Connection`: the
+/// stream is a handle, a copy closes the same one, and a pointer would outlive
+/// the `Connection` on every path that returns normally.
+///
+/// The daemon socket only, never a direct SSH session. Closing that one means a
+/// libssh2 teardown handshake over a link a fatal path has usually just watched
+/// fail, and a process on its way out must not be made to wait on it.
+var active_daemon_socket: ?struct { io: std.Io, stream: std.Io.net.Stream } = null;
+
+fn registerDaemonSocket(io: std.Io, stream: std.Io.net.Stream) void {
+    active_daemon_socket = .{ .io = io, .stream = stream };
+}
+
+/// Forgets a socket somebody else is about to close, so this never closes a
+/// handle twice. Matched by handle, not unconditionally: a command that opens a
+/// second connection while the first is still live would otherwise have the
+/// first one's `deinit` drop the registration belonging to the second.
+fn clearDaemonSocket(stream: std.Io.net.Stream) void {
+    const open = active_daemon_socket orelse return;
+    if (open.stream.socket.handle != stream.socket.handle) return;
+    active_daemon_socket = null;
+}
+
+/// Ends the conversation with the daemon before the process ends.
+///
+/// Called from every path here that reaches `std.process.exit`. Idempotent, and
+/// it clears the registration before closing: a closed handle can be reissued
+/// to something else, and a second close would then land on a stranger.
+pub fn closeDaemonSocket() void {
+    const open = active_daemon_socket orelse return;
+    active_daemon_socket = null;
+    var stream = open.stream;
+    stream.close(open.io);
+}
+
 /// Fail-loud exit: in JSON mode emits `{"ok":false,"error":...}` on stdout
 /// (agents parse one stream); in human mode writes stderr. Always exit 1.
 pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    closeDaemonSocket();
     settleActiveExecution("command failed before recording an outcome");
     releaseReservation();
     releaseClaim();
@@ -61,6 +115,7 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 /// one they will want to search for, and a code that only exists in `--json`
 /// is a code half the callers never see.
 pub fn failWithCode(code: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
+    closeDaemonSocket();
     settleActiveExecution("command failed before recording an outcome");
     releaseReservation();
     releaseClaim();
@@ -274,6 +329,18 @@ pub fn releaseClaim() void {
     };
 }
 
+/// `std.process.exit`, with the daemon conversation ended first.
+///
+/// The exits in this file are reached through `fail` and its siblings, which
+/// close the socket themselves. A command that has already written its whole
+/// response and only needs the status code exits directly instead, and those
+/// sites are why this exists: they are the same abrupt teardown seen from a
+/// path that did not fail. See `active_daemon_socket`.
+pub fn exitNow(code: u8) noreturn {
+    closeDaemonSocket();
+    std.process.exit(code);
+}
+
 /// Process exit codes with a defined meaning to callers.
 pub const exit_code = struct {
     pub const ok: u8 = 0;
@@ -294,6 +361,7 @@ pub const exit_code = struct {
 /// error would invite exactly the blind retry that can double-apply a remote
 /// side effect.
 pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observed: []const u8) noreturn {
+    closeDaemonSocket();
     releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
@@ -325,6 +393,7 @@ pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observ
 /// be able to tell "it did not work" from "we do not know", because only the
 /// first is safe to retry.
 pub fn failIndeterminateAfterOutput(request_id: []const u8) noreturn {
+    closeDaemonSocket();
     clearExecution(); // already settled by the execution itself
     releaseClaim();
     if (active_ctx) |ctx| {
@@ -350,6 +419,7 @@ pub fn receiptFatal(
     err: anyerror,
     known_remote_status: ?[]const u8,
 ) noreturn {
+    closeDaemonSocket();
     releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
@@ -798,7 +868,12 @@ pub const Connection = struct {
     pub fn deinit(conn: *Connection) void {
         switch (conn.inner) {
             .direct => |*client| client.deinit(),
-            .daemon => |*client| client.deinit(),
+            // Forgotten before it is closed: the exit hooks must not find a
+            // handle this call has already given back to the OS.
+            .daemon => |*client| {
+                clearDaemonSocket(client.stream);
+                client.deinit();
+            },
         }
         conn.* = undefined;
     }
@@ -844,7 +919,10 @@ fn openConnection(
     if (!parsed.boolean("no-daemon") and !env_disabled) {
         const request = daemonRequest(server, auth);
         switch (DaemonClient.acquire(ctx.io, ctx.arena, ctx.environ, request)) {
-            .ok => |client| return .{ .inner = .{ .daemon = client }, .transport = "daemon" },
+            .ok => |client| {
+                registerDaemonSocket(ctx.io, client.stream);
+                return .{ .inner = .{ .daemon = client }, .transport = "daemon" };
+            },
             .unavailable => |reason| {
                 // Fall back, loudly: human mode warns on stderr now; JSON
                 // mode carries transport+daemonError in the response. Warned
