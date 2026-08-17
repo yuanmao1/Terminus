@@ -192,12 +192,31 @@ def restore(mut: Mutation, original: bytes) -> None:
 
 
 def git_out(*args: str) -> str:
-    """A read-only git query. Never a write: this tool must not touch history."""
+    """A read-only git query, stripped. Never a write: this tool must not touch
+    history."""
     proc = subprocess.run(
         ["git", *args], cwd=REPO, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
     )
     return proc.stdout.strip() if proc.returncode == 0 else f"<git {args[0]} failed>"
+
+
+def git_status_lines() -> list[str]:
+    """`git status --porcelain`, with leading whitespace intact.
+
+    Deliberately not `git_out`: that strips the whole output, which eats the
+    leading space of the *first* porcelain line only. Porcelain v1 is two status
+    characters then a space, so `line[3:]` is the path — and a shifted first line
+    silently reported `ools/mutate.py`. One wrong character in a path is exactly
+    the kind of detail that makes a reader distrust the rest of the artifact.
+    """
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=REPO, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    if proc.returncode != 0:
+        sys.exit("git status failed; refusing to report provenance we cannot read")
+    return [ln for ln in proc.stdout.split("\n") if ln.strip()]
 
 
 def sha256_of(path: Path) -> str:
@@ -210,13 +229,24 @@ def provenance() -> dict:
     A bare list of outcomes cannot be re-checked: it does not say which commit it
     describes, whether the tree was clean, or which manifest produced it. Without
     those, "39/39 killed" is a number someone has to be taken at their word for.
+
+    Tracked modifications and untracked files are reported separately, and only
+    the first is a problem. A mutation edits a file that is already tracked, so a
+    mutation that failed to revert can only ever show up as a tracked change —
+    while an untracked file is this run's own `--json` artifact, or unrelated
+    scratch. Conflating the two made a clean 39/39 run end on "every mutation is
+    supposed to be reverted; this means one was not", pointing at the artifact it
+    had just written.
     """
-    dirty = git_out("status", "--porcelain")
+    lines = git_status_lines()
+    untracked = [ln[3:] for ln in lines if ln.startswith("??")]
+    tracked = [ln[3:] for ln in lines if not ln.startswith("??")]
     return {
         "head": git_out("rev-parse", "HEAD"),
         "head_subject": git_out("log", "-1", "--format=%s"),
-        "tree_clean": dirty == "",
-        "tree_dirty_paths": dirty.splitlines(),
+        "tracked_clean": tracked == [],
+        "tracked_dirty_paths": tracked,
+        "untracked_paths": untracked,
         "manifest_sha256": sha256_of(MANIFEST),
         "manifest_entries": len(json.loads(MANIFEST.read_text(encoding="utf-8"))["mutations"]),
     }
@@ -284,12 +314,12 @@ def main() -> int:
 
     before = provenance()
     print(f"HEAD: {before['head'][:12]}  {before['head_subject']}")
-    print(f"tree: {'clean' if before['tree_clean'] else 'DIRTY -> ' + ', '.join(before['tree_dirty_paths'])}")
+    print(f"tree: {'clean' if before['tracked_clean'] else 'DIRTY -> ' + ', '.join(before['tracked_dirty_paths'])}")
     print(f"manifest: {before['manifest_entries']} entries, sha256 {before['manifest_sha256'][:12]}")
-    if not before["tree_clean"]:
+    if not before["tracked_clean"]:
         sys.exit(
-            "\nthe working tree is not clean, so a mutation cannot be told apart "
-            "from an edit that was already there. Commit or stash first."
+            "\nthe working tree has tracked modifications, so a mutation cannot be "
+            "told apart from an edit that was already there. Commit or stash first."
         )
 
     # Prove the tree is green before mutating it. Every outcome below is a claim
@@ -394,9 +424,9 @@ def main() -> int:
     for r in bad:
         print(f"  {r.outcome:<12} {r.id}")
     after = provenance()
-    if not after["tree_clean"]:
-        print("\nWARNING: the working tree is not clean after the run:")
-        for p in after["tree_dirty_paths"]:
+    if not after["tracked_clean"]:
+        print("\nWARNING: tracked files are modified after the run:")
+        for p in after["tracked_dirty_paths"]:
             print(f"  {p}")
         print("Every mutation is supposed to be reverted; this means one was not.")
         return 1
