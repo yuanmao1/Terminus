@@ -5,7 +5,19 @@
     "Run with: python tools/mutate.py",
     "`find` must appear exactly once in `file`; if it does not, the mutation",
     "reports NOT_APPLIED rather than passing, because a manifest that has",
-    "drifted from the code tests nothing."
+    "drifted from the code tests nothing.",
+    "Two limits of the runner shape the `expect_gate` values below, and both are",
+    "the runner's, not the gates': `failing_gate_names` ends a name at the first",
+    "apostrophe, so `gate: SKILL.md's --json key sets ...` is reported as",
+    "`gate: SKILL.md` (and the two SKILL.md gates are indistinguishable to it);",
+    "and the subprocess output is decoded with the console codepage, so a gate",
+    "name carrying a non-ASCII character never matches. `expect_gate` is matched",
+    "as a substring, so those entries name an ASCII prefix or fragment.",
+    "Also note: the runner restores files with Path.write_text, which rewrites",
+    "LF as CRLF on Windows. `cmd_job.zig`'s adjacency gate reads its own source",
+    "and ends a function body at \"\\n}\\n\", so it fails on CRLF text with no",
+    "mutation at all — every adjacency-gate failure reported for a cmd_job.zig",
+    "mutation under this runner has to be read with that in mind."
   ],
   "mutations": [
     {
@@ -103,6 +115,214 @@
       "find": "    if (probe.exit_code == null) return null;\n",
       "replace": "",
       "expect_gate": "cmd_job.decltest.finalProbe"
+    },
+    {
+      "id": "M2h-settlement-ledger-status",
+      "rule": "An observation whose attempt the ledger already settled reports `settled`, not `unproven`.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        .status => |s| if (s == .indeterminate) .unproven else .settled,",
+      "replace": "        .status => |s| if (s == .indeterminate) .unproven else .unproven,",
+      "expect_gate": "gate: a vanished session does not un-prove an attempt the ledger settled"
+    },
+    {
+      "id": "M2h-claim-live-clock",
+      "rule": "A lease is stamped from a live wall clock, not from the process's start time.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        .now = wallClockSeconds(ctx.io),",
+      "replace": "        .now = ctx.now,",
+      "expect_gate": "gate: --force takes over a lease renewed after the forcing process started"
+    },
+    {
+      "id": "M4-still-ours-always",
+      "rule": "A renewal that answered `not ours` forbids every destructive step after it.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    if (!authority.holds()) return false;\n    authority.* = holdClaim(claim, wallClockSeconds(io));\n    return authority.holds();",
+      "replace": "    if (!authority.holds()) return true;\n    authority.* = holdClaim(claim, wallClockSeconds(io));\n    return true;",
+      "expect_gate": "blackbox: `job kill` sends nothing to the host once the scope has moved"
+    },
+    {
+      "id": "M4-release-any-owner",
+      "rule": "A displaced holder may not release the lease its successor now holds.",
+      "file": "src/core/store/leases.zig",
+      "find": "        \\\\UPDATE leases SET released_at = ?1, release_reason = ?2\n        \\\\ WHERE server_id = ?3 AND scope_kind = ?4 AND scope_key = ?5\n        \\\\   AND owner_request_id = ?6 AND released_at IS NULL",
+      "replace": "        \\\\UPDATE leases SET released_at = ?1, release_reason = ?2\n        \\\\ WHERE server_id = ?3 AND scope_kind = ?4 AND scope_key = ?5\n        \\\\   AND (owner_request_id = ?6 OR 1) AND released_at IS NULL",
+      "expect_gate": "gate: a displaced holder releases nothing, and its renewal says so"
+    },
+    {
+      "id": "M4-pre-kill-renewal",
+      "rule": "`job kill` renews the scope lease immediately before it stops a session.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);\n    const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|\n",
+      "replace": "    const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|\n",
+      "expect_gate": "blackbox: `job kill` sends nothing to the host once the scope has moved"
+    },
+    {
+      "id": "M4-post-kill-downgrade",
+      "rule": "A lost lease costs a kill its claims, not the exit code it already read.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    const terminal: Core.Store.op_state.Terminal = .{ .exited = .{ .exit_code = code } };",
+      "replace": "    const terminal: Core.Store.op_state.Terminal = if (authority.holds()) .{ .exited = .{ .exit_code = code } } else authority.lostTerminal(ctx, job.name, if (execution) |e| e.status else .remote_started);",
+      "expect_gate": "blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read"
+    },
+    {
+      "id": "M4-lost-terminal-hoisted",
+      "rule": "`job rm`'s lost-lease terminal sits below the exit-code arm, never above it.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    const terminal: Core.Store.op_state.Terminal = if (probe.exit_code) |code|",
+      "replace": "    const terminal: Core.Store.op_state.Terminal = if (!authority.holds())\n        authority.lostTerminal(ctx, job.name, if (execution) |e| e.status else .remote_started)\n    else if (probe.exit_code) |code|",
+      "expect_gate": "blackbox: a lost scope costs `job kill` and `job rm` their claims, not the exit status they read"
+    },
+    {
+      "id": "M4-authority-conjunct",
+      "rule": "A cancellation cannot be proven by a command that has lost the scope.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    return authority.holds() and !refused and session_gone and can_prove;",
+      "replace": "    _ = authority;\n    return !refused and session_gone and can_prove;",
+      "expect_gate": "cmd_job.decltest.cancellationProvable"
+    },
+    {
+      "id": "M5-skill-added-field",
+      "rule": "A key added to an emitter struct must be added to SKILL.md's key set too.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    cancellationProven: bool,",
+      "replace": "    cancellationProven: bool,\n    killLatencyMs: i64 = 0,",
+      "expect_gate": "gate: SKILL.md"
+    },
+    {
+      "id": "M5-skill-nullability-flip",
+      "rule": "A key that gains a `?` moves buckets in SKILL.md, and the document must move with it.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    sessionGone: bool,",
+      "replace": "    sessionGone: ?bool,",
+      "expect_gate": "gate: SKILL.md"
+    },
+    {
+      "id": "M5-skill-key-renamed",
+      "rule": "SKILL.md's documented key names are the struct's own field names.",
+      "file": "skill/SKILL.md",
+      "find": "`attemptRetained`, `resultRecord`, `authority`.",
+      "replace": "`attemptsRetained`, `resultRecord`, `authority`.",
+      "expect_gate": "gate: SKILL.md"
+    },
+    {
+      "id": "M5-skill-code-renamed",
+      "rule": "SKILL.md's `resultRecord` codes are `SidecarReading`'s own tag names.",
+      "file": "skill/SKILL.md",
+      "find": "`exit_code_out_of_range`, `foreign`.",
+      "replace": "`exit_code_out_of_range`, `alien`.",
+      "expect_gate": "gate: SKILL.md"
+    },
+    {
+      "id": "M6-read-result-status",
+      "rule": "`readResult` honours the script's unreadable-record exit status.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "    const result = try run(executor, arena, try resultReadScript(arena, request_id));\n    if (result.exit_code == result_unreadable_exit) return error.ResultUnreadable;\n",
+      "replace": "    const result = try run(executor, arena, try resultReadScript(arena, request_id));\n",
+      "expect_gate": "gate: a sidecar that could not be read is not a sidecar that is not there"
+    },
+    {
+      "id": "M6-read-result-pipeline",
+      "rule": "The sidecar read is not a pipeline: a failing `head` must be the script's status.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "        \\\\head -c {d} \"$r\" || exit {d}",
+      "replace": "        \\\\head -c {d} \"$r\" | tr -d '\\n' || exit {d}",
+      "expect_gate": "gate: a sidecar that could not be read is not a sidecar that is not there"
+    },
+    {
+      "id": "M6-probe-tail-status",
+      "rule": "`probeTail` honours the script's unreadable-record exit status.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "    const result = try run(executor, arena, try probeScript(arena, name, request_id, tail_bytes));\n    if (result.exit_code == result_unreadable_exit) return error.ResultUnreadable;\n",
+      "replace": "    const result = try run(executor, arena, try probeScript(arena, name, request_id, tail_bytes));\n",
+      "expect_gate": "gate: neither reader turns an unreadable result record into an absent one"
+    },
+    {
+      "id": "M6-probe-subshell",
+      "rule": "The probe's sidecar read is a brace group; a subshell would let the script carry on.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "        \\\\[ -f \"$r\" ] && {{ head -c {d} \"$r\" || exit {d}; }}",
+      "replace": "        \\\\[ -f \"$r\" ] && ( head -c {d} \"$r\" || exit {d}; )",
+      "expect_gate": "gate: neither reader turns an unreadable result record into an absent one"
+    },
+    {
+      "id": "M6-unreadable-exit-code",
+      "rule": "The unreadable-record exit status is distinct from success.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "const result_unreadable_exit: i32 = 44;",
+      "replace": "const result_unreadable_exit: i32 = 0;",
+      "expect_gate": "gate: neither reader turns an unreadable result record into an absent one"
+    },
+    {
+      "id": "M7-transfer-exited",
+      "rule": "A copier's exit status may not settle a transfer.",
+      "file": "src/core/store/receipts.zig",
+      "find": "            // variant and therefore not this change's to make.\n            .transfer_push, .transfer_pull, .fetch => false,",
+      "replace": "            // variant and therefore not this change's to make.\n            .transfer_push, .transfer_pull, .fetch => true,",
+      "expect_gate": "terminal cell is decided, and none of them by default"
+    },
+    {
+      "id": "M7-transfer-remote-deadline",
+      "rule": "A remote-reported deadline may not settle a transfer.",
+      "file": "src/core/store/receipts.zig",
+      "find": "            // terminal that carries what it observed at the destination.\n            .transfer_push, .transfer_pull, .fetch => false,",
+      "replace": "            // terminal that carries what it observed at the destination.\n            .transfer_push, .transfer_pull, .fetch => true,",
+      "expect_gate": "terminal cell is decided, and none of them by default"
+    },
+    {
+      "id": "M7-transfer-cancel-confirmed",
+      "rule": "A confirmed cancellation of a copier may not settle a transfer.",
+      "file": "src/core/store/receipts.zig",
+      "find": "            // nothing had been sent to one.\n            .transfer_push, .transfer_pull, .fetch => false,",
+      "replace": "            // nothing had been sent to one.\n            .transfer_push, .transfer_pull, .fetch => true,",
+      "expect_gate": "terminal cell is decided, and none of them by default"
+    },
+    {
+      "id": "M7-transfer-indeterminate",
+      "rule": "`indeterminate` stays admissible for every kind, so a refused transfer cannot wedge.",
+      "file": "src/core/store/receipts.zig",
+      "find": "        .indeterminate => switch (kind) {\n            .exec,\n            .job,\n            .session_write,\n            .transfer_push,",
+      "replace": "        .indeterminate => switch (kind) {\n            .transfer_push => false,\n            .exec,\n            .job,\n            .session_write,",
+      "expect_gate": "terminal cell is decided, and none of them by default"
+    },
+    {
+      "id": "M8-renew-conflict-branch",
+      "rule": "The conflict branch's kill is renewed on the line above it, not before its settlement.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        // narrowest this side can make the window.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);\n",
+      "replace": "        // narrowest this side can make the window.\n",
+      "expect_gate": "gate: every destructive remote call is renewed on the line above it"
+    },
+    {
+      "id": "M8-renew-declined-branch",
+      "rule": "The unusable-record branch's kill is renewed on the line above it.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        // peer may now own can still be withheld.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);\n",
+      "replace": "        // peer may now own can still be withheld.\n",
+      "expect_gate": "gate: every destructive remote call is renewed on the line above it"
+    },
+    {
+      "id": "M8-renew-exit-code-branch",
+      "rule": "The already-finished branch's kill is renewed on the line above it.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        // command no longer has the scope for is not one it may stop.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);\n",
+      "replace": "        // command no longer has the scope for is not one it may stop.\n",
+      "expect_gate": "gate: every destructive remote call is renewed on the line above it"
+    },
+    {
+      "id": "M8-renew-refuses-always",
+      "rule": "Discriminating control: a renewal that refuses its own command is caught end to end, in the three kill branches that have one and in the adjacency scan.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        // command no longer has the scope for is not one it may stop.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement",
+      "replace": "        // command no longer has the scope for is not one it may stop.\n        if (true) refuseKillAfterSettlement",
+      "expect_gate": "blackbox: a kill on a job that already finished settles, then needs the scope to clean up"
+    },
+    {
+      "id": "M8-settlement-renewal",
+      "rule": "A settlement is a claim under this command's name, so it too is gated on a renewal.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        // The settlement's renewal. The kill's is below, after the transaction.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);\n",
+      "replace": "        // The settlement's renewal. The kill's is below, after the transaction.\n",
+      "expect_gate": "blackbox: a kill on a job that already finished settles, then needs the scope to clean up"
     }
   ]
 }
