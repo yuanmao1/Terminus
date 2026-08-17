@@ -6,18 +6,39 @@
     "`find` must appear exactly once in `file`; if it does not, the mutation",
     "reports NOT_APPLIED rather than passing, because a manifest that has",
     "drifted from the code tests nothing.",
-    "Two limits of the runner shape the `expect_gate` values below, and both are",
-    "the runner's, not the gates': `failing_gate_names` ends a name at the first",
-    "apostrophe, so `gate: SKILL.md's --json key sets ...` is reported as",
-    "`gate: SKILL.md` (and the two SKILL.md gates are indistinguishable to it);",
-    "and the subprocess output is decoded with the console codepage, so a gate",
-    "name carrying a non-ASCII character never matches. `expect_gate` is matched",
-    "as a substring, so those entries name an ASCII prefix or fragment.",
-    "Also note: the runner restores files with Path.write_text, which rewrites",
-    "LF as CRLF on Windows. `cmd_job.zig`'s adjacency gate reads its own source",
-    "and ends a function body at \"\\n}\\n\", so it fails on CRLF text with no",
-    "mutation at all — every adjacency-gate failure reported for a cmd_job.zig",
-    "mutation under this runner has to be read with that in mind."
+    "`expect_gate` is matched as a substring of the failing test's full name, so",
+    "it may name a distinctive fragment — but it should name the whole gate,",
+    "because a fragment can be a prefix of a second gate and then either one",
+    "satisfies the entry. Three runner defects used to force shortened values",
+    "here and are now fixed: names were cut at the first apostrophe, output was",
+    "decoded with the console codepage (so `gate: every kind × terminal cell`",
+    "could never match), and files were restored through `Path.write_text`,",
+    "which rewrote LF as CRLF. That last one was the worst of the three: with",
+    "`*.zig text eol=lf` in `.gitattributes`, `git diff` normalises CRLF away",
+    "and shows nothing, while `cmd_job.zig`'s adjacency gate reads its own",
+    "source and ends a function body at \"\\n}\\n\" — so a corrupted tree failed",
+    "that gate under the *next* mutation's name. The runner now restores by",
+    "bytes and verifies the restored file against what it read, aborting the",
+    "run if it differs.",
+    "Deleted entry, recorded so nobody reads its absence as the rule lapsing:",
+    "`v11-live-dest-unique` mutation-tested the UNIQUE on",
+    "`idx_checkpoints_live_dest` (src/core/store/migrate.zig:511), the index",
+    "that keeps two in-flight transfers off one destination. That is no longer",
+    "a gate's job. `migrate.frozenStatement` (src/core/store/migrate.zig:621)",
+    "slices the statement out of the v11 migration text at comptime — a",
+    "`std.mem.indexOf` for the literal `CREATE UNIQUE INDEX",
+    "idx_checkpoints_live_dest`, `orelse @compileError` — on behalf of",
+    "`checkpoints_index_ddl` (src/core/store/migrate.zig:651). So weakening or",
+    "removing the index stops the build. Verified rather than assumed: dropping",
+    "`UNIQUE` from line 511 reports `no frozen statement starts with: CREATE",
+    "UNIQUE INDEX idx_checkpoints_live_dest` at migrate.zig:628, referenced",
+    "from the schema-shape drift gate. A rule the compiler refuses is stronger",
+    "than one a test catches, and a mutation that cannot compile proves nothing",
+    "about a gate either way — so the entry was deleted, not repaired. (It had",
+    "also become unrunnable for a second reason: its `find` text now appears",
+    "twice in migrate.zig, once in the DDL and once in the `frozenStatement`",
+    "call that pins it, which is why it reported NOT_APPLIED rather than",
+    "BUILD_ERROR.)"
   ],
   "mutations": [
     {
@@ -48,7 +69,7 @@
       "id": "M3-digest-write-once",
       "rule": "A declared digest may never be overwritten.",
       "file": "src/core/store/transfers.zig",
-      "find": "        \\\\   AND expected_sha256 IS NULL\n",
+      "find": "    \\\\   AND expected_sha256 IS NULL\n",
       "replace": "",
       "expect_gate": "gate: the digest a transfer will be judged by is declared once, before it sends"
     },
@@ -56,16 +77,16 @@
       "id": "M3-digest-phase",
       "rule": "A digest may only be declared while the operation is still in created/connecting.",
       "file": "src/core/store/transfers.zig",
-      "find": "        \\\\   AND request_id IN (\n        \\\\         SELECT request_id FROM operations\n        \\\\          WHERE status IN ('created','connecting')\n        \\\\       )\n",
-      "replace": "",
+      "find": "    \\\\   AND expected_sha256 IS NULL\n    \\\\   AND confirmed_offset = 0\n    \\\\   AND state IN ({[before_first_byte]s})\n    \\\\   AND request_id IN (\n    \\\\         SELECT request_id FROM operations\n    \\\\          WHERE status IN ({[before_submission]s})\n    \\\\       )\n",
+      "replace": "    \\\\   AND expected_sha256 IS NULL\n    \\\\   AND confirmed_offset = 0\n    \\\\   AND state IN ({[before_first_byte]s})\n    \\\\   AND request_id IN (\n    \\\\         SELECT request_id FROM operations\n    \\\\          WHERE status IN ({[before_submission]s}) OR 1\n    \\\\       )\n",
       "expect_gate": "gate: the digest a transfer will be judged by is declared once, before it sends"
     },
     {
       "id": "M3-checkpoint-fail-loud",
       "rule": "A checkpoint UPDATE that matches no row is an error, not a success.",
       "file": "src/core/store/transfers.zig",
-      "find": "        return error.CheckpointRowMissing;",
-      "replace": "        return;",
+      "find": "    if (store.db.changes() != 0) return;\n\n    // Existence and ownership come back under their own names; what is left is\n",
+      "replace": "    if (store.db.changes() >= 0) return;\n\n    // Existence and ownership come back under their own names; what is left is\n",
       "expect_gate": "gate: a checkpoint write that lands on no row is an error, not a success"
     },
     {
@@ -85,20 +106,12 @@
       "expect_gate": "gate: one request cannot hold two checkpoints, or two live transfers one destination"
     },
     {
-      "id": "v11-live-dest-unique",
-      "rule": "At most one in-flight transfer may hold a given destination.",
-      "file": "src/core/store/migrate.zig",
-      "find": "CREATE UNIQUE INDEX idx_checkpoints_live_dest",
-      "replace": "CREATE INDEX idx_checkpoints_live_dest",
-      "expect_gate": "gate: one request cannot hold two checkpoints, or two live transfers one destination"
-    },
-    {
       "id": "v11-offset-needs-proof",
       "rule": "A non-zero confirmed offset requires a prefix hash to prove it.",
       "file": "src/core/store/migrate.zig",
       "find": "  \\\\  CHECK (confirmed_offset = 0 OR partial_sha256 IS NOT NULL),\n",
       "replace": "",
-      "expect_gate": "gate: a confirmed offset without a prefix hash is refused by the schema"
+      "expect_gate": "gate: a confirmed offset without a prefix hash, or without a source identity, is refused by the schema"
     },
     {
       "id": "M3-no-coalesce",
@@ -106,13 +119,13 @@
       "file": "src/core/store/transfers.zig",
       "find": "       partial_sha256 = ?3, updated_at = ?4",
       "replace": "       partial_sha256 = COALESCE(?3, partial_sha256), updated_at = ?4",
-      "expect_gate": "gate: a confirmed offset without a prefix hash is refused by the schema"
+      "expect_gate": "gate: a confirmed offset without a prefix hash, or without a source identity, is refused by the schema"
     },
     {
       "id": "M2g-final-probe-unknown",
       "rule": "A post-kill re-probe may only upgrade a cancellation when it establishes an exit code.",
       "file": "src/cli/cmd_job.zig",
-      "find": "    if (probe.exit_code == null) return null;\n",
+      "find": "    if (probe.exit_code == null) return .{};\n",
       "replace": "",
       "expect_gate": "cmd_job.decltest.finalProbe"
     },
@@ -186,7 +199,7 @@
       "file": "src/cli/cmd_job.zig",
       "find": "    cancellationProven: bool,",
       "replace": "    cancellationProven: bool,\n    killLatencyMs: i64 = 0,",
-      "expect_gate": "gate: SKILL.md"
+      "expect_gate": "gate: SKILL.md's --json key sets are the ones these structs emit"
     },
     {
       "id": "M5-skill-nullability-flip",
@@ -194,7 +207,7 @@
       "file": "src/cli/cmd_job.zig",
       "find": "    sessionGone: bool,",
       "replace": "    sessionGone: ?bool,",
-      "expect_gate": "gate: SKILL.md"
+      "expect_gate": "gate: SKILL.md's --json key sets are the ones these structs emit"
     },
     {
       "id": "M5-skill-key-renamed",
@@ -202,7 +215,7 @@
       "file": "skill/SKILL.md",
       "find": "`attemptRetained`, `resultRecord`, `authority`.",
       "replace": "`attemptsRetained`, `resultRecord`, `authority`.",
-      "expect_gate": "gate: SKILL.md"
+      "expect_gate": "gate: SKILL.md's --json key sets are the ones these structs emit"
     },
     {
       "id": "M5-skill-code-renamed",
@@ -210,7 +223,7 @@
       "file": "skill/SKILL.md",
       "find": "`exit_code_out_of_range`, `foreign`.",
       "replace": "`exit_code_out_of_range`, `alien`.",
-      "expect_gate": "gate: SKILL.md"
+      "expect_gate": "gate: SKILL.md's resultRecord codes are SidecarReading's own tag names"
     },
     {
       "id": "M6-read-result-status",
@@ -258,7 +271,7 @@
       "file": "src/core/store/receipts.zig",
       "find": "            // variant and therefore not this change's to make.\n            .transfer_push, .transfer_pull, .fetch => false,",
       "replace": "            // variant and therefore not this change's to make.\n            .transfer_push, .transfer_pull, .fetch => true,",
-      "expect_gate": "terminal cell is decided, and none of them by default"
+      "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M7-transfer-remote-deadline",
@@ -266,7 +279,7 @@
       "file": "src/core/store/receipts.zig",
       "find": "            // terminal that carries what it observed at the destination.\n            .transfer_push, .transfer_pull, .fetch => false,",
       "replace": "            // terminal that carries what it observed at the destination.\n            .transfer_push, .transfer_pull, .fetch => true,",
-      "expect_gate": "terminal cell is decided, and none of them by default"
+      "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M7-transfer-cancel-confirmed",
@@ -274,7 +287,7 @@
       "file": "src/core/store/receipts.zig",
       "find": "            // nothing had been sent to one.\n            .transfer_push, .transfer_pull, .fetch => false,",
       "replace": "            // nothing had been sent to one.\n            .transfer_push, .transfer_pull, .fetch => true,",
-      "expect_gate": "terminal cell is decided, and none of them by default"
+      "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M7-transfer-indeterminate",
@@ -282,7 +295,7 @@
       "file": "src/core/store/receipts.zig",
       "find": "        .indeterminate => switch (kind) {\n            .exec,\n            .job,\n            .session_write,\n            .transfer_push,",
       "replace": "        .indeterminate => switch (kind) {\n            .transfer_push => false,\n            .exec,\n            .job,\n            .session_write,",
-      "expect_gate": "terminal cell is decided, and none of them by default"
+      "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M8-renew-conflict-branch",

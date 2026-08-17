@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -88,38 +89,87 @@ def load(ids: list[str] | None) -> list[Mutation]:
 
 
 def run_gates(zig: str) -> tuple[int, str]:
+    # UTF-8 explicitly: gate names carry non-ASCII (`gate: every kind × terminal
+    # cell ...`), and decoding zig's output with the console codepage — cp936 on
+    # the machine this was written on — turns `×` into mojibake, so the entry
+    # naming that gate can never match and reports WRONG_GATE against the gate
+    # that did in fact catch it.
     proc = subprocess.run(
         [zig, "build", "test", "--summary", "all"],
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         errors="replace",
     )
     return proc.returncode, proc.stdout + proc.stderr
+
+
+# `error: 'cli.cmd_job.test.gate: SKILL.md's --json key sets ...' failed:`
+#
+# The closing quote is found by the ` failed` / ` exited with code` that follows
+# it, not by being the next apostrophe: test names contain apostrophes, and
+# stopping at the first one truncated `gate: SKILL.md's --json key sets are the
+# ones these structs emit` to `gate: SKILL.md` — which is also a prefix of
+# `gate: SKILL.md's resultRecord codes ...`, so the two gates became
+# indistinguishable and either could satisfy an entry naming the other.
+GATE_FAILURE = re.compile(r"error: '(.+?)' (?:failed|exited with code)")
 
 
 def failing_gate_names(output: str) -> list[str]:
     """Zig prints `error: 'module.test.NAME' failed:` for each failing test."""
     names = []
     for line in output.splitlines():
-        marker = "error: '"
-        if marker in line and ("failed" in line or "exited with code" in line):
-            rest = line.split(marker, 1)[1]
-            name = rest.split("'", 1)[0]
-            if name not in names:
-                names.append(name)
+        m = GATE_FAILURE.search(line)
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
     return names
 
 
-def apply(mut: Mutation) -> str | None:
-    """Rewrites the file in place; returns the original text, or None if the
+def apply(mut: Mutation) -> bytes | None:
+    """Rewrites the file in place; returns the original bytes, or None if the
     pattern was not found exactly once (a drifted manifest, not a passing
-    mutation — those are different outcomes and must not be conflated)."""
-    text = mut.path().read_text(encoding="utf-8")
+    mutation — those are different outcomes and must not be conflated).
+
+    Bytes, not `Path.read_text`/`write_text`: those translate newlines on
+    Windows, so an LF repo came back CRLF after every mutation. `.gitattributes`
+    says `*.zig text eol=lf`, which means `git diff` normalises the damage away
+    and shows nothing — while `cmd_job.zig`'s adjacency gate, which reads its
+    own source and ends a function body at "\\n}\\n", fails outright on CRLF
+    text with no mutation applied at all. The result was not a silent runner but
+    a lying one: real gate failures attributed to whichever mutation happened to
+    run next.
+    """
+    raw = mut.path().read_bytes()
+    text = raw.decode("utf-8")
     if text.count(mut.find) != 1:
         return None
-    mut.path().write_text(text.replace(mut.find, mut.replace, 1), encoding="utf-8")
-    return text
+    mut.path().write_bytes(text.replace(mut.find, mut.replace, 1).encode("utf-8"))
+    return raw
+
+
+def restore(mut: Mutation, original: bytes) -> None:
+    """Puts the file back and proves it went back, byte for byte.
+
+    A restore that does not restore poisons every result after it, and the one
+    this runner shipped was invisible to `git diff`. So the write is checked
+    rather than trusted, and a mismatch stops the run: continuing would produce
+    outcomes that look like findings and are not. It is deliberately not a
+    repair — a runner that quietly fixes its own corruption is how the first one
+    went unnoticed.
+    """
+    path = mut.path()
+    path.write_bytes(original)
+    after = path.read_bytes()
+    if after == original:
+        return
+    sys.exit(
+        f"\nrestore of {mut.file} did not reproduce the file it started from "
+        f"({len(original)} bytes before, {len(after)} after).\n"
+        f"The working tree is now modified and every result past this point "
+        f"would be measuring the runner, not the gates.\n"
+        f"Recover with: git checkout -- {mut.file}"
+    )
 
 
 def evaluate(mut: Mutation, zig: str) -> Result:
@@ -148,11 +198,16 @@ def evaluate(mut: Mutation, zig: str) -> Result:
         return Result(mut.id, mut.rule, mut.file, mut.expect_gate, "WRONG_GATE", gates, elapsed,
                       "caught, but not by the gate that claims to prove this rule")
     finally:
-        mut.path().write_text(original, encoding="utf-8")
+        restore(mut, original)
 
 
 def main() -> int:
+    # Gate names reach stdout verbatim, `×` included; a gbk console would raise
+    # on the way out and lose the report that was already paid for.
+    sys.stdout.reconfigure(encoding="utf-8")
+
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+
     ap.add_argument("--id", action="append", help="run only this mutation (repeatable)")
     ap.add_argument("--list", action="store_true", help="print the manifest and exit")
     ap.add_argument("--json", metavar="PATH", help="write results as JSON")
