@@ -1,17 +1,47 @@
-# zig fmt canonicalises to LF. Without this, a Windows checkout gets CRLF and
-# `zig fmt --check` reports every file in the repo as unformatted, which buries
-# the ones that genuinely are.
+# Every text file is LF — in the index and in the working tree.
+#
+# `text=auto` lets git detect text from binary; `eol=lf` overrides a checkout
+# that would otherwise follow `core.autocrlf`, which is `true` on the machine
+# this is developed on. Without the `eol=lf` half, a file's working-tree bytes
+# differ from its committed blob while `git diff` normalises the difference away
+# and reports nothing — so a tool that hashes or byte-compares a file disagrees
+# with version control and cannot be told why.
+#
+# That cost real time twice, in both directions:
+#
+#   * `zig fmt --check` reported every file in the repo as unformatted on a
+#     Windows checkout, burying the ones that genuinely were. This is what the
+#     original `*.zig`/`*.zon` rules below were added for.
+#   * `tools/mutate.py` restored source with `Path.write_text`, which rewrote LF
+#     as CRLF. `cmd_job.zig`'s adjacency gate reads its own source and ends a
+#     function body at "\n}\n", a string CRLF text cannot contain — so that gate
+#     failed for mutations in unrelated files and contaminated a whole
+#     26-mutation pass. The runner was not silent, it was misattributing.
+#   * The byte sizes quoted for the two evidence artefacts were measured on CRLF
+#     working-tree copies, overstating the committed blobs by exactly one byte
+#     per line.
+#
+# All 137 tracked files are text today, so this rule covers every one of them.
+# The `binary` marks below are for file types that do not exist here yet: an exe
+# or an image added later must not be silently line-ending-converted, and saying
+# so now is cheaper than diagnosing it then.
+* text=auto eol=lf
+
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.db binary
+
+# Redundant against the catch-all, kept because these are the two that broke
+# first and an explicit rule is what a reader looks for.
 *.zig text eol=lf
 *.zon text eol=lf
-
-# Same reason, for the text `core.autocrlf=true` was still converting. Without
-# these, a file's worktree bytes differ from its committed blob while `git diff`
-# normalises the difference away and reports nothing — so a tool that hashes or
-# byte-compares a file disagrees with version control and cannot be told why.
-# That cost real time twice: `tools/mutate.py` restored source as CRLF and made
-# `cmd_job.zig`'s adjacency gate fail with `FunctionUnterminated` for mutations
-# in unrelated files, and the byte sizes quoted for the evidence artefacts were
-# measured on CRLF worktree copies and so overstated the committed blobs.
-*.json text eol=lf
-*.md text eol=lf
-*.py text eol=lf
