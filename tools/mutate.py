@@ -252,6 +252,47 @@ def provenance() -> dict:
     }
 
 
+def vet_json_target(raw: str) -> Path:
+    """Refuses a `--json` path that could destroy something.
+
+    `write_json` overwrites unconditionally, and the residue check below excludes
+    this path from "tracked files modified after the run" — so `--json
+    src/core/control.zig` would replace a source file with JSON *and* report the
+    tree clean. That is a destruction path and a pseudo-success path in the one
+    tool whose whole job is producing trustworthy evidence.
+
+    Three conditions, all of them cheap:
+      * the name ends in `.json`, so no `.zig`/`.py`/`.md` can be named at all;
+      * it is not inside a source or vendored tree;
+      * if it already exists it must currently parse as JSON, so the only file it
+        can overwrite is a previous artifact.
+    """
+    path = Path(raw)
+    resolved = path if path.is_absolute() else (REPO / path)
+    if path.suffix != ".json":
+        sys.exit(f"--json must name a .json file; got {raw}")
+    try:
+        rel = resolved.resolve().relative_to(REPO.resolve()).as_posix()
+    except ValueError:
+        sys.exit(f"--json must stay inside the repository; got {raw}")
+    for guarded in ("src/", "test/", "tools/", "vendor/", "skill/", "npm/"):
+        if rel.startswith(guarded):
+            sys.exit(
+                f"--json would write into {guarded} — refusing.\n"
+                f"That directory holds source, not evidence, and this tool "
+                f"overwrites its target without asking."
+            )
+    if resolved.exists():
+        try:
+            json.loads(resolved.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            sys.exit(
+                f"--json target {rel} exists and is not JSON — refusing to "
+                f"overwrite it.\nOnly a previous artifact may be replaced."
+            )
+    return Path(rel)
+
+
 def write_json(path: str, payload) -> None:
     """Writes the artifact with LF endings, byte-exactly.
 
@@ -317,6 +358,8 @@ def main() -> int:
         help="verify every `find` still occurs exactly once, and exit; no builds",
     )
     args = ap.parse_args()
+
+    json_target = vet_json_target(args.json) if args.json else None
 
     muts = load(args.id)
     if args.list:
@@ -471,7 +514,7 @@ def main() -> int:
     # files, which held only until the artifact was committed — after that,
     # rewriting it was a *tracked* modification and a clean 58/58 run again
     # accused itself of leaving a mutation applied.
-    wrote = {Path(args.json).as_posix()} if args.json else set()
+    wrote = {json_target.as_posix()} if json_target else set()
     left_behind = [p for p in after["tracked_dirty_paths"] if p not in wrote]
     if left_behind:
         print("\nWARNING: tracked files are modified after the run:")
