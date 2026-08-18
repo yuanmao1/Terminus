@@ -450,32 +450,49 @@ every key of its set — the emitter structs have no defaults, so a missing key 
 a compile error rather than a shape you discover at runtime. Absent is never a
 signal; `null` means "there is no such reading", never "we did not look".
 
-`job kill` — 19 keys. Never null: `ok`, `action`
+`job kill` — 21 keys. Never null: `ok`, `action`
 (`killed` | `already_finished` | `finished_during_kill` | `not_killed`), `job`,
 `status`, `outcomeProven`, `observedAt`, `sessionGone`, `sessionCleanedUp` (the
 same boolean under the older name, published everywhere so it means one thing),
-`cancellationProven`, `resultRecord`, `authority`. Nullable: `exitCode` (null
-when no record answered, and deliberately null on the `conflict` and
-unusable-record branches — those codes must not be read as an outcome),
-`finishedAt`, `conflict`, `requestId` (null when the row names no attempt),
-`resultRecordError`, `cacheError`, `authorityError`, `hint`.
+`cancellationProven`, `resultRecord`, `authority`,
+`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
+Nullable: `exitCode` (null when no record answered, and deliberately null on the
+`conflict` and unusable-record branches — those codes must not be read as an
+outcome), `finishedAt`, `conflict`, `requestId` (null when the row names no
+attempt), `resultRecordError`, `cacheError`, `authorityError`,
+`leaseReleaseError`, `hint`.
 
-`job rm` — 16 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
+`job rm` — 18 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
 `job`, `status`, `outcomeProven`, `rowRemoved`, `evidenceRetained`,
-`attemptRetained`, `resultRecord`, `authority`. Nullable: `conflict`,
-`requestId`, `resultRecordError`, `cacheError`, `authorityError`, `hint`.
+`attemptRetained`, `resultRecord`, `authority`,
+`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
+Nullable: `conflict`, `requestId`, `resultRecordError`, `cacheError`,
+`authorityError`, `leaseReleaseError`, `hint`.
 `resultRecord` / `resultRecordError` are on this verb too — `job rm` deletes the
 local row, so this line and the receipt are the only places the reading survives.
+
+`leaseRelease` is the same key `session rm` publishes, and it answers a different
+question from `authority`: that one says whether the scope lease was still ours
+while there were steps left to take, this one says whether the scope is free now.
+`left_held` is a leak — the lease is still holding this job's scope, so the next
+`job kill`, `job rm` or `run --name` on it is refused until the lease lapses (120s)
+— and it used to be a line on stderr under a document that said `ok: true`. It
+does **not** change the exit code or `ok`: on a completed kill or removal the act
+did complete and is durably recorded, so exiting non-zero would say otherwise and
+send you into a retry the leaked lease would refuse. Branch on `leaseRelease`;
+`leaseReleaseError` is prose.
 
 `status` on these two verbs is the ledger's word for the attempt, and it has two
 values `job status` never prints: `"unknown"` (the row names no attempt, or names
 a request the ledger does not have) and, on `job rm`, `"unchanged"`.
-`authorityError`, `cacheError` and `hint` are prose — do not match their text.
+`authorityError`, `cacheError`, `leaseReleaseError` and `hint` are prose — do not
+match their text.
 `resultRecordError` is prose too, with the exceptions named above: the tokens
 `read_error` and `probe_error`, which are stable and always arrive beside the
 same word in `resultRecord`. Presence alone is meaningful only for `cacheError`,
 where non-null is the one signal that the local row was not updated; the others
-mirror `resultRecord` and `authority`, which you can branch on directly.
+mirror `resultRecord`, `authority` and `leaseRelease`, which you can branch on
+directly.
 
 ### Removing a session
 

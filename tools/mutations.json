@@ -237,8 +237,8 @@
       "id": "M5-skill-key-renamed",
       "rule": "SKILL.md's documented key names are the struct's own field names.",
       "file": "skill/SKILL.md",
-      "find": "`attemptRetained`, `resultRecord`, `authority`.",
-      "replace": "`attemptsRetained`, `resultRecord`, `authority`.",
+      "find": "`attemptRetained`, `resultRecord`, `authority`,\n",
+      "replace": "`attemptsRetained`, `resultRecord`, `authority`,\n",
       "expect_gate": "gate: SKILL.md's --json key sets are the ones these structs emit"
     },
     {
@@ -629,8 +629,8 @@
       "id": "M3b-claim-release-failure-is-reported",
       "rule": "A scope lease this command could not hand back is reported as still held, so a leak cannot hide under a document that says the command succeeded.",
       "file": "src/cli/cli.zig",
-      "find": "        return .{ .code = \"left_held\", .detail = detail };\n",
-      "replace": "        return .{ .code = \"released\", .detail = detail };\n",
+      "find": "        return .{ .code = codes.left_held, .detail = detail };\n",
+      "replace": "        return .{ .code = codes.released, .detail = detail };\n",
       "expect_gate": "gate: a release that could not be recorded reports the lease as still held"
     },
     {
@@ -728,6 +728,38 @@
       "find": "is nothing to read a word off, so it is `unknown`.\n",
       "replace": "is nothing to read a word off, so it is `absent`.\n",
       "expect_gate": "gate: SKILL.md publishes the word `session rm` uses when the ledger has no row"
+    },
+    {
+      "id": "W2-kill-publishes-the-answer",
+      "rule": "`job kill` publishes what its release actually answered, not a constant: a leaked lease is visible as `left_held` on the branch that exits 0.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "                .leaseRelease = lease.code,\n                .leaseReleaseError = lease.detail,\n                .hint = hint,\n",
+      "replace": "                .leaseRelease = Cli.ClaimRelease.released.code,\n                .leaseReleaseError = null,\n                .hint = hint,\n",
+      "expect_gate": "blackbox: a `job kill` that completed and could not give the scope back says so, and still exits 0"
+    },
+    {
+      "id": "W2-rm-publishes-the-answer",
+      "rule": "`job rm` publishes what its release actually answered, not a constant.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .leaseRelease = lease.code,\n            .leaseReleaseError = lease.detail,\n            .hint = hint,\n        }),\n        .human => {\n            if (!removed) {\n",
+      "replace": "            .leaseRelease = Cli.ClaimRelease.released.code,\n            .leaseReleaseError = null,\n            .hint = hint,\n        }),\n        .human => {\n            if (!removed) {\n",
+      "expect_gate": "blackbox: a `job rm` that could not give the scope back keeps the row and names the leak"
+    },
+    {
+      "id": "W2-release-precedes-the-document",
+      "rule": "A claim-holding reporter releases the scope through `releaseClaimReporting` above the document that publishes the answer; a hard-coded value with no release behind it is refused.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        \". Its log, its result record and its local row are all still there\",\n    );\n    const lease = Cli.releaseClaimReporting();\n",
+      "replace": "        \". Its log, its result record and its local row are all still there\",\n    );\n    const lease = Cli.ClaimRelease.released;\n",
+      "expect_gate": "gate: every kill and removal document is written after the release it publishes"
+    },
+    {
+      "id": "W2-skill-lease-vocabulary",
+      "rule": "skill/SKILL.md's published `leaseRelease` values are `Cli.ClaimRelease.codes`, not prose nobody checks.",
+      "file": "skill/SKILL.md",
+      "find": "`authority`,\n`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).\nNullable: `exitCode`",
+      "replace": "`authority`,\n`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_behind`).\nNullable: `exitCode`",
+      "expect_gate": "gate: SKILL.md publishes exactly the leaseRelease vocabulary, everywhere it publishes it"
     }
   ]
 }

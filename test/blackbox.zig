@@ -905,6 +905,23 @@ const FakeHost = struct {
         /// them cannot be arranged from outside, but the binary is blocked on
         /// this socket right now, and that is exactly the same instant.
         seize: bool = false,
+        /// Renew the binary's *own* lease an hour into the future while it waits
+        /// for this reply, so the release it makes on the way out cannot be dated
+        /// and `leases.release` refuses it.
+        ///
+        /// The only deterministic way to reach `left_held` — a leaked lease — from
+        /// outside the process. The three ways a release can fail are a store that
+        /// cannot be reached, a clock that cannot be read, and a stamp that would
+        /// contradict the row's own history; only the third can be arranged, and
+        /// only by writing the row through the ordinary renewal with a stamp in
+        /// the future. Every later renewal is refused for the same reason, which is
+        /// why this belongs on the *last* remote call a branch makes if the report
+        /// is to say `authority: held`.
+        ///
+        /// Not raw SQL where the ordinary writer would do — see `strandLease` for
+        /// why no public lease writer can leave this row behind, and for what a
+        /// real machine does to produce it.
+        strand: bool = false,
     };
 
     /// The job whose scope a `seize` rule takes, and who takes it. Fixed rather
@@ -945,6 +962,12 @@ const FakeHost = struct {
     /// seizure that did not happen makes the whole window vanish.
     record_failures: std.atomic.Value(u32),
     seize_failures: std.atomic.Value(u32),
+    /// What `Rule.strand` did: how many times it pushed the binary's own lease
+    /// into the future, and how many times it could not. Both counted — a strand
+    /// that never fired leaves the release perfectly datable, and the gate would
+    /// then be asserting `left_held` on a command with nothing wrong with it.
+    strands: std.atomic.Value(u32),
+    strand_failures: std.atomic.Value(u32),
     /// Take the scope lease while answering the daemon *version handshake*,
     /// before any command has been sent.
     ///
@@ -1004,6 +1027,8 @@ const FakeHost = struct {
             .seen_lock = .init,
             .record_failures = .init(0),
             .seize_failures = .init(0),
+            .strands = .init(0),
+            .strand_failures = .init(0),
             .seize_on_ping = seize_on_ping,
             .seized_on_ping = .init(false),
         };
@@ -1170,6 +1195,32 @@ const FakeHost = struct {
         };
     }
 
+    /// Asserts that a `strand` rule fired and did what it says.
+    ///
+    /// Both halves, unlike `expectSeized`: a strand that never fired leaves a
+    /// release that dates perfectly well, so a gate asserting `left_held` over it
+    /// would be measuring nothing at all rather than measuring the wrong thing.
+    fn expectStranded(host: *FakeHost) !void {
+        const failed = host.strand_failures.load(.monotonic);
+        std.testing.expectEqual(@as(u32, 0), failed) catch |err| {
+            host.banner("--- the scripted lease stranding did not happen:");
+            std.debug.print(
+                "{d} scripted lease stranding(s) failed, so the release this gate drives was never made undatable\n",
+                .{failed},
+            );
+            return err;
+        };
+        const done = host.strands.load(.monotonic);
+        std.testing.expect(done > 0) catch |err| {
+            host.banner("--- the scripted lease stranding never fired:");
+            std.debug.print(
+                "no `strand` rule matched a command, so the binary's release was ordinary and `left_held` cannot mean anything here\n",
+                .{},
+            );
+            return err;
+        };
+    }
+
     fn stop(host: *FakeHost) void {
         host.closing.store(true, .release);
         // One throwaway connection, to return the blocked `accept`. Closing the
@@ -1261,6 +1312,7 @@ const FakeHost = struct {
             if (std.mem.indexOf(u8, command, rule.needle) != null) {
                 if (rule.uses != std.math.maxInt(u32)) rule.uses -= 1;
                 if (rule.seize) host.seize();
+                if (rule.strand) host.strand();
                 return .{
                     .v = protocol.version,
                     .ok = true,
@@ -1323,6 +1375,57 @@ const FakeHost = struct {
             // a different command.
             .acquired => return error.NothingWasHoldingTheJobScope,
         }
+    }
+
+    /// Leaves the binary's own lease undatable, from a second connection to the
+    /// same database, while the binary waits for the reply this is attached to.
+    ///
+    /// See `Rule.strand` for why this is the only reachable shape of the failure.
+    fn strand(host: *FakeHost) void {
+        host.strandLease() catch |err| {
+            _ = host.strand_failures.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "the gate's fake host could not strand the job lease: {s}\n",
+                .{@errorName(err)},
+            );
+            return;
+        };
+        _ = host.strands.fetchAdd(1, .monotonic);
+    }
+
+    fn strandLease(host: *FakeHost) !void {
+        var store = try Store.open(host.db);
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(host.allocator);
+        defer arena_state.deinit();
+        const now = try Store.leases.clockSeconds(&store);
+        const held = try Store.leases.active(&store, arena_state.allocator(), 1, now);
+        // Exactly the binary's own claim, and nothing else. Anything else here
+        // means this fired at a moment the gate did not mean to describe.
+        if (held.len != 1) return error.OneLeaseWasNotHeldWhenTheStrandFired;
+        const ours = held[0];
+        // An hour ahead, and written straight onto the row: the shape a renewal
+        // taken before this machine's clock was stepped backwards leaves behind.
+        // `leases.renew` cannot be used for it — it matches only rows whose
+        // `expires_at` is still ahead of the stamp it is writing, which a stamp an
+        // hour out never is — and every other public writer runs the lazy expiry
+        // pass with the stamp it is given, which would sweep this row instead of
+        // dating it and turn the release into `not_ours`. The row stays live and
+        // stays ours (`expires_at` moves out with it); the one thing that changes
+        // is that no stamp from this machine's clock can now be written onto it
+        // without contradicting what it already records. Exactly the state
+        // `requireForwardStamp` exists to refuse, and `cli.zig`'s own gate builds
+        // the same thing from the acquisition end.
+        const ahead = now + 3600;
+        var stmt = try store.db.prepare(
+            "UPDATE leases SET renewed_at = ?1, expires_at = ?2 WHERE id = ?3",
+        );
+        defer stmt.deinit();
+        try stmt.bindInt(1, ahead);
+        try stmt.bindInt(2, ahead + ours.expires_at - ours.renewed_at);
+        try stmt.bindInt(3, ours.id);
+        _ = try stmt.step();
+        if (store.db.changes() == 0) return error.LeaseVanishedBeforeItCouldBeStranded;
     }
 };
 
@@ -2257,6 +2360,10 @@ fn probeFailureAfterTheKill(
         try quiet.expectSaysNot("probe_error");
         try quiet.expectSays("\"rowRemoved\": true");
         try quiet.expectSays("\"action\": \"removed\"");
+        // The ordinary lease answer on a removal that completed, and the control
+        // for `job rm`'s leak gate below: this row went back.
+        try quiet.expectSays("\"leaseRelease\": \"released\"");
+        try quiet.expectSays("\"leaseReleaseError\": null");
 
         var store = try f.open();
         defer store.close();
@@ -3170,6 +3277,10 @@ fn killBranchRefusesAScopeItHasLost(branch: KillBranch) !void {
     try killed.expectSays("\"ok\": false");
     try killed.expectSays("\"sessionGone\": false");
     try killed.expectSays("\"cancellationProven\": false");
+    // The peer took our row, so there was nothing of ours left to hand back — and
+    // that is neither a clean release nor a leak. One of three discriminating
+    // values across these fixtures; see the two `left_held` gates below.
+    try killed.expectSays("\"leaseRelease\": \"not_ours\"");
     // …on the branch this fixture means to drive, and not another one.
     try killed.expectSays(branch.marker);
 
@@ -3230,6 +3341,11 @@ fn killBranchStillKillsWhatItHolds(branch: KillBranch) !void {
     try killed.expectSays("\"authority\": \"held\"");
     try killed.expectSays("\"authorityError\": null");
     try killed.expectSays("\"sessionGone\": true");
+    // The ordinary answer, and the control that keeps the leak gates below honest:
+    // a `leaseRelease` hard-coded to `left_held`, or a release that had stopped
+    // happening at all, fails here on all three branches.
+    try killed.expectSays("\"leaseRelease\": \"released\"");
+    try killed.expectSays("\"leaseReleaseError\": null");
 
     var store = try f.open();
     defer store.close();
@@ -3300,6 +3416,216 @@ test "blackbox: a kill on a job that already finished settles, then needs the sc
         .code = 0,
         .settled = "completed",
     });
+}
+
+// --- The leaked lease, published rather than left on stderr -----------------
+//
+// `Cli.releaseClaim` returned `void`. On a clock-ordering violation or a store
+// error it wrote a line to stderr and handed nothing back, so the caller went on
+// to report `ok: true` over a lease that is still holding the job's scope — and
+// the next `job kill`, `job rm` or `run --name` on that name is refused for the
+// whole TTL, under a document that said the command succeeded. W1 closed that for
+// `session rm`; the two gates below are the same shape on the two verbs that were
+// left behind.
+//
+// The failure is *arranged*, not waited for: see `FakeHost.Rule.strand`. What each
+// gate then asserts is three things a stdout match cannot establish on its own —
+// that the document names the leak, that the store agrees the lease is still held,
+// and that the scope really is barred, by running the next command and watching it
+// be refused.
+//
+// The controls are in the fixtures above and below: `killBranchStillKillsWhatItHolds`
+// asserts `released` on all three kill branches, `killBranchRefusesAScopeItHasLost`
+// asserts `not_ours` on all three, and the `job rm` that completes asserts
+// `released`. A binary that answered `left_held` unconditionally fails seven
+// assertions before it reaches these two.
+
+/// Asserts that one lease row is still held by the binary's own claim — not by a
+/// peer, and not released — and that the scope it names is therefore barred.
+///
+/// Read from the store rather than believed from the report: `left_held` is a
+/// claim about a row, and a report that printed the word over a row that had in
+/// fact been handed back would be a new way of lying about the same thing.
+fn expectScopeStillHeld(f: *Fixture, arena: std.mem.Allocator) !void {
+    const t = std.testing;
+    var store = try f.open();
+    defer store.close();
+    const now = try Store.leases.clockSeconds(&store);
+    const held = try Store.leases.active(&store, arena, 1, now);
+    try t.expectEqual(@as(usize, 1), held.len);
+    // Not the fake host's peer: no takeover happened here, and a `not_ours` shaped
+    // fixture would prove something else entirely.
+    try t.expect(!std.mem.eql(u8, FakeHost.seizing_peer, held[0].owner_request_id));
+    // …and it outlives this command by a long way, which is what makes the
+    // refusal below the operator's real experience rather than a race.
+    try t.expect(held[0].expires_at > now);
+}
+
+test "blackbox: a `job kill` that completed and could not give the scope back says so, and still exits 0" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "kill_lease_left_held");
+    defer f.deinit();
+    try f.seedServer();
+    const request_id = "01QQQQQQQQ0123456789ABCDEF";
+    try seedRunningJob(&f, request_id, "deploy", kill_branch_sentinel);
+
+    var rules = [_]FakeHost.Rule{
+        // The job had already finished on its own: nothing at the result
+        // record's address and its sentinel in the tail.
+        .{ .needle = probe_split, .stdout = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ kill_branch_sentinel ++ ":0\n" },
+        // The kill, and the last remote call this branch makes. The strand rides
+        // it because both of this branch's renewals are already behind us: the
+        // report therefore says `authority: held` — the lease *was* ours the whole
+        // time it mattered — and the only thing that failed is handing it back.
+        // Before `has-session`: the kill's script contains both words.
+        .{ .needle = "kill-session", .exit_code = 0, .strand = true },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var killed = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer killed.deinit(f.allocator);
+
+    // The window really opened. Asserted before anything downstream, because a
+    // strand that never fired makes every line below a statement about an
+    // ordinary command.
+    try host.expectStranded();
+    try host.expectSent("kill-session");
+    try host.expectFullyScripted();
+
+    // **Exit 0, and that is the rule rather than an oversight.** The kill
+    // completed and the outcome is durably recorded; a non-zero code would say
+    // otherwise and send a caller into the retry this very lease would refuse.
+    // The leak is reported in a field, not in the status code.
+    try killed.expectCode(0);
+    try killed.expectSays("\"ok\": true");
+    try killed.expectSays("\"action\": \"already_finished\"");
+    try killed.expectSays("\"outcomeProven\": true");
+    // Two different questions, two different answers, and this is the pair that
+    // says why both keys exist: the lease was ours for every step that needed it,
+    // and the scope is not free now.
+    try killed.expectSays("\"authority\": \"held\"");
+    try killed.expectSays("\"authorityError\": null");
+    try killed.expectSays("\"leaseRelease\": \"left_held\"");
+    // Prose, and present. A code with no sentence beside it leaves an operator a
+    // word and nothing to do about it.
+    try killed.expectSaysNot("\"leaseReleaseError\": null");
+    try killed.expectSays("will block further changes to that scope until its TTL lapses");
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // The act really did complete, which is what makes exit 0 honest: the
+        // ledger holds the outcome and the row carries it.
+        const op = (try Store.operations.get(&store, arena, request_id)).?;
+        try t.expectEqualStrings("completed", op.status.text());
+        const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+        try t.expectEqualStrings("exited", @tagName(row.status));
+    }
+    try expectScopeStillHeld(&f, arena);
+
+    // And the consequence the report exists to warn about, performed. The next
+    // command on this job is refused — before it dials, so the fake host sees
+    // nothing new — which is exactly what a caller that read `ok: true` and
+    // retried would have walked into with no explanation.
+    var again = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer again.deinit(f.allocator);
+    try host.expectFullyScripted();
+    try again.expectCode(1);
+    try again.expectSays("holds a lease on an overlapping scope");
+}
+
+test "blackbox: a `job rm` that could not give the scope back keeps the row and names the leak" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "rm_lease_left_held");
+    defer f.deinit();
+    try f.seedServer();
+    const request_id = "01RRRRRRRR0123456789ABCDEF";
+    try seedRunningJob(&f, request_id, "deploy", kill_branch_sentinel);
+
+    // A job still running: no result record, no sentinel. So nothing here can
+    // settle an outcome, and the removal's own steps are the whole story.
+    const running = "\n" ++ probe_split ++ "\n20\nstill working\n";
+    var rules = [_]FakeHost.Rule{
+        // The look before the kill.
+        .{ .needle = probe_split, .stdout = running, .uses = 1 },
+        // Before `has-session`, as ever.
+        .{ .needle = "kill-session", .exit_code = 0 },
+        // The look after it — the last remote call `job rm` makes — and where the
+        // strand rides. Unlike the kill gate above, the renewal that decides
+        // whether the row may be deleted comes *after* this call, so it is refused
+        // by the same contradiction: `authority` is `unreadable` and the row is
+        // kept. That is the honest pair, and it is the shape of this verb rather
+        // than a weaker fixture: there is no round trip between `job rm`'s last
+        // renewal and its commit for a strand to land in.
+        .{ .needle = probe_split, .stdout = running, .strand = true },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var removed = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer removed.deinit(f.allocator);
+
+    try host.expectStranded();
+    // The session was stopped — that much happened and the report must not deny
+    // it — and nothing was deleted after it.
+    try host.expectSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+
+    // Exit 1: the row survived and nothing remote is unknown because of it, so a
+    // retry once the scope frees is safe. Not 75 — and not 0, which is what this
+    // path reported before the renewal answered anything.
+    try removed.expectCode(1);
+    try removed.expectSays("\"ok\": false");
+    try removed.expectSays("\"action\": \"not_removed\"");
+    try removed.expectSays("\"rowRemoved\": false");
+    try removed.expectSays("\"evidenceRetained\": true");
+    try removed.expectSays("\"authority\": \"unreadable\"");
+    try removed.expectSays("\"leaseRelease\": \"left_held\"");
+    try removed.expectSaysNot("\"leaseReleaseError\": null");
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // The row is the assertion: a removal that could not re-establish its
+        // standing does not get to forget the name.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+        const op = (try Store.operations.get(&store, arena, request_id)).?;
+        try t.expectEqualStrings("indeterminate", op.status.text());
+    }
+    try expectScopeStillHeld(&f, arena);
+
+    // …and the barrier is real here too. The row is still there, so this refusal
+    // is the operator's next experience of the job, and `left_held` in the
+    // document above is the only warning they were given.
+    var again = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer again.deinit(f.allocator);
+    try host.expectFullyScripted();
+    try again.expectCode(1);
+    try again.expectSays("holds a lease on an overlapping scope");
 }
 
 // --- `session rm`: the destructive verb that had no authority at all --------

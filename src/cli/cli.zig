@@ -263,43 +263,61 @@ pub fn registerClaim(
 /// `code` is the machine-readable half and is never null. `detail` is prose:
 /// nothing may branch on it.
 pub const ClaimRelease = struct {
-    /// `not_taken` | `released` | `not_ours` | `left_held`.
+    /// One of `codes`, and never null.
     code: []const u8,
     detail: ?[]const u8,
+
+    /// The whole published vocabulary, in one namespace so it can be
+    /// *enumerated* rather than transcribed.
+    ///
+    /// Three verbs publish this key — `session rm`, `job kill`, `job rm` — and
+    /// `skill/SKILL.md` publishes the value list beside each of them. A list of
+    /// words in prose is exactly what drifts, and the key-set gates read keys and
+    /// skip parentheticals, so the values had nothing holding them. Held against
+    /// this namespace instead: renaming a word here rewrites the check along with
+    /// the code. See the gate in `cmd_job.zig`.
+    pub const codes = struct {
+        pub const not_taken = "not_taken";
+        pub const released = "released";
+        pub const not_ours = "not_ours";
+        pub const left_held = "left_held";
+    };
 
     /// No claim was registered by this command, so there is none to give back.
     /// The answer for every branch that refuses before the lease is acquired —
     /// distinct from `released`, because "nothing was taken" and "what was taken
     /// was handed back" are different facts about the scope.
-    pub const not_taken: ClaimRelease = .{ .code = "not_taken", .detail = null };
+    pub const not_taken: ClaimRelease = .{ .code = codes.not_taken, .detail = null };
 
     /// The row was ours and is now released and dated.
-    pub const released: ClaimRelease = .{ .code = "released", .detail = null };
+    pub const released: ClaimRelease = .{ .code = codes.released, .detail = null };
 
     /// `leases.release` matched no row: the claim is not ours to give back,
     /// because a peer displaced it. Nothing of ours is left holding the scope, so
     /// this is not a leak — but it is not a release either, and a caller that
     /// collapsed the two would report a lost claim as a clean hand-back.
     pub const not_ours: ClaimRelease = .{
-        .code = "not_ours",
+        .code = codes.not_ours,
         .detail = "this command's scope lease was no longer ours to release; a peer had taken it over",
     };
 
     /// The claim is still held and will block further changes to this scope until
     /// its TTL lapses. The leak, named.
     fn leftHeld(detail: []const u8) ClaimRelease {
-        return .{ .code = "left_held", .detail = detail };
+        return .{ .code = codes.left_held, .detail = detail };
     }
 
     pub fn holdsScope(r: ClaimRelease) bool {
-        return std.mem.eql(u8, r.code, "left_held");
+        return std.mem.eql(u8, r.code, codes.left_held);
     }
 };
 
 /// Gives the scope back, and says what happened.
 ///
-/// See `releaseClaim` for the void form every other caller uses, and
-/// `ClaimRelease` for why the answer exists at all.
+/// The form every verb that takes a scope lease now uses: `session rm`,
+/// `job kill` and `job rm` all publish the answer. See `releaseClaim` for the
+/// void form the process-ending paths below are left with, and `ClaimRelease`
+/// for why the answer exists at all.
 ///
 /// **The release is stamped with the clock as it is now**, read through the
 /// store, and not with the `ctx.now` the claim used to be registered with.
@@ -388,14 +406,17 @@ pub fn releaseClaimReporting() ClaimRelease {
 
 /// Gives the scope back, if this command still holds it.
 ///
-/// Called at settle by the command itself and from every process-ending path
-/// below. A claim that is no longer ours — a peer took it over with `--force` —
-/// matches no row and is left exactly where it is.
+/// Called from every process-ending path below, none of which has a document of
+/// its own to put the answer in. A claim that is no longer ours — a peer took it
+/// over with `--force` — matches no row and is left exactly where it is.
 ///
 /// The form for a caller that has already written its report, or has none: the
 /// answer is dropped, and a failure reaches the operator through the stderr line
-/// `releaseClaimReporting` writes. A caller whose output should carry the answer
-/// calls that one instead and puts it in the document — see `ClaimRelease`.
+/// `releaseClaimReporting` writes. No verb reports through this any more — the
+/// three that take a scope lease all publish `leaseRelease` — and a new one that
+/// did would be reintroducing the defect: a leaked lease refuses the next command
+/// on that scope for its whole TTL, and the caller must be able to read that off
+/// the document rather than off a terminal. See `ClaimRelease`.
 pub fn releaseClaim() void {
     _ = releaseClaimReporting();
 }

@@ -1044,6 +1044,20 @@ const KillJson = struct {
     /// reached the host: `held`, `lapsed`, or `unreadable`.
     authority: []const u8,
     authorityError: ?[]const u8,
+    /// What became of that lease when this command tried to hand it back:
+    /// `not_taken` | `released` | `not_ours` | `left_held`. Non-null on every
+    /// branch, refusals included, and the same enumeration `session rm`
+    /// publishes — see `Cli.ClaimRelease`.
+    ///
+    /// A different question from `authority`, and both are needed. `authority`
+    /// says whether the lease was still ours while there were steps left to take;
+    /// this says whether the scope is free now. `left_held` is a leak: the lease
+    /// is still holding this job's scope and the next `job kill`, `job rm` or
+    /// `run --name` on it is refused until the TTL lapses. It used to be a line
+    /// on stderr under a document that said `ok: true`.
+    leaseRelease: []const u8,
+    /// Prose about the answer above, for a human. Nothing branches on it.
+    leaseReleaseError: ?[]const u8,
     hint: ?[]const u8,
 };
 
@@ -1080,6 +1094,12 @@ const RemovalJson = struct {
     cacheError: ?[]const u8,
     authority: []const u8,
     authorityError: ?[]const u8,
+    /// The same two keys `KillJson` publishes, for the same reason — see there.
+    /// This verb has one more reason to carry them: it is the one that deletes the
+    /// local row, so a lease it could not hand back goes on barring a scope whose
+    /// job no longer appears in `job ls`.
+    leaseRelease: []const u8,
+    leaseReleaseError: ?[]const u8,
     hint: ?[]const u8,
 };
 
@@ -1504,6 +1524,55 @@ test "gate: SKILL.md publishes the resultRecord values that are not readings" {
     const branch_verdict = expectSkillList(branch_what, documented_branch, &result_record_non_readings);
     try value_verdict;
     try branch_verdict;
+}
+
+// `leaseRelease`'s values are `Cli.ClaimRelease`'s whole vocabulary, and nothing
+// read them. The key-set gate above cannot: it skips every parenthetical, because
+// those hold values rather than keys — so the document could list three words for
+// four, or invent a fifth, and stay green. That is the same class of drift as the
+// 19-keys-for-21-fields refusal, one level down, and it is the gap W1 left when it
+// gave `session rm` this key: the words went into the prose with no gate behind
+// them.
+//
+// Held against `ClaimRelease.codes` rather than a transcription of it, so renaming
+// a word rewrites the check along with the code. The namespace exists for this.
+//
+// All three paragraphs that publish the list, in one gate, because it is one
+// vocabulary: `job kill`'s, `job rm`'s and — since neither module owns the words
+// and this is where the parser lives — `session rm`'s. A gate that read only the
+// two paragraphs added here would let the third go stale beside them.
+test "gate: SKILL.md publishes exactly the leaseRelease vocabulary, everywhere it publishes it" {
+    const gpa = std.testing.allocator;
+
+    var actual: std.ArrayList([]const u8) = .empty;
+    defer actual.deinit(gpa);
+    inline for (@typeInfo(Cli.ClaimRelease.codes).@"struct".decls) |decl| {
+        try actual.append(gpa, @field(Cli.ClaimRelease.codes, decl.name));
+    }
+
+    const published = [_]struct { heading: []const u8, what: []const u8 }{
+        .{ .heading = "\n`job kill` — ", .what = "`job kill`'s leaseRelease values" },
+        .{ .heading = "\n`job rm` — ", .what = "`job rm`'s leaseRelease values" },
+        .{ .heading = "\n`session rm --json` — ", .what = "`session rm`'s leaseRelease values" },
+    };
+    // Every paragraph before any verdict is raised, for the reason the key-set
+    // gate gives: a word that was renamed is one complaint from each of the three,
+    // and reporting one of them hides that the other two say the same thing.
+    var drifted: ?anyerror = null;
+    inline for (published) |p| {
+        const opened = try skillAfter(skill_md, p.heading, "the key-set paragraph it opens");
+        const para = opened[0..skillParagraphEnd(opened)];
+        const documented = try skillEntries(
+            gpa,
+            try skillSegment(para, "`leaseRelease` (", ")", p.what),
+            p.what,
+        );
+        defer gpa.free(documented);
+        expectSkillList(p.what, documented, actual.items) catch |err| {
+            drifted = err;
+        };
+    }
+    if (drifted) |err| return err;
 }
 
 /// `fatalTmux`, plus the one error only a result-record reader can raise.
@@ -2431,6 +2500,10 @@ fn refuseKill(
     probe: Tmux.JobProbe,
 ) noreturn {
     const hint = refusalHint(ctx, authority, job.name, "");
+    // Before the document, and that ordering is the rule on every branch of both
+    // verbs: the answer this publishes is what the release actually did, not a
+    // prediction of what it is about to do.
+    const lease = Cli.releaseClaimReporting();
     switch (ctx.out.format) {
         .json => ctx.out.json(KillJson{
             .ok = false,
@@ -2455,15 +2528,19 @@ fn refuseKill(
             .cacheError = null,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
             .hint = hint,
         }) catch {},
-        .human => ctx.out.print(
-            "job '{s}': NOT killed — {s}\n",
-            .{ job.name, hint },
-        ) catch {},
+        .human => {
+            ctx.out.print(
+                "job '{s}': NOT killed — {s}\n",
+                .{ job.name, hint },
+            ) catch {};
+            if (lease.detail) |text| ctx.out.print("  note: {s}\n", .{text}) catch {};
+        },
     }
     ctx.out.flush() catch {};
-    Cli.releaseClaim();
     Cli.exitNow(Cli.exit_code.failure);
 }
 
@@ -2514,6 +2591,12 @@ fn refuseKillAfterSettlement(
             job.name,
         },
     ) catch "this command recorded what it had read and then found it no longer held the scope lease for this job; the kill was not sent and nothing was deleted. Wait, or re-run with --force";
+    // Before the document, on both arms. `failIndeterminateAfterOutput` below
+    // releases the claim too, and used to be where the `!proven` arm's release
+    // happened — on the far side of the report, so the one branch whose lease
+    // answer mattered most could not carry it. Reached with nothing registered it
+    // is a no-op that answers `not_taken` into a `_`.
+    const lease = Cli.releaseClaimReporting();
     switch (ctx.out.format) {
         .json => ctx.out.json(KillJson{
             .ok = false,
@@ -2539,18 +2622,20 @@ fn refuseKillAfterSettlement(
             .cacheError = cacheError(ctx, job.name, settled.cache),
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
             .hint = hint,
         }) catch {},
-        .human => ctx.out.print(
-            "job '{s}': NOT killed — {s}\n",
-            .{ job.name, hint },
-        ) catch {},
+        .human => {
+            ctx.out.print(
+                "job '{s}': NOT killed — {s}\n",
+                .{ job.name, hint },
+            ) catch {};
+            if (lease.detail) |text| ctx.out.print("  note: {s}\n", .{text}) catch {};
+        },
     }
     ctx.out.flush() catch {};
-    // `failIndeterminateAfterOutput` releases the claim itself; the proven arm
-    // has to do it on the way past.
     if (!proven) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
-    Cli.releaseClaim();
     Cli.exitNow(Cli.exit_code.failure);
 }
 
@@ -2568,6 +2653,7 @@ fn refuseRemoval(
         job.name,
         ". Its log, its result record and its local row are all still there",
     );
+    const lease = Cli.releaseClaimReporting();
     switch (ctx.out.format) {
         .json => ctx.out.json(RemovalJson{
             .ok = false,
@@ -2585,15 +2671,19 @@ fn refuseRemoval(
             .cacheError = null,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
             .hint = hint,
         }) catch {},
-        .human => ctx.out.print(
-            "job '{s}' was NOT removed: {s}\n",
-            .{ job.name, hint },
-        ) catch {},
+        .human => {
+            ctx.out.print(
+                "job '{s}' was NOT removed: {s}\n",
+                .{ job.name, hint },
+            ) catch {};
+            if (lease.detail) |text| ctx.out.print("  note: {s}\n", .{text}) catch {};
+        },
     }
     ctx.out.flush() catch {};
-    Cli.releaseClaim();
     Cli.exitNow(Cli.exit_code.failure);
 }
 
@@ -2778,7 +2868,7 @@ fn killJob(
         // The kill is on the far side of the settlement on this branch, so the
         // scope is given back after it rather than at the settle: releasing in
         // between would open the job to a peer mid-`kill-session`.
-        Cli.releaseClaim();
+        const lease = Cli.releaseClaimReporting();
 
         switch (ctx.out.format) {
             .json => try ctx.out.json(KillJson{
@@ -2803,6 +2893,8 @@ fn killJob(
                 .cacheError = cacheError(ctx, job.name, settled.cache),
                 .authority = authority.code(),
                 .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+                .leaseRelease = lease.code,
+                .leaseReleaseError = lease.detail,
                 .hint = "the two records disagree; settle it by hand with 'terminus request reconcile <request-id> --override'",
             }),
             .human => {
@@ -2812,6 +2904,7 @@ fn killJob(
                 );
                 if (cacheError(ctx, job.name, settled.cache)) |text|
                     try ctx.out.print("  {s}\n", .{text});
+                if (lease.detail) |text| try ctx.out.print("  note: {s}\n", .{text});
             },
         }
         try ctx.out.flush();
@@ -2859,7 +2952,7 @@ fn killJob(
         if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
-        Cli.releaseClaim();
+        const lease = Cli.releaseClaimReporting();
 
         switch (ctx.out.format) {
             .json => try ctx.out.json(KillJson{
@@ -2885,6 +2978,8 @@ fn killJob(
                 .cacheError = cacheError(ctx, job.name, settled.cache),
                 .authority = authority.code(),
                 .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+                .leaseRelease = lease.code,
+                .leaseReleaseError = lease.detail,
                 // Not `--from-log`: that reconcile reads these same two
                 // records and will refuse for the same reason.
                 .hint = "the result record is unusable, so no mechanical reconcile can settle this; check the host and use 'terminus request reconcile <request-id> --override'",
@@ -2896,6 +2991,7 @@ fn killJob(
                 );
                 if (cacheError(ctx, job.name, settled.cache)) |text|
                     try ctx.out.print("  {s}\n", .{text});
+                if (lease.detail) |text| try ctx.out.print("  note: {s}\n", .{text});
             },
         }
         try ctx.out.flush();
@@ -2946,7 +3042,12 @@ fn killJob(
         if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
-        Cli.releaseClaim();
+        // The remote work is behind us, so the scope goes back here — and what
+        // came of that is published below rather than left on stderr. This is the
+        // branch where it matters most: a proven outcome and a cleaned-up session
+        // exit 0 with `ok: true`, and a lease that could not be handed back goes
+        // on refusing the next command on this job under exactly that document.
+        const lease = Cli.releaseClaimReporting();
 
         // A surviving session is a real failure even though the outcome is
         // known: `ensure` treats one as ready, so the next launch under this
@@ -2990,6 +3091,8 @@ fn killJob(
                 .cacheError = cacheError(ctx, job.name, settled.cache),
                 .authority = authority.code(),
                 .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+                .leaseRelease = lease.code,
+                .leaseReleaseError = lease.detail,
                 .hint = hint,
             }),
             .human => {
@@ -3015,6 +3118,10 @@ fn killJob(
                 // launch still said the job was live — with `$?` zero and
                 // nothing on screen to suggest otherwise.
                 if (hint) |text| try ctx.out.print("  {s}\n", .{text});
+                // …and for the same reason: this is the one report on either verb
+                // that can be a clean success, so a lease left behind it has to
+                // reach the terminal too.
+                if (lease.detail) |text| try ctx.out.print("  note: {s}\n", .{text});
             },
         }
         switch (exit) {
@@ -3172,7 +3279,7 @@ fn killJob(
     );
     // The remote work is done on this branch — the kill and the re-probe are
     // both behind us — so the scope goes back with the settlement.
-    Cli.releaseClaim();
+    const lease = Cli.releaseClaimReporting();
     const settled_status = settled.statusText();
 
     // The same predicate the terminal above was chosen with, on purpose: what
@@ -3216,6 +3323,8 @@ fn killJob(
             .cacheError = cache_error,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
             .hint = hint,
         }),
         .human => {
@@ -3249,6 +3358,7 @@ fn killJob(
             // which file to look at. The others' hints are already spelled out
             // by the sentence they follow.
             if (!authority.holds() or final.unreadable) if (hint) |text| try ctx.out.print("  {s}\n", .{text});
+            if (lease.detail) |text| try ctx.out.print("  note: {s}\n", .{text});
         },
     }
     if (!proven) {
@@ -3733,7 +3843,7 @@ fn reportFinishedDuringKill(
         // two of them disagreeing about how the job ended.
         finishSync(job, .exited, code, probe.finished_at orelse ctx.now),
     );
-    Cli.releaseClaim();
+    const lease = Cli.releaseClaimReporting();
     const settled_status = settled.statusText();
     const proven = settled.settlement.proves();
     const cache_error = cacheError(ctx, job.name, settled.cache);
@@ -3769,6 +3879,8 @@ fn reportFinishedDuringKill(
             .cacheError = cache_error,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
             .hint = hint,
         }),
         .human => {
@@ -3784,6 +3896,7 @@ fn reportFinishedDuringKill(
                 );
             if (cache_error) |text| try ctx.out.print("  {s}\n", .{text});
             if (!authority.holds()) if (hint) |text| try ctx.out.print("  {s}\n", .{text});
+            if (lease.detail) |text| try ctx.out.print("  note: {s}\n", .{text});
         },
     }
     if (!proven) {
@@ -4090,7 +4203,11 @@ fn removeJob(
             .grounds = .session_proven_gone,
         } } else .none,
     );
-    Cli.releaseClaim();
+    // Every deletion this verb was going to make is behind it, so the scope goes
+    // back here — and the answer is published below. On this verb the leak has one
+    // more consequence than on `job kill`: the row may be gone, so a lease left
+    // holding this job's scope bars a name that no longer appears in `job ls`.
+    const lease = Cli.releaseClaimReporting();
     // `proven` is about the outcome, not about the deletion: it is true only
     // when a real exit code reached the ledger. A removal that settled
     // `indeterminate` deleted the row just the same, and saying otherwise
@@ -4187,6 +4304,8 @@ fn removeJob(
             .cacheError = cache_error,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
             .hint = hint,
         }),
         .human => {
@@ -4219,6 +4338,7 @@ fn removeJob(
             // read, never tells the operator that those records are now gone.
             if (log_discarded and (proven or unreconcilable))
                 try ctx.out.print("  its log and result record were deleted; nothing can read them again\n", .{});
+            if (lease.detail) |text| try ctx.out.print("  note: {s}\n", .{text});
         },
     }
     if (!ok) {
@@ -4548,6 +4668,114 @@ test "gate: every destructive remote call is renewed on the line above it" {
     // A scan that matched nothing would have reported nothing. Say how many
     // sites the rule is actually holding.
     try t.expectEqual(@as(usize, destructive_remote_call_count), found);
+}
+
+// --- The release comes before the document that publishes it ----------------
+//
+// `KillJson` and `RemovalJson` have no defaults, so a branch that omits
+// `leaseRelease` does not compile. What the compiler cannot ask is where the
+// value came from. A branch that wrote `Cli.ClaimRelease.released.code` by hand,
+// or one that reported first and released afterwards, satisfies the type and
+// publishes a guess — and a guess that says `released` over a leaked lease is the
+// original defect with an extra key on it.
+//
+// So the order is checked where it lives, the same way the renewal adjacency is:
+// in the text. Every claim-holding reporter must call `releaseClaimReporting`
+// once per document it writes, and each call must sit *above* the document it
+// answers for. Strict alternation is what says so — release, document, release,
+// document — because equal counts alone would pass a function that released twice
+// and then reported twice.
+//
+// The void `Cli.releaseClaim()` is banned from these bodies outright. It is what
+// every one of these branches used before this pass: it drops the answer, so the
+// document above it went out saying nothing about a scope that may still be
+// barred. The process-ending paths in `cli.zig` still use it, and correctly —
+// they have no document to put an answer in.
+
+/// The functions that hold a `Claim` and publish a document. `killJob` and
+/// `removeJob` are the verbs; the other four are the endings they delegate to.
+const claim_reporting_bodies = [_][]const u8{
+    "\nfn refuseKill(",
+    "\nfn refuseKillAfterSettlement(",
+    "\nfn refuseRemoval(",
+    "\nfn killJob(",
+    "\nfn reportFinishedDuringKill(",
+    "\nfn removeJob(",
+};
+
+/// How many `KillJson` / `RemovalJson` documents those six write between them.
+/// Asserted for the reason `destructive_remote_call_count` is: a scan that found
+/// nothing must fail rather than pass over an empty region.
+const claim_reporting_document_count = 9;
+
+test "gate: every kill and removal document is written after the release it publishes" {
+    const t = std.testing;
+    const source = @embedFile("cmd_job.zig");
+    var documents: usize = 0;
+    for (claim_reporting_bodies) |header| {
+        const body = try Control.bodyOf(source, header);
+        const name = header[1..];
+
+        if (std.mem.indexOf(u8, body, "Cli.releaseClaim();")) |at| {
+            std.debug.print(
+                \\
+                \\{s}… gives the scope back through the void `Cli.releaseClaim()`, which drops
+                \\the `ClaimRelease` answer. This function publishes a document, so it has to
+                \\report what the release did: use `Cli.releaseClaimReporting()` and put its
+                \\`code` and `detail` in the `leaseRelease` / `leaseReleaseError` keys. A leaked
+                \\lease goes on refusing the next command on that scope for its whole TTL.
+                \\  at byte {d} of the body
+                \\
+            , .{ name, at });
+            return error.ClaimReleasedWithoutReporting;
+        }
+
+        var releases: usize = 0;
+        var reports: usize = 0;
+        var i: usize = 0;
+        while (i < body.len) {
+            const next_release = std.mem.indexOfPos(u8, body, i, "Cli.releaseClaimReporting()");
+            const next_report = std.mem.indexOfPos(u8, body, i, "Json{");
+            if (next_report == null) break;
+            if (next_release == null or next_release.? > next_report.?) {
+                std.debug.print(
+                    \\
+                    \\{s}… writes a document at byte {d} of its body with no
+                    \\`Cli.releaseClaimReporting()` above it and below the previous one. The value
+                    \\in `leaseRelease` would then be a prediction of a release that has not
+                    \\happened yet, and the whole point of the key is that it is the answer.
+                    \\
+                , .{ name, next_report.? });
+                return error.DocumentWrittenBeforeTheRelease;
+            }
+            releases += 1;
+            reports += 1;
+            i = next_report.? + 1;
+        }
+        // Everything after the last document: a release with nothing publishing it
+        // is a dropped answer as surely as the void form is.
+        if (std.mem.indexOfPos(u8, body, i, "Cli.releaseClaimReporting()") != null) {
+            std.debug.print(
+                \\
+                \\{s}… releases the scope after its last document, so that answer reaches
+                \\nobody. Move the release above the report.
+                \\
+            , .{name});
+            return error.ReleaseAfterTheLastDocument;
+        }
+        if (reports == 0) {
+            std.debug.print(
+                \\
+                \\{s}… writes no `KillJson` or `RemovalJson` at all. Either it stopped being a
+                \\reporter — in which case take it out of `claim_reporting_bodies` — or the scan
+                \\has stopped covering it, which is the failure mode this message exists for.
+                \\
+            , .{name});
+            return error.ReporterPublishesNothing;
+        }
+        documents += reports;
+    }
+    try t.expectEqual(@as(usize, claim_reporting_document_count), documents);
 }
 
 /// Refuses an attempt that another claim on the same scope makes unsafe.
