@@ -252,45 +252,74 @@ def provenance() -> dict:
     }
 
 
-def vet_json_target(raw: str) -> Path:
-    """Refuses a `--json` path that could destroy something.
+ARTIFACT_ALLOWLIST = ("docs/evidence/mutation-run.json",)
 
-    `write_json` overwrites unconditionally, and the residue check below excludes
-    this path from "tracked files modified after the run" — so `--json
-    src/core/control.zig` would replace a source file with JSON *and* report the
-    tree clean. That is a destruction path and a pseudo-success path in the one
-    tool whose whole job is producing trustworthy evidence.
 
-    Three conditions, all of them cheap:
-      * the name ends in `.json`, so no `.zig`/`.py`/`.md` can be named at all;
-      * it is not inside a source or vendored tree;
-      * if it already exists it must currently parse as JSON, so the only file it
-        can overwrite is a previous artifact.
+def is_tracked(rel: str) -> bool:
+    """Whether git has this path in the index. A read; never a write."""
+    proc = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", rel],
+        cwd=REPO, capture_output=True, text=True,
+    )
+    return proc.returncode == 0
+
+
+class JsonTarget:
+    """Where the artifact goes, resolved once and used everywhere after.
+
+    Two defects made the first version of this guard partly theatre, and both are
+    the same mistake: validating one thing and acting on another.
+
+    It resolved a relative path against REPO but the writes used the raw string,
+    which Python resolves against the *current working directory*. Run from
+    outside the repository, the check inspected one file and the write landed on a
+    different one.
+
+    And "it already parses as JSON" was the wrong test for "this is a previous
+    artifact". `docs/evidence/store-census.json` and
+    `v11-recut-corroboration.json` are tracked, parseable, and outside the guarded
+    directories, so both census evidence artifacts could be overwritten and then
+    excluded from the residue check that exists to notice exactly that.
+
+    So: the path is canonicalised once, `absolute` is what every write uses, and
+    the rule is now trackedness rather than parseability — no tracked file may be
+    overwritten at all, with one allowlisted exception for the artifact this tool
+    is for.
     """
+
+    def __init__(self, absolute, rel):
+        self.absolute = absolute
+        self.rel = rel
+
+    def as_posix(self):
+        return self.rel
+
+
+def vet_json_target(raw: str) -> JsonTarget:
     path = Path(raw)
-    resolved = path if path.is_absolute() else (REPO / path)
     if path.suffix != ".json":
         sys.exit(f"--json must name a .json file; got {raw}")
+    resolved = (path if path.is_absolute() else (REPO / path)).resolve()
     try:
-        rel = resolved.resolve().relative_to(REPO.resolve()).as_posix()
+        rel = resolved.relative_to(REPO.resolve()).as_posix()
     except ValueError:
         sys.exit(f"--json must stay inside the repository; got {raw}")
     for guarded in ("src/", "test/", "tools/", "vendor/", "skill/", "npm/"):
         if rel.startswith(guarded):
             sys.exit(
-                f"--json would write into {guarded} — refusing.\n"
+                f"--json would write into {guarded} — refusing. "
                 f"That directory holds source, not evidence, and this tool "
                 f"overwrites its target without asking."
             )
-    if resolved.exists():
-        try:
-            json.loads(resolved.read_text(encoding="utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            sys.exit(
-                f"--json target {rel} exists and is not JSON — refusing to "
-                f"overwrite it.\nOnly a previous artifact may be replaced."
-            )
-    return Path(rel)
+    if rel not in ARTIFACT_ALLOWLIST and is_tracked(rel):
+        sys.exit(
+            f"--json target {rel} is tracked by git — refusing to overwrite it. "
+            f"Only these artifacts may be replaced: "
+            f"{', '.join(ARTIFACT_ALLOWLIST)}. "
+            f"Parseable-as-JSON is not the same as 'a previous artifact of this "
+            f"tool': the census evidence files are both."
+        )
+    return JsonTarget(resolved, rel)
 
 
 def write_json(path: str, payload) -> None:
@@ -463,7 +492,7 @@ def main() -> int:
             print("green" if back_code == 0 else "STILL RED")
             if back_code != 0:
                 if args.json:
-                    write_json(args.json, [asdict(x) for x in results])
+                    write_json(json_target.absolute, [asdict(x) for x in results])
                     print(f"      wrote partial results to {args.json}")
                 sys.exit(
                     f"\nthe tree still fails after restoring {mut.file}, so the build "
@@ -501,7 +530,7 @@ def main() -> int:
             },
             "results": [asdict(r) for r in results],
         }
-        write_json(args.json, artifact)
+        write_json(json_target.absolute, artifact)
         print(f"\nwrote {args.json}")
 
     print(f"\n{len(killed)}/{len(results)} killed by the gate that claims the rule")
