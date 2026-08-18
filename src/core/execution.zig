@@ -26,6 +26,7 @@ const operations = @import("store/operations.zig");
 const receipts = @import("store/receipts.zig");
 const transfers = @import("store/transfers.zig");
 const jobs = @import("store/jobs.zig");
+const sessions = @import("store/sessions.zig");
 const leases = @import("store/leases.zig");
 const op_state = @import("store/op_state.zig");
 const scope_mod = @import("store/scope.zig");
@@ -162,6 +163,48 @@ pub const CacheResult = union(enum) {
     refused: jobs.Conflict,
 };
 
+/// What `Execution.settleAndRemoveSession`'s one transaction did.
+///
+/// Three answers rather than a bool, because they send the caller to three
+/// different reports and only one of them is a removal that happened.
+pub const SessionRemoval = union(enum) {
+    /// The terminal is written and the local row is gone. One commit, so neither
+    /// of those can be true without the other.
+    removed: struct {
+        /// False means this machine had no metadata row for the session. Not a
+        /// refusal — `sessions.removeLocked` has no owner, no expectation and no
+        /// compare-and-swap — and an ordinary state for a session started
+        /// outside Terminus. Reported rather than discarded, because "there was
+        /// no row" and "the row is gone" are different facts and only one of
+        /// them means a memory cascade happened.
+        had_row: bool,
+        recorded: receipts.TerminalRecord,
+    },
+    /// Something else was laying claim to the scope when the transaction opened.
+    /// Nothing was deleted, no terminal was written, and the attempt is still
+    /// unsettled — so the scope stays barred. The caller settles it with a
+    /// terminal that is honest about the partial state it is actually in.
+    refused: Blocker,
+    /// The ledger already held a terminal for this attempt. The verdict on record
+    /// is not the one this call was going to write, so the row is *not* deleted:
+    /// a removal whose only durable record is somebody else's settlement is the
+    /// pairing this whole transaction exists to forbid.
+    ///
+    /// Unreachable by construction today — a `session rm` settles its own
+    /// operation once, and `Cli.settleActiveExecution` only fires on a path that
+    /// never reaches here — which is why it is a value rather than an error: a
+    /// caller that does reach it has to report what the ledger holds instead of
+    /// inventing a verdict beside it.
+    already_settled: receipts.TerminalRecord,
+};
+
+pub const SessionRemovalError = Error || error{
+    /// The attempt names no server, so there is no `sessions` row it could be
+    /// about. Our defect, not an operator's: every control operation over a
+    /// session is created with the host it resolved.
+    SessionRemovalHasNoServer,
+};
+
 pub const SettledWithCache = struct {
     outcome: receipts.SettleOutcome,
     cache: CacheResult,
@@ -189,6 +232,20 @@ pub const SettledWithCache = struct {
 /// `comptime builtin.is_test`, so the shipped binary contains neither the
 /// variable nor the branch.
 pub var between_settle_and_cache: if (builtin.is_test) ?*const fn () void else void =
+    if (builtin.is_test) null else {};
+
+/// Called between the ownership guard and the local delete of
+/// `settleAndRemoveSession`.
+///
+/// A test seam, and the same one `between_settle_and_cache` is: "the ownership
+/// check, the local delete and the terminal are one transaction" cannot be
+/// observed from outside. The gate installs a probe that tries to take the scope
+/// from another connection at exactly that instant; under one `BEGIN IMMEDIATE`
+/// it cannot take the write lock, and under three separate writes it can.
+///
+/// `void` outside a test build, so the shipped binary contains neither the
+/// variable nor the branch.
+pub var between_ownership_and_removal: if (builtin.is_test) ?*const fn () void else void =
     if (builtin.is_test) null else {};
 
 /// `jobs.removeLocked` takes its grounds at comptime — the statement's state
@@ -722,6 +779,101 @@ pub const Execution = struct {
         return .{ .outcome = outcome, .cache = cache };
     }
 
+    /// Settles this attempt and deletes the local session row it names — one
+    /// transaction, re-validating on the way in that the scope is still ours.
+    ///
+    /// This is `session rm`'s last three acts, and they used to be three:
+    /// `stillOurs` renewed the lease, then `execution.settle` ran a whole
+    /// transaction of its own writing the proven cancellation, and only then
+    /// `sessions.remove` deleted the row. Two defects fell out of that order and
+    /// this closes both.
+    ///
+    /// **The window.** A peer's takeover landing between the renewal and the
+    /// delete was never re-checked, so the command went on to drop the row — and
+    /// cascade that session's memories — under a scope that had changed hands.
+    /// `1f47542` closed the same `renew → settle → act` window for `cmd_job`'s
+    /// kill; this is its recurrence one verb over.
+    ///
+    /// **The order.** The terminal was written *first*. A failure in
+    /// `sessions.remove` afterwards left the durable ledger asserting a completed
+    /// removal while the row, its memories and possibly the pane log were all
+    /// still there — and a terminal is frozen, so nothing could correct it.
+    ///
+    /// So: one `BEGIN IMMEDIATE` holding the ownership check, the terminal and
+    /// the delete. If it cannot commit, nothing is deleted and no terminal is
+    /// written; the attempt stays unsettled, the scope stays barred, and that is
+    /// the correct fail-closed outcome rather than a missing record.
+    ///
+    /// **What the ownership check is.** `blockerLocked`, keyed on this attempt's
+    /// own `request_id` — the same definition of "somebody else is laying claim
+    /// to this" that `begin` and `submitted` use, exempting only the id it is
+    /// handed. Asked *here*, inside the transaction, rather than taken on trust
+    /// from a renewal that has already returned. A `--force` takeover writes the
+    /// incumbent's row `released` and inserts its own, so it is exactly what this
+    /// sees.
+    ///
+    /// **What it does not prove**, stated rather than left to be discovered: it
+    /// answers "has anything else claimed this scope", not "is our own lease row
+    /// still live". A lease that lapsed with no successor passes it. That arm is
+    /// held by the `stillOurs` renewal on the far side of the last remote call,
+    /// which is why the caller keeps it; closing it in here as well would need a
+    /// locked by-owner read that `leases` does not expose today.
+    ///
+    /// The terminal goes in before the delete, because it is the write that can
+    /// still be refused — `canSettle`, `canTransition` and `terminalDescribesKind`
+    /// all run inside `settleLocked`. A refusal there rolls back through the
+    /// `errdefer` with nothing deleted; and an `already_settled` answer means the
+    /// verdict on record is not the one this call was going to write, so the row
+    /// is deliberately kept rather than deleted against somebody else's terminal.
+    pub fn settleAndRemoveSession(
+        self: *Execution,
+        session: []const u8,
+        terminal: op_state.Terminal,
+        extra: receipts.TerminalExtra,
+    ) SessionRemovalError!SessionRemoval {
+        // A session row is keyed on a host (`sessions.server_id` is NOT NULL), so
+        // an attempt with no server cannot name the row it is about. Refused
+        // rather than defaulted: picking a server here would delete somebody
+        // else's row.
+        const server_id = self.server_id orelse return error.SessionRemovalHasNoServer;
+        const at = self.now();
+
+        try self.store.db.exec("BEGIN IMMEDIATE");
+        errdefer self.store.db.exec("ROLLBACK") catch {};
+
+        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at)) |blocker| {
+            // Nothing of ours was written, so the commit only keeps the lease
+            // expiry pass the check performed on its way through — the same
+            // thing `begin` and `submitted` commit on their refusal paths.
+            try self.store.db.exec("COMMIT");
+            return .{ .refused = blocker };
+        }
+
+        if (comptime builtin.is_test) {
+            if (between_ownership_and_removal) |probe| probe();
+        }
+
+        const outcome = try receipts.settleLocked(self.store, self.id(), terminal, extra, at);
+        switch (outcome) {
+            .already_settled => |winner| {
+                // Nothing was written by the settlement either — see
+                // `settleLocked`'s three non-writing exits — so this commits for
+                // the same reason the refusal above does.
+                try self.store.db.exec("COMMIT");
+                self.settled = true;
+                self.status = winner.status;
+                return .{ .already_settled = winner };
+            },
+            .recorded => |record| {
+                const had_row = try sessions.removeLocked(self.store, server_id, session);
+                try self.store.db.exec("COMMIT");
+                self.settled = true;
+                self.status = record.status;
+                return .{ .removed = .{ .had_row = had_row, .recorded = record } };
+            },
+        }
+    }
+
     /// Classifies a transport failure against how far we got.
     ///
     /// This is the only route from an SSH/daemon error to a terminal, which
@@ -731,7 +883,6 @@ pub const Execution = struct {
         const terminal = op_state.terminalForTransportLoss(self.status, detail);
         return self.settle(terminal, .{});
     }
-
     /// Deliberately leaves the attempt in flight.
     ///
     /// A job outlives the process that launched it, so `run` must be able to
@@ -781,6 +932,118 @@ fn reportLostReceipt(self: *Execution, err: anyerror) void {
     );
 }
 
+/// Inserts the operation row `opts` describes. Caller holds the transaction.
+///
+/// One field list, shared by `begin` and `recordRefusal`, because two copies of
+/// it drift: a column added to one and not the other would make a refused
+/// attempt describe itself differently from an accepted one, and the whole point
+/// of recording the refusal is that the two are comparable.
+fn createLocked(
+    store: *Store,
+    request_id: *const [ids.len]u8,
+    capability_json: ?[]const u8,
+    opts: BeginOptions,
+) Error!void {
+    try operations.create(store, .{
+        .request_id = request_id,
+        .server_id = opts.server_id,
+        .server_name = opts.server_name,
+        .kind = opts.kind,
+        .scope_kind = opts.scope.kind,
+        .scope_key = opts.scope.key,
+        .alias = opts.alias,
+        .argv_redacted = opts.argv_redacted,
+        .argv_sha256 = opts.argv_sha256,
+        .cwd = opts.cwd,
+        .shell = opts.shell,
+        .capability_json = capability_json,
+        .transport = opts.transport,
+        .mutating = opts.mutating,
+        .now = opts.now,
+    });
+}
+
+/// A refusal that was written down, and what the ledger now holds for it.
+///
+/// The status travels with the id because the caller has to report it, and a
+/// caller that spelled the word itself would be making a second, independently
+/// drifting statement about what this function writes. There is one place that
+/// decides a refusal settles `cancelled`, and it is the `local_abandon` below.
+pub const RecordedRefusal = struct {
+    request_id: [ids.len]u8,
+    status: op_state.Status,
+
+    pub fn id(r: *const RecordedRefusal) []const u8 {
+        return &r.request_id;
+    }
+};
+
+/// Records an attempt that a peer's claim refused before it could open.
+///
+/// `begin` returns `.blocked` having inserted nothing, and for most verbs that is
+/// right: nothing happened to anything, so there is nothing to record. For a
+/// destructive control act it is not. `docs/m3b-job-control.md` §8 requires that a
+/// `session rm` refused by a held claim "records the refusal", and a refusal with
+/// no row leaves five questions with no answer: whether anybody tried to remove
+/// this session, who, when, how often, and what stopped them.
+///
+/// One transaction: the row is created and settled together, so no refusal can be
+/// left sitting at `created` because the process died between the two writes.
+///
+/// **The terminal is `local_abandon`, and that choice is the substance.** Its own
+/// words are "nothing had been handed over, so there is nothing to stop", which is
+/// literally this: the refusal is decided before the connection is opened. It
+/// settles `cancelled`, and `cancelled` does not block scope
+/// (`op_state.Status.blocksScope`) — which is the property that makes writing this
+/// row safe at all. A record of a refusal that went on to refuse the next command
+/// would be worse than no record.
+///
+/// Worth stating in full, because it is stronger than "we picked a safe terminal":
+/// *no* admissible terminal here could bar the scope. `canSettle` admits only
+/// `never_submitted` and `local_abandon` from `created`, they settle `failed` and
+/// `cancelled`, and `created` itself does not block either — so every reachable
+/// state of this row is non-blocking by construction rather than by choice.
+///
+/// Deliberately **not** `never_submitted`: that variant's evidence is a
+/// `transport_error`, and a peer's lease is not a transport failure. Putting a
+/// refusal's reason in that field would be the same category error as an exit code
+/// on a write.
+///
+/// Returns the id it minted, so the refusal is queryable by request id the way
+/// every other attempt is.
+pub fn recordRefusal(
+    store: *Store,
+    arena: Allocator,
+    io: std.Io,
+    opts: BeginOptions,
+    reason: []const u8,
+) Error!RecordedRefusal {
+    const request_id = ids.generate(io);
+    const capability_json = try opts.capability.toJson(arena);
+
+    try store.db.exec("BEGIN IMMEDIATE");
+    errdefer store.db.exec("ROLLBACK") catch {};
+
+    try createLocked(store, &request_id, capability_json, opts);
+    const recorded = switch (try receipts.settleLocked(
+        store,
+        &request_id,
+        .{ .local_abandon = .{ .reason = reason } },
+        .{},
+        opts.now,
+    )) {
+        .recorded => |record| record,
+        // The id was minted three statements ago and nothing else has ever seen
+        // it, so a terminal already standing against it is not a race — it is a
+        // generator collision, and a refusal recorded onto somebody else's
+        // attempt would be worse than an unrecorded one.
+        .already_settled => return error.IllegalTransition,
+    };
+
+    try store.db.exec("COMMIT");
+    return .{ .request_id = request_id, .status = recorded.status };
+}
+
 /// Opens an execution, applying the scope guard and lease check first.
 ///
 /// This check is the fast path, not the binding one: it refuses before we
@@ -819,23 +1082,7 @@ pub fn begin(
         advisory = blocker;
     }
 
-    try operations.create(store, .{
-        .request_id = &request_id,
-        .server_id = opts.server_id,
-        .server_name = opts.server_name,
-        .kind = opts.kind,
-        .scope_kind = opts.scope.kind,
-        .scope_key = opts.scope.key,
-        .alias = opts.alias,
-        .argv_redacted = opts.argv_redacted,
-        .argv_sha256 = opts.argv_sha256,
-        .cwd = opts.cwd,
-        .shell = opts.shell,
-        .capability_json = capability_json,
-        .transport = opts.transport,
-        .mutating = opts.mutating,
-        .now = opts.now,
-    });
+    try createLocked(store, &request_id, capability_json, opts);
 
     // The override audit belongs to the same transaction as the operation.
     // Appending it afterwards meant a failure there left a `created`

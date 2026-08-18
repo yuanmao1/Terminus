@@ -10111,3 +10111,430 @@ test "gate: the terminal and the cache row it describes are written once, togeth
     try t.expectEqual(@as(?i64, 0), cached.exit_code);
     try t.expectEqual(@as(?i64, 2000), cached.finished_at);
 }
+
+// --- `session rm`'s composite: the terminal and the local delete are one write --
+//
+// `docs/m3b-job-control.md` §2.2 and the F1/F2 review. `session rm` used to renew
+// its lease, run a whole `execution.settle` transaction, and only then delete the
+// local `sessions` row — whose delete cascades that session's memories. Two
+// separate defects lived in that shape, and both are about a moment *between* two
+// writes:
+//
+//  * a `--force` takeover landing in the window was never re-checked, so the
+//    delete went ahead under a scope that had changed hands;
+//  * the terminal came first, so a failed delete left the ledger permanently
+//    asserting a removal whose row was still on disk — and a terminal is frozen,
+//    so nothing could correct it.
+//
+// The three gates below prove the three halves of the fix: there is no instant
+// between the check and the delete, a peer's claim at the door refuses the whole
+// thing, and a delete that cannot happen leaves no terminal claiming it did.
+
+/// A control operation over one session, at `submitted` and holding its scope.
+///
+/// `submitted` because `remote_cancel_confirmed` is only admissible from there
+/// (`op_state.canSettle`), which is the honest shape: this terminal says a remote
+/// session was stopped, and nothing that never reached the remote can say that.
+const SeededRemoval = struct {
+    execution: execution.Execution,
+    session_id: i64,
+    owner: []const u8,
+};
+
+fn seedSessionRemoval(
+    store: *Store,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    session: []const u8,
+) !SeededRemoval {
+    const session_id = try Store.sessions.ensure(store, 1, session, 1000);
+    // The destruction no remote command can undo. A gate that only counted the
+    // session row would pass over a cascade.
+    _ = try Store.memories.add(
+        store,
+        .{ .server_id = 1, .session_id = session_id },
+        .{ .key = "runbook", .content = "restart the queue first", .now = 1000 },
+    );
+
+    const start = try execution.begin(store, arena, io, .{
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .control,
+        .scope = .{ .kind = .job, .key = session },
+        .alias = session,
+        .owner_token = "one-machine",
+        .now = 1000,
+    });
+    var exec = switch (start) {
+        .ready => |e| e,
+        .blocked => return error.SeedWasBlocked,
+    };
+    try exec.connecting();
+    switch (try exec.submitted()) {
+        .submitted => {},
+        .refused => return error.SeedWasRefused,
+    }
+
+    const owner = try arena.dupe(u8, exec.id());
+    switch (try Store.leases.acquire(store, arena, .{
+        .server_id = 1,
+        .scope = .{ .kind = .job, .key = session },
+        .owner_request_id = owner,
+        .profile_token = "one-machine",
+        .owner_label = session,
+        .ttl_secs = 120,
+        .now = try Store.leases.clockSeconds(store),
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.SeedClaimDidNotTake,
+    }
+    return .{ .execution = exec, .session_id = session_id, .owner = owner };
+}
+
+/// The proven stop `cmd_session` writes, minus the prose it renders per session.
+fn provenStop(verified_at: i64) op_state.Terminal {
+    return .{ .remote_cancel_confirmed = .{
+        .pid = null,
+        .term_sent = true,
+        .kill_sent = false,
+        .absence_verified_at = verified_at,
+        .verification_method = "tmux kill-session then has-session reported the session absent",
+    } };
+}
+
+fn sessionMemories(store: *Store, arena: std.mem.Allocator, session_id: i64) !usize {
+    const rows = try Store.memories.list(store, arena, .{ .server_id = 1, .session_id = session_id }, .{});
+    var mine: usize = 0;
+    for (rows) |row| if (row.scope == .session) {
+        mine += 1;
+    };
+    return mine;
+}
+
+/// The probe `execution.between_ownership_and_removal` installs for the gate
+/// below.
+///
+/// Same shape and same reasoning as `CacheRace`: the hook is a bare function
+/// pointer with nothing to capture, and one gate installs it, runs one removal and
+/// clears it.
+const TakeoverRace = struct {
+    /// Opened before the removal starts, for the reason `CacheRace` gives:
+    /// opening a connection while the write lock is held would measure
+    /// `Store.open`, not the window.
+    var peer: ?*Store = null;
+    var result: Result = .not_run;
+    var failure: ?anyerror = null;
+
+    const Result = enum {
+        /// The hook never fired. Either the removal did not reach the window or
+        /// nothing installed the probe — neither is evidence that the window is
+        /// closed.
+        not_run,
+        /// The peer could not take the write lock, so there is no instant between
+        /// the ownership check and the delete at which the scope could change
+        /// hands under a check that has already passed.
+        excluded,
+        /// The peer wrote. The check is committed evidence about a scope somebody
+        /// else now holds, which is the split this gate exists to forbid.
+        slipped_through,
+    };
+
+    /// A takeover, written as `leases.takeover` would: the incumbent is marked
+    /// released and a new row appears. Rendered from the enum for the same reason
+    /// `CacheRace.steal_sql` is — a renamed reason must move this line with it.
+    const seize_sql = "UPDATE leases SET released_at = 2000, release_reason = '" ++
+        @tagName(Store.leases.ReleaseReason.takeover) ++ "' WHERE released_at IS NULL";
+
+    fn reset() void {
+        peer = null;
+        result = .not_run;
+        failure = null;
+    }
+
+    fn seizeTheScope() void {
+        const store = peer orelse {
+            failure = error.NoPeerConnection;
+            return;
+        };
+        // Whether the lock is held *now* is the question; waiting for it would
+        // answer a different one.
+        store.db.exec("PRAGMA busy_timeout=0") catch |err| {
+            failure = err;
+            return;
+        };
+        store.db.exec("BEGIN IMMEDIATE") catch {
+            // SQLite allows one writer, and the removal is it.
+            result = .excluded;
+            return;
+        };
+        result = .slipped_through;
+        store.db.exec(seize_sql) catch |err| {
+            failure = err;
+        };
+        store.db.exec("COMMIT") catch |err| {
+            failure = err;
+        };
+    }
+};
+
+test "gate: nothing can take the scope between `session rm`'s ownership check and its delete" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_session_removal_atomic");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    var seeded = try seedSessionRemoval(&store, arena, scratch.io, "shell");
+    defer seeded.execution.deinit();
+
+    // What this gate proves: the ownership check that licenses the delete and the
+    // delete itself are one write, so a `--force` takeover cannot land between
+    // them. The renewal before the last remote call is unavoidably outside the
+    // transaction — the caller has to ask the host something — so the only thing
+    // standing between "checked" and "deleted" is this transaction. Split in two,
+    // the check would be stale by an unbounded amount and the takeover it exists
+    // to catch would sail past it.
+    //
+    // What it does not prove: anything about two processes truly running at once,
+    // or about a reader. The probe sets `busy_timeout=0`, so the answer is about
+    // the lock rather than about how long it was willing to wait.
+    var peer = try Store.open(scratch.path);
+    defer peer.close();
+
+    TakeoverRace.reset();
+    TakeoverRace.peer = &peer;
+    execution.between_ownership_and_removal = TakeoverRace.seizeTheScope;
+    defer {
+        execution.between_ownership_and_removal = null;
+        TakeoverRace.reset();
+    }
+
+    const done = try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{});
+
+    if (TakeoverRace.failure) |err| return err;
+    // `not_run` fails here too: a removal that never reaches the window has not
+    // been shown to close it.
+    try t.expectEqual(TakeoverRace.Result.excluded, TakeoverRace.result);
+
+    // And the outcome agrees: the row is gone, its memories with it, and the
+    // terminal is on record.
+    switch (done) {
+        .removed => |r| try t.expect(r.had_row),
+        else => return error.RemovalDidNotHappen,
+    }
+    try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
+    try t.expectEqual(@as(usize, 0), try sessionMemories(&store, arena, seeded.session_id));
+    try t.expectEqual(op_state.Status.cancelled, seeded.execution.status);
+}
+
+// The takeover the gate above excludes from the window, landing at the door
+// instead: a peer holds an overlapping scope when the transaction opens.
+//
+// Everything is refused together. The local row stands, its memories stand, and —
+// the part F2 is about — **no terminal is written at all**. The operation stays
+// unsettled and goes on barring the scope, which is the fail-closed answer: a
+// caller that cannot prove what it did must not leave a record saying it did it.
+test "gate: a peer's claim refuses `session rm`'s composite whole, and writes no terminal" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_session_removal_refused");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    var seeded = try seedSessionRemoval(&store, arena, scratch.io, "shell");
+    defer seeded.execution.deinit();
+
+    // The takeover, as `job kill --force` performs it: the incumbent's row is
+    // released with a reason and the displacer's row is inserted. What the check
+    // inside the transaction sees is the second one.
+    const peer_owner = "01PEEEEEEER0123456789ABCDE";
+    switch (try Store.leases.takeover(&store, arena, .{
+        .server_id = 1,
+        .scope = .{ .kind = .job, .key = "shell" },
+        .owner_request_id = peer_owner,
+        .profile_token = "the-other-machine",
+        .owner_label = "shell",
+        .ttl_secs = 120,
+        .now = try Store.leases.clockSeconds(&store),
+    })) {
+        .taken => {},
+        .acquired => return error.PeerDidNotSeize,
+    }
+
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{})) {
+        .refused => |blocker| switch (blocker) {
+            .lease => |lease| try t.expectEqualStrings(peer_owner, lease.owner_request_id),
+            .unsettled => return error.WrongBlocker,
+        },
+        else => return error.RemovalWasNotRefused,
+    }
+
+    // Nothing was destroyed.
+    try t.expectEqual(@as(?i64, seeded.session_id), try Store.sessions.idByName(&store, 1, "shell"));
+    try t.expectEqual(@as(usize, 1), try sessionMemories(&store, arena, seeded.session_id));
+
+    // And nothing was claimed. No terminal receipt, and the operation is where it
+    // was — still `submitted`, still barring the scope, still settleable by the
+    // caller with a terminal that is honest about the partial state.
+    try t.expectEqual(@as(?Store.receipts.TerminalRecord, null), try Store.receipts.terminalOf(&store, seeded.execution.id()));
+    const op = (try Store.operations.get(&store, arena, seeded.execution.id())).?;
+    try t.expectEqual(op_state.Status.submitted, op.status);
+    try t.expect(op.status.blocksScope());
+    try t.expect(!seeded.execution.settled);
+}
+
+// The other order defect, driven from the other end: the local delete fails and
+// the terminal must not survive it.
+//
+// A `BEFORE DELETE` trigger is how the failure is arranged, and it is arranged
+// rather than described because the shape is what matters: the delete is refused
+// by the database, mid-transaction, after the terminal has already been inserted.
+// Written the old way round — settle, commit, then delete — this is precisely the
+// state that left a frozen `cancelled` receipt over a session row that is still on
+// disk, with its memories, and possibly its pane log still on the host.
+test "gate: a `session rm` whose local delete fails leaves no terminal claiming it" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_session_removal_delete_fails");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    var seeded = try seedSessionRemoval(&store, arena, scratch.io, "shell");
+    defer seeded.execution.deinit();
+
+    try store.db.exec(
+        \\CREATE TRIGGER refuse_session_delete BEFORE DELETE ON sessions
+        \\BEGIN SELECT RAISE(ABORT, 'the local delete cannot happen'); END
+    );
+
+    try t.expectError(
+        error.Constraint,
+        seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}),
+    );
+
+    // The whole transaction went back: no terminal, and the attempt is still
+    // `submitted` rather than frozen at `cancelled`. That is the assertion — a
+    // frozen terminal cannot be corrected, so the *only* safe answer to a delete
+    // that will not happen is to write nothing.
+    try t.expectEqual(@as(?Store.receipts.TerminalRecord, null), try Store.receipts.terminalOf(&store, seeded.execution.id()));
+    const op = (try Store.operations.get(&store, arena, seeded.execution.id())).?;
+    try t.expectEqual(op_state.Status.submitted, op.status);
+    try t.expect(!seeded.execution.settled);
+
+    // The row and its memories are where they were.
+    try t.expectEqual(@as(?i64, seeded.session_id), try Store.sessions.idByName(&store, 1, "shell"));
+    try t.expectEqual(@as(usize, 1), try sessionMemories(&store, arena, seeded.session_id));
+
+    // The discriminating control: with the trigger gone the same call removes,
+    // settles and reports the row it deleted — so none of the above passes because
+    // the composite simply never works.
+    try store.db.exec("DROP TRIGGER refuse_session_delete");
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{})) {
+        .removed => |r| try t.expect(r.had_row),
+        else => return error.RemovalDidNotHappen,
+    }
+    try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
+    try t.expectEqual(@as(usize, 0), try sessionMemories(&store, arena, seeded.session_id));
+    try t.expectEqual(op_state.Status.cancelled, (try Store.operations.get(&store, arena, seeded.execution.id())).?.status);
+}
+
+// A refused attempt is recorded, and the record does not bar the next command.
+//
+// The end-to-end half is in `test/blackbox.zig`, which runs a second removal after
+// the peer lets go and insists it succeeds. This is the store-side half, and it
+// asks the two barriers directly rather than through a command: `blocksScope` and
+// the guard's own query. Both have to say no, because they are two definitions of
+// "this bars a change" and a refusal that satisfied one and not the other would be
+// a trap that only showed up under one of them.
+test "gate: a recorded `session rm` refusal is queryable and bars nothing" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_session_refusal_recorded");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    const scope: execution.Scope = .{ .kind = .job, .key = "shell" };
+    const refusal = try execution.recordRefusal(&store, arena, scratch.io, .{
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .control,
+        .scope = scope,
+        .alias = "shell",
+        .owner_token = "one-machine",
+        .now = 1000,
+    }, "a peer holds an overlapping scope; nothing was sent to the host");
+
+    // Queryable by request id, which is the property — an alias is a convenience
+    // handle that names get reused under.
+    const op = (try Store.operations.get(&store, arena, refusal.id())) orelse
+        return error.RefusalIsNotQueryable;
+    // What the function says it wrote is what the row holds. The caller reports
+    // this word, so a returned status that drifted from the settlement would put
+    // a wrong one in every refusal document.
+    try t.expectEqual(op.status, refusal.status);
+    try t.expectEqualStrings("control", op.kind);
+    try t.expect(op.mutating);
+
+    // Settled, in the same transaction that created it: a refusal left at
+    // `created` would be a row somebody has to wonder about.
+    try t.expectEqual(op_state.Status.cancelled, op.status);
+    const terminal = (try Store.receipts.terminalOf(&store, refusal.id())) orelse
+        return error.RefusalLeftNoTerminal;
+    try t.expectEqual(op_state.Status.cancelled, terminal.status);
+
+    // Both barriers: the predicate, and the query the mutation guard actually
+    // runs. A refusal that blocked the scope it was refused by would be worse than
+    // no record at all.
+    try t.expect(!op.status.blocksScope());
+    try t.expectEqual(
+        @as(usize, 0),
+        (try Store.operations.unsettledInScope(&store, arena, 1, scope)).len,
+    );
+
+    // The discriminating control, in the same store: an operation that *should*
+    // bar the scope still does. Without it, a guard that had stopped returning
+    // anything at all would satisfy the assertion above.
+    const live = try execution.begin(&store, arena, scratch.io, .{
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .control,
+        .scope = scope,
+        .alias = "shell",
+        .owner_token = "one-machine",
+        .now = 1001,
+    });
+    var running = switch (live) {
+        .ready => |e| e,
+        .blocked => return error.RefusalBarsTheNextCommand,
+    };
+    defer running.deinit();
+    try running.connecting();
+    switch (try running.submitted()) {
+        .submitted => {},
+        .refused => return error.RefusalBarsTheNextCommand,
+    }
+    try t.expectEqual(
+        @as(usize, 1),
+        (try Store.operations.unsettledInScope(&store, arena, 1, scope)).len,
+    );
+}

@@ -549,17 +549,17 @@
       "id": "M3b-session-rm-log-renewal",
       "rule": "The pane log is deleted only under a lease renewed immediately above the deletion; a scope lost during the kill forbids it.",
       "file": "src/cli/cmd_session.zig",
-      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, false);\n",
+      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, state.not_attempted, code.authority_lost);\n",
       "replace": "",
       "expect_gate": "blackbox: `session rm` deletes nothing once the scope has moved after the kill"
     },
     {
-      "id": "M3b-session-rm-row-renewal",
-      "rule": "The local session row - and the memories its delete cascades - is kept when the scope moves during the log deletion.",
-      "file": "src/cli/cmd_session.zig",
-      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, true);\n",
-      "replace": "",
-      "expect_gate": "blackbox: `session rm` keeps the local row when the scope moves during the log deletion"
+      "id": "M3b-session-removal-revalidates-owner",
+      "rule": "The scope is re-validated inside the transaction that deletes the local session row, so a takeover landing after the last renewal cannot destroy that row or the memories its delete cascades.",
+      "file": "src/core/execution.zig",
+      "find": "        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at)) |blocker| {\n            // Nothing of ours was written, so the commit only keeps the lease\n",
+      "replace": "        if (@as(?Blocker, null)) |blocker| {\n            // Nothing of ours was written, so the commit only keeps the lease\n",
+      "expect_gate": "gate: a peer's claim refuses `session rm`'s composite whole, and writes no terminal"
     },
     {
       "id": "M3b-session-rm-contends-with-job",
@@ -599,7 +599,55 @@
       "file": "src/cli/cmd_session.zig",
       "find": "        .kind = .control,\n        .scope = contentionScope(name),\n        .alias = name,\n        .owner_token = owner_token,\n",
       "replace": "        .kind = .control,\n        .scope = contentionScope(name),\n        .alias = name,\n        .mutating = false,\n        .owner_token = owner_token,\n",
-      "expect_gate": "blackbox: `session rm` is refused while a peer holds the session's scope"
+      "expect_gate": "blackbox: a `session rm` refused by a peer's claim is recorded and does not bar the next one"
+    },
+    {
+      "id": "M3b-session-removal-one-transaction",
+      "rule": "The terminal that records a session removal and the delete of the local row are one commit, so a delete that cannot happen leaves no terminal claiming it did.",
+      "file": "src/core/execution.zig",
+      "find": "                const had_row = try sessions.removeLocked(self.store, server_id, session);\n                try self.store.db.exec(\"COMMIT\");\n",
+      "replace": "                try self.store.db.exec(\"COMMIT\");\n                const had_row = try sessions.removeLocked(self.store, server_id, session);\n",
+      "expect_gate": "gate: a `session rm` whose local delete fails leaves no terminal claiming it"
+    },
+    {
+      "id": "M3b-session-refusal-is-settled",
+      "rule": "A refused `session rm` is recorded and settled in one transaction, so no refusal is left at `created` for somebody to wonder about.",
+      "file": "src/core/execution.zig",
+      "find": "    const recorded = switch (try receipts.settleLocked(\n        store,\n        &request_id,\n        .{ .local_abandon = .{ .reason = reason } },\n        .{},\n        opts.now,\n    )) {\n        .recorded => |record| record,\n        // The id was minted three statements ago and nothing else has ever seen\n        // it, so a terminal already standing against it is not a race — it is a\n        // generator collision, and a refusal recorded onto somebody else's\n        // attempt would be worse than an unrecorded one.\n        .already_settled => return error.IllegalTransition,\n    };\n",
+      "replace": "    _ = reason;\n    const recorded: struct { status: op_state.Status } = .{ .status = .cancelled };\n",
+      "expect_gate": "gate: a recorded `session rm` refusal is queryable and bars nothing"
+    },
+    {
+      "id": "M3b-session-rm-log-failure-is-not-a-removal",
+      "rule": "A removal whose log deletion failed settles a document saying so, so the ledger cannot read as a completed removal over a log that is still on the host.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    const proven = provenCancellation(ctx, session, verified_at, false);\n",
+      "replace": "    const proven = provenCancellation(ctx, session, verified_at, true);\n",
+      "expect_gate": "blackbox: a `session rm` whose log deletion fails reports the partial and settles it honestly"
+    },
+    {
+      "id": "M3b-claim-release-failure-is-reported",
+      "rule": "A scope lease this command could not hand back is reported as still held, so a leak cannot hide under a document that says the command succeeded.",
+      "file": "src/cli/cli.zig",
+      "find": "        return .{ .code = \"left_held\", .detail = detail };\n",
+      "replace": "        return .{ .code = \"released\", .detail = detail };\n",
+      "expect_gate": "gate: a release that could not be recorded reports the lease as still held"
+    },
+    {
+      "id": "M3b-skill-session-rm-key-count",
+      "rule": "skill/SKILL.md's published key count for `session rm --json` is held against the emitter struct, so the document cannot drift from it the way it did at 11 keys for 12 fields.",
+      "file": "skill/SKILL.md",
+      "find": "`session rm --json` — 16 keys, every branch emitting all of them.\n",
+      "replace": "`session rm --json` — 15 keys, every branch emitting all of them.\n",
+      "expect_gate": "gate: SKILL.md's `session rm --json` key set is the one RemovalJson emits"
+    },
+    {
+      "id": "M3b-skill-session-rm-error-codes",
+      "rule": "skill/SKILL.md's published `errorCode` vocabulary for `session rm` is held against the constants the branches actually emit.",
+      "file": "skill/SKILL.md",
+      "find": "`SESSION_SURVIVED_KILL`, `LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,\n",
+      "replace": "`SESSION_SURVIVED_KILL`, `LOG_DELETE_FAILED`,\n",
+      "expect_gate": "gate: SKILL.md publishes exactly `session rm`'s errorCode vocabulary"
     }
   ]
 }

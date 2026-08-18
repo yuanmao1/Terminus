@@ -63,7 +63,16 @@ pub fn list(store: *Store, arena: std.mem.Allocator, server_id: i64) (Db.Error |
 
 /// Returns false if no such session row existed. Cascade-deletes the
 /// session's memories.
-pub fn remove(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {
+///
+/// Caller must hold the write transaction, and that requirement is the whole
+/// reason this exists separately from `remove`. This delete is the local half of
+/// `session rm`, and it has to land in the *same* transaction as the terminal
+/// receipt that says the removal happened: settled first and deleted afterwards,
+/// a failure in between leaves the ledger asserting a removal whose row, and
+/// whose cascaded memories, are still on disk. See
+/// `execution.Execution.settleAndRemoveSession`.
+pub fn removeLocked(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {
+    try store.db.requireTransaction();
     var stmt = try store.db.prepare(
         "DELETE FROM sessions WHERE server_id = ?1 AND name = ?2",
     );
@@ -72,6 +81,23 @@ pub fn remove(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {
     try stmt.bindText(2, name);
     _ = try stmt.step();
     return store.db.changes() > 0;
+}
+
+/// `removeLocked` on its own.
+///
+/// **Not what `session rm` uses**, and a caller reaching for it should say why
+/// it is not composing the delete with a terminal receipt: this drops a session
+/// row and cascades that session's memories away with nothing in the ledger
+/// recording that anybody did so. `session rm` goes through
+/// `execution.Execution.settleAndRemoveSession` for exactly that reason. Kept as
+/// the single-statement form because a caller that legitimately has no operation
+/// to settle should still not open its own transaction by hand.
+pub fn remove(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {
+    try store.db.exec("BEGIN IMMEDIATE");
+    errdefer store.db.exec("ROLLBACK") catch {};
+    const had_row = try removeLocked(store, server_id, name);
+    try store.db.exec("COMMIT");
+    return had_row;
 }
 
 pub fn cursor(store: *Store, session_id: i64) Db.Error!i64 {

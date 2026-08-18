@@ -507,14 +507,40 @@ something.
   reconcile it, so a plain "retry" would walk into a refusal. Go and look
   (`tmux attach -t t-<name>`), then `terminus request reconcile <request-id>`.
 - **Lease lost *before* the kill**: nothing is sent, nothing local is written.
-  `action:"not_removed"`, `sessionGone:false`, `localRow:"kept"`, and the exit
-  code is **1, not 75** — this command changed nothing, so re-running once the
-  scope frees is safe. The ledger records `failed`.
+  `action:"not_removed"`, `errorCode:"AUTHORITY_LOST_BEFORE_KILL"`,
+  `sessionState:"not_attempted"`, `localRow:"kept"`, and the exit code is **1, not
+  75** — this command changed nothing, so re-running once the scope frees is safe.
+  The ledger records `failed`.
 - **Lease lost *after* the kill**: the session really did stop, and every step
   after it is declined — the pane log and the local row (with its memories) are
-  both **kept**. `action:"not_removed"`, `logDeleted` reports which side of the
-  log the loss fell on, `localRow:"kept"`, exit 1. The ledger records the
-  ordinary `indeterminate` terminal carrying `error_code:"AUTHORITY_LOST"`.
+  both **kept**. `action:"not_removed"`, `errorCode:"AUTHORITY_LOST"`, `logState`
+  reports which side of the log the loss fell on, `localRow:"kept"`, exit 1. The
+  ledger records the ordinary `indeterminate` terminal carrying
+  `error_code:"AUTHORITY_LOST"`.
+- **The scope taken just before the record was written**: the kill and the log
+  deletion both landed, and the one transaction that re-validates the scope, writes
+  the terminal and deletes the local row found a peer's claim — so all three rolled
+  back together. `errorCode:"SCOPE_TAKEN_BEFORE_COMMIT"`, `logState:"deleted"`,
+  `localRow:"kept"`, `authority:"held"` (the renewals *did* hold; the atomic
+  re-validation is what refused), exit 1. There is no state in which the ledger
+  says a session was removed and the row is still there: nothing is deleted unless
+  the terminal is written in the same commit, and neither is written unless both
+  are.
+- **The log deletion failed**: the session is gone, its pane log is still on the
+  host with nothing left to recreate it, and this machine still holds the metadata
+  row and this session's memories. `errorCode:"LOG_DELETE_FAILED"`,
+  `logState:"delete_failed"` — which is *not* `not_attempted`, so you know to go
+  looking for the orphan — `localRow:"kept"`, exit **1**. The ledger settles
+  `cancelled`, because the session's absence was proven before that step and a
+  later failure does not make an earlier reading unknown; the receipt's
+  `detail_json` carries `logDeleted:false` and `localRecordDropped:false`, which is
+  what tells this apart from a completed removal. The scope is left free, so the
+  repair is simply to run the same command again.
+- **Refused by a peer's claim**: `errorCode:"SCOPE_HELD_BY_PEER"`, nothing sent,
+  exit 1 — **and the refusal is recorded**, as a `control` operation of its own
+  settled `cancelled`. It is queryable by `requestId` and it does **not** bar the
+  next command; the scope was never yours to begin with, and a record that refused
+  the next attempt would be worse than no record.
 - **The receipt never carries an exit code.** A removal runs no command of
   yours; what it establishes is that the session is gone, and that is what the
   ledger holds — status `cancelled`, evidence `remote_cancel_confirmed`, with the
@@ -525,14 +551,37 @@ something.
 - There is no `--force`. A takeover would displace somebody's claim on a shell
   about to be destroyed along with its memories; wait the lease out (120s).
 
-`session rm --json` — 11 keys, every branch emitting all of them. Never null:
-`ok`, `action` (`removed` | `not_removed`), `session`, `server`, `requestId`,
-`status`, `sessionGone`, `logDeleted`, `localRow`
-(`removed` | `absent` | `kept`), `authority` (`held` | `lapsed` | `unreadable`).
-Nullable: `authorityError`, `hint` — both prose, do not match their text.
-`localRow:"absent"` is not a failure: it means this machine had no metadata row
-for the session, which is ordinary for a session that was started outside
-Terminus, and the *session* was still proven gone.
+`session rm --json` — 16 keys, every branch emitting all of them.
+Never null: `ok`, `action` (`removed` | `not_removed`), `errorCode`, `session`,
+`server`, `requestId`, `status`,
+`sessionState` (`gone` | `present` | `not_attempted`),
+`logState` (`deleted` | `delete_failed` | `not_attempted`),
+`localRow` (`removed` | `absent` | `kept`),
+`authority` (`held` | `lapsed` | `unreadable`),
+`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
+Nullable: `authorityError`, `leaseReleaseError`, `reason`, `hint` — all four
+prose, do not match their text.
+
+`session rm --json`'s `errorCode` is one of `none`, `SCOPE_HELD_BY_PEER`,
+`AUTHORITY_LOST_BEFORE_KILL`, `AUTHORITY_LOST`, `SCOPE_TAKEN_BEFORE_COMMIT`,
+`SESSION_SURVIVED_KILL`, `LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,
+`LEDGER_WRITE_FAILED`, `OWNER_COLLISION`. It is never null and never absent:
+`none` is the value on the one branch that completed the removal, so a caller
+never has to decide whether a missing key means success. `LEDGER_WRITE_FAILED`
+exits **76** and is the one branch where the remote effect happened and the ledger
+does not have it — reconcile before acting on that session again.
+
+Three things this key set is deliberate about. `localRow:"absent"` is not a
+failure: it means this machine had no metadata row for the session, which is
+ordinary for a session started outside Terminus, and the *session* was still
+proven gone. `logState` and `sessionState` are words rather than booleans because
+`false` cannot tell "we tried and the host refused" from "we never got that far",
+and those two leave different things behind. And `leaseRelease` is on every branch
+because a lease this command could not hand back goes on refusing the next command
+on that scope until it lapses — `left_held` is that leak, reported in the document
+rather than only on stderr. It does **not** change the exit code: on a completed
+removal the removal really did complete and is durably recorded, so exiting
+non-zero would say the opposite and invite a retry into a refusal.
 
 ### Waiting on a job and reporting business state
 

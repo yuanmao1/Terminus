@@ -141,33 +141,117 @@ fn listSessions(
 
 /// One reader for every branch of `session rm --json`.
 ///
-/// Every key is present on every path, including the refusals. A caller gets
-/// one parser rather than three, and — the part that matters — `action` alone
-/// never says what survived: `sessionGone`, `logDeleted` and `localRow` each
-/// report what actually happened to one thing, because a refusal that came
-/// after the kill destroyed strictly more than one that came before it.
+/// Every key is present on every path, including the refusals, and — since the
+/// four paths that used to fall through to the generic `{ok, error}` envelope
+/// were brought in — including the ones that report a *partial destruction*. That
+/// was the sharp defect: the initial blocker, the seized lease, a failed log
+/// deletion and a failed local delete each emitted two keys, so a caller that had
+/// just had a session stopped under it received none of `requestId`,
+/// `sessionState`, `logState` or `localRow` — the four facts it needs to know
+/// what is left on the host.
+///
+/// No defaults, so a branch that omits a key does not compile and a branch that
+/// stops reporting one cannot be added. Where a branch has nothing to say it says
+/// so with a word: the machine-readable enumerations are non-null everywhere and
+/// each carries an explicit "we did not get that far" member, because a bool
+/// cannot tell "the log is still there because we failed to delete it" from "the
+/// log is still there because we never reached that step" — and those two leave
+/// the host in different states.
+///
+/// `action` alone never says what survived. `sessionState`, `logState` and
+/// `localRow` each report what actually happened to one thing, because a refusal
+/// after the kill destroyed strictly more than one before it.
 const RemovalJson = struct {
     ok: bool,
     /// `removed` | `not_removed`.
     action: []const u8,
+    /// Why this command ended the way it did, as a stable token. **Never null and
+    /// never absent**: `none` on the one branch that completed the removal. Branch
+    /// on this; the prose fields below are not a protocol.
+    errorCode: []const u8,
     session: []const u8,
     server: []const u8,
     /// The control operation's own id. Everything this command did is on its
-    /// trail, and this is how to ask for it.
+    /// trail, and this is how to ask for it — on every branch, refusals included.
     requestId: []const u8,
     /// What the ledger holds for that operation now.
     status: []const u8,
-    sessionGone: bool,
-    logDeleted: bool,
+    /// `gone` | `present` | `not_attempted` — the host's own answer to "is that
+    /// session there", or that it was never asked.
+    sessionState: []const u8,
+    /// `deleted` | `delete_failed` | `not_attempted`. `delete_failed` means the
+    /// pane log of a session that is *gone* is still on the host with nothing
+    /// left to recreate it; `not_attempted` means the step was never reached.
+    logState: []const u8,
     /// `removed` | `absent` | `kept`.
     ///
-    /// Three words rather than a bool, because `sessions.remove` answering
-    /// false is not a refusal — see the call site.
+    /// Three words rather than a bool, because `sessions.remove` answering false
+    /// is not a refusal — see the call site.
     localRow: []const u8,
-    /// `held` | `lapsed` | `unreadable`. Branch on this, never on the prose.
+    /// `held` | `lapsed` | `unreadable`: what this command's own renewals
+    /// answered. Branch on this, never on the prose.
     authority: []const u8,
     authorityError: ?[]const u8,
-    hint: ?[]const u8 = null,
+    /// `not_taken` | `released` | `not_ours` | `left_held`: what became of the
+    /// scope lease. `left_held` is a leak — the next command on this scope is
+    /// refused until the lease lapses — and it used to be a line on stderr under
+    /// a document that said `ok: true`.
+    leaseRelease: []const u8,
+    leaseReleaseError: ?[]const u8,
+    /// What happened, in a sentence, and null on the branch where nothing went
+    /// wrong. Prose — nothing may branch on it — but it is the only place a
+    /// refusal's *counterparty* is named: the blocking request id, the machine
+    /// that holds the lease, the host's own error text. That used to reach a JSON
+    /// caller only because four branches fell through to `{ok, error}`, and
+    /// bringing them into the fixed set would have dropped it.
+    reason: ?[]const u8,
+    hint: ?[]const u8,
+};
+
+/// The stable `errorCode` vocabulary, named once so the branches cannot spell it
+/// two ways and `skill/SKILL.md` has something to be held against.
+const code = struct {
+    /// The removal completed. Present rather than null, for the reason
+    /// `resultRecord` publishes `not_requested`: a caller must never have to
+    /// decide whether a missing key means success or an older binary.
+    pub const none = "none";
+    /// A peer's unsettled writer or lease covers this session's scope. Nothing
+    /// was sent.
+    pub const scope_held = "SCOPE_HELD_BY_PEER";
+    /// A renewal answered that the scope is no longer ours, before the kill.
+    pub const authority_lost_before_kill = "AUTHORITY_LOST_BEFORE_KILL";
+    /// A renewal answered that the scope is no longer ours, after it.
+    pub const authority_lost = Authority.lost_code;
+    /// Every renewal held, and the transaction that was to record the removal
+    /// found a peer's claim on the scope. Distinct from `AUTHORITY_LOST`: there
+    /// the renewal said so, here the renewals all passed and the atomic
+    /// re-validation is what refused.
+    pub const scope_taken_before_commit = "SCOPE_TAKEN_BEFORE_COMMIT";
+    /// The kill went out and the host still reports the session present.
+    pub const survived = "SESSION_SURVIVED_KILL";
+    /// The session is gone and its pane log could not be deleted.
+    pub const log_delete_failed = "LOG_DELETE_FAILED";
+    /// The ledger already held a terminal for this attempt, so this command did
+    /// not write the one it had established and did not delete the local row.
+    pub const already_settled = "LEDGER_ALREADY_SETTLED";
+    /// The session was stopped, its log deleted, and the transaction carrying the
+    /// terminal and the local delete could not be written. Nothing local changed.
+    pub const ledger_write_failed = "LEDGER_WRITE_FAILED";
+    /// The id minted for this command already held a lease on the scope.
+    pub const owner_collision = "OWNER_COLLISION";
+};
+
+/// The three step vocabularies, for the same reason.
+const state = struct {
+    const gone = "gone";
+    const present = "present";
+    const deleted = "deleted";
+    const delete_failed = "delete_failed";
+    /// The step was never reached. The member a bool cannot express.
+    const not_attempted = "not_attempted";
+    const row_removed = "removed";
+    const row_absent = "absent";
+    const row_kept = "kept";
 };
 
 fn removeSession(
@@ -193,7 +277,12 @@ fn removeSession(
     // `mutating` is left at its default `true` and it is worth saying why out
     // loud: this is the most destructive verb in the tree. It stops a shell,
     // deletes a log and cascades away a session's memories.
-    const start = Core.execution.begin(store, ctx.arena, ctx.io, .{
+    //
+    // Held in a value rather than written inline at the call, because the refusal
+    // path below records an operation from the same description: a refused
+    // attempt has to describe itself exactly as an accepted one does, or the two
+    // are not comparable in the ledger.
+    const opts: Core.execution.BeginOptions = .{
         .server_id = server.id,
         .server_name = server.name,
         .kind = .control,
@@ -201,7 +290,9 @@ fn removeSession(
         .alias = name,
         .owner_token = owner_token,
         .now = ctx.now,
-    }) catch |err| Cli.storeFatal(store, err);
+    };
+    const start = Core.execution.begin(store, ctx.arena, ctx.io, opts) catch |err|
+        Cli.storeFatal(store, err);
 
     // Refused here means refused before the connection is opened: no socket, no
     // tmux command, nothing on the host to undo. This is the arm that closes
@@ -209,7 +300,7 @@ fn removeSession(
     // belongs to, and it is now something `session rm` can see.
     var execution = switch (start) {
         .ready => |e| e,
-        .blocked => |blocker| reportBlocked(blocker, server_name, name),
+        .blocked => |blocker| refuseBeforeOpening(ctx, store, opts, server_name, name, blocker),
     };
     Cli.registerExecution(&execution);
     defer {
@@ -221,7 +312,7 @@ fn removeSession(
     // rather than two: `blockerLocked` exempts a lease whose owner is the
     // request id it was handed, so our own claim cannot refuse us, and a peer
     // arriving later sees a row that names the operation that took it.
-    const claim = claimScope(ctx, store, server.id, name, execution.id(), owner_token);
+    const claim = claimScope(ctx, store, &execution, opts, server_name, name);
     var authority: Authority = .held;
 
     execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
@@ -246,10 +337,10 @@ fn removeSession(
     switch (execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "about to submit")) {
         .submitted => {},
         .refused => |blocker| {
-            execution.abandon(
-                "another command claimed an overlapping scope between this one dialing and the kill; nothing was sent to the host",
-            ) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
-            reportBlocked(blocker, server_name, name);
+            const reason = "another command claimed an overlapping scope between this one dialing and the kill; nothing was sent to the host";
+            execution.abandon(reason) catch |err|
+                Cli.receiptFatal(execution.id(), err, execution.status.text());
+            refuseWithNothingSent(ctx, &execution, server_name, name, authority, code.scope_held, reason, blockerHint(ctx, blocker));
         },
     }
 
@@ -277,67 +368,94 @@ fn removeSession(
     // The kill cannot be taken back; every step after it can still be declined,
     // so the scope is asked for again. A loss here keeps the log *and* the local
     // row, and the receipt records that this command established nothing.
-    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, false);
+    //
+    // On one line, and the adjacency gate below is why: it looks at the last line
+    // of *code* before a destructive call, so a renewal wrapped across two lines
+    // would put its own continuation there and read as if nothing had asked.
+    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, state.not_attempted, code.authority_lost);
     // Only now: a live pane recreates its log through `pipe-pane`, so a log
     // deleted under a surviving session quietly comes back holding a partial
     // history that starts mid-stream. `gone` above is what licenses this line,
     // which is why the proof comes first and the deletion second.
-    Tmux.removeLog(executor, ctx.arena, name) catch |err| {
-        // The session's absence was established before this line and does not
-        // become unknown because a later deletion failed, so the receipt keeps
-        // it rather than being abandoned into `indeterminate` on the way out.
-        // What is not claimed is a clean removal: the log is still on the host,
-        // the local row is kept, and the exit says so.
-        _ = execution.settle(provenCancellation(ctx, name, verified_at), .{}) catch |e|
-            Cli.receiptFatal(execution.id(), e, execution.status.text());
-        fatal(
-            "session '{s}:{s}' was stopped but its log could not be deleted: {s} ({s}); the local record is kept",
-            .{ server_name, name, executor.errorMessage(), @errorName(err) },
-        );
+    Tmux.removeLog(executor, ctx.arena, name) catch |err|
+        refuseLogUndeleted(ctx, &execution, server_name, name, authority, verified_at, executor, err);
+
+    // The composite: re-validate the scope, write the terminal, drop the local
+    // row — one transaction, all three or none of them.
+    //
+    // This used to be three separate steps in the other order: a renewal, then a
+    // whole `execution.settle` transaction writing the proven cancellation, and
+    // only then `sessions.remove`. Both halves of that were wrong. A `--force`
+    // takeover landing inside the settlement was never re-checked, so the delete
+    // — which cascades this session's memories — went ahead under a scope that
+    // had changed hands; and because the terminal came first, a failed delete
+    // left the ledger permanently asserting a removal whose row was still on
+    // disk. See `Execution.settleAndRemoveSession`.
+    const proven = provenCancellation(ctx, name, verified_at, true);
+    const removal = execution.settleAndRemoveSession(name, proven.terminal, proven.extra) catch |err|
+        refuseLedgerUnwritable(ctx, &execution, server_name, name, authority, err);
+
+    const had_row = switch (removal) {
+        // The bool is no longer discarded, and this is the one place in the CLI
+        // where discarding it was not a swallowed refusal. `sessions.removeLocked`
+        // has no owner, no expectation and no compare-and-swap: false means only
+        // that this machine had no metadata row for the session, which `merge`
+        // below documents as an ordinary state — a session started outside
+        // Terminus is alive remotely with nothing local naming it. It is now
+        // *reported* rather than merely justified (§2.2), because "there was no
+        // row" and "the row is gone" are different facts about this machine and
+        // only one of them means a cascade happened.
+        .removed => |done| done.had_row,
+        // The scope moved between the log deletion's round trip and the commit.
+        // Nothing was deleted and no terminal was written, so the attempt is
+        // still ours to settle — with the honest partial, not the clean removal
+        // it was about to write.
+        .refused => refuseAfterKill(
+            ctx,
+            &execution,
+            server_name,
+            name,
+            authority,
+            state.deleted,
+            code.scope_taken_before_commit,
+        ),
+        .already_settled => |winner| refuseAlreadySettled(ctx, &execution, server_name, name, authority, winner),
     };
-
-    // The last renewal, and the last chance to notice a loss that happened
-    // during the log deletion's round trip. The local row is the one thing still
-    // in front of us, and deleting it cascades this session's memories
-    // (`sessions.remove`), so it is refusable too.
-    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, true);
-
-    _ = execution.settle(provenCancellation(ctx, name, verified_at), .{}) catch |err|
-        Cli.receiptFatal(execution.id(), err, execution.status.text());
-
-    // The bool is no longer discarded, and this is the one place in the CLI
-    // where discarding it was not a swallowed refusal. `sessions.remove` has no
-    // owner, no expectation and no compare-and-swap: false means only that this
-    // machine had no metadata row for the session, which `merge` below documents
-    // as an ordinary state — a session started outside Terminus is alive
-    // remotely with nothing local naming it. It is now *reported* rather than
-    // merely justified (§2.2), because "there was no row" and "the row is gone"
-    // are different facts about this machine and only one of them means a
-    // cascade happened.
-    const had_row = Store.sessions.remove(store, server.id, name) catch |err|
-        Cli.storeFatal(store, err);
-    Cli.releaseClaim();
+    const lease = Cli.releaseClaimReporting();
 
     switch (ctx.out.format) {
         .json => try ctx.out.json(RemovalJson{
             .ok = true,
             .action = "removed",
+            .errorCode = code.none,
             .session = name,
             .server = server_name,
             .requestId = execution.id(),
             .status = execution.status.text(),
-            .sessionGone = true,
-            .logDeleted = true,
-            .localRow = if (had_row) "removed" else "absent",
+            .sessionState = state.gone,
+            .logState = state.deleted,
+            .localRow = if (had_row) state.row_removed else state.row_absent,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .session = name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
+            .reason = null,
+            .hint = null,
         }),
-        .human => try ctx.out.print("removed session '{s}:{s}'\n", .{ server_name, name }),
+        .human => {
+            try ctx.out.print("removed session '{s}:{s}'\n", .{ server_name, name });
+            if (lease.detail) |text| try ctx.out.print("  note: {s}\n", .{text});
+        },
     }
 }
 
-/// The terminal a proven session removal settles, in one place because two
-/// sites write it and they must not disagree about what was established.
+/// The terminal a proven session stop settles, plus the document that says how
+/// far the removal actually got.
+///
+/// In one place because two sites write it and they must not disagree about what
+/// was established — and, since the log-deletion failure became a reported
+/// outcome rather than a `fatal`, because the two sites do not establish the same
+/// thing and the difference has to survive into the ledger.
 ///
 /// `remote_cancel_confirmed`, and the payload is where the honesty lives.
 ///
@@ -349,7 +467,10 @@ fn removeSession(
 ///
 /// `term_sent = true, kill_sent = false`: `tmux kill-session` hangs the pane up
 /// on our behalf, and nothing here sends SIGKILL to anything. Written as what
-/// happened rather than as two convenient trues.
+/// happened rather than as two convenient trues. Note that neither flag reaches
+/// the row: `receipts.terminalEvent`'s `remote_cancel_confirmed` arm writes
+/// `cancel_method`, the pid pair and `finished_at`, and drops these two. Recorded
+/// here as a known gap rather than as something this file can fix.
 ///
 /// `verification_method` names both tmux commands, so a reader sees the
 /// granularity of the proof beside the verdict. What was verified is that the
@@ -357,24 +478,73 @@ fn removeSession(
 /// had forked has stopped. A command that daemonized, called `disown` or ran
 /// under `setsid` outlives the shell, and nothing on this receipt claims
 /// otherwise.
+///
+/// **`detail_json` is what stops `cancelled` from meaning two things.** A
+/// completed removal and a removal whose log deletion failed both settle
+/// `cancelled` through this variant, because both really did stop the session and
+/// that is the whole of what the variant claims. Read from the status column alone
+/// they would be indistinguishable — which was half of F2: the ledger asserting a
+/// removal while the log survived. So the settlement carries a versioned document
+/// naming the two facts the variant has no field for, in the column `receipts`
+/// documents for exactly this ("the document is versioned precisely so a new fact
+/// does not need [a column]").
+const ProvenStop = struct {
+    terminal: Core.Store.op_state.Terminal,
+    extra: Core.Store.receipts.TerminalExtra,
+};
+
 fn provenCancellation(
     ctx: *Cli.Ctx,
     session: []const u8,
     verified_at: i64,
-) Core.Store.op_state.Terminal {
+    /// True only on the path that goes on to delete the local row in the same
+    /// transaction as this terminal. The log deletion is the step before it, so
+    /// this is also "the removal ran to the end".
+    completed: bool,
+) ProvenStop {
     const target = Tmux.targetName(ctx.arena, session) catch
         fatal("out of memory recording the removal of session '{s}'", .{session});
-    return .{ .remote_cancel_confirmed = .{
-        .pid = null,
-        .term_sent = true,
-        .kill_sent = false,
-        .absence_verified_at = verified_at,
-        .verification_method = std.fmt.allocPrint(
-            ctx.arena,
-            "tmux kill-session -t ={s} then has-session reported the session absent",
-            .{target},
-        ) catch "tmux kill-session then has-session reported the session absent",
-    } };
+    return .{
+        .terminal = .{ .remote_cancel_confirmed = .{
+            .pid = null,
+            .term_sent = true,
+            .kill_sent = false,
+            .absence_verified_at = verified_at,
+            .verification_method = if (completed) std.fmt.allocPrint(
+                ctx.arena,
+                "tmux kill-session -t ={s} then has-session reported the session absent",
+                .{target},
+            ) catch "tmux kill-session then has-session reported the session absent" else std.fmt.allocPrint(
+                ctx.arena,
+                "tmux kill-session -t ={s} then has-session reported the session absent; the pane log was not deleted and the local record was kept",
+                .{target},
+            ) catch "tmux kill-session then has-session reported the session absent; the pane log was not deleted",
+        } },
+        .extra = .{ .detail_json = stopJson(ctx.arena, completed) catch
+            fatal("out of memory recording the removal of session '{s}'", .{session}) },
+    };
+}
+
+/// What the settlement establishes beyond the session's absence.
+///
+/// Two booleans and an event name, versioned like every other `detail_json`
+/// document. `logDeleted` false with `localRecordDropped` false is the partial:
+/// the session is gone, its pane log is still on the host with nothing left to
+/// recreate it, and this machine still holds the session's metadata row and its
+/// memories.
+fn stopJson(arena: std.mem.Allocator, completed: bool) std.mem.Allocator.Error![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    std.json.Stringify.value(.{
+        .schemaVersion = Core.Store.receipts.schema_version,
+        .event = "session_stopped",
+        .logDeleted = completed,
+        // Whether this terminal was committed in the same transaction as the
+        // delete of the local `sessions` row. That delete may have matched no row
+        // — an ordinary state — which is reported to the caller as
+        // `localRow:"absent"`; what this says is that the removal reached it.
+        .localRecordDropped = completed,
+    }, .{}, &writer.writer) catch return error.OutOfMemory;
+    return writer.toOwnedSlice();
 }
 
 /// The kill went out and the host says the session is still there.
@@ -413,30 +583,39 @@ fn refuseSurvivedKill(
     _ = execution.settle(.{ .indeterminate = .{
         .reason = reason,
         .last_observed = execution.status,
-        .error_code = "SESSION_SURVIVED_KILL",
+        .error_code = code.survived,
     } }, .{}) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
+    // Before the report, so the answer can be in it. Every branch of this verb
+    // says what became of the lease, because a leaked one refuses the next
+    // command and used to do so under a document that never mentioned it.
+    const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
         .action = "not_removed",
+        .errorCode = code.survived,
         .session = session,
         .server = server_name,
         .requestId = execution.id(),
         .status = execution.status.text(),
-        .sessionGone = false,
-        .logDeleted = false,
-        .localRow = "kept",
+        .sessionState = state.present,
+        .logState = state.not_attempted,
+        .localRow = state.row_kept,
         .authority = authority.code(),
         .authorityError = authority.note(ctx.arena, .{ .session = session }),
+        .leaseRelease = lease.code,
+        .leaseReleaseError = lease.detail,
+        .reason = reason,
         .hint = std.fmt.allocPrint(
             ctx.arena,
             "inspect it with 'tmux attach -t {s}' on the host, then settle the record with 'terminus request reconcile <request-id>' — until it is settled this session's scope stays barred",
             .{target},
         ) catch "inspect the session on the host, then settle the record with 'terminus request reconcile <request-id>'",
-    }, reason);
+    });
     Cli.failIndeterminateAfterOutput(execution.id());
 }
 
-/// Refused before anything reached the host.
+/// Refused before anything reached the host, by a renewal that answered "not
+/// ours".
 ///
 /// Settled through `Execution.abandon`, which routes to the one function allowed
 /// to classify a give-up (`op_state.terminalForTransportLoss`): from
@@ -458,72 +637,283 @@ fn refuseBeforeKill(
     ) catch "the scope lease was lost before the kill was sent; nothing was touched";
     execution.abandon(reason) catch |err|
         Cli.receiptFatal(execution.id(), err, execution.status.text());
+    refuseWithNothingSent(
+        ctx,
+        execution,
+        server_name,
+        session,
+        authority,
+        code.authority_lost_before_kill,
+        reason,
+        "nothing was sent to the host, so re-running this once the scope is free is safe",
+    );
+}
+
+/// One report for every refusal that sent nothing and settled `failed`.
+///
+/// Shared because the three of them — a renewal that answered before the kill,
+/// the scope guard binding at `submitted`, and a peer's claim arriving between
+/// `begin` and the acquisition — differ in one code and one sentence and in
+/// nothing else. Each already had a settled operation by the time it got here;
+/// what this owns is the release, the document and the exit.
+///
+/// Exit 1, not 75. These commands changed nothing, so nothing about the remote is
+/// unknown *because of them* — the distinction the two codes exist for.
+fn refuseWithNothingSent(
+    ctx: *Cli.Ctx,
+    execution: *Core.execution.Execution,
+    server_name: []const u8,
+    session: []const u8,
+    authority: Authority,
+    error_code: []const u8,
+    reason: []const u8,
+    hint: ?[]const u8,
+) noreturn {
+    const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
         .action = "not_removed",
+        .errorCode = error_code,
         .session = session,
         .server = server_name,
         .requestId = execution.id(),
         .status = execution.status.text(),
-        .sessionGone = false,
-        .logDeleted = false,
-        .localRow = "kept",
+        .sessionState = state.not_attempted,
+        .logState = state.not_attempted,
+        .localRow = state.row_kept,
         .authority = authority.code(),
         .authorityError = authority.note(ctx.arena, .{ .session = session }),
-        .hint = "nothing was sent to the host, so re-running this once the scope is free is safe",
-    }, reason);
-    // Exit 1, not 75. This command changed nothing, so nothing about the remote
-    // is unknown *because of it* — the distinction the two codes exist for.
-    Cli.releaseClaim();
+        .leaseRelease = lease.code,
+        .leaseReleaseError = lease.detail,
+        .reason = reason,
+        .hint = hint,
+    });
     Cli.exitNow(Cli.exit_code.failure);
 }
 
 /// Refused after the kill landed, with everything downstream of it declined.
 ///
 /// The kill cannot be undone and this does not pretend otherwise; what it
-/// refuses is the log deletion and the local row, and `log_deleted` says which
+/// refuses is the log deletion and the local row, and `log_state` says which
 /// side of the log this loss fell on.
 ///
-/// Settled `indeterminate` carrying `AUTHORITY_LOST`, and not
-/// `remote_cancel_confirmed`, even though `has-session` really did report the
-/// session absent. The reading was true when it was taken; what it can no longer
-/// support is a claim about *this name* now, because the peer holding the lease
-/// has been free to create a session under it ever since. `job kill` reached the
-/// same rule through `cancellationProvable`'s `authority.holds()` conjunct.
+/// Settled `indeterminate`, and not `remote_cancel_confirmed`, even though
+/// `has-session` really did report the session absent. The reading was true when
+/// it was taken; what it can no longer support is a claim about *this name* now,
+/// because the peer holding the scope has been free to create a session under it
+/// ever since. `job kill` reached the same rule through `cancellationProvable`'s
+/// `authority.holds()` conjunct.
+///
+/// Two codes reach this, and the difference is worth a caller's attention:
+/// `AUTHORITY_LOST` means a renewal said the scope was gone, and
+/// `SCOPE_TAKEN_BEFORE_COMMIT` means every renewal held and the transaction that
+/// was to record the removal found a peer's claim. `authority` stays `held` in the
+/// second case, because it reports what the renewals answered and they answered
+/// truthfully.
 fn refuseAfterKill(
     ctx: *Cli.Ctx,
     execution: *Core.execution.Execution,
     server_name: []const u8,
     session: []const u8,
     authority: Authority,
-    log_deleted: bool,
+    log_state: []const u8,
+    error_code: []const u8,
 ) noreturn {
     const reason = std.fmt.allocPrint(
         ctx.arena,
-        "this command stopped session '{s}' and then found it no longer held the scope lease it took beforehand ({s}); another session may have created or acted on that name in between, so nothing here establishes what is there now",
-        .{ session, authority.code() },
-    ) catch "this command lost the scope lease for this session after stopping it";
+        "this command stopped session '{s}' and then found it no longer held the scope it took beforehand ({s}); another session may have created or acted on that name in between, so nothing here establishes what is there now",
+        .{ session, error_code },
+    ) catch "this command lost the scope for this session after stopping it";
     _ = execution.settle(.{ .indeterminate = .{
         .reason = reason,
         .last_observed = execution.status,
-        .error_code = Authority.lost_code,
+        .error_code = error_code,
     } }, .{}) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
+    const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
         .action = "not_removed",
+        .errorCode = error_code,
         .session = session,
         .server = server_name,
         .requestId = execution.id(),
         .status = execution.status.text(),
-        .sessionGone = true,
-        .logDeleted = log_deleted,
-        .localRow = "kept",
+        .sessionState = state.gone,
+        .logState = log_state,
+        .localRow = state.row_kept,
         .authority = authority.code(),
         .authorityError = authority.note(ctx.arena, .{ .session = session }),
+        .leaseRelease = lease.code,
+        .leaseReleaseError = lease.detail,
+        .reason = reason,
         .hint = "the local row and this session's memories were kept; settle the record with 'terminus request reconcile <request-id>'",
-    }, reason);
-    Cli.releaseClaim();
+    });
     Cli.exitNow(Cli.exit_code.failure);
+}
+
+/// The session was stopped and its pane log could not be deleted.
+///
+/// This used to `fatal` after settling, so a caller that had just had a shell
+/// stopped under it received `{ok:false, error:"..."}` and had to read English to
+/// discover that a log was orphaned on the host and a local row was left behind.
+///
+/// **The terminal is `remote_cancel_confirmed`, and this is the partial shape
+/// that had to be decided.** What the variant claims is a verified absence of the
+/// session, and that is exactly what was established: the host answered before
+/// this line was reached, and a later deletion failing does not make an earlier
+/// reading unknown. `indeterminate` would be the mistake §7.5 rejected one level
+/// up — recording a proof as an unknown, which additionally bars the scope and so
+/// forces a `request reconcile` before the re-run that would actually finish the
+/// job. Both remote steps are idempotent and the local row is still there, so a
+/// re-run is the repair; `cancelled` releases the scope for it.
+///
+/// What stops `cancelled` from reading as a completed removal is the settlement's
+/// own `detail_json` (`logDeleted:false`, `localRecordDropped:false`) and its
+/// `cancel_method`, which names what was not done. See `provenCancellation`.
+fn refuseLogUndeleted(
+    ctx: *Cli.Ctx,
+    execution: *Core.execution.Execution,
+    server_name: []const u8,
+    session: []const u8,
+    authority: Authority,
+    verified_at: i64,
+    executor: Core.Executor,
+    cause: anyerror,
+) noreturn {
+    const proven = provenCancellation(ctx, session, verified_at, false);
+    _ = execution.settle(proven.terminal, proven.extra) catch |err|
+        Cli.receiptFatal(execution.id(), err, execution.status.text());
+    const reason = std.fmt.allocPrint(
+        ctx.arena,
+        "session '{s}:{s}' was stopped and its pane log could not be deleted: {s} ({s}); the log is still on the host and the local record — with this session's memories — was kept",
+        .{ server_name, session, executor.errorMessage(), @errorName(cause) },
+    ) catch "the session was stopped and its pane log could not be deleted; the local record was kept";
+    const lease = Cli.releaseClaimReporting();
+    report(ctx, .{
+        .ok = false,
+        .action = "not_removed",
+        .errorCode = code.log_delete_failed,
+        .session = session,
+        .server = server_name,
+        .requestId = execution.id(),
+        .status = execution.status.text(),
+        .sessionState = state.gone,
+        .logState = state.delete_failed,
+        .localRow = state.row_kept,
+        .authority = authority.code(),
+        .authorityError = authority.note(ctx.arena, .{ .session = session }),
+        .leaseRelease = lease.code,
+        .leaseReleaseError = lease.detail,
+        .reason = reason,
+        // Exit 1 and a re-run, not 75 and a reconcile: the record is settled, so
+        // the scope is free and `session rm` can be run again to finish.
+        .hint = "the session is gone; re-run this command once the host is reachable to delete the log and the local record",
+    });
+    Cli.exitNow(Cli.exit_code.failure);
+}
+
+/// The one write that could not be made: the transaction carrying the terminal
+/// and the local delete failed against the store.
+///
+/// The remote half already happened — the session is stopped, its pane log is
+/// deleted — and the local half provably did not: the transaction rolls back, so
+/// no terminal was written and no row was removed. That is the shape a caller most
+/// needs told, and it used to be the shape it was told least about. The old code
+/// reached here through `Cli.receiptFatal`, whose envelope is `{ok, error,
+/// errorCode, requestId, cause, remoteStatus, hint}` — so a caller that had just
+/// had a shell destroyed under it learned neither that the session was gone nor
+/// that its log had been deleted nor that its local row survived.
+///
+/// So it emits the verb's own fixed structure, and keeps the exit code the
+/// tree-wide envelope uses. **76, not 1 and not 75.** The remote effect is real and
+/// the ledger does not have it; that is exactly what `receipt_persist_failed`
+/// means, and downgrading it to a plain failure would let a caller read "nothing
+/// happened" off a destroyed session.
+///
+/// The operation is left unsettled deliberately. It goes on barring this session's
+/// scope until somebody reconciles it, which is right: this command cannot write
+/// what it established, so the next one must not proceed as if it had.
+fn refuseLedgerUnwritable(
+    ctx: *Cli.Ctx,
+    execution: *Core.execution.Execution,
+    server_name: []const u8,
+    session: []const u8,
+    authority: Authority,
+    cause: anyerror,
+) noreturn {
+    const reason = std.fmt.allocPrint(
+        ctx.arena,
+        "session '{s}:{s}' was stopped and its pane log deleted, and the record of it could not be written: {s}. Nothing local was deleted and no terminal was recorded — the whole transaction rolled back — so this session's scope stays barred until the attempt is reconciled",
+        .{ server_name, session, @errorName(cause) },
+    ) catch "the session was stopped and the record of it could not be written; nothing local was deleted";
+    // Cleared before the report: the attempt is deliberately left unsettled, and
+    // the process-exit hook must not invent a verdict for it on the way out.
+    Cli.clearExecution();
+    const lease = Cli.releaseClaimReporting();
+    report(ctx, .{
+        .ok = false,
+        .action = "not_removed",
+        .errorCode = code.ledger_write_failed,
+        .session = session,
+        .server = server_name,
+        .requestId = execution.id(),
+        .status = execution.status.text(),
+        .sessionState = state.gone,
+        .logState = state.deleted,
+        .localRow = state.row_kept,
+        .authority = authority.code(),
+        .authorityError = authority.note(ctx.arena, .{ .session = session }),
+        .leaseRelease = lease.code,
+        .leaseReleaseError = lease.detail,
+        .reason = reason,
+        .hint = "the remote effect happened and the local ledger is incomplete; settle the record with 'terminus request reconcile <request-id>', then re-run to clear the local row",
+    });
+    Cli.exitNow(Cli.exit_code.receipt_persist_failed);
+}
+
+/// The ledger already held a terminal for this attempt when the removal's
+/// transaction tried to write one.
+///
+/// Unreachable by construction today — this command settles its own operation
+/// once — and reported rather than asserted because if it ever is reached, the
+/// row's verdict belongs to whoever wrote it and this command must not delete a
+/// session against it. Nothing was deleted; the local row and its memories stand.
+///
+/// Exit 75: what the ledger holds is not what this command established, so
+/// nothing here says what the record means.
+fn refuseAlreadySettled(
+    ctx: *Cli.Ctx,
+    execution: *Core.execution.Execution,
+    server_name: []const u8,
+    session: []const u8,
+    authority: Authority,
+    winner: Core.Store.receipts.TerminalRecord,
+) noreturn {
+    const reason = std.fmt.allocPrint(
+        ctx.arena,
+        "session '{s}:{s}' was stopped and its log deleted, and the ledger already held a '{s}' terminal for this request written by somebody else — so this command wrote no verdict and deleted no local record",
+        .{ server_name, session, winner.status.text() },
+    ) catch "the ledger already held a terminal for this request; no local record was deleted";
+    const lease = Cli.releaseClaimReporting();
+    report(ctx, .{
+        .ok = false,
+        .action = "not_removed",
+        .errorCode = code.already_settled,
+        .session = session,
+        .server = server_name,
+        .requestId = execution.id(),
+        .status = execution.status.text(),
+        .sessionState = state.gone,
+        .logState = state.deleted,
+        .localRow = state.row_kept,
+        .authority = authority.code(),
+        .authorityError = authority.note(ctx.arena, .{ .session = session }),
+        .leaseRelease = lease.code,
+        .leaseReleaseError = lease.detail,
+        .reason = reason,
+        .hint = "read the recorded terminal with 'terminus request receipt <request-id>' before acting on this session again",
+    });
+    Cli.failIndeterminateAfterOutput(execution.id());
 }
 
 /// Writes one refusal, in whichever format the caller asked for.
@@ -531,29 +921,104 @@ fn refuseAfterKill(
 /// Printed rather than raised through `fail`, so the request id reaches the
 /// operator on every path: a refused removal is still a recorded attempt, and
 /// auditing or reconciling it needs the id.
-fn report(ctx: *Cli.Ctx, body: RemovalJson, reason: []const u8) void {
+fn report(ctx: *Cli.Ctx, body: RemovalJson) void {
     switch (ctx.out.format) {
         .json => ctx.out.json(body) catch {},
         .human => {
-            ctx.out.print("refused: {s}\n  request: {s}\n", .{ reason, body.requestId }) catch {};
+            ctx.out.print("refused: {s}\n  request: {s}\n", .{ body.reason orelse "the removal did not complete", body.requestId }) catch {};
             if (body.hint) |text| ctx.out.print("  {s}\n", .{text}) catch {};
+            if (body.leaseReleaseError) |text| ctx.out.print("  {s}\n", .{text}) catch {};
         },
     }
     ctx.out.flush() catch {};
 }
 
-/// Refuses a removal that a peer's claim makes unsafe, before anything is sent.
-fn reportBlocked(blocker: Core.execution.Blocker, server_name: []const u8, session: []const u8) noreturn {
-    switch (blocker) {
-        .unsettled => |op| fatal(
-            "refused: request {s} is {s} on a scope that overlaps session '{s}:{s}', so removing it could destroy work that is still running; nothing was sent to the host. Reconcile it ('terminus request reconcile {s}') or wait for it to settle",
-            .{ op.request_id, op.status.text(), server_name, session, op.request_id },
-        ),
-        .lease => |lease| fatal(
-            "refused: request {s} (on {s}) holds a lease on a scope that overlaps session '{s}:{s}' until {d}; nothing was sent to the host. Wait for it to lapse",
+/// Refuses a removal that a peer's claim makes unsafe, before `begin` has even
+/// created a row — and records that the refusal happened.
+///
+/// `execution.begin` returns `.blocked` having inserted nothing, so until now a
+/// refused `session rm` left no trace of any kind: `docs/m3b-job-control.md` §8
+/// says a removal blocked by a held claim "is refused and records the refusal",
+/// and it recorded nothing. Five questions had no answer — whether anybody tried,
+/// who, when, how often, and what stopped them — for the single most destructive
+/// verb in the tree.
+///
+/// So the row is written here, through `execution.recordRefusal`, which creates
+/// and settles it in one transaction. The terminal is `local_abandon` and settles
+/// `cancelled`, which **does not block scope** — the property that makes writing
+/// it safe. A record of a refusal that went on to refuse the next command would be
+/// worse than no record at all, so that is asserted by a gate rather than left to
+/// this comment.
+///
+/// The refusal itself is unchanged: nothing was sent, no socket was opened, and
+/// the peer's claim is neither displaced nor released.
+fn refuseBeforeOpening(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    opts: Core.execution.BeginOptions,
+    server_name: []const u8,
+    session: []const u8,
+    blocker: Core.execution.Blocker,
+) noreturn {
+    const reason = blockerReason(ctx, blocker, server_name, session);
+    const refusal = Core.execution.recordRefusal(store, ctx.arena, ctx.io, opts, reason) catch |err|
+        Cli.storeFatal(store, err);
+    // `not_taken`: this path never acquired a lease, and saying "released" would
+    // claim a hand-back that never happened.
+    report(ctx, .{
+        .ok = false,
+        .action = "not_removed",
+        .errorCode = code.scope_held,
+        .session = session,
+        .server = server_name,
+        .requestId = refusal.id(),
+        // Read back off the settlement rather than spelled here: one place
+        // decides what a refusal settles as, and it is `recordRefusal`.
+        .status = refusal.status.text(),
+        .sessionState = state.not_attempted,
+        .logState = state.not_attempted,
+        .localRow = state.row_kept,
+        .authority = Authority.code(.held),
+        .authorityError = null,
+        .leaseRelease = Cli.ClaimRelease.not_taken.code,
+        .leaseReleaseError = Cli.ClaimRelease.not_taken.detail,
+        .reason = reason,
+        .hint = blockerHint(ctx, blocker),
+    });
+    Cli.exitNow(Cli.exit_code.failure);
+}
+
+/// The sentence naming whose claim refused this removal.
+fn blockerReason(
+    ctx: *Cli.Ctx,
+    blocker: Core.execution.Blocker,
+    server_name: []const u8,
+    session: []const u8,
+) []const u8 {
+    return switch (blocker) {
+        .unsettled => |op| std.fmt.allocPrint(
+            ctx.arena,
+            "request {s} is {s} on a scope that overlaps session '{s}:{s}', so removing it could destroy work that is still running; nothing was sent to the host",
+            .{ op.request_id, op.status.text(), server_name, session },
+        ) catch "an unsettled command holds a scope that overlaps this session; nothing was sent to the host",
+        .lease => |lease| std.fmt.allocPrint(
+            ctx.arena,
+            "request {s} (on {s}) holds a lease on a scope that overlaps session '{s}:{s}' until {d}; nothing was sent to the host",
             .{ lease.owner_request_id, lease.profile_token, server_name, session, lease.expires_at },
-        ),
-    }
+        ) catch "another command holds a lease on a scope that overlaps this session; nothing was sent to the host",
+    };
+}
+
+/// What to do about it. Prose; nothing branches on it.
+fn blockerHint(ctx: *Cli.Ctx, blocker: Core.execution.Blocker) ?[]const u8 {
+    return switch (blocker) {
+        .unsettled => |op| std.fmt.allocPrint(
+            ctx.arena,
+            "reconcile it ('terminus request reconcile {s}') or wait for it to settle; for a job's session use 'terminus job kill' / 'terminus job rm', which are the verbs for a job",
+            .{op.request_id},
+        ) catch "reconcile the blocking request or wait for it to settle",
+        .lease => "wait for that lease to lapse; there is no --force here, because a takeover would displace somebody's claim on a shell about to be destroyed along with its memories",
+    };
 }
 
 /// The scope a command acting on session `name` contends on.
@@ -625,29 +1090,38 @@ test contentionScope {
 /// pending: a takeover displaces somebody else's claim on a session that is
 /// about to be destroyed along with its memories, and nothing in this slice
 /// establishes whose shell it is. Waiting out the TTL is the escape hatch.
+///
+/// Takes the execution rather than just its id because its two refusals are
+/// branches of `session rm` like any other: they used to `fatal`, which emits the
+/// generic `{ok, error}` envelope, so a caller that hit the one-in-a-thousand
+/// window between `begin`'s check and this acquisition got two keys instead of the
+/// verb's fixed set. Both settle the attempt and both report through
+/// `refuseWithNothingSent`.
 fn claimScope(
     ctx: *Cli.Ctx,
     store: *Store,
-    server_id: i64,
+    execution: *Core.execution.Execution,
+    opts: Core.execution.BeginOptions,
+    server_name: []const u8,
     session: []const u8,
-    owner_request_id: []const u8,
-    owner_token: []const u8,
 ) Claim {
+    const server_id = opts.server_id orelse
+        fatal("internal: the control operation for session '{s}' names no server", .{session});
     const claim: Claim = .{
         .store = store,
         .server_id = server_id,
         .scope = contentionScope(session),
-        .owner_request_id = owner_request_id,
+        .owner_request_id = execution.id(),
         .subject = .{ .session = session },
     };
     const outcome = Store.leases.acquire(store, ctx.arena, .{
         .server_id = server_id,
         .scope = claim.scope,
-        .owner_request_id = owner_request_id,
+        .owner_request_id = execution.id(),
         // Audit subject: which machine did this. It decides nothing — that is
         // the point of the column — but a claim with no record of who took it
         // is not much of an audit trail.
-        .profile_token = owner_token,
+        .profile_token = opts.owner_token,
         .owner_label = session,
         .ttl_secs = Claim.ttl_secs,
         // A live clock, not `ctx.now`. A lease is compared against a clock
@@ -657,26 +1131,56 @@ fn claimScope(
         .now = wallClockSeconds(ctx.io),
     }) catch |err| Cli.storeFatal(store, err);
 
-    return switch (outcome) {
-        .acquired => blk: {
-            Cli.registerClaim(store, server_id, claim.scope, owner_request_id, session);
-            break :blk claim;
+    switch (outcome) {
+        .acquired => {
+            Cli.registerClaim(store, server_id, claim.scope, execution.id(), session);
+            return claim;
         },
         // The owner is a freshly minted request id, so it cannot already hold a
         // lease. Not folded into `acquired`: reaching this would mean two
         // commands are about to share an owner, which is the thing the whole
         // barrier exists to stop.
-        .renewed => |lease| fatal(
-            "internal: the id minted for this command ({s}) already held a lease on the scope for session '{s}'; refusing to share an owner with whatever took it",
-            .{ lease.owner_request_id, session },
-        ),
+        .renewed => |lease| {
+            const reason = std.fmt.allocPrint(
+                ctx.arena,
+                "internal: the id minted for this command ({s}) already held a lease on the scope for session '{s}'; refusing to share an owner with whatever took it — nothing was sent to the host",
+                .{ lease.owner_request_id, session },
+            ) catch "internal: the id minted for this command already held a lease on this session's scope; nothing was sent to the host";
+            execution.abandon(reason) catch |err|
+                Cli.receiptFatal(execution.id(), err, execution.status.text());
+            refuseWithNothingSent(
+                ctx,
+                execution,
+                server_name,
+                session,
+                .held,
+                code.owner_collision,
+                reason,
+                "this is a defect in Terminus, not a state you can clear; report the request id",
+            );
+        },
         // `begin` checked the same barrier a moment ago, so this is a peer that
         // arrived in between. Nothing has been sent.
-        .conflict => |lease| fatal(
-            "refused: request {s} (on {s}) took a lease on a scope that overlaps session '{s}' until {d} while this command was starting; nothing was sent to the host",
-            .{ lease.owner_request_id, lease.profile_token, session, lease.expires_at },
-        ),
-    };
+        .conflict => |lease| {
+            const reason = std.fmt.allocPrint(
+                ctx.arena,
+                "request {s} (on {s}) took a lease on a scope that overlaps session '{s}' until {d} while this command was starting; nothing was sent to the host",
+                .{ lease.owner_request_id, lease.profile_token, session, lease.expires_at },
+            ) catch "another command took a lease on a scope that overlaps this session while this one was starting; nothing was sent to the host";
+            execution.abandon(reason) catch |err|
+                Cli.receiptFatal(execution.id(), err, execution.status.text());
+            refuseWithNothingSent(
+                ctx,
+                execution,
+                server_name,
+                session,
+                .held,
+                code.scope_held,
+                reason,
+                "wait for that lease to lapse; there is no --force here, because a takeover would displace somebody's claim on a shell about to be destroyed along with its memories",
+            );
+        },
+    }
 }
 
 // --- Adjacency, held against the source that has to have it -----------------
@@ -769,4 +1273,271 @@ fn validateName(name: []const u8) void {
             else => fatal("session name may only contain [a-zA-Z0-9._-]", .{}),
         }
     }
+}
+
+// --- The published key set, held against the struct that emits it -----------
+//
+// `RemovalJson` cannot drift from itself: it has no defaults, so a branch that
+// omits a key does not compile. What can drift is the document. `skill/SKILL.md`
+// publishes the key set as prose — a count, a never-null list and a nullable list
+// — and prose does not fail to build when somebody adds a field, renames one, or
+// takes a `?` off.
+//
+// It already drifted: the document said 11 keys for a struct with 12, and nothing
+// caught it, because the `session rm` paragraph was the one key set with no gate
+// reading it. `cmd_job.zig` has held `KillJson` and `RemovalJson` against their
+// paragraphs since they were published; this is the same rule for this verb.
+//
+// Nullability is read from `@typeInfo` rather than from a list maintained beside
+// it, because a list maintained beside it is one more thing to forget.
+//
+// The parse is a literal read of English and will break if that paragraph is
+// reflowed. That is the trade, taken deliberately: a reformat that defeats the
+// check fails the gate rather than quietly checking nothing. Every failure below
+// prints the literal it was looking for, so the repair is to the document — or, if
+// the wording genuinely moved on, to the needle here.
+//
+// The machinery is a second, smaller copy of `cmd_job.zig`'s. That is a real cost
+// and it is stated rather than hidden: those helpers are file-private, and hoisting
+// them into a module both files can reach is a module-boundary change, which is not
+// this slice's to make.
+
+/// The same text `terminus setup` ships, embedded rather than read: the gate runs
+/// wherever the tests run, with no working directory to be wrong about.
+const skill_md = @embedFile("terminus_skill");
+
+const SkillError = error{
+    SkillAnchorMissing,
+    SkillCountUnreadable,
+    SkillListUnterminated,
+    SkillParensUnbalanced,
+    SkillKeySetDrifted,
+};
+
+/// Whatever follows `needle`, or a loud failure naming it.
+fn skillAfter(hay: []const u8, needle: []const u8, what: []const u8) SkillError![]const u8 {
+    const at = std.mem.indexOf(u8, hay, needle) orelse {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: cannot find {s}.
+            \\  looked for the literal: "{s}"
+            \\This gate parses that text to learn what the document claims about
+            \\`session rm --json`'s key set. If the paragraph was reworded or reflowed,
+            \\fix the needle in src/cli/cmd_session.zig; deleting the gate puts the
+            \\document back to drifting from the struct unnoticed — which is how it came
+            \\to publish 11 keys for a 12-field struct.
+            \\
+        , .{ what, needle });
+        return error.SkillAnchorMissing;
+    };
+    return hay[at + needle.len ..];
+}
+
+/// The paragraph starting at `s`: up to its first blank line, or all of it. A line
+/// of only spaces, tabs or `\r` is blank, so the parse does not depend on how the
+/// checkout wrote its line endings.
+fn skillParagraph(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, s, i, '\n')) |nl| {
+        var j = nl + 1;
+        while (j < s.len and (s[j] == ' ' or s[j] == '\t' or s[j] == '\r')) j += 1;
+        if (j == s.len or s[j] == '\n') return s[0..nl];
+        i = nl + 1;
+    }
+    return s;
+}
+
+/// Every `code span` after `label` that is not inside a parenthetical aside, up to
+/// the first `.` outside both parentheses and code spans.
+///
+/// Parentheses are the reason this is not a plain search for the next period: the
+/// document puts each enumeration's values in one (`gone` | `present` | ...), and
+/// those are values, not keys.
+fn skillKeys(
+    gpa: std.mem.Allocator,
+    para: []const u8,
+    label: []const u8,
+    what: []const u8,
+) (SkillError || std.mem.Allocator.Error)![]const []const u8 {
+    const rest = try skillAfter(para, label, what);
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    var depth: usize = 0;
+    var i: usize = 0;
+    var ended = false;
+    while (i < rest.len) : (i += 1) {
+        switch (rest[i]) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) {
+                    std.debug.print(
+                        \\
+                        \\skill/SKILL.md: unbalanced parentheses in {s}, so the gate cannot tell
+                        \\the keys from the values.
+                        \\  text read: "{s}"
+                        \\
+                    , .{ what, rest });
+                    return error.SkillParensUnbalanced;
+                }
+                depth -= 1;
+            },
+            '`' => {
+                const close = std.mem.indexOfScalarPos(u8, rest, i + 1, '`') orelse {
+                    std.debug.print(
+                        \\
+                        \\skill/SKILL.md: an unclosed `code span` in {s}.
+                        \\  text read: "{s}"
+                        \\
+                    , .{ what, rest });
+                    return error.SkillListUnterminated;
+                };
+                if (depth == 0) try out.append(gpa, rest[i + 1 .. close]);
+                i = close;
+            },
+            '.' => if (depth == 0) {
+                ended = true;
+                break;
+            },
+            else => {},
+        }
+    }
+    if (!ended or out.items.len == 0) {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: {s} is empty or runs past the end of its sentence, so the
+            \\gate would be checking nothing.
+            \\  text read: "{s}"
+            \\
+        , .{ what, rest });
+        return error.SkillListUnterminated;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn skillHas(list: []const []const u8, entry: []const u8) bool {
+    for (list) |item| if (std.mem.eql(u8, item, entry)) return true;
+    return false;
+}
+
+/// One documented list against the one the code actually has, in both directions.
+/// Both matter: an entry the document invented is as wrong as one it forgot, and a
+/// field whose `?` came or went shows up as one of each.
+fn expectSkillKeys(
+    what: []const u8,
+    documented: []const []const u8,
+    actual: []const []const u8,
+) SkillError!void {
+    var drifted = false;
+    for (documented) |entry| {
+        if (!skillHas(actual, entry)) {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md lists `{s}` among {s}, and RemovalJson has nothing of that
+                \\name there — it was removed, renamed, or moved to the other list.
+                \\
+            , .{ entry, what });
+            drifted = true;
+        }
+    }
+    for (actual) |entry| {
+        if (!skillHas(documented, entry)) {
+            std.debug.print(
+                \\
+                \\RemovalJson has `{s}` among {s}, and skill/SKILL.md does not list it there.
+                \\
+            , .{ entry, what });
+            drifted = true;
+        }
+    }
+    if (!drifted and documented.len != actual.len) {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md repeats an entry among {s}: {d} listed for {d} in the struct.
+            \\
+        , .{ what, documented.len, actual.len });
+        drifted = true;
+    }
+    if (drifted) return error.SkillKeySetDrifted;
+}
+
+test "gate: SKILL.md's `session rm --json` key set is the one RemovalJson emits" {
+    const gpa = std.testing.allocator;
+    const fields = @typeInfo(RemovalJson).@"struct".fields;
+
+    var never_null: std.ArrayList([]const u8) = .empty;
+    defer never_null.deinit(gpa);
+    var nullable: std.ArrayList([]const u8) = .empty;
+    defer nullable.deinit(gpa);
+    inline for (fields) |f| {
+        // From the type. A hand-kept list of which keys are optional would be
+        // exactly the drift this gate exists to catch.
+        const bucket = if (@typeInfo(f.type) == .optional) &nullable else &never_null;
+        try bucket.append(gpa, f.name);
+    }
+
+    const heading = "\n`session rm --json` — ";
+    const para = skillParagraph(try skillAfter(skill_md, heading, "the key-set paragraph it opens"));
+
+    const keys_at = std.mem.indexOf(u8, para, " keys,") orelse {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: "`session rm --json` — " is not followed by "<n> keys,", so
+            \\the gate cannot read the count the document claims.
+            \\
+        , .{});
+        return error.SkillCountUnreadable;
+    };
+    const claimed = std.fmt.parseInt(usize, para[0..keys_at], 10) catch {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: "`session rm --json` — " is followed by "{s} keys,", which is
+            \\not a number.
+            \\
+        , .{para[0..keys_at]});
+        return error.SkillCountUnreadable;
+    };
+    if (claimed != fields.len) {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md says "`session rm --json` — {d} keys,"; RemovalJson has {d}
+            \\fields. This is the exact drift the gate was added for.
+            \\
+        , .{ claimed, fields.len });
+        return error.SkillKeySetDrifted;
+    }
+
+    const documented_never_null = try skillKeys(gpa, para, "Never null: ", "`session rm`'s never-null keys");
+    defer gpa.free(documented_never_null);
+    const documented_nullable = try skillKeys(gpa, para, "Nullable: ", "`session rm`'s nullable keys");
+    defer gpa.free(documented_nullable);
+
+    // Both, before either is raised: a field that gained or lost its `?` is one
+    // complaint from each list, and reporting half of that would send the reader
+    // looking for a rename that never happened.
+    const never_null_verdict = expectSkillKeys("`session rm`'s never-null keys", documented_never_null, never_null.items);
+    const nullable_verdict = expectSkillKeys("`session rm`'s nullable keys", documented_nullable, nullable.items);
+    try never_null_verdict;
+    try nullable_verdict;
+}
+
+// `errorCode`'s vocabulary is published too, and a token the document invented
+// would send an agent looking for a branch that cannot happen. Held against the
+// `code` namespace rather than a transcription of it, so a renamed constant
+// rewrites the check along with the code.
+test "gate: SKILL.md publishes exactly `session rm`'s errorCode vocabulary" {
+    const gpa = std.testing.allocator;
+    const para = skillParagraph(try skillAfter(
+        skill_md,
+        "\n`session rm --json`'s `errorCode` is ",
+        "the errorCode vocabulary paragraph",
+    ));
+    const documented = try skillKeys(gpa, para, "one of ", "`session rm`'s errorCode values");
+    defer gpa.free(documented);
+
+    var actual: std.ArrayList([]const u8) = .empty;
+    defer actual.deinit(gpa);
+    inline for (@typeInfo(code).@"struct".decls) |decl| {
+        try actual.append(gpa, @field(code, decl.name));
+    }
+    try expectSkillKeys("`session rm`'s errorCode values", documented, actual.items);
 }

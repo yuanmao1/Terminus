@@ -251,11 +251,55 @@ pub fn registerClaim(
     };
 }
 
-/// Gives the scope back, if this command still holds it.
+/// What became of the scope lease a command took.
 ///
-/// Called at settle by the command itself and from every process-ending path
-/// below. A claim that is no longer ours — a peer took it over with `--force` —
-/// matches no row and is left exactly where it is.
+/// Returned rather than printed, and that is the defect this closes. Every
+/// failure below used to write a line to stderr and hand `void` back, so the
+/// caller went on to report `ok: true` — a leaked lease that refuses the
+/// operator's next command for its whole TTL, under a JSON document claiming
+/// success. The stderr line is still written, because it names the subject and a
+/// human reading a terminal wants it; the value is what a machine reads.
+///
+/// `code` is the machine-readable half and is never null. `detail` is prose:
+/// nothing may branch on it.
+pub const ClaimRelease = struct {
+    /// `not_taken` | `released` | `not_ours` | `left_held`.
+    code: []const u8,
+    detail: ?[]const u8,
+
+    /// No claim was registered by this command, so there is none to give back.
+    /// The answer for every branch that refuses before the lease is acquired —
+    /// distinct from `released`, because "nothing was taken" and "what was taken
+    /// was handed back" are different facts about the scope.
+    pub const not_taken: ClaimRelease = .{ .code = "not_taken", .detail = null };
+
+    /// The row was ours and is now released and dated.
+    pub const released: ClaimRelease = .{ .code = "released", .detail = null };
+
+    /// `leases.release` matched no row: the claim is not ours to give back,
+    /// because a peer displaced it. Nothing of ours is left holding the scope, so
+    /// this is not a leak — but it is not a release either, and a caller that
+    /// collapsed the two would report a lost claim as a clean hand-back.
+    pub const not_ours: ClaimRelease = .{
+        .code = "not_ours",
+        .detail = "this command's scope lease was no longer ours to release; a peer had taken it over",
+    };
+
+    /// The claim is still held and will block further changes to this scope until
+    /// its TTL lapses. The leak, named.
+    fn leftHeld(detail: []const u8) ClaimRelease {
+        return .{ .code = "left_held", .detail = detail };
+    }
+
+    pub fn holdsScope(r: ClaimRelease) bool {
+        return std.mem.eql(u8, r.code, "left_held");
+    }
+};
+
+/// Gives the scope back, and says what happened.
+///
+/// See `releaseClaim` for the void form every other caller uses, and
+/// `ClaimRelease` for why the answer exists at all.
 ///
 /// **The release is stamped with the clock as it is now**, read through the
 /// store, and not with the `ctx.now` the claim used to be registered with.
@@ -280,8 +324,8 @@ pub fn registerClaim(
 /// in-process caller (the gates included) would find it null and need a
 /// fallback, and the only fallback on offer is the frozen stamp this exists to
 /// stop using. See `leases.clockSeconds`.
-pub fn releaseClaim() void {
-    const held = active_claim orelse return;
+pub fn releaseClaimReporting() ClaimRelease {
+    const held = active_claim orelse return .not_taken;
     active_claim = null; // never re-enter
     const now = Store.leases.clockSeconds(held.store) catch |err| {
         // Reported, not swallowed, and the claim is deliberately left held: a
@@ -292,9 +336,11 @@ pub fn releaseClaim() void {
                 "the claim is left held and will lapse at its TTL\n",
             .{ held.job_name, @errorName(err) },
         );
-        return;
+        return ClaimRelease.leftHeld(
+            "the clock could not be read, so this command's scope lease was left held and will block further changes to that scope until its TTL lapses",
+        );
     };
-    _ = Store.leases.release(
+    const released = Store.leases.release(
         held.store,
         held.server_id,
         held.scope,
@@ -311,22 +357,47 @@ pub fn releaseClaim() void {
             // either the clock moved backwards under us or something wrote that
             // row with a time it had no business writing. Left held rather than
             // forced through.
-            error.LeaseTimestampsOutOfOrder => std.debug.print(
-                "terminus: refused to date the release of the scope lease for job '{s}': the clock now reads " ++
-                    "earlier than the lease's own acquisition or last renewal, so recording it would put that row's " ++
-                    "timestamps out of order; the claim is left held and will lapse at its TTL\n",
-                .{held.job_name},
-            ),
+            error.LeaseTimestampsOutOfOrder => {
+                std.debug.print(
+                    "terminus: refused to date the release of the scope lease for job '{s}': the clock now reads " ++
+                        "earlier than the lease's own acquisition or last renewal, so recording it would put that row's " ++
+                        "timestamps out of order; the claim is left held and will lapse at its TTL\n",
+                    .{held.job_name},
+                );
+                return ClaimRelease.leftHeld(
+                    "the clock now reads earlier than this lease's own acquisition or last renewal, so dating the release would put that row's timestamps out of order; the claim was left held and will block further changes to that scope until its TTL lapses",
+                );
+            },
             // Reported, not swallowed: what is left behind is a scope that
             // refuses the operator's next attempt on this job until the lease
             // lapses.
-            else => std.debug.print(
-                "terminus: could not release the scope lease for job '{s}': {s}; " ++
-                    "it will block further changes to that job until it expires\n",
-                .{ held.job_name, @errorName(err) },
-            ),
+            else => {
+                std.debug.print(
+                    "terminus: could not release the scope lease for job '{s}': {s}; " ++
+                        "it will block further changes to that job until it expires\n",
+                    .{ held.job_name, @errorName(err) },
+                );
+                return ClaimRelease.leftHeld(
+                    "the store refused the release, so this command's scope lease was left held and will block further changes to that scope until its TTL lapses",
+                );
+            },
         }
     };
+    return if (released) .released else .not_ours;
+}
+
+/// Gives the scope back, if this command still holds it.
+///
+/// Called at settle by the command itself and from every process-ending path
+/// below. A claim that is no longer ours — a peer took it over with `--force` —
+/// matches no row and is left exactly where it is.
+///
+/// The form for a caller that has already written its report, or has none: the
+/// answer is dropped, and a failure reaches the operator through the stderr line
+/// `releaseClaimReporting` writes. A caller whose output should carry the answer
+/// calls that one instead and puts it in the document — see `ClaimRelease`.
+pub fn releaseClaim() void {
+    _ = releaseClaimReporting();
 }
 
 /// `std.process.exit`, with the daemon conversation ended first.
@@ -1248,6 +1319,94 @@ test "gate: a released claim records the time the scope was actually held" {
     // ...and the release is not recorded before the renewal that preceded it.
     // With the frozen stamp this one is negative by thirty seconds.
     try t.expect(released_at >= renewed_at);
+}
+
+// A release that could not happen used to be a line on stderr and a `void`
+// return, so the caller went on to report success. That is the shape §3.1 calls
+// a pretend-success: the command's own act may well have completed, but it left a
+// lease holding a scope, and the next command on that scope is refused for the
+// whole TTL while the JSON said `ok: true` with nothing in it about a lease.
+//
+// The failure is reconstructed rather than described, and the ordering violation
+// is the one of the three that can be arranged deterministically: a row acquired
+// with a stamp in the future cannot be released against the real clock without
+// putting its own timestamps out of order, which `leases.release` refuses
+// outright. What the gate asserts is both halves of the fix — the answer names
+// the leak in a value a caller can branch on, and the row really is still held.
+test "gate: a release that could not be recorded reports the lease as still held" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cli_claim_release_failed");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+
+    const owner: []const u8 = "01CLAIMLEAKED0123456789ABC";
+    const scope: Core.execution.Scope = .{ .kind = .job, .key = "deploy" };
+    // An hour ahead of this machine's clock, so the release below cannot be
+    // dated without contradicting the row.
+    const ahead = (try Store.leases.clockSeconds(&store)) + 3600;
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = scope,
+        .owner_request_id = owner,
+        .profile_token = "one-machine",
+        .owner_label = "deploy",
+        .ttl_secs = 120,
+        .now = ahead,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ClaimDidNotTake,
+    }
+    registerClaim(&store, 1, scope, owner, "deploy");
+
+    const outcome = releaseClaimReporting();
+    try t.expectEqualStrings("left_held", outcome.code);
+    try t.expect(outcome.holdsScope());
+    // Prose, and present: a caller reporting the code alone would leave an
+    // operator with a word and no way to know what to do about it.
+    try t.expect(outcome.detail != null);
+
+    // The half that makes it worth reporting: the scope is still claimed, so the
+    // next command on it is refused until this row lapses.
+    const held = try Store.leases.active(&store, arena, 1, ahead);
+    try t.expectEqual(@as(usize, 1), held.len);
+    try t.expectEqualStrings(owner, held[0].owner_request_id);
+
+    // And the ordinary release still says so, on a row that can be dated. The
+    // discriminating control: a `releaseClaimReporting` that answered
+    // `left_held` unconditionally would satisfy everything above.
+    const fine: []const u8 = "01CLAIMDATED00123456789ABC";
+    const other: Core.execution.Scope = .{ .kind = .job, .key = "build" };
+    const past = (try Store.leases.clockSeconds(&store)) - 60;
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = other,
+        .owner_request_id = fine,
+        .profile_token = "one-machine",
+        .owner_label = "build",
+        .ttl_secs = 120,
+        .now = past,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ClaimDidNotTake,
+    }
+    registerClaim(&store, 1, other, fine, "build");
+    const gave_back = releaseClaimReporting();
+    try t.expectEqualStrings("released", gave_back.code);
+    try t.expect(!gave_back.holdsScope());
+    try t.expectEqual(@as(?[]const u8, null), gave_back.detail);
+
+    // Nothing registered: not the same answer as a release, and not an error.
+    const nothing = releaseClaimReporting();
+    try t.expectEqualStrings("not_taken", nothing.code);
 }
 
 test {
