@@ -256,12 +256,32 @@ ARTIFACT_ALLOWLIST = ("docs/evidence/mutation-run.json",)
 
 
 def is_tracked(rel: str) -> bool:
-    """Whether git has this path in the index. A read; never a write."""
+    """Whether git has this path in the index. A read; never a write.
+
+    `git ls-files --error-unmatch` answers with three exit codes, not two:
+    **0** tracked, **1** untracked, and **128** for a git or index error — not a
+    repository, a corrupt index, an unreadable `.git`. The first version of this
+    read `returncode == 0`, which turned every 128 into "untracked" and therefore
+    into permission to overwrite. A guard that fails open when git is unhealthy is
+    worse than no guard, because it only yields on the day something is already
+    wrong.
+
+    So only 0 and 1 are answers. Anything else stops the run: this decides
+    whether a tracked file may be destroyed, and it must not be guessed.
+    """
     proc = subprocess.run(
         ["git", "ls-files", "--error-unmatch", "--", rel],
         cwd=REPO, capture_output=True, text=True,
     )
-    return proc.returncode == 0
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    sys.exit(
+        f"git ls-files could not say whether {rel} is tracked "
+        f"(exit {proc.returncode}). Refusing to decide whether it may be "
+        f"overwritten.\n{proc.stderr.strip()}"
+    )
 
 
 class JsonTarget:
