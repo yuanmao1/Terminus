@@ -536,6 +536,31 @@ something.
   `detail_json` carries `logDeleted:false` and `localRecordDropped:false`, which is
   what tells this apart from a completed removal. The scope is left free, so the
   repair is simply to run the same command again.
+- **The kill got no answer**: the `kill-session` round trip failed at the
+  transport, or the host answered with a tmux error instead of a result. The kill
+  may have landed and nothing here can say. `errorCode:"KILL_UNANSWERED"`,
+  `sessionState:"unknown"` — not `present`, which nothing reported, and not
+  `not_attempted`, which would deny a command that was sent — `logState` and
+  `localRow` both untouched, exit **75**. The ledger records `indeterminate`
+  carrying the same code, so the scope stays barred until you reconcile it. Look
+  at the host before re-running.
+- **This command's own lease stopped being live before the record was written**:
+  every renewal held, and the one transaction that re-validates then writes found
+  *this command's* lease no longer live and ours — it lapsed during the last round
+  trip, or was swept, or a peer had it. Frequently there is no peer at all, which
+  is why this is not `SCOPE_TAKEN_BEFORE_COMMIT`: a swept lease leaves the scope
+  genuinely clear, and "is anybody else claiming this" answers *no* while the
+  answer to "is it still ours" is also no. `errorCode:"CLAIM_LOST_BEFORE_COMMIT"`,
+  `logState:"deleted"`, `localRow:"kept"`, exit 1. Nothing was deleted and no
+  terminal was written.
+- **A ledger write failed**: any step of this command that writes to the ledger and
+  cannot. `errorCode:"RECEIPT_PERSIST_FAILED"`, exit **76**, and the three step
+  keys report exactly how far the command had got — including the branch where the
+  refusal's *own* record is what could not be written, where `requestId` is the id
+  the command minted and nothing exists under it (`status:"unknown"` says so).
+  `localRow` is `"unknown"` only when a composite could not commit *and* its
+  rollback could not be confirmed; every other branch can prove the row is where it
+  was and says `"kept"`.
 - **Refused by a peer's claim**: `errorCode:"SCOPE_HELD_BY_PEER"`, nothing sent,
   exit 1 — **and the refusal is recorded**, as a `control` operation of its own
   settled `cancelled`. It is queryable by `requestId` and it does **not** bar the
@@ -554,9 +579,9 @@ something.
 `session rm --json` — 16 keys, every branch emitting all of them.
 Never null: `ok`, `action` (`removed` | `not_removed`), `errorCode`, `session`,
 `server`, `requestId`, `status`,
-`sessionState` (`gone` | `present` | `not_attempted`),
+`sessionState` (`gone` | `present` | `unknown` | `not_attempted`),
 `logState` (`deleted` | `delete_failed` | `not_attempted`),
-`localRow` (`removed` | `absent` | `kept`),
+`localRow` (`removed` | `absent` | `kept` | `unknown`),
 `authority` (`held` | `lapsed` | `unreadable`),
 `leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
 Nullable: `authorityError`, `leaseReleaseError`, `reason`, `hint` — all four
@@ -564,12 +589,17 @@ prose, do not match their text.
 
 `session rm --json`'s `errorCode` is one of `none`, `SCOPE_HELD_BY_PEER`,
 `AUTHORITY_LOST_BEFORE_KILL`, `AUTHORITY_LOST`, `SCOPE_TAKEN_BEFORE_COMMIT`,
-`SESSION_SURVIVED_KILL`, `LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,
-`LEDGER_WRITE_FAILED`, `OWNER_COLLISION`. It is never null and never absent:
+`CLAIM_LOST_BEFORE_COMMIT`, `SESSION_SURVIVED_KILL`, `KILL_UNANSWERED`,
+`LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`, `LEDGER_WRITE_FAILED`,
+`RECEIPT_PERSIST_FAILED`, `OWNER_COLLISION`. It is never null and never absent:
 `none` is the value on the one branch that completed the removal, so a caller
-never has to decide whether a missing key means success. `LEDGER_WRITE_FAILED`
-exits **76** and is the one branch where the remote effect happened and the ledger
-does not have it — reconcile before acting on that session again.
+never has to decide whether a missing key means success. `LEDGER_WRITE_FAILED` and
+`RECEIPT_PERSIST_FAILED` both exit **76**: a write this command needed could not be
+made, so reconcile before acting on that session again.
+
+`session rm --json`'s `status` is the ledger's word for this attempt, except on the
+one branch where the write that would have created the row is what failed — there
+is nothing to read a word off, so it is `unknown`.
 
 Three things this key set is deliberate about. `localRow:"absent"` is not a
 failure: it means this machine had no metadata row for the session, which is

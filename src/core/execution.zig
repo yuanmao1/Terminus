@@ -165,7 +165,7 @@ pub const CacheResult = union(enum) {
 
 /// What `Execution.settleAndRemoveSession`'s one transaction did.
 ///
-/// Three answers rather than a bool, because they send the caller to three
+/// Four answers rather than a bool, because they send the caller to four
 /// different reports and only one of them is a removal that happened.
 pub const SessionRemoval = union(enum) {
     /// The terminal is written and the local row is gone. One commit, so neither
@@ -185,6 +185,18 @@ pub const SessionRemoval = union(enum) {
     /// unsettled — so the scope stays barred. The caller settles it with a
     /// terminal that is honest about the partial state it is actually in.
     refused: Blocker,
+    /// This attempt's *own* lease is no longer live and ours, whatever anybody
+    /// else is or is not claiming. Carries the state it read, because "it lapsed
+    /// under us", "somebody swept it", "a peer took it" and "we never had it"
+    /// are four different things to tell an operator.
+    ///
+    /// Separate from `refused` and not folded into it: that arm names a
+    /// counterparty, and this one frequently has none. The state this exists for
+    /// — `swept` — is precisely the one where there is nothing to find, which is
+    /// why the overlap check passed it.
+    ///
+    /// Nothing was deleted and no terminal was written, exactly as `refused`.
+    claim_lost: leases.ClaimState,
     /// The ledger already held a terminal for this attempt. The verdict on record
     /// is not the one this call was going to write, so the row is *not* deleted:
     /// a removal whose only durable record is somebody else's settlement is the
@@ -196,6 +208,34 @@ pub const SessionRemoval = union(enum) {
     /// caller that does reach it has to report what the ledger holds instead of
     /// inventing a verdict beside it.
     already_settled: receipts.TerminalRecord,
+};
+
+/// What became of a composite transaction that could not be committed.
+///
+/// Three answers, and the split that matters is between the two that are proofs
+/// and the one that is not. `errdefer store.db.exec("ROLLBACK") catch {}` — the
+/// shape this replaces — throws away the only evidence that the rollback
+/// happened, and the caller then reported "nothing local was changed" on both
+/// paths. On the second one that is a claim about a row nobody looked at: if the
+/// `ROLLBACK` statement itself failed, the terminal and the delete may be on
+/// disk and may not be, and the honest word for that is *unknown*.
+///
+/// Reported through an out-parameter rather than folded into the error, because
+/// the two are independent: *why* the transaction failed and *whether it was
+/// undone* are different questions, and collapsing them would cost the caller
+/// the cause it needs to print.
+pub const Rollback = union(enum) {
+    /// Nothing needed rolling back: the transaction committed, or it never
+    /// opened. Set before the transaction begins, so a failure on the way in
+    /// reads as what it is.
+    none,
+    /// The transaction failed and `ROLLBACK` succeeded. Nothing this call would
+    /// have written is on disk — a proof, and the one the caller may report a
+    /// known local state from.
+    confirmed,
+    /// The transaction failed and `ROLLBACK` failed too, carrying `@errorName`.
+    /// Whether the terminal and the local delete landed is genuinely not known.
+    unconfirmed: []const u8,
 };
 
 pub const SessionRemovalError = Error || error{
@@ -800,24 +840,42 @@ pub const Execution = struct {
     /// still there — and a terminal is frozen, so nothing could correct it.
     ///
     /// So: one `BEGIN IMMEDIATE` holding the ownership check, the terminal and
-    /// the delete. If it cannot commit, nothing is deleted and no terminal is
-    /// written; the attempt stays unsettled, the scope stays barred, and that is
-    /// the correct fail-closed outcome rather than a missing record.
+    /// the delete. If it cannot commit, the `errdefer` puts it back — nothing is
+    /// deleted and no terminal is written; the attempt stays unsettled, the scope
+    /// stays barred, and that is the correct fail-closed outcome rather than a
+    /// missing record. Whether that undo actually happened is reported through
+    /// `rollback` rather than assumed, because a `ROLLBACK` whose own statement
+    /// failed establishes nothing; see `Rollback`.
     ///
-    /// **What the ownership check is.** `blockerLocked`, keyed on this attempt's
-    /// own `request_id` — the same definition of "somebody else is laying claim
-    /// to this" that `begin` and `submitted` use, exempting only the id it is
-    /// handed. Asked *here*, inside the transaction, rather than taken on trust
-    /// from a renewal that has already returned. A `--force` takeover writes the
-    /// incumbent's row `released` and inserts its own, so it is exactly what this
-    /// sees.
+    /// **What the ownership check is.** Two conjuncts, and they answer two
+    /// different questions that neither one can answer alone.
     ///
-    /// **What it does not prove**, stated rather than left to be discovered: it
-    /// answers "has anything else claimed this scope", not "is our own lease row
-    /// still live". A lease that lapsed with no successor passes it. That arm is
-    /// held by the `stillOurs` renewal on the far side of the last remote call,
-    /// which is why the caller keeps it; closing it in here as well would need a
-    /// locked by-owner read that `leases` does not expose today.
+    /// `blockerLocked`, keyed on this attempt's own `request_id`, answers *has
+    /// anything else claimed this scope* — the same definition `begin` and
+    /// `submitted` use, exempting only the id it is handed. A `--force` takeover
+    /// writes the incumbent's row `released` and inserts its own, so it is
+    /// exactly what this sees.
+    ///
+    /// `leases.claimStateLocked`, keyed the same way, answers *is our own lease
+    /// still live and ours*. It used to be missing, and its absence was a hole
+    /// rather than a rough edge: if this command's lease expires during the last
+    /// remote round trip and **no successor takes it**, the expiry pass sweeps
+    /// the row, `blockerLocked` finds nothing to report — there genuinely is
+    /// nothing — and the terminal plus the cascading delete committed anyway. A
+    /// session's row and its memories were destroyed by a command that held
+    /// nothing. The `stillOurs` renewal on the far side of the last remote call
+    /// narrows that window and cannot close it; only a check inside this
+    /// transaction can.
+    ///
+    /// **The claim read comes first, and the refusal it drives comes second.**
+    /// Reading it first is forced: `blockerLocked` runs the lazy expiry pass on
+    /// its way through, which turns our own `lapsed` row into a `swept` one, so
+    /// asking afterwards could only ever report somebody's housekeeping — here,
+    /// this transaction's own — and never "we found it expired". Refusing on it
+    /// *second* is a separate choice: both refusals decline the identical act, so
+    /// the order only decides which fact the caller reports, and a peer's request
+    /// id is more use than "our lease is not ours". A `--force` takeover satisfies
+    /// both readings at once and is reported as the blocker it is.
     ///
     /// The terminal goes in before the delete, because it is the write that can
     /// still be refused — `canSettle`, `canTransition` and `terminalDescribesKind`
@@ -830,7 +888,15 @@ pub const Execution = struct {
         session: []const u8,
         terminal: op_state.Terminal,
         extra: receipts.TerminalExtra,
+        /// Whether the transaction was undone, when it could not be committed.
+        /// Written on every path. See `Rollback` for why the caller needs it and
+        /// why `catch {}` was not good enough.
+        rollback: *Rollback,
     ) SessionRemovalError!SessionRemoval {
+        // Before anything can fail, so a caller that got an error is reading an
+        // answer rather than whatever was in the variable.
+        rollback.* = .none;
+
         // A session row is keyed on a host (`sessions.server_id` is NOT NULL), so
         // an attempt with no server cannot name the row it is about. Refused
         // rather than defaulted: picking a server here would delete somebody
@@ -839,14 +905,53 @@ pub const Execution = struct {
         const at = self.now();
 
         try self.store.db.exec("BEGIN IMMEDIATE");
-        errdefer self.store.db.exec("ROLLBACK") catch {};
+        // Declared after `BEGIN`, so a `BEGIN` that failed leaves `rollback` at
+        // `.none` — which is the truth: no transaction opened, so nothing needed
+        // undoing.
+        errdefer {
+            if (self.store.db.exec("ROLLBACK")) |_| {
+                rollback.* = .confirmed;
+            } else |err| {
+                rollback.* = .{ .unconfirmed = @errorName(err) };
+            }
+        }
 
-        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at)) |blocker| {
+        // Our own claim, read before the pass that would rewrite what it says.
+        const claim = try leases.claimStateLocked(
+            self.store,
+            self.arena,
+            server_id,
+            self.scope,
+            self.id(),
+            at,
+        );
+
+        const blocker = try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at);
+
+        // A peer, when there is one to name. Both refusals are the same act — the
+        // whole composite is declined and nothing is written — so what the order
+        // decides is only which fact the caller reports, and a blocking request id
+        // is strictly more use to an operator than "our lease is not ours". A
+        // `--force` takeover shows up in both readings at once, and this is the
+        // arm that can say who did it.
+        if (blocker) |found| {
             // Nothing of ours was written, so the commit only keeps the lease
             // expiry pass the check performed on its way through — the same
             // thing `begin` and `submitted` commit on their refusal paths.
             try self.store.db.exec("COMMIT");
-            return .{ .refused = blocker };
+            return .{ .refused = found };
+        }
+
+        // And our own claim when there is nobody to name, which is the state this
+        // conjunct was added for: nothing else holds the scope, so the check above
+        // is clear and correct, and the lease this command has been acting under
+        // stopped being live anyway.
+        if (!claim.holds()) {
+            // Commits for the same reason the arm above does: nothing of ours was
+            // written, and the expiry pass `blockerLocked` ran on its way through
+            // is worth keeping.
+            try self.store.db.exec("COMMIT");
+            return .{ .claim_lost = claim };
         }
 
         if (comptime builtin.is_test) {
@@ -1017,8 +1122,20 @@ pub fn recordRefusal(
     io: std.Io,
     opts: BeginOptions,
     reason: []const u8,
+    /// The id this refusal is minted under, written before anything here can
+    /// fail.
+    ///
+    /// An out-parameter rather than part of the return value, because the caller
+    /// needs it on precisely the path where there is no return value. A refused
+    /// removal whose *record* could not be written is still a failure an operator
+    /// has to be able to name, and a failure with no handle on it is one nobody
+    /// can look up, correlate or report. Nothing was written under this id when
+    /// that happens, and the caller has to say so — what it must not do is print
+    /// no id at all.
+    minted: *ids.RequestId,
 ) Error!RecordedRefusal {
     const request_id = ids.generate(io);
+    minted.* = request_id;
     const capability_json = try opts.capability.toJson(arena);
 
     try store.db.exec("BEGIN IMMEDIATE");

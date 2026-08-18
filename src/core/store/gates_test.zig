@@ -10147,6 +10147,19 @@ fn seedSessionRemoval(
     io: std.Io,
     session: []const u8,
 ) !SeededRemoval {
+    return seedSessionRemovalAt(store, arena, io, session, try Store.leases.clockSeconds(store));
+}
+
+/// `seedSessionRemoval` with the lease acquired at a stated moment, so a gate can
+/// seed a claim that has already run out. Nothing else about the fixture changes:
+/// the operation is at `submitted` and the row and its memory are there either way.
+fn seedSessionRemovalAt(
+    store: *Store,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    session: []const u8,
+    lease_taken_at: i64,
+) !SeededRemoval {
     const session_id = try Store.sessions.ensure(store, 1, session, 1000);
     // The destruction no remote command can undo. A gate that only counted the
     // session row would pass over a cascade.
@@ -10183,7 +10196,7 @@ fn seedSessionRemoval(
         .profile_token = "one-machine",
         .owner_label = session,
         .ttl_secs = 120,
-        .now = try Store.leases.clockSeconds(store),
+        .now = lease_taken_at,
     })) {
         .acquired => {},
         .renewed, .conflict => return error.SeedClaimDidNotTake,
@@ -10314,7 +10327,8 @@ test "gate: nothing can take the scope between `session rm`'s ownership check an
         TakeoverRace.reset();
     }
 
-    const done = try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{});
+    var rollback: execution.Rollback = .none;
+    const done = try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback);
 
     if (TakeoverRace.failure) |err| return err;
     // `not_run` fails here too: a removal that never reaches the window has not
@@ -10371,7 +10385,8 @@ test "gate: a peer's claim refuses `session rm`'s composite whole, and writes no
         .acquired => return error.PeerDidNotSeize,
     }
 
-    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{})) {
+    var rollback: execution.Rollback = .none;
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback)) {
         .refused => |blocker| switch (blocker) {
             .lease => |lease| try t.expectEqualStrings(peer_owner, lease.owner_request_id),
             .unsettled => return error.WrongBlocker,
@@ -10422,10 +10437,17 @@ test "gate: a `session rm` whose local delete fails leaves no terminal claiming 
         \\BEGIN SELECT RAISE(ABORT, 'the local delete cannot happen'); END
     );
 
+    var rollback: execution.Rollback = .none;
     try t.expectError(
         error.Constraint,
-        seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}),
+        seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback),
     );
+    // The rollback happened and is *known* to have happened. `RAISE(ABORT)` aborts
+    // the statement and leaves the transaction alive, so the `ROLLBACK` this call
+    // issues has something to roll back and succeeds. That is what entitles the CLI
+    // to report a known local state on this path; the sibling gate below is the
+    // shape where it is not entitled to.
+    try t.expectEqualStrings("confirmed", @tagName(rollback));
 
     // The whole transaction went back: no terminal, and the attempt is still
     // `submitted` rather than frozen at `cancelled`. That is the assertion — a
@@ -10444,13 +10466,185 @@ test "gate: a `session rm` whose local delete fails leaves no terminal claiming 
     // settles and reports the row it deleted — so none of the above passes because
     // the composite simply never works.
     try store.db.exec("DROP TRIGGER refuse_session_delete");
-    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{})) {
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback)) {
         .removed => |r| try t.expect(r.had_row),
         else => return error.RemovalDidNotHappen,
     }
     try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
     try t.expectEqual(@as(usize, 0), try sessionMemories(&store, arena, seeded.session_id));
     try t.expectEqual(op_state.Status.cancelled, (try Store.operations.get(&store, arena, seeded.execution.id())).?.status);
+}
+
+// The hole the overlap check structurally could not see: **our own** lease.
+//
+// `blockerLocked` answers "has anything else claimed this scope", and that is a
+// different question. If this command's lease runs out during the last remote
+// round trip and *no successor takes it*, the expiry pass retires the row, the
+// overlap check finds nothing to report — there genuinely is nothing — and the
+// terminal plus the cascading delete used to commit anyway. A session's row and
+// its memories, destroyed by a command holding nothing.
+//
+// Three legs, and the middle one is the fix's whole substance:
+//
+//  * the claim has lapsed and nobody has swept it: refused, reported `lapsed`;
+//  * it has been swept, so the scope reads clear to every other barrier:
+//    refused, reported `swept` — and the gate asks the overlap check directly to
+//    show that it, on its own, would have let this through;
+//  * a live claim on the same fixture still removes, so none of the above passes
+//    because the composite has simply stopped working.
+test "gate: `session rm`'s composite refuses when its own lease is no longer live" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_session_removal_claim_lost");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    // A claim taken an hour ago with a two-minute TTL: the shape of a command
+    // whose last round trip hung. Dated off the store's own clock rather than a
+    // literal, so the composite's live `now()` really is past it.
+    const long_ago = (try Store.leases.clockSeconds(&store)) - 3600;
+    var seeded = try seedSessionRemovalAt(&store, arena, scratch.io, "shell", long_ago);
+    defer seeded.execution.deinit();
+
+    var rollback: execution.Rollback = .none;
+
+    // Leg one. Nobody has run an expiry pass yet, so the row is still sitting
+    // there unreleased and out of date, and that is what the caller is told.
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback)) {
+        .claim_lost => |claim| try t.expectEqualStrings("lapsed", claim.code()),
+        else => return error.RemovalWasNotRefused,
+    }
+
+    // Leg two. That refusal's own transaction ran the lazy expiry pass on its way
+    // through — every barrier here does — so the row is now released as `expired`
+    // with no successor. This is the state that used to pass.
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback)) {
+        .claim_lost => |claim| try t.expectEqualStrings("swept", claim.code()),
+        else => return error.RemovalWasNotRefused,
+    }
+
+    // …and the reason it used to pass, asked of the barrier itself: in exactly
+    // this state the overlap check reports nothing, because there is nothing to
+    // report. It is not wrong; it is answering a question that does not cover
+    // this.
+    try store.db.exec("BEGIN IMMEDIATE");
+    const conflict = try Store.leases.conflictForLocked(
+        &store,
+        arena,
+        1,
+        .{ .kind = .job, .key = "shell" },
+        seeded.owner,
+        try Store.leases.clockSeconds(&store),
+    );
+    try store.db.exec("COMMIT");
+    try t.expectEqual(@as(?Store.leases.Lease, null), conflict);
+
+    // Nothing was destroyed on either leg, and nothing was claimed. The attempt is
+    // where it was — still `submitted`, still barring the scope, still settleable
+    // by the caller with a terminal that is honest about the partial state.
+    try t.expectEqual(@as(?i64, seeded.session_id), try Store.sessions.idByName(&store, 1, "shell"));
+    try t.expectEqual(@as(usize, 1), try sessionMemories(&store, arena, seeded.session_id));
+    try t.expectEqual(@as(?Store.receipts.TerminalRecord, null), try Store.receipts.terminalOf(&store, seeded.execution.id()));
+    const op = (try Store.operations.get(&store, arena, seeded.execution.id())).?;
+    try t.expectEqual(op_state.Status.submitted, op.status);
+    try t.expect(!seeded.execution.settled);
+
+    // Leg three, the discriminating control: the same attempt, the same session,
+    // a claim that is live. Without it every assertion above would hold just as
+    // well against a composite that had started refusing everything.
+    switch (try Store.leases.acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = .{ .kind = .job, .key = "shell" },
+        .owner_request_id = seeded.owner,
+        .profile_token = "one-machine",
+        .owner_label = "shell",
+        .ttl_secs = 120,
+        .now = try Store.leases.clockSeconds(&store),
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.SeedClaimDidNotTake,
+    }
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback)) {
+        .removed => |r| try t.expect(r.had_row),
+        else => return error.RemovalDidNotHappen,
+    }
+    try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
+    try t.expectEqual(@as(usize, 0), try sessionMemories(&store, arena, seeded.session_id));
+    try t.expectEqual(op_state.Status.cancelled, seeded.execution.status);
+}
+
+// A composite that could not commit *and* could not confirm its own rollback.
+//
+// The sibling of the `RAISE(ABORT)` gate above, and the difference between the two
+// triggers is the entire point. `ABORT` ends the statement and leaves the
+// transaction alive, so the `ROLLBACK` that follows has something to undo and
+// succeeds — a proof that nothing was written, which is what lets the CLI report a
+// known local state. `ROLLBACK` inside the trigger unwinds the transaction itself,
+// so the explicit `ROLLBACK` afterwards finds none active and fails. Nothing about
+// the local row is then established by this process, and the honest word is
+// `unknown`.
+//
+// This is a real sqlite behaviour arranged, not a seam faked: the same shape arrives
+// whenever the failure that killed a statement also killed the transaction under it.
+test "gate: a `session rm` whose rollback cannot be confirmed says so instead of claiming the row is untouched" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_session_removal_rollback_unknown");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    var seeded = try seedSessionRemoval(&store, arena, scratch.io, "shell");
+    defer seeded.execution.deinit();
+
+    try store.db.exec(
+        \\CREATE TRIGGER unwind_on_session_delete BEFORE DELETE ON sessions
+        \\BEGIN SELECT RAISE(ROLLBACK, 'the delete takes the transaction with it'); END
+    );
+
+    var rollback: execution.Rollback = .none;
+    try t.expectError(
+        error.Constraint,
+        seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback),
+    );
+
+    // The assertion. `catch {}` — the shape this replaces — could only ever produce
+    // silence here, and the caller reported "nothing local was deleted" off it.
+    try t.expectEqualStrings("unconfirmed", @tagName(rollback));
+    switch (rollback) {
+        // Carries the cause, so an operator is not left with a bare word.
+        .unconfirmed => |why| try t.expect(why.len > 0),
+        .none, .confirmed => return error.RollbackWasConfirmed,
+    }
+
+    // What sqlite actually did is beside the point of the report and is asserted
+    // anyway: this trigger really does unwind the transaction, so no terminal and
+    // no delete survived. The *report* may not claim that, because the process
+    // could not establish it — but a gate that did not check it would not know
+    // whether it had arranged the shape it meant to.
+    try t.expectEqual(@as(?Store.receipts.TerminalRecord, null), try Store.receipts.terminalOf(&store, seeded.execution.id()));
+    try t.expectEqual(@as(?i64, seeded.session_id), try Store.sessions.idByName(&store, 1, "shell"));
+    try t.expectEqual(@as(usize, 1), try sessionMemories(&store, arena, seeded.session_id));
+
+    // The discriminating control, in the same store: with the trigger gone the same
+    // call commits, and `Rollback` says `none` rather than reporting an unconfirmed
+    // undo of a transaction that was never undone.
+    try store.db.exec("DROP TRIGGER unwind_on_session_delete");
+    switch (try seeded.execution.settleAndRemoveSession("shell", provenStop(2000), .{}, &rollback)) {
+        .removed => |r| try t.expect(r.had_row),
+        else => return error.RemovalDidNotHappen,
+    }
+    try t.expectEqualStrings("none", @tagName(rollback));
+    try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
 }
 
 // A refused attempt is recorded, and the record does not bar the next command.
@@ -10474,6 +10668,7 @@ test "gate: a recorded `session rm` refusal is queryable and bars nothing" {
     try seedServer(&store);
 
     const scope: execution.Scope = .{ .kind = .job, .key = "shell" };
+    var minted: Store.ids.RequestId = undefined;
     const refusal = try execution.recordRefusal(&store, arena, scratch.io, .{
         .server_id = 1,
         .server_name = "lease-host",
@@ -10482,7 +10677,7 @@ test "gate: a recorded `session rm` refusal is queryable and bars nothing" {
         .alias = "shell",
         .owner_token = "one-machine",
         .now = 1000,
-    }, "a peer holds an overlapping scope; nothing was sent to the host");
+    }, "a peer holds an overlapping scope; nothing was sent to the host", &minted);
 
     // Queryable by request id, which is the property — an alias is a convenience
     // handle that names get reused under.

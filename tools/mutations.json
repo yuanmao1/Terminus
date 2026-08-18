@@ -549,7 +549,7 @@
       "id": "M3b-session-rm-log-renewal",
       "rule": "The pane log is deleted only under a lease renewed immediately above the deletion; a scope lost during the kill forbids it.",
       "file": "src/cli/cmd_session.zig",
-      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, state.not_attempted, code.authority_lost);\n",
+      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseAfterKill(ctx, &execution, server_name, name, authority, state.log.not_attempted, code.authority_lost);\n",
       "replace": "",
       "expect_gate": "blackbox: `session rm` deletes nothing once the scope has moved after the kill"
     },
@@ -557,8 +557,8 @@
       "id": "M3b-session-removal-revalidates-owner",
       "rule": "The scope is re-validated inside the transaction that deletes the local session row, so a takeover landing after the last renewal cannot destroy that row or the memories its delete cascades.",
       "file": "src/core/execution.zig",
-      "find": "        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at)) |blocker| {\n            // Nothing of ours was written, so the commit only keeps the lease\n",
-      "replace": "        if (@as(?Blocker, null)) |blocker| {\n            // Nothing of ours was written, so the commit only keeps the lease\n",
+      "find": "        const blocker = try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at);\n",
+      "replace": "        const blocker = @as(?Blocker, null);\n",
       "expect_gate": "gate: a peer's claim refuses `session rm`'s composite whole, and writes no terminal"
     },
     {
@@ -645,9 +645,89 @@
       "id": "M3b-skill-session-rm-error-codes",
       "rule": "skill/SKILL.md's published `errorCode` vocabulary for `session rm` is held against the constants the branches actually emit.",
       "file": "skill/SKILL.md",
-      "find": "`SESSION_SURVIVED_KILL`, `LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,\n",
-      "replace": "`SESSION_SURVIVED_KILL`, `LOG_DELETE_FAILED`,\n",
+      "find": "`LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`, `LEDGER_WRITE_FAILED`,\n",
+      "replace": "`LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,\n",
       "expect_gate": "gate: SKILL.md publishes exactly `session rm`'s errorCode vocabulary"
+    },
+    {
+      "id": "M3b-session-removal-proves-own-claim",
+      "rule": "The transaction that writes the terminal and deletes the local session row proves this command's own lease is still live and ours, not merely that nothing else claims the scope — a lease that lapsed with no successor leaves every overlap check clear.",
+      "file": "src/core/execution.zig",
+      "find": "        if (!claim.holds()) {\n",
+      "replace": "        if (false) {\n",
+      "expect_gate": "gate: `session rm`'s composite refuses when its own lease is no longer live"
+    },
+    {
+      "id": "M3b-lease-claim-state-expiry",
+      "rule": "A lease whose TTL has passed is not a live claim, however recently it lapsed; `claimStateLocked` reports `lapsed`, and no grace window makes it `held`.",
+      "file": "src/core/store/leases.zig",
+      "find": "        return if (lease.expires_at > now) .{ .held = lease } else .{ .lapsed = lease };\n",
+      "replace": "        return if (lease.expires_at > now - 86400) .{ .held = lease } else .{ .lapsed = lease };\n",
+      "expect_gate": "gate: a claim's own state is read by owner, and a swept lease is not a free scope"
+    },
+    {
+      "id": "M3b-lease-claim-state-does-not-sweep",
+      "rule": "`claimStateLocked` reads the claim without running the expiry pass, so \"we found it expired\" stays distinguishable from \"somebody's housekeeping had already retired it\".",
+      "file": "src/core/store/leases.zig",
+      "find": "    try store.db.requireTransaction();\n\n    // The unreleased row first, then the most recently released one. Ordinary\n",
+      "replace": "    try store.db.requireTransaction();\n    try expireLapsedLocked(store, server_id, now);\n\n    // The unreleased row first, then the most recently released one. Ordinary\n",
+      "expect_gate": "gate: a claim's own state is read by owner, and a swept lease is not a free scope"
+    },
+    {
+      "id": "M3b-session-rm-kill-unanswered",
+      "rule": "A kill that gets no answer emits `session rm`'s own fixed key set and exits 75, matching the `indeterminate` the ledger records for it; exit 1 would tell an agent nothing happened.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    const gone = Tmux.killSession(executor, ctx.arena, name) catch |err|\n        refuseKillUnanswered(ctx, &execution, server_name, name, authority, executor, err);\n",
+      "replace": "    const gone = Tmux.killSession(executor, ctx.arena, name) catch |err| fatalTmux(err, executor, name);\n",
+      "expect_gate": "blackbox: `session rm` reports 75 and the full document when the kill gets no answer"
+    },
+    {
+      "id": "M3b-session-rm-ledger-failure-exit-code",
+      "rule": "A ledger write `session rm` needed and could not make exits 76, never 1: the record is missing and a caller must not read that as \"nothing happened\".",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    Cli.exitNow(Cli.exit_code.receipt_persist_failed);\n",
+      "replace": "    Cli.exitNow(Cli.exit_code.failure);\n",
+      "expect_gate": "blackbox: a `session rm` that cannot write to the ledger reports the full document and exits 76"
+    },
+    {
+      "id": "M3b-session-rm-ledger-failure-keys",
+      "rule": "A ledger write failure emits `session rm`'s fixed key set — including what became of the scope lease — rather than the shared `receiptFatal` envelope, which reports neither the session, the log, the local row nor a leaked lease.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    execution.connecting() catch |err| refuseLedgerUnrecordable(\n        ctx,\n        execution.id(),\n        server_name,\n        name,\n        execution.status.text(),\n        authority,\n        Facts.untouched,\n        code.receipt_persist_failed,\n        \"the step that records this attempt dialling could not be written; nothing has been sent to the host\",\n        \"nothing was sent, so the host is untouched; the attempt is left unsettled and bars this session's scope until it is reconciled\",\n        err,\n    );\n",
+      "replace": "    execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, \"created\");\n",
+      "expect_gate": "blackbox: a `session rm` that cannot write to the ledger reports the full document and exits 76"
+    },
+    {
+      "id": "M3b-session-rm-unconfirmed-rollback-unknown",
+      "rule": "A composite whose rollback could not be confirmed reports `localRow:\"unknown\"`; `kept` there is a claim about a row nobody looked at.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "        .unconfirmed => state.row.unknown,\n",
+      "replace": "        .unconfirmed => state.row.kept,\n",
+      "expect_gate": "localRowAfterFailedCommit"
+    },
+    {
+      "id": "M3b-session-removal-rollback-reported",
+      "rule": "Whether the composite's rollback succeeded is reported to the caller rather than swallowed, so the caller can tell a proven-untouched local row from an unknown one.",
+      "file": "src/core/execution.zig",
+      "find": "        errdefer {\n            if (self.store.db.exec(\"ROLLBACK\")) |_| {\n                rollback.* = .confirmed;\n            } else |err| {\n                rollback.* = .{ .unconfirmed = @errorName(err) };\n            }\n        }\n",
+      "replace": "        errdefer self.store.db.exec(\"ROLLBACK\") catch {};\n",
+      "expect_gate": "gate: a `session rm` whose rollback cannot be confirmed says so instead of claiming the row is untouched"
+    },
+    {
+      "id": "M3b-skill-session-rm-step-states",
+      "rule": "skill/SKILL.md's published value vocabulary for `session rm`'s step-state keys is held against the constants the branches emit, so a word can be added to neither side unnoticed.",
+      "file": "skill/SKILL.md",
+      "find": "`sessionState` (`gone` | `present` | `unknown` | `not_attempted`),\n",
+      "replace": "`sessionState` (`gone` | `present` | `not_attempted`),\n",
+      "expect_gate": "gate: SKILL.md publishes exactly `session rm`'s step-state vocabularies"
+    },
+    {
+      "id": "M3b-skill-session-rm-no-row-status",
+      "rule": "skill/SKILL.md's published word for `session rm`'s `status` when the ledger holds no row is held against the constant the branch emits.",
+      "file": "skill/SKILL.md",
+      "find": "is nothing to read a word off, so it is `unknown`.\n",
+      "replace": "is nothing to read a word off, so it is `absent`.\n",
+      "expect_gate": "gate: SKILL.md publishes the word `session rm` uses when the ledger has no row"
     }
   ]
 }

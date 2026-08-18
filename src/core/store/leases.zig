@@ -104,6 +104,18 @@ pub const Lease = struct {
 pub const Error = Db.Error || error{
     UnknownScopeKind,
     OutOfMemory,
+    /// A released lease row carries a `release_reason` this module does not
+    /// write.
+    ///
+    /// Only `claimStateLocked` can raise it, and it raises rather than guessing
+    /// because the reason is what separates "somebody swept our lapsed row" from
+    /// "somebody took the scope off us" — two facts with opposite consequences
+    /// for the caller. Every writer in this file binds one of `ReleaseReason`'s
+    /// four words, so an unrecognised one is not a state to be classified: it is
+    /// a row nothing here wrote, and folding it into the nearest plausible arm
+    /// would hand a caller a verdict about a lease this module does not
+    /// understand.
+    UnknownReleaseReason,
     /// A lease operation was handed an empty owner.
     ///
     /// Named rather than left to the schema's `CHECK`, because only the two
@@ -281,6 +293,143 @@ pub fn conflictForLocked(
         if (lease.scope().overlaps(target)) return lease;
     }
     return null;
+}
+
+/// What the row *this* attempt took says now.
+///
+/// Six answers and not a bool, and the arithmetic of that is the whole point:
+/// `true`/`false` collapses six facts that send a caller to six different
+/// places, and the one it collapses most damagingly is `swept` — a lease that
+/// lapsed and was tidied away with **nobody replacing it**. In that state every
+/// overlap check on the scope reads clear, so a guard phrased as "is anything
+/// else claiming this" says yes-go-ahead about a scope its caller stopped
+/// holding. See `claimStateLocked`.
+///
+/// Each arm carries the row it read, because a caller reporting a lost claim
+/// wants to be able to name when it was taken and when it stopped being theirs.
+pub const ClaimState = union(enum) {
+    /// Ours, unreleased, and its TTL has not passed. The only member that
+    /// licenses an act.
+    held: Lease,
+    /// Ours and unreleased, and its TTL *has* passed. Nobody has swept it yet —
+    /// the next writer to run the expiry pass will — but the scope is already
+    /// free to anyone who asks, so this is not a claim, it is the memory of one.
+    lapsed: Lease,
+    /// Ours, and released by the expiry pass: it lapsed, somebody's housekeeping
+    /// tidied it, and no successor took the scope.
+    ///
+    /// **The state that used to pass.** It is indistinguishable from "the scope
+    /// is free" to every reader that asks about *other* claims, which is what
+    /// `conflictForLocked` and `operations.unsettledInScope` both do.
+    swept: Lease,
+    /// Ours, and released by somebody else taking the scope. `by` is `takeover`
+    /// or `force`; another attempt owns this scope now and has since we stopped
+    /// looking.
+    displaced: struct { lease: Lease, by: ReleaseReason },
+    /// Ours, and released by us. Distinct from `displaced` because it is not a
+    /// contention loss at all: a caller acting on a claim it has already handed
+    /// back is a defect in the caller, and reporting it as "a peer took it" would
+    /// send somebody hunting for a peer that does not exist.
+    handed_back: Lease,
+    /// No row on this scope has ever named this owner. Either the acquisition
+    /// never happened or the caller is asking under an identity that never held
+    /// anything.
+    never_taken,
+
+    /// Whether this state licenses an act on the scope. Only `held` does.
+    pub fn holds(s: ClaimState) bool {
+        return switch (s) {
+            .held => true,
+            .lapsed, .swept, .displaced, .handed_back, .never_taken => false,
+        };
+    }
+
+    /// The machine-readable word for it. Prose belongs to the caller; this is
+    /// what a refusal reason quotes so a reader learns *which* state refused it.
+    pub fn code(s: ClaimState) []const u8 {
+        return switch (s) {
+            .held => "held",
+            .lapsed => "lapsed",
+            .swept => "swept",
+            .displaced => "displaced",
+            .handed_back => "handed_back",
+            .never_taken => "never_taken",
+        };
+    }
+};
+
+/// Reads this attempt's own claim on `scope`, by owner, under the caller's
+/// transaction. Answers "is our lease still live and ours", which is not the
+/// question any other reader here answers.
+///
+/// `conflictForLocked` cannot be made to answer it. That function reports
+/// whether *something else* claims an overlapping scope, and it is silent about
+/// our own row by construction — `heldBy` skips it. So a claim that lapsed and
+/// was swept with no successor leaves the overlap check clear, and a composite
+/// guarded only by the overlap check goes on to act: that is how
+/// `execution.settleAndRemoveSession` came to be able to write a terminal and
+/// cascade a session's memories on behalf of a command that no longer held
+/// anything.
+///
+/// **No expiry pass, deliberately.** Every other reader in this file sweeps
+/// lapsed rows on the way through. This one must not: the sweep is exactly what
+/// erases the difference between `lapsed` and `swept`, and that difference is a
+/// reading — "we found it expired" against "somebody else's housekeeping had
+/// already retired it". A caller that wants both readings therefore has to take
+/// this one *before* anything that sweeps; `settleAndRemoveSession` fixes that
+/// order and says so.
+///
+/// Returns the state, never a verdict. Whether a given state may act, and what
+/// it refuses with, belongs to the caller — see `ClaimState.holds`.
+pub fn claimStateLocked(
+    store: *Store,
+    arena: Allocator,
+    server_id: i64,
+    scope: Scope,
+    owner_request_id: []const u8,
+    now: i64,
+) Error!ClaimState {
+    try requireOwner(owner_request_id);
+    try store.db.requireTransaction();
+
+    // The unreleased row first, then the most recently released one. Ordinary
+    // rather than defensive: the partial unique index allows at most one
+    // unreleased row per key, and nothing here deletes rows, so an owner that
+    // has acquired this scope more than once over its life has one live row and
+    // a tail of history behind it. Reading the tail's newest entry is what makes
+    // `swept` / `displaced` / `handed_back` answerable at all.
+    var stmt = try store.db.prepare(
+        \\SELECT id, server_id, scope_kind, scope_key, owner_request_id, profile_token,
+        \\       owner_label, note, acquired_at, renewed_at, expires_at,
+        \\       released_at, release_reason
+        \\FROM leases
+        \\ WHERE server_id = ?1 AND scope_kind = ?2 AND scope_key = ?3
+        \\   AND owner_request_id = ?4
+        \\ ORDER BY (released_at IS NULL) DESC, released_at DESC, id DESC
+        \\ LIMIT 1
+    );
+    defer stmt.deinit();
+    try stmt.bindInt(1, server_id);
+    try stmt.bindText(2, @tagName(scope.kind));
+    try stmt.bindText(3, scope.key);
+    try stmt.bindText(4, owner_request_id);
+
+    if (!try stmt.step()) return .never_taken;
+    const lease = try rowToLease(arena, &stmt);
+    if (stmt.columnOptInt(11) == null)
+        return if (lease.expires_at > now) .{ .held = lease } else .{ .lapsed = lease };
+
+    // A released row's reason is the fact. `expires_at` says nothing here: a row
+    // taken over inside its TTL and a row swept after it are both released, and
+    // only the reason tells them apart.
+    const text = stmt.columnOptText(12) orelse return error.UnknownReleaseReason;
+    const reason = std.meta.stringToEnum(ReleaseReason, text) orelse
+        return error.UnknownReleaseReason;
+    return switch (reason) {
+        .expired => .{ .swept = lease },
+        .takeover, .force => .{ .displaced = .{ .lease = lease, .by = reason } },
+        .released => .{ .handed_back = lease },
+    };
 }
 
 /// Currently-held leases on a server (expired ones filtered out and marked).
@@ -966,4 +1115,131 @@ test "gate: the store's clock is a real wall clock, not a stamp somebody passed 
 
     // 2024-01-01. A clock that answered 0, or a fixture value, fails here.
     try t.expect((try clockSeconds(&store)) > 1_704_067_200);
+}
+
+// --- The claim's own state ---------------------------------------------------
+//
+// `claimStateLocked` exists because `conflictForLocked` answers a different
+// question and structurally cannot answer this one: it skips rows held by the
+// id it is handed, so it is silent about the caller's own claim. Six states, and
+// the gate walks every one of them — a `bool` here would have collapsed the two
+// halves of every pair below into one word.
+//
+// The `swept` leg carries the extra assertion that makes it the sharp case: in
+// that state the overlap check reads *clear*, so a composite guarded on overlap
+// alone proceeds. That is the arm this whole function was added for, and it is
+// asserted rather than described.
+
+/// `claimStateLocked` under its own write transaction, the way every caller
+/// reaches it.
+fn claimStateOf(store: *Store, arena: Allocator, scope: Scope, owner: []const u8, now: i64) !ClaimState {
+    try store.db.exec("BEGIN IMMEDIATE");
+    errdefer store.db.exec("ROLLBACK") catch {};
+    const answer = try claimStateLocked(store, arena, 1, scope, owner, now);
+    try store.db.exec("COMMIT");
+    return answer;
+}
+
+test "gate: a claim's own state is read by owner, and a swept lease is not a free scope" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "lease_claim_state");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    const scope: Scope = .{ .kind = .job, .key = "deploy" };
+
+    // Nothing taken. Not folded into "not held": a caller told only `false` here
+    // cannot tell a lease it never acquired from one taken off it.
+    try t.expectEqualStrings("never_taken", (try claimStateOf(&store, arena, scope, owner_a, 1000)).code());
+
+    try t.expect((try acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = scope,
+        .owner_request_id = owner_a,
+        .profile_token = "one-machine",
+        .ttl_secs = 100,
+        .now = 1000,
+    })) == .acquired);
+
+    // Ours and live.
+    const live = try claimStateOf(&store, arena, scope, owner_a, 1050);
+    try t.expect(live.holds());
+    try t.expectEqualStrings("held", live.code());
+    try t.expectEqual(@as(i64, 1100), live.held.expires_at);
+
+    // Read by *owner*: a peer asking about the same scope has no claim on it,
+    // and must not be handed ours. A read keyed on the scope alone would answer
+    // `held` here, which is the v11 "everybody is the same owner" defect in a
+    // new function.
+    try t.expectEqualStrings("never_taken", (try claimStateOf(&store, arena, scope, owner_b, 1050)).code());
+
+    // Past its TTL and not yet swept. Still ours in the table, and already not a
+    // claim: the scope is free to whoever asks next.
+    const lapsed = try claimStateOf(&store, arena, scope, owner_a, 5000);
+    try t.expect(!lapsed.holds());
+    try t.expectEqualStrings("lapsed", lapsed.code());
+
+    // Now somebody's housekeeping runs the expiry pass — `active`, `acquire`,
+    // `begin` and the scope guard all do — and nobody takes the scope.
+    try t.expectEqual(@as(usize, 0), (try active(&store, arena, 1, 5000)).len);
+    const swept = try claimStateOf(&store, arena, scope, owner_a, 5000);
+    try t.expect(!swept.holds());
+    try t.expectEqualStrings("swept", swept.code());
+
+    // **The reason this function exists.** In exactly that state the overlap
+    // check reads clear — there is nothing else to find — so a guard built on it
+    // alone licenses the act. Both barriers, because both were consulted and
+    // both say "nothing is in your way", which is true and is not the same as
+    // "the scope is yours".
+    try store.db.exec("BEGIN IMMEDIATE");
+    const conflict = try conflictForLocked(&store, arena, 1, scope, owner_a, 5000);
+    try store.db.exec("COMMIT");
+    try t.expectEqual(@as(?Lease, null), conflict);
+
+    // Taken over, inside its TTL: a different fact from lapsing, and the only one
+    // where somebody else is acting on this scope right now.
+    const other: Scope = .{ .kind = .job, .key = "build" };
+    try t.expect((try acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = other,
+        .owner_request_id = owner_a,
+        .profile_token = "one-machine",
+        .ttl_secs = 600,
+        .now = 2000,
+    })) == .acquired);
+    _ = try takeover(&store, arena, .{
+        .server_id = 1,
+        .scope = other,
+        .owner_request_id = owner_b,
+        .profile_token = "the-other-machine",
+        .ttl_secs = 600,
+        .now = 2100,
+    });
+    const displaced = try claimStateOf(&store, arena, other, owner_a, 2200);
+    try t.expect(!displaced.holds());
+    try t.expectEqualStrings("displaced", displaced.code());
+    try t.expectEqual(ReleaseReason.takeover, displaced.displaced.by);
+
+    // And a claim we gave back ourselves. Not `displaced`: there is no peer to
+    // go looking for, and telling an operator to look for one would be inventing
+    // a counterparty.
+    const third: Scope = .{ .kind = .job, .key = "release" };
+    try t.expect((try acquire(&store, arena, .{
+        .server_id = 1,
+        .scope = third,
+        .owner_request_id = owner_a,
+        .profile_token = "one-machine",
+        .ttl_secs = 600,
+        .now = 3000,
+    })) == .acquired);
+    try t.expect(try release(&store, 1, third, owner_a, .released, 3100));
+    const given_back = try claimStateOf(&store, arena, third, owner_a, 3200);
+    try t.expect(!given_back.holds());
+    try t.expectEqualStrings("handed_back", given_back.code());
 }

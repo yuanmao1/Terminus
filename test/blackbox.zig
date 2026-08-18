@@ -4103,3 +4103,321 @@ test "blackbox: a `session rm` whose log deletion fails reports the partial and 
     try expectContains(detail, "\"logDeleted\":false");
     try expectContains(detail, "\"localRecordDropped\":false");
 }
+
+// --- The fixed key set, held against the document the binary actually emits ---
+//
+// `cmd_session.zig` holds `RemovalJson` against `skill/SKILL.md` at compile time,
+// which proves the struct and the document agree. It cannot prove that a *branch*
+// emits the struct: the hard-failure paths below reached shared helpers that emit
+// `{ok, error}`, and compiled perfectly well doing it. So this reads the emitted
+// document.
+//
+// It counts as well as names. The names catch a key that was renamed or dropped;
+// the count catches one that was added — a check that only looked for sixteen
+// literals it already knew would pass over a seventeenth nobody documented.
+// `RemovalJson` is flat and `Output.json` indents by two, so every top-level key
+// and only a top-level key appears as a newline, two spaces and a quote.
+const removal_keys = [_][]const u8{
+    "\n  \"ok\":",
+    "\n  \"action\":",
+    "\n  \"errorCode\":",
+    "\n  \"session\":",
+    "\n  \"server\":",
+    "\n  \"requestId\":",
+    "\n  \"status\":",
+    "\n  \"sessionState\":",
+    "\n  \"logState\":",
+    "\n  \"localRow\":",
+    "\n  \"authority\":",
+    "\n  \"authorityError\":",
+    "\n  \"leaseRelease\":",
+    "\n  \"leaseReleaseError\":",
+    "\n  \"reason\":",
+    "\n  \"hint\":",
+};
+
+fn expectFixedRemovalDocument(r: Run) !void {
+    for (removal_keys) |needle| try r.expectSays(needle);
+    const found = std.mem.count(u8, r.stdout, "\n  \"");
+    std.testing.expectEqual(removal_keys.len, found) catch |err| {
+        std.debug.print(
+            "the document has {d} top-level keys, wanted {d}\n--- stdout ---\n{s}\n",
+            .{ found, removal_keys.len, r.stdout },
+        );
+        return err;
+    };
+}
+
+/// How many operation rows the ledger holds.
+///
+/// Counted rather than looked up by alias, because "this command wrote no row" is a
+/// statement about the whole table: an earlier leg of the same gate may legitimately
+/// have left one under the same alias, and `latestByAlias` would hand that back and
+/// read as a success.
+fn operationCount(store: *Store) !i64 {
+    var stmt = try store.db.prepare("SELECT COUNT(*) FROM operations");
+    defer stmt.deinit();
+    if (!try stmt.step()) return error.CountReturnedNothing;
+    return stmt.columnInt(0);
+}
+
+// The kill went out and nothing came back to say what it did.
+//
+// This used to leave the process exiting **1** through `fatalTmux` → `Cli.fail`
+// with `{ok, error}` — two keys — while the exit hook settled the submitted
+// operation `indeterminate`. The ledger said "unknown" and the exit status said
+// "plain failure", and 1 is what an agent reads as *nothing happened, retry is
+// safe*. On the one call in this verb that cannot be taken back, that is the worst
+// thing the two could disagree about.
+//
+// Arranged with exit 41 from the kill script, which is its `command -v tmux` guard
+// failing — a real answer this verb can get from a real host, and the one shape
+// that reaches `killSession`'s error path deterministically. `fatalTmux` itself is
+// untouched and still serves `session new`, `session ls`, `exec`, `job` and
+// `read`/`write`.
+//
+// Two legs on one fixture and one host. Without the second, every assertion here
+// would hold against a binary that had started refusing every kill.
+test "blackbox: `session rm` reports 75 and the full document when the kill gets no answer" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_kill_unanswered");
+    defer f.deinit();
+    try f.seedServer();
+    const session_id = try seedSessionWithMemory(&f, "shell", "the shell runbook");
+    try seedSessionRow(&f, "other");
+
+    var rules = [_]FakeHost.Rule{
+        // Keyed on the target, because both legs' kill scripts carry
+        // `kill-session` and this gate needs them answered differently.
+        .{ .needle = "kill-session -t =t-shell", .exit_code = 41 },
+        .{ .needle = "kill-session -t =t-other", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var blind = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer blind.deinit(f.allocator);
+
+    // The kill really was sent — this is not a withheld one — and nothing after it
+    // was. Named before the exit code, because the regression that matters is "it
+    // deleted the log anyway", not "the number was wrong".
+    try host.expectSent("kill-session -t =t-shell");
+    try host.expectNeverSent("rm -f");
+    // 75, not 1: the ledger holds `indeterminate` and that bars this session's
+    // scope, so "plain failure, retry" would walk a caller into a refusal.
+    try blind.expectCode(75);
+    try expectFixedRemovalDocument(blind);
+    try blind.expectSays("\"action\": \"not_removed\"");
+    try blind.expectSays("\"errorCode\": \"KILL_UNANSWERED\"");
+    // The word that had to exist. `present` would report something the host never
+    // said; `not_attempted` would deny a command that was sent.
+    try blind.expectSays("\"sessionState\": \"unknown\"");
+    try blind.expectSays("\"logState\": \"not_attempted\"");
+    try blind.expectSays("\"localRow\": \"kept\"");
+    // The lease was never lost on this path, and the report must not blame the
+    // wrong barrier.
+    try blind.expectSays("\"authority\": \"held\"");
+    try blind.expectSays("\"leaseRelease\": \"released\"");
+    // The error name reaches the operator, which is the one thing `fatalTmux`'s
+    // per-error sentences carried that a fixed key set must not lose.
+    try blind.expectSays("TmuxMissing");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Nothing local was destroyed, memories included.
+        try t.expectEqual(@as(?i64, session_id), try Store.sessions.idByName(&store, 1, "shell"));
+        try t.expectEqual(@as(usize, 1), try sessionMemoryCount(&store, arena, session_id));
+
+        const op = (try Store.operations.latestByAlias(&store, arena, 1, "shell")) orelse
+            return error.RemovalRecordedNoOperation;
+        try t.expectEqualStrings("control", op.kind);
+        try t.expectEqualStrings("indeterminate", op.status.text());
+        // Its own code on the receipt, so this is distinguishable from a survived
+        // kill and from a lost lease — three unknowns that send an operator to
+        // three different places.
+        const recorded = (try terminalErrorCode(&store, arena, op.request_id)) orelse
+            return error.RemovalLeftNoTerminalReceipt;
+        try t.expectEqualStrings("KILL_UNANSWERED", recorded);
+
+        // And the scope was handed back even though the act failed: a claim held by
+        // a process that has exited would lock the operator out for its whole TTL.
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 0), held.len);
+    }
+
+    // The discriminating control: the same fixture, the same host, a session whose
+    // kill is answered. It still removes, still deletes the log, still exits 0.
+    var fine = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "other", "--json", "--db", f.db,
+    }, &environ);
+    defer fine.deinit(f.allocator);
+
+    try host.expectSent("kill-session -t =t-other");
+    try host.expectSent("rm -f");
+    try host.expectFullyScripted();
+    try fine.expectCode(0);
+    try fine.expectSays("\"action\": \"removed\"");
+    try fine.expectSays("\"errorCode\": \"none\"");
+    try fine.expectSays("\"sessionState\": \"gone\"");
+}
+
+// A ledger write this command needs, and cannot make.
+//
+// Two shapes, and until now neither emitted this verb's document. The first went
+// through `Cli.receiptFatal`, whose envelope is `{ok, error, errorCode, requestId,
+// cause, remoteStatus, hint}` and whose cleanup is the `void` `releaseClaim()` — so
+// a caller learned nothing about the session, the log or its local row, and a
+// `left_held` lease that will refuse its next command for 120s reached stderr and
+// nowhere else. The second went through `Cli.storeFatal` → `Cli.fail`: `{ok,
+// error}` and **exit 1**, on the one branch where the record *is* the whole act.
+//
+// Both are arranged with a trigger on `operations`, which is a real refusal from
+// the real store rather than a seam: `BEFORE UPDATE` catches the transition to
+// `connecting`, `BEFORE INSERT` catches the refusal row a blocked removal writes.
+// `receiptFatal` and `storeFatal` are untouched and still serve every other verb.
+test "blackbox: a `session rm` that cannot write to the ledger reports the full document and exits 76" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_ledger_unwritable");
+    defer f.deinit();
+    try f.seedServer();
+    const session_id = try seedSessionWithMemory(&f, "shell", "the shell runbook");
+
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    // Leg one: the step that records this attempt dialling cannot be written. It
+    // runs before the socket is opened, so nothing reaches the host — and the lease
+    // has already been taken, which is what makes `leaseRelease` worth asserting.
+    var before_leg_two: i64 = 0;
+    {
+        var store = try f.open();
+        defer store.close();
+        try store.db.exec(
+            \\CREATE TRIGGER refuse_operation_update BEFORE UPDATE ON operations
+            \\BEGIN SELECT RAISE(ABORT, 'the ledger cannot be advanced'); END
+        );
+    }
+
+    var unwritable = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer unwritable.deinit(f.allocator);
+
+    try host.expectNeverSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    // 76, not 1 and not 75: a write we needed did not happen. `receiptFatal`
+    // already exited 76 here; what it did not do is say what is on the host.
+    try unwritable.expectCode(76);
+    try expectFixedRemovalDocument(unwritable);
+    try unwritable.expectSays("\"errorCode\": \"RECEIPT_PERSIST_FAILED\"");
+    try unwritable.expectSays("\"sessionState\": \"not_attempted\"");
+    try unwritable.expectSays("\"logState\": \"not_attempted\"");
+    try unwritable.expectSays("\"localRow\": \"kept\"");
+    // The half `receiptFatal` threw away: the claim was taken, and what became of
+    // it is in the document rather than only on stderr.
+    try unwritable.expectSays("\"leaseRelease\": \"released\"");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        try t.expectEqual(@as(?i64, session_id), try Store.sessions.idByName(&store, 1, "shell"));
+        try t.expectEqual(@as(usize, 1), try sessionMemoryCount(&store, arena, session_id));
+        // Reported as released, and actually released. A document that said so over
+        // a row still holding the scope would be the same defect one layer up.
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 0), held.len);
+
+        try store.db.exec("DROP TRIGGER refuse_operation_update");
+        // Leg two's arrangement: a peer's claim, so `begin` refuses before it
+        // inserts anything, and a trigger that stops the refusal's own row from
+        // being written.
+        try store.db.exec(
+            \\CREATE TRIGGER refuse_operation_insert BEFORE INSERT ON operations
+            \\BEGIN SELECT RAISE(ABORT, 'the ledger cannot be written'); END
+        );
+        before_leg_two = try operationCount(&store);
+    }
+    try seedPeerLease(&f, "shell", "01QQQQQQQQ0123456789ABCDEF");
+
+    var unrecordable = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer unrecordable.deinit(f.allocator);
+
+    try host.expectNeverSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    // Exit 1 before this change: "nothing happened, a retry is safe" — true of the
+    // host and false of the ledger, which is now missing the only trace that
+    // anybody tried to destroy this session.
+    try unrecordable.expectCode(76);
+    try expectFixedRemovalDocument(unrecordable);
+    try unrecordable.expectSays("\"errorCode\": \"RECEIPT_PERSIST_FAILED\"");
+    // No row exists, so there is no ledger word to read — and the document says
+    // that rather than borrowing one.
+    try unrecordable.expectSays("\"status\": \"unknown\"");
+    // Never acquired: `not_taken` and not `released`, because "nothing was taken"
+    // and "what was taken was handed back" are different facts about the scope.
+    try unrecordable.expectSays("\"leaseRelease\": \"not_taken\"");
+    try unrecordable.expectSays("\"localRow\": \"kept\"");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // The refusal really left no row, which is what the report is admitting.
+        // Counted, because leg one legitimately left a `created` row under this
+        // same alias and a lookup by alias would hand that one back.
+        try t.expectEqual(before_leg_two, try operationCount(&store));
+
+        try store.db.exec("DROP TRIGGER refuse_operation_insert");
+        // The peer lets go, so the control leg is not measuring the blocker.
+        try t.expect(try Store.leases.release(
+            &store,
+            1,
+            .{ .kind = .job, .key = "shell" },
+            "01QQQQQQQQ0123456789ABCDEF",
+            .released,
+            try Store.leases.clockSeconds(&store),
+        ));
+    }
+
+    // The discriminating control: the same fixture with a writable ledger removes,
+    // exits 0 and reports `none`. Without it, everything above is satisfied by a
+    // binary that had started answering 76 to every removal.
+    var fine = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer fine.deinit(f.allocator);
+
+    try host.expectSent("kill-session");
+    try host.expectSent("rm -f");
+    try host.expectFullyScripted();
+    try fine.expectCode(0);
+    try expectFixedRemovalDocument(fine);
+    try fine.expectSays("\"errorCode\": \"none\"");
+    try fine.expectSays("\"localRow\": \"removed\"");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
+    }
+}
