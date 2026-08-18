@@ -848,10 +848,18 @@ const set_cursor_sql = std.fmt.comptimePrint(
 
 /// Forgets a job row, against the row the caller read and on stated grounds.
 ///
-/// Opens its own transaction. `removeLocked` is the variant for a caller that
-/// is settling the operation in the same breath — `job rm` is, and the two
-/// must land together or not at all: a delete that outlived a failed
-/// settlement would leave an unsettled attempt with no row naming it.
+/// Opens its own transaction, which is why **`job rm` must not use it**.
+/// `removeLocked` is the variant for a caller that is settling the operation and
+/// re-reading its authority in the same breath, and `job rm` is that caller: the
+/// delete, the terminal and the in-transaction claim check must land together or
+/// not at all. It reaches `removeLocked` through
+/// `execution.settleAndForgetJob`.
+///
+/// That leaves one legitimate caller: `run --name X` displacing the row that holds
+/// the name (`RemovalGrounds.superseded_by_relaunch`). It holds a reservation
+/// rather than a lease, so there is no claim for a contract to re-read and no
+/// operation of somebody else's to settle — and the grounds it passes admit no
+/// `running` row, which is what the guard is there instead of an authority.
 pub fn remove(
     store: *Store,
     expected: RemoveExpectation,

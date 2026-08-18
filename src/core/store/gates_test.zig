@@ -10733,3 +10733,614 @@ test "gate: a recorded `session rm` refusal is queryable and bars nothing" {
         (try Store.operations.unsettledInScope(&store, arena, 1, scope)).len,
     );
 }
+
+// --- The shared authority matrix ---------------------------------------------
+//
+// The reason the same defect kept coming back is that each verb was tested on its
+// own. `session rm` grew a gate for the settle-then-act window; `job kill` grew a
+// different one; `job rm`'s two standalone delete branches grew none at all, and
+// went on calling `jobs.remove` — a `BEGIN IMMEDIATE` of their own with no
+// terminal beside them and no authority check inside them.
+//
+// So one table, whose rows are the destructive paths and whose columns are the
+// authority scenarios, driven against the real entry points. The finding it makes
+// visible is that **the table has no per-path column**: `expectedCell` discards
+// `path`, because every path now answers through `execution.commitDestruction`.
+// The day one of them stops doing so, one row's cells start disagreeing with the
+// other three and this fails naming the cell.
+//
+// Every cell is decided. The eight that cannot be reached say why, and the reason
+// is a property of `leases.zig` rather than an inconvenience of the fixture — see
+// `expectedCell`.
+//
+// What this does *not* cover, deliberately: `job kill`. It is not a row here
+// because it commits no local destruction, and the gate below says so
+// structurally rather than leaving a hole in the table.
+
+/// The destructive paths, as rows.
+const DestructivePath = enum {
+    /// `session rm` — `Execution.settleAndRemoveSession`. Authority owner and
+    /// target operation are the *same* value.
+    session_rm,
+    /// `job rm` with a live attempt to settle in the removal's transaction.
+    /// Authority owner and target operation are two different values.
+    job_rm_attached,
+    /// `job rm` whose attempt is already terminal, so the removal writes no
+    /// terminal of its own and defers to the one on record.
+    job_rm_settled_attempt,
+    /// `job rm` whose row names no attempt at all: nothing to settle, nothing to
+    /// exempt from the peer check.
+    job_rm_no_attempt,
+};
+
+/// What the authority owner's own claim is in when the transaction opens. The six
+/// members of `leases.ClaimState`, by name, so a claim state added there without a
+/// column here fails to compile.
+const ClaimScenario = enum {
+    held,
+    lapsed,
+    swept,
+    displaced,
+    handed_back,
+    never_taken,
+};
+
+/// What else claims the scope at the same moment.
+///
+/// Three and not two, because the two kinds of peer come from different tables and
+/// a guard can be mis-keyed for one and not the other. An unsettled operation is
+/// where the *target* would be mistaken for a peer; a foreign lease is where *our
+/// own claim* would be.
+const PeerScenario = enum { none, unsettled_operation, foreign_lease };
+
+/// What the contract must answer for one cell.
+const Expected = union(enum) {
+    /// The destruction and the ledger write landed.
+    committed,
+    /// Declined over a peer, which the answer names.
+    refused,
+    /// Declined over the authority owner's own claim, which the answer reports the
+    /// state of.
+    claim_lost,
+    /// The cell is not reachable, and this is why. A statement about coverage
+    /// rather than a hole in the table.
+    unreachable_because: []const u8,
+};
+
+/// The pinned table.
+///
+/// `path` is deliberately unused, and that is the whole point: one contract means
+/// one answer per scenario, whatever is being destroyed. It is taken as a
+/// parameter so the signature says what the table is indexed by.
+fn expectedCell(path: DestructivePath, claim: ClaimScenario, peer: PeerScenario) Expected {
+    _ = path;
+
+    if (peer == .foreign_lease) switch (claim) {
+        // `leases.acquire` refuses on any overlap and `leases.takeover` displaces
+        // *every* overlap, so two unreleased leases on overlapping scopes cannot
+        // coexist. A peer that ends up holding an overlapping lease has therefore
+        // taken ours, and the state that leaves us in is `displaced` — never
+        // `held`.
+        .held => return .{ .unreachable_because = "no peer can hold an overlapping lease while ours is unreleased: acquire refuses an overlap and takeover displaces ours, which reads as `displaced`" },
+        // Every lease writer runs the lazy expiry pass before it inserts, so a
+        // peer acquiring over our lapsed row releases it as `expired` on the way
+        // past and we read `swept`. A takeover instead reads `displaced`. Neither
+        // leaves `lapsed` standing beside a live foreign lease.
+        .lapsed => return .{ .unreachable_because = "a lease writer sweeps our lapsed row before it inserts, so a peer's overlapping lease leaves us `swept` (or `displaced`), never `lapsed`" },
+        .swept, .displaced, .handed_back, .never_taken => {},
+    };
+
+    // A peer outranks our own claim state: both refusals decline the identical
+    // act, and a blocking request id is more use to an operator than "our lease is
+    // not ours". See `execution.authorityLocked`.
+    if (peer != .none) return .refused;
+
+    return switch (claim) {
+        .held => .committed,
+        .lapsed, .swept, .displaced, .handed_back, .never_taken => .claim_lost,
+    };
+}
+
+/// One seeded destructive act, with both of its identities named.
+const MatrixSubject = struct {
+    /// The live target attempt, for the paths that have one to settle.
+    execution: ?execution.Execution = null,
+    /// The target operation's request id, or null when the path has none.
+    target: ?[]const u8 = null,
+    /// Whose claim licenses the act.
+    authority: []const u8,
+    /// The `jobs` row, for the three job paths.
+    job: ?Store.jobs.Job = null,
+    /// The `sessions` row, for `session rm`.
+    session_id: ?i64 = null,
+};
+
+const matrix_scope: execution.Scope = .{ .kind = .job, .key = "deploy" };
+const matrix_name: []const u8 = "deploy";
+const matrix_peer_owner: []const u8 = "01PEEEEEEER0123456789ABCDE";
+const matrix_third_owner: []const u8 = "01THIRDDDDD123456789ABCDEF";
+
+/// The control id `cmd_job.claimJobScope` mints per invocation: a lease owner that
+/// backs no operation row and is not the attempt being acted on.
+fn matrixAuthority(arena: std.mem.Allocator) ![]const u8 {
+    const minted = testId("controlclaim");
+    return arena.dupe(u8, &minted);
+}
+
+fn seedSubmittedOperation(
+    store: *Store,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    kind: Store.operations.Kind,
+    now: i64,
+) !execution.Execution {
+    const start = try execution.begin(store, arena, io, .{
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = kind,
+        .scope = matrix_scope,
+        .alias = matrix_name,
+        .owner_token = "one-machine",
+        .now = now,
+    });
+    var exec = switch (start) {
+        .ready => |e| e,
+        .blocked => return error.SeedWasBlocked,
+    };
+    try exec.connecting();
+    switch (try exec.submitted()) {
+        .submitted => {},
+        .refused => return error.SeedWasRefused,
+    }
+    return exec;
+}
+
+fn seedMatrixJobRow(
+    store: *Store,
+    arena: std.mem.Allocator,
+    owner_request_id: []const u8,
+) !Store.jobs.Job {
+    _ = try Store.jobs.create(store, 1, matrix_name, "./deploy.sh", "TERMINUS-SENTINEL-1", owner_request_id, 1000);
+    if (!try Store.jobs.markStarted(store, owner_request_id)) return error.JobDidNotStart;
+    return (try Store.jobs.getByName(store, arena, 1, matrix_name)) orelse error.JobRowMissing;
+}
+
+/// The subject, seeded before any claim exists.
+///
+/// The order matters and is the fixture's one subtlety: `execution.begin` and
+/// `Execution.submitted` both run the lazy lease-expiry pass on their way through,
+/// so a lapsed claim arranged before them would be swept and the `lapsed` column
+/// would silently become the `swept` one.
+fn seedMatrixSubject(
+    store: *Store,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    path: DestructivePath,
+    now: i64,
+) !MatrixSubject {
+    switch (path) {
+        .session_rm => {
+            const session_id = try Store.sessions.ensure(store, 1, matrix_name, 1000);
+            // The destruction no remote command can undo. A gate that only
+            // counted the session row would pass over a cascade.
+            _ = try Store.memories.add(
+                store,
+                .{ .server_id = 1, .session_id = session_id },
+                .{ .key = "runbook", .content = "restart the queue first", .now = 1000 },
+            );
+            const exec = try seedSubmittedOperation(store, arena, io, .control, now);
+            const id = try arena.dupe(u8, exec.id());
+            return .{ .execution = exec, .target = id, .authority = id, .session_id = session_id };
+        },
+        .job_rm_attached => {
+            const exec = try seedSubmittedOperation(store, arena, io, .job, now);
+            const id = try arena.dupe(u8, exec.id());
+            const job = try seedMatrixJobRow(store, arena, id);
+            return .{
+                .execution = exec,
+                .target = id,
+                .authority = try matrixAuthority(arena),
+                .job = job,
+            };
+        },
+        .job_rm_settled_attempt => {
+            var exec = try seedSubmittedOperation(store, arena, io, .job, now);
+            const id = try arena.dupe(u8, exec.id());
+            const job = try seedMatrixJobRow(store, arena, id);
+            // An earlier observer already settled it, so `attach` would answer
+            // null and this removal has no terminal of its own to write.
+            _ = try exec.settle(.{ .indeterminate = .{
+                .reason = "settled by an earlier observer",
+                .last_observed = .submitted,
+            } }, .{});
+            return .{ .target = id, .authority = try matrixAuthority(arena), .job = job };
+        },
+        .job_rm_no_attempt => {
+            // An owner with no operation row behind it: the 0.1.x shape, and the
+            // shape a launcher that died before writing its attempt row leaves.
+            const orphan = testId("orphanedowner");
+            const job = try seedMatrixJobRow(store, arena, &orphan);
+            return .{ .authority = try matrixAuthority(arena), .job = job };
+        },
+    }
+}
+
+/// A peer's unsettled, mutating operation on an overlapping scope.
+///
+/// Taken with `force`, because our own attempt already bars the scope by then and
+/// that is exactly the state this peer has to arrive in. Deliberately never
+/// settled and never `deinit`ed: an unsettled row is the whole of what it is for.
+fn seedForcedPeerOperation(
+    store: *Store,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    now: i64,
+) !void {
+    const start = try execution.begin(store, arena, io, .{
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .control,
+        .scope = matrix_scope,
+        .alias = matrix_name,
+        .owner_token = "the-other-machine",
+        .force = true,
+        .now = now,
+    });
+    var peer = switch (start) {
+        .ready => |e| e,
+        .blocked => return error.PeerSeedWasBlocked,
+    };
+    try peer.connecting();
+    switch (try peer.submitted()) {
+        .submitted => {},
+        .refused => return error.PeerSeedWasRefused,
+    }
+    peer.settled = true; // not ours to settle; it is the blocker
+}
+
+fn mustAcquireMatrixClaim(
+    store: *Store,
+    arena: std.mem.Allocator,
+    owner: []const u8,
+    ttl_secs: i64,
+    at: i64,
+) !void {
+    switch (try Store.leases.acquire(store, arena, .{
+        .server_id = 1,
+        .scope = matrix_scope,
+        .owner_request_id = owner,
+        .profile_token = "one-machine",
+        .owner_label = matrix_name,
+        .ttl_secs = ttl_secs,
+        .now = at,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ClaimDidNotTake,
+    }
+}
+
+/// Puts the authority owner's claim into the state the column names.
+fn arrangeMatrixClaim(
+    store: *Store,
+    arena: std.mem.Allocator,
+    owner: []const u8,
+    claim: ClaimScenario,
+    peer: PeerScenario,
+    now: i64,
+) !void {
+    switch (claim) {
+        // Nothing acquired. Not the same as a claim taken and lost, which is why
+        // `ClaimState` keeps the two apart.
+        .never_taken => {},
+        .held => try mustAcquireMatrixClaim(store, arena, owner, 600, now),
+        // A claim taken an hour ago with a two-minute TTL: the shape of a command
+        // whose last round trip hung. Nothing runs a lease writer afterwards, so
+        // the row is still sitting there unreleased and out of date.
+        .lapsed => try mustAcquireMatrixClaim(store, arena, owner, 120, now - 3600),
+        .swept => {
+            try mustAcquireMatrixClaim(store, arena, owner, 120, now - 3600);
+            // Somebody's ordinary housekeeping: `active` runs the expiry pass, and
+            // nobody takes the scope. This is the state in which every overlap
+            // check reads clear.
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                (try Store.leases.active(store, arena, 1, now)).len,
+            );
+        },
+        .displaced => {
+            // A TTL that outlasts `now`, so the takeover below finds a live row to
+            // displace. Dated in the past with a short TTL, the takeover's own
+            // expiry pass would release it first — `expires_at <= now` is the
+            // predicate, so even an expiry landing exactly on the boundary sweeps
+            // it — and the takeover would answer `acquired`, leaving us `swept`
+            // rather than `displaced`.
+            try mustAcquireMatrixClaim(store, arena, owner, 10800, now - 7200);
+            // The displacer is live only where the cell wants a peer to name. In
+            // the other two columns it is dated so that it has itself lapsed by
+            // now, which is what leaves the scope clear while our row still
+            // records that somebody took it.
+            const live = peer == .foreign_lease;
+            switch (try Store.leases.takeover(store, arena, .{
+                .server_id = 1,
+                .scope = matrix_scope,
+                .owner_request_id = matrix_peer_owner,
+                .profile_token = "the-other-machine",
+                .owner_label = matrix_name,
+                .ttl_secs = if (live) 600 else 120,
+                .now = if (live) now else now - 3600,
+            })) {
+                .taken => {},
+                .acquired => return error.PeerDidNotSeize,
+            }
+        },
+        .handed_back => {
+            try mustAcquireMatrixClaim(store, arena, owner, 600, now);
+            if (!try Store.leases.release(store, 1, matrix_scope, owner, .released, now))
+                return error.ClaimWasNotOurs;
+        },
+    }
+}
+
+/// A third party's lease over the whole host, which overlaps the job scope
+/// (`scope.Scope.overlaps`) without being the same key.
+///
+/// Only reachable once our own row is released — see `expectedCell` — which is why
+/// it is seeded after the claim rather than before it.
+fn seedForeignMatrixLease(store: *Store, arena: std.mem.Allocator, now: i64) !void {
+    switch (try Store.leases.acquire(store, arena, .{
+        .server_id = 1,
+        .scope = .{ .kind = .server },
+        .owner_request_id = matrix_third_owner,
+        .profile_token = "a-third-machine",
+        .ttl_secs = 600,
+        .now = now,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ForeignLeaseDidNotTake,
+    }
+}
+
+fn expectPeerNamed(peer: PeerScenario, blocker: execution.Blocker) !void {
+    switch (peer) {
+        .unsettled_operation => switch (blocker) {
+            .unsettled => {},
+            .lease => return error.RefusedByTheWrongKindOfPeer,
+        },
+        .foreign_lease => switch (blocker) {
+            .lease => {},
+            .unsettled => return error.RefusedByTheWrongKindOfPeer,
+        },
+        .none => return error.RefusedWithNoPeerSeeded,
+    }
+}
+
+fn matrixSubjectPresent(
+    store: *Store,
+    arena: std.mem.Allocator,
+    path: DestructivePath,
+) !bool {
+    return switch (path) {
+        .session_rm => (try Store.sessions.idByName(store, 1, matrix_name)) != null,
+        .job_rm_attached, .job_rm_settled_attempt, .job_rm_no_attempt => (try Store.jobs.getByName(store, arena, 1, matrix_name)) != null,
+    };
+}
+
+/// Seeds one cell, runs the path's real entry point, and asserts the answer.
+fn runAuthorityCell(
+    allocator: std.mem.Allocator,
+    path: DestructivePath,
+    claim: ClaimScenario,
+    peer: PeerScenario,
+    want: Expected,
+) !void {
+    const t = std.testing;
+    var scratch = try Scratch.init(allocator, "gate_authority_matrix");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    // The store's own clock, not a literal: the claim states below are decided by
+    // comparing the row against the clock `commitDestruction` will read.
+    const now = try Store.leases.clockSeconds(&store);
+
+    var subject = try seedMatrixSubject(&store, arena, scratch.io, path, now);
+
+    // **The identity model, asserted rather than described.** This is the
+    // distinction four rounds of per-verb fixes conflated: for `session rm` the
+    // authority owner and the target operation are one string, and for `job rm`
+    // they are two. A fixture in which they were accidentally equal on the job
+    // rows would make every cell below pass for the wrong reason.
+    switch (path) {
+        .session_rm => try t.expectEqualStrings(subject.authority, subject.target.?),
+        .job_rm_attached, .job_rm_settled_attempt => try t.expect(
+            !std.mem.eql(u8, subject.authority, subject.target.?),
+        ),
+        .job_rm_no_attempt => try t.expectEqual(@as(?[]const u8, null), subject.target),
+    }
+
+    // Before the claim: `begin` and `submitted` sweep lapsed leases on their way
+    // through.
+    if (peer == .unsettled_operation) try seedForcedPeerOperation(&store, arena, scratch.io, now);
+
+    try arrangeMatrixClaim(&store, arena, subject.authority, claim, peer, now);
+
+    // `displaced` seeds its own peer through the takeover that displaced us.
+    if (peer == .foreign_lease and claim != .displaced)
+        try seedForeignMatrixLease(&store, arena, now);
+
+    var rollback: execution.Rollback = .none;
+    switch (path) {
+        .session_rm => {
+            const done = try subject.execution.?.settleAndRemoveSession(
+                matrix_name,
+                provenStop(now),
+                .{},
+                &rollback,
+            );
+            switch (want) {
+                .committed => switch (done) {
+                    .removed => |r| try t.expect(r.had_row),
+                    else => return error.CellDidNotCommit,
+                },
+                .refused => switch (done) {
+                    .refused => |blocker| try expectPeerNamed(peer, blocker),
+                    else => return error.CellWasNotRefused,
+                },
+                .claim_lost => switch (done) {
+                    .claim_lost => |state| try t.expectEqualStrings(@tagName(claim), state.code()),
+                    else => return error.CellDidNotReportALostClaim,
+                },
+                .unreachable_because => return error.UnreachableCellWasRun,
+            }
+            // The cascade, which is the part no remote command can undo.
+            try t.expectEqual(
+                @as(usize, if (want == .committed) 0 else 1),
+                try sessionMemories(&store, arena, subject.session_id.?),
+            );
+        },
+        .job_rm_attached, .job_rm_settled_attempt, .job_rm_no_attempt => {
+            const settlement: execution.JobSettlement = if (subject.execution) |*e| .{ .attempt = .{
+                .execution = e,
+                .terminal = .{ .indeterminate = .{
+                    .reason = "job removed before its outcome was established",
+                    .last_observed = .submitted,
+                } },
+                .extra = .{},
+            } } else if (subject.target) |id|
+                .{ .absent = .{ .already_on_record = id } }
+            else
+                .{ .absent = .no_operation };
+
+            const done = try execution.settleAndForgetJob(
+                &store,
+                arena,
+                scratch.io,
+                1,
+                matrix_scope,
+                .{ .lease_owner_request_id = subject.authority },
+                settlement,
+                .{ .expected = subject.job.?.removeExpectation(), .grounds = .session_proven_gone },
+                &rollback,
+            );
+            switch (want) {
+                .committed => switch (done) {
+                    .forgotten => |f| try t.expect(f.write == .applied),
+                    else => return error.CellDidNotCommit,
+                },
+                .refused => switch (done) {
+                    .refused => |blocker| try expectPeerNamed(peer, blocker),
+                    else => return error.CellWasNotRefused,
+                },
+                .claim_lost => switch (done) {
+                    .claim_lost => |state| try t.expectEqualStrings(@tagName(claim), state.code()),
+                    else => return error.CellDidNotReportALostClaim,
+                },
+                .unreachable_because => return error.UnreachableCellWasRun,
+            }
+        },
+    }
+
+    // The destruction, or its absence. A refusal that wrote no terminal and
+    // deleted the row anyway would satisfy every assertion above.
+    try t.expectEqual(want != .committed, try matrixSubjectPresent(&store, arena, path));
+
+    // And the ledger. On a declined cell the target is left exactly as it was, so
+    // the attempt stays unsettled and goes on barring the scope — the fail-closed
+    // answer. Asserted only where this call was the one that would have written
+    // the terminal: `job_rm_settled_attempt` has one on record already, and
+    // `job_rm_no_attempt` has no operation to hold one.
+    if (want != .committed) switch (path) {
+        .session_rm, .job_rm_attached => {
+            try t.expectEqual(
+                @as(?Store.receipts.TerminalRecord, null),
+                try Store.receipts.terminalOf(&store, subject.target.?),
+            );
+            try t.expect(!subject.execution.?.settled);
+        },
+        .job_rm_settled_attempt, .job_rm_no_attempt => {},
+    };
+
+    // Nothing failed, so nothing was rolled back. A cell that reported an undo
+    // would mean the transaction never committed at all.
+    try t.expectEqualStrings("none", @tagName(rollback));
+
+    if (subject.execution) |*e| e.deinit();
+}
+
+test "gate: every destructive path answers every authority scenario the same way" {
+    const t = std.testing;
+    var decided: usize = 0;
+    var stated_unreachable: usize = 0;
+    for (std.enums.values(DestructivePath)) |path| {
+        for (std.enums.values(ClaimScenario)) |claim| {
+            for (std.enums.values(PeerScenario)) |peer| {
+                const want = expectedCell(path, claim, peer);
+                switch (want) {
+                    .unreachable_because => |why| {
+                        // A reason, not an empty arm: the point of the member is
+                        // that the table states what it does not cover.
+                        try t.expect(why.len > 0);
+                        stated_unreachable += 1;
+                        continue;
+                    },
+                    .committed, .refused, .claim_lost => {},
+                }
+                runAuthorityCell(t.allocator, path, claim, peer, want) catch |err| {
+                    std.debug.print(
+                        "\nauthority matrix cell failed: path={s} claim={s} peer={s} want={s}: {s}\n",
+                        .{ @tagName(path), @tagName(claim), @tagName(peer), @tagName(want), @errorName(err) },
+                    );
+                    return err;
+                };
+                decided += 1;
+            }
+        }
+    }
+
+    // The counts, so a table that stopped covering something fails rather than
+    // passing over an empty loop: four paths, six claim states, three peer
+    // scenarios, less the two foreign-lease columns `leases.zig` makes impossible.
+    try t.expectEqual(@as(usize, 4 * 6 * 3), decided + stated_unreachable);
+    try t.expectEqual(@as(usize, 4 * 2), stated_unreachable);
+    try t.expectEqual(@as(usize, 64), decided);
+}
+
+// `job kill` is the fifth destructive verb, and it is deliberately *not* a row in
+// the matrix above. This is why, stated structurally rather than left as a hole.
+//
+// Its settlement goes through `Execution.settleAttachedAndSyncJob`, whose only
+// local write is a `JobCacheSync` — and that type has no arm that destroys
+// anything. So `job kill` cannot reach `commitDestruction`, and the authority
+// question it has to answer is a different one: the kill has already gone out by
+// the time it settles, so its terminal must be writable *precisely when the
+// authority is lost* (`cmd_job.lostTerminal`, an `indeterminate` carrying
+// `AUTHORITY_LOST`). An in-transaction refusal there would suppress the one record
+// that says a pane was stopped and nobody can say what became of the work.
+//
+// What holds `job kill` instead is the renewal adjacency gate in `cmd_job.zig`,
+// which proves there is nothing between the question and each `kill-session`.
+//
+// The assertion is on the shape of `JobCacheSync`, because that is the thing that
+// would have to change for `job kill` to become a destruction: the `.forget` arm
+// used to live there, which is exactly how `job rm`'s two standalone branches came
+// to destroy rows through a route with no authority in it.
+test "gate: the settlement `job kill` writes cannot express a destruction" {
+    const t = std.testing;
+    const fields = @typeInfo(execution.JobCacheSync).@"union".fields;
+    try t.expectEqual(@as(usize, 2), fields.len);
+    try t.expectEqualStrings("none", fields[0].name);
+    try t.expectEqualStrings("finish", fields[1].name);
+
+    // And the destructive contract's own vocabulary, for the other direction: two
+    // destructions, both of which name a subject. A third arm added here without a
+    // row in the matrix above fails this count.
+    const destructions = @typeInfo(execution.Destruction).@"union".fields;
+    try t.expectEqual(@as(usize, 2), destructions.len);
+    try t.expectEqualStrings("session_row", destructions[0].name);
+    try t.expectEqualStrings("job_row", destructions[1].name);
+}

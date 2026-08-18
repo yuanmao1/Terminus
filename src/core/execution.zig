@@ -119,6 +119,14 @@ pub const Error = Store.Db.Error || receipts.Error || operations.Error ||
 /// `jobs` is that the write is checked against that reading. Deriving the
 /// expectation inside this function would mean reading the row again, which is
 /// the guess the CAS exists to replace.
+///
+/// **Two arms, and there used to be a third.** `.forget` — `job rm` destroying
+/// the row — lived here beside them, which made one function both a
+/// non-destructive cache sync (used by `job status`, `job watch` and every
+/// `job kill` branch, none of which need an authority) and a destructive commit
+/// (which cannot happen without one). It now goes through `settleAndForgetJob`,
+/// so the type no longer offers a caller a way to destroy a row without naming
+/// whose claim licenses it.
 pub const JobCacheSync = union(enum) {
     /// This settlement has no cache row behind it: the attempt is not a job,
     /// or its row has already been forgotten. Distinct from a refusal — the
@@ -126,9 +134,6 @@ pub const JobCacheSync = union(enum) {
     none,
     /// Record how the job ended.
     finish: Finish,
-    /// Destroy the row: `job rm`, which settles the attempt and forgets the
-    /// name in the same breath.
-    forget: Forget,
 
     pub const Finish = struct {
         expected: jobs.FinishExpectation,
@@ -138,11 +143,6 @@ pub const JobCacheSync = union(enum) {
         /// The column mixes them by nature; the ledger is where the two are
         /// kept apart.
         at: i64,
-    };
-
-    pub const Forget = struct {
-        expected: jobs.RemoveExpectation,
-        grounds: jobs.RemovalGrounds,
     };
 };
 
@@ -238,7 +238,14 @@ pub const Rollback = union(enum) {
     unconfirmed: []const u8,
 };
 
-pub const SessionRemovalError = Error || error{
+/// Everything `settleAndRemoveSession` can answer with.
+///
+/// It carries `jobs.WriteError` through `DestructiveError`, which a session
+/// removal cannot produce: one destructive contract means one error set, and
+/// `sessions.removeLocked` and `jobs.removeLocked` do not fail the same way. The
+/// same trade `AdoptError` records, for the same reason — the alternative is two
+/// copies of the transaction.
+pub const SessionRemovalError = DestructiveError || ContractError || error{
     /// The attempt names no server, so there is no `sessions` row it could be
     /// about. Our defect, not an operator's: every control operation over a
     /// session is created with the host it resolved.
@@ -274,14 +281,18 @@ pub const SettledWithCache = struct {
 pub var between_settle_and_cache: if (builtin.is_test) ?*const fn () void else void =
     if (builtin.is_test) null else {};
 
-/// Called between the ownership guard and the local delete of
-/// `settleAndRemoveSession`.
+/// Called between the authority check and the local destruction of
+/// `commitDestruction`.
 ///
-/// A test seam, and the same one `between_settle_and_cache` is: "the ownership
-/// check, the local delete and the terminal are one transaction" cannot be
+/// A test seam, and the same one `between_settle_and_cache` is: "the authority
+/// check, the terminal and the local destruction are one transaction" cannot be
 /// observed from outside. The gate installs a probe that tries to take the scope
 /// from another connection at exactly that instant; under one `BEGIN IMMEDIATE`
 /// it cannot take the write lock, and under three separate writes it can.
+///
+/// One seam for every destructive path, because there is now one transaction: a
+/// per-verb hook would have been a second thing to remember to add when a fourth
+/// verb arrives.
 ///
 /// `void` outside a test build, so the shipped binary contains neither the
 /// variable nor the branch.
@@ -289,9 +300,9 @@ pub var between_ownership_and_removal: if (builtin.is_test) ?*const fn () void e
     if (builtin.is_test) null else {};
 
 /// `jobs.removeLocked` takes its grounds at comptime — the statement's state
-/// list is rendered from them — and a sync request carries them as a value.
-/// One `inline else` is the whole of the conversion.
-fn removeUnderGrounds(store: *Store, forget: JobCacheSync.Forget) jobs.WriteError!jobs.Write {
+/// list is rendered from them — and a destruction request carries them as a
+/// value. One `inline else` is the whole of the conversion.
+fn removeUnderGrounds(store: *Store, forget: JobForget) jobs.WriteError!jobs.Write {
     return switch (forget.grounds) {
         inline else => |grounds| jobs.removeLocked(store, forget.expected, grounds),
     };
@@ -308,15 +319,119 @@ fn removeUnderGrounds(store: *Store, forget: JobCacheSync.Forget) jobs.WriteErro
 /// them is.
 pub const AdoptError = Error || transfers.Error;
 
+// --- Who licenses a destructive act, and what it is about --------------------
+//
+// The tree conflated these two for four rounds of fixes, and every one of them
+// was patched per-verb: the lease-renewal barrier, the settle-then-act window,
+// the non-transactional composite, and the missing in-transaction ownership
+// check. The reason a fix kept failing to generalise is that "the request id" is
+// not one thing.
+//
+//   * `session rm` holds its lease under the request id of the control operation
+//     it is about (`cmd_session.claimScope` passes `execution.id()`), so its
+//     authority owner, its target operation and its own identity are the same
+//     string.
+//   * `job kill` / `job rm` hold theirs under a control id minted per invocation
+//     (`cmd_job.claimJobScope`) that backs no operation row at all, while the
+//     `Execution` they carry is the *target job attempt* — somebody else's
+//     unsettled work.
+//
+// So a guard keyed on "the request id" asks the wrong question on two of the
+// three verbs, and it does so confidently. Keyed the target's way round,
+// `leases.claimStateLocked` answers `never_taken` about a lease that is live and
+// ours, and `leases.conflictForLocked` reports our own lease as a peer's. Keyed
+// the authority's way round for the operation half, the target attempt — which is
+// unsettled and inside the scope, because that is exactly what makes it worth
+// destroying — is reported as a peer blocking us from destroying it.
+//
+// Hence two types rather than two strings, with differently named fields so that
+// an anonymous literal meant for one cannot coerce into the other.
+
+/// Whose claim licenses a destructive act.
+///
+/// The owner of the lease this command took before it dialled —
+/// `Control.Claim.owner_request_id`. This and only this may key a lease read:
+/// `leases.claimStateLocked` answers *by owner*, and `leases.conflictForLocked`
+/// exempts *by owner*.
+///
+/// Not the thing being acted on. `job kill` acts on somebody else's attempt and
+/// holding the lease under that attempt's id would make two concurrent kills
+/// renew each other — the defect one level down, which is why the id is minted
+/// per invocation in the first place.
+pub const AuthorityOwner = struct {
+    /// The lease owner's request id.
+    lease_owner_request_id: []const u8,
+};
+
+/// What a destructive act is about: the operation whose terminal it writes or
+/// defers to, or the statement that there is none.
+///
+/// Never used to key a lease read — see `AuthorityOwner`. What it *is* used for
+/// is the operation half of the peer check, where the target has to be exempted
+/// or it is mistaken for a peer.
+pub const TargetOperation = union(enum) {
+    /// The attempt this act settles, or whose recorded terminal it defers to.
+    attempt: []const u8,
+    /// There is no operation behind this act at all: a `jobs` row whose attempt
+    /// row is missing, so there is nothing to settle and nothing to exempt.
+    /// Stated by the caller rather than reached by passing an empty string,
+    /// which `leases.requireOwner` would refuse anyway and which the operation
+    /// half would silently match against every other empty one.
+    none,
+
+    pub fn requestId(t: TargetOperation) ?[]const u8 {
+        return switch (t) {
+            .attempt => |id| id,
+            .none => null,
+        };
+    }
+};
+
+/// The pair, as every guard in this file takes it.
+pub const Identity = struct {
+    authority: AuthorityOwner,
+    target: TargetOperation,
+
+    /// The shape where the two are the same value.
+    ///
+    /// `begin` and `submitted` — where the acting attempt is both the thing that
+    /// would hold a lease and the thing being recorded — and `session rm`, whose
+    /// control operation is its own lease owner. Named rather than left to two
+    /// literals at each call site, because "these two are deliberately the same
+    /// string here" is the fact a reader needs and a repeated literal does not
+    /// state.
+    pub fn coincident(request_id: []const u8) Identity {
+        return .{
+            .authority = .{ .lease_owner_request_id = request_id },
+            .target = .{ .attempt = request_id },
+        };
+    }
+
+    /// Whether an unsettled operation row is *not* a peer.
+    ///
+    /// Both ids, and each covers a case the other cannot. Exempting the target
+    /// is what stops `job rm` from reading the very attempt it is settling as a
+    /// blocker. Exempting the authority owner matters where the two coincide —
+    /// `session rm`, `begin`, `submitted` — and is a no-op for the job verbs,
+    /// whose minted control id backs no operation row; it is written
+    /// unconditionally so that the day a verb holds its lease under a second
+    /// *real* operation, that operation is not its own blocker either.
+    fn exempts(self: Identity, request_id: []const u8) bool {
+        if (std.mem.eql(u8, self.authority.lease_owner_request_id, request_id)) return true;
+        if (self.target.requestId()) |target| return std.mem.eql(u8, target, request_id);
+        return false;
+    }
+};
+
 /// Whether anything else is laying claim to `target`, as one definition.
 ///
-/// `request_id` is this attempt's own identity, and it answers both halves at
-/// once: an unsettled operation with that id is *us*, and a lease with that
-/// owner is *ours*. Those used to be two parameters — the request id for the
-/// operation half and `policy.ownerToken` for the lease half — and the second
-/// was a token minted once per machine profile, so every agent on one machine
-/// skipped every other agent's lease as if it were its own. One id means the
-/// lease half can only ever exempt the attempt that actually took the lease.
+/// `identity` is who is asking, in both of the senses that matter: an unsettled
+/// operation this identity exempts is *us or our subject*, and a lease whose
+/// owner is its authority is *ours*. The lease half used to take
+/// `policy.ownerToken` — a token minted once per machine profile — so every agent
+/// on one machine skipped every other agent's lease as if it were its own; then
+/// it took a single request id, which is right for `begin` and wrong for a verb
+/// whose lease owner and subject are two values. See `Identity`.
 ///
 /// `server_id` is optional and null is a real value here, not "skip the
 /// check": it names the local realm, the set of attempts recorded against no
@@ -339,14 +454,14 @@ fn blockerLocked(
     arena: Allocator,
     server_id: ?i64,
     target: Scope,
-    request_id: []const u8,
+    identity: Identity,
     now: i64,
 ) Error!?Blocker {
     var found: ?Blocker = null;
 
     const unsettled = try operations.unsettledInScope(store, arena, server_id, target);
     for (unsettled) |op| {
-        if (std.mem.eql(u8, op.request_id, request_id)) continue;
+        if (identity.exempts(op.request_id)) continue;
         found = .{ .unsettled = op };
         break;
     }
@@ -367,12 +482,524 @@ fn blockerLocked(
     // leases on the way past, and that housekeeping should not depend on the
     // order the two checks happen to be in.
     if (server_id) |host| {
-        if (try leases.conflictForLocked(store, arena, host, target, request_id, now)) |lease| {
+        if (try leases.conflictForLocked(
+            store,
+            arena,
+            host,
+            target,
+            identity.authority.lease_owner_request_id,
+            now,
+        )) |lease| {
             if (found == null) found = .{ .lease = lease };
         }
     }
 
     return found;
+}
+
+/// What the authority owner's claim, and any peer's, say about a destructive act
+/// — read inside the caller's transaction.
+///
+/// Three answers and not a bool, because they send a caller to three different
+/// reports and two of them are not the same refusal. `blocked` names a
+/// counterparty; `claim_lost` frequently has none to name, and the state it
+/// exists for is precisely the one where there is nothing to find.
+pub const AuthorityVerdict = union(enum) {
+    /// Nothing else claims an overlapping scope, and the authority owner's own
+    /// claim is `held`. The only member that licenses a destructive commit.
+    cleared,
+    /// Something else was laying claim to the scope. Carries it, so the caller
+    /// can name who.
+    blocked: Blocker,
+    /// The authority owner's *own* claim is not live and theirs, whatever anybody
+    /// else is or is not claiming. Carries the state it read, because "it lapsed
+    /// under us", "somebody swept it", "a peer took it", "we gave it back" and
+    /// "we never had it" are five different things to tell an operator.
+    claim_lost: leases.ClaimState,
+};
+
+/// The in-transaction authority check every destructive commit runs, expressed
+/// once.
+///
+/// **Two conjuncts, answering two questions neither can answer alone.**
+///
+/// `blockerLocked`, keyed on `identity`, answers *has anything else claimed this
+/// scope* — the same definition `begin` and `submitted` use. A `--force` takeover
+/// writes the incumbent's row `released` and inserts its own, so it is exactly
+/// what this sees.
+///
+/// `leases.claimStateLocked`, keyed on the authority owner, answers *is our own
+/// claim still live and ours*. Its absence was a hole rather than a rough edge: if
+/// the authority's lease expires during the last remote round trip and **no
+/// successor takes it**, the expiry pass sweeps the row, `blockerLocked` finds
+/// nothing to report — there genuinely is nothing — and the destruction commits
+/// anyway.
+///
+/// **The claim read comes first, and the refusal it drives comes second.** Reading
+/// it first is forced: `blockerLocked` runs the lazy expiry pass on its way
+/// through, which turns our own `lapsed` row into a `swept` one, so asking
+/// afterwards could only ever report somebody's housekeeping — here, this
+/// transaction's own — and never "we found it expired". Refusing on it *second* is
+/// a separate choice: both refusals decline the identical act, so the order only
+/// decides which fact the caller reports, and a peer's request id is more use than
+/// "our lease is not ours". A `--force` takeover satisfies both readings at once
+/// and is reported as the blocker it is.
+///
+/// **What can kill an authority between the last renewal and this check.**
+/// `Db.busy_timeout` is 5 s, so ordinary lock contention cannot span the 120 s
+/// `Control.Claim.ttl_secs`: waiting for the write lock is not a way to lose a
+/// claim. What is: a peer's `--force` takeover (`leases.takeover`), the process
+/// being suspended, a VM being resumed after a pause longer than the TTL, and a
+/// forward jump of the wall clock — every one of which leaves the lease row
+/// lapsed or displaced while this process believes its last renewal.
+///
+/// `server_id` is non-optional, unlike `blockerLocked`'s. `leases.server_id` is
+/// `NOT NULL REFERENCES servers(id)`, so an attempt in the local realm cannot
+/// hold a claim at all and there is no authority for this function to read. A
+/// destructive verb with no host is therefore refused by its caller before it
+/// gets here — see `SessionRemovalError.SessionRemovalHasNoServer` — rather than
+/// being handed a null that would read as "no authority needed".
+///
+/// Caller must hold the write transaction. A guard evaluated outside the
+/// transaction that acts on it is not a guard.
+pub fn authorityLocked(
+    store: *Store,
+    arena: Allocator,
+    server_id: i64,
+    scope: Scope,
+    identity: Identity,
+    now: i64,
+) Error!AuthorityVerdict {
+    try store.db.requireTransaction();
+
+    // Our own claim, read before the pass that would rewrite what it says.
+    const claim = try leases.claimStateLocked(
+        store,
+        arena,
+        server_id,
+        scope,
+        identity.authority.lease_owner_request_id,
+        now,
+    );
+
+    // A peer, when there is one to name.
+    if (try blockerLocked(store, arena, server_id, scope, identity, now)) |found|
+        return .{ .blocked = found };
+
+    // And our own claim when there is nobody to name, which is the state this
+    // conjunct was added for: nothing else holds the scope, so the check above is
+    // clear and correct, and the claim this command has been acting under stopped
+    // being live anyway.
+    if (!claim.holds()) return .{ .claim_lost = claim };
+
+    return .cleared;
+}
+
+// --- One destructive transaction, expressed once -----------------------------
+//
+// Every destructive commit in the tree runs under the same four guarantees:
+//
+//   1. inside the transaction, the authority owner's own claim state is re-read
+//      and the act is refused unless it is `held`;
+//   2. inside the same transaction, a peer blocker is checked for, keyed so that
+//      the target operation is never mistaken for a peer;
+//   3. the terminal and the local destruction land in that same transaction, or
+//      neither does;
+//   4. a rollback that could not be confirmed reports the local state as unknown
+//      rather than guessing.
+//
+// Written once because it was written per-verb four times and drifted every time.
+// `session rm` is the reference and reaches this through
+// `Execution.settleAndRemoveSession`; `job rm` reaches it through
+// `settleAndForgetJob`, including the two branches that used to call
+// `jobs.remove` — a `BEGIN IMMEDIATE` of its own with no terminal beside it and
+// no authority check at all.
+//
+// The price of one contract is one error set: `sessions.removeLocked` can fail
+// with `Db.Error` and `jobs.removeLocked` with `jobs.WriteError`, so
+// `DestructiveError` carries both and each caller declares a handful of refusals
+// it cannot itself produce. That is the same trade `AdoptError` records, and it is
+// bounded — the alternative is two copies of the transaction, which is what this
+// replaces.
+
+/// The local state a destructive commit destroys.
+///
+/// One arm per verb, and they are not interchangeable: the session delete has no
+/// owner, no expectation and no compare-and-swap, while the job delete is a CAS
+/// against the row the caller read and carries the grounds that entitle it.
+pub const Destruction = union(enum) {
+    /// `session rm`: the `sessions` row named here, whose delete cascades that
+    /// session's memories away.
+    session_row: []const u8,
+    /// `job rm`: the `jobs` cache row, against the row the caller read.
+    job_row: JobForget,
+};
+
+/// `job rm`'s destruction, as the compare-and-swap wants it.
+///
+/// Carries no authority of its own: the authority is named on
+/// `DestructiveCommit`, once, beside the target — which is the whole point of
+/// this pass. A `Forget` that carried its own owner would be a second place for
+/// the two identities to disagree.
+pub const JobForget = struct {
+    expected: jobs.RemoveExpectation,
+    grounds: jobs.RemovalGrounds,
+};
+
+/// What the destruction actually did.
+pub const Destroyed = union(enum) {
+    /// False means this machine had no metadata row for the session. Not a
+    /// refusal — `sessions.removeLocked` has no expectation to lose — and an
+    /// ordinary state for a session started outside Terminus. Reported rather
+    /// than discarded, because "there was no row" and "the row is gone" are
+    /// different facts and only one of them means a memory cascade happened.
+    session_row: struct { had_row: bool },
+    /// The CAS answer: applied, or refused with the conflict that refused it.
+    job_row: jobs.Write,
+};
+
+/// What a destructive commit writes to the ledger beside the destruction.
+pub const Ledger = union(enum) {
+    /// Settle the target in the same transaction as the destruction.
+    settle: Settle,
+    /// No terminal accompanies this destruction, and which of the two reasons
+    /// applies is *stated* rather than inferred from a null.
+    none: Absent,
+
+    pub const Settle = struct {
+        execution: *Execution,
+        terminal: op_state.Terminal,
+        extra: receipts.TerminalExtra,
+        /// What to do when the ledger already holds a terminal for the target.
+        on_rival: Rival,
+    };
+
+    /// The two answers to "a peer settled this attempt before we could", and the
+    /// two verbs really do differ.
+    pub const Rival = enum {
+        /// Decline the destruction. `session rm`: the verdict on record is not
+        /// the one this call was going to write, so a removal whose only durable
+        /// record is somebody else's settlement is exactly the pairing this
+        /// transaction exists to forbid.
+        decline,
+        /// Destroy anyway. `job rm`: forgetting a name asserts nothing about how
+        /// the job ended — it is the operator forgetting a name — so declining
+        /// because somebody else settled the attempt first would leave the row
+        /// behind for good.
+        destroy_anyway,
+    };
+
+    pub const Absent = union(enum) {
+        /// There is no operation behind this destruction at all: a `jobs` row
+        /// whose attempt row is missing.
+        no_operation,
+        /// The ledger already holds a terminal for this attempt, so there is
+        /// nothing for this call to write. Carries the request id, because the
+        /// attempt is still the *target* and still has to be exempted from the
+        /// peer check.
+        already_on_record: []const u8,
+    };
+
+    /// What the act is about — derived from the ledger rather than asked for
+    /// separately, so a caller cannot name a target that disagrees with the
+    /// attempt it is settling. That disagreement is the defect this whole pass
+    /// is about; making it unexpressible is cheaper than checking for it.
+    pub fn target(l: Ledger) TargetOperation {
+        return switch (l) {
+            .settle => |s| .{ .attempt = s.execution.id() },
+            .none => |absent| switch (absent) {
+                .no_operation => .none,
+                .already_on_record => |id| .{ .attempt = id },
+            },
+        };
+    }
+};
+
+/// One destructive act, named in full.
+pub const DestructiveCommit = struct {
+    /// The host the scope and the claim belong to. Non-optional; see
+    /// `authorityLocked`.
+    server_id: i64,
+    scope: Scope,
+    /// Whose claim licenses this. The lease owner, which for `job kill` / `job
+    /// rm` is not the attempt being settled — see `AuthorityOwner`.
+    authority: AuthorityOwner,
+    /// What this writes to the ledger, and what it is about.
+    ledger: Ledger,
+    /// What it destroys locally.
+    destroys: Destruction,
+
+    fn identity(c: DestructiveCommit) Identity {
+        return .{ .authority = c.authority, .target = c.ledger.target() };
+    }
+};
+
+/// What the ledger half of a committed destruction did.
+pub const LedgerResult = union(enum) {
+    /// This call recorded the terminal.
+    recorded: receipts.TerminalRecord,
+    /// A terminal already stood for the target, this call wrote none, and the
+    /// destruction went ahead regardless — `Ledger.Rival.destroy_anyway`. Named
+    /// rather than folded into `recorded`, because the caller must report the
+    /// verdict on record and not the one it asked for.
+    rival: receipts.TerminalRecord,
+    /// Nothing was written, for the reason the caller stated.
+    absent: Ledger.Absent,
+};
+
+/// What one destructive transaction did.
+pub const Committed = union(enum) {
+    /// The destruction and the ledger write landed together. One commit, so
+    /// neither can be true without the other.
+    done: struct { destroyed: Destroyed, ledger: LedgerResult },
+    /// Something else was laying claim to the scope when the transaction opened.
+    /// Nothing was destroyed, no terminal was written, and the target is still
+    /// unsettled — so the scope stays barred, which is the correct fail-closed
+    /// outcome rather than a missing record.
+    refused: Blocker,
+    /// The authority owner's *own* claim is no longer live and theirs. Nothing
+    /// was destroyed and no terminal was written, exactly as `refused`.
+    claim_lost: leases.ClaimState,
+    /// The ledger already held a terminal for the target and the caller asked to
+    /// `decline` over one. Nothing was destroyed.
+    already_settled: receipts.TerminalRecord,
+};
+
+/// A wrapper read an arm of the contract's answer that its own request could not
+/// have produced — a job's CAS answer off a session removal, or a recorded
+/// terminal off a commit that stated there was none to write.
+///
+/// Named rather than left to `unreachable`, for the reason
+/// `jobs.UnexplainedJobsRefusal` is: it means this file's own dispatch and its
+/// wrappers have drifted apart, which is a bug here and not a state any caller
+/// can act on.
+pub const ContractError = error{ContractAnsweredAboutSomethingElse};
+
+pub const DestructiveError = Error || jobs.WriteError;
+
+/// Wall-clock seconds, from the `io` a call already has.
+///
+/// The one clock a destructive commit may use. `ctx.now` is read once at process
+/// start, and a lease is the one thing in this tree that is *compared* against a
+/// clock rather than merely stamped with one — so a claim check dated from process
+/// start reports a lapsed lease as live, which is the guard answering yes about a
+/// scope nobody holds. Taken from `io` rather than as a parameter precisely so no
+/// caller can hand in the frozen stamp.
+fn nowFrom(io: std.Io) i64 {
+    const ts = std.Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+}
+
+/// Runs one destructive act under the contract above.
+///
+/// The order inside the transaction is the substance:
+///
+///  1. the authority check, which can refuse before anything is written;
+///  2. the terminal, because it is the next thing that can still be refused —
+///     `canSettle`, `canTransition` and `terminalDescribesKind` all run inside
+///     `receipts.settleLocked`;
+///  3. the destruction, last, because it is the step nothing downstream can undo.
+///
+/// A refusal at (1) or (2) commits rather than rolls back, and that is deliberate:
+/// nothing of ours was written, so the commit only keeps the lazy lease-expiry
+/// pass the check performed on its way through — the same thing `begin` and
+/// `submitted` commit on their refusal paths.
+///
+/// A *failure* anywhere takes the whole thing down through the `errdefer`, and
+/// whether that undo happened is reported through `rollback` rather than assumed:
+/// a `ROLLBACK` whose own statement failed establishes nothing. See `Rollback`.
+///
+/// The in-memory `Execution` is updated only after the COMMIT. A handle marked
+/// settled beside a transaction that rolled back would be a process believing a
+/// terminal that is not on disk.
+pub fn commitDestruction(
+    store: *Store,
+    arena: Allocator,
+    io: std.Io,
+    commit: DestructiveCommit,
+    /// Whether the transaction was undone, when it could not be committed.
+    /// Written on every path, before anything here can fail.
+    rollback: *Rollback,
+) DestructiveError!Committed {
+    rollback.* = .none;
+    const at = nowFrom(io);
+
+    try store.db.exec("BEGIN IMMEDIATE");
+    // Declared after `BEGIN`, so a `BEGIN` that failed leaves `rollback` at
+    // `.none` — which is the truth: no transaction opened, so nothing needed
+    // undoing.
+    errdefer {
+        if (store.db.exec("ROLLBACK")) |_| {
+            rollback.* = .confirmed;
+        } else |err| {
+            rollback.* = .{ .unconfirmed = @errorName(err) };
+        }
+    }
+
+    switch (try authorityLocked(store, arena, commit.server_id, commit.scope, commit.identity(), at)) {
+        .cleared => {},
+        .blocked => |found| {
+            try store.db.exec("COMMIT");
+            return .{ .refused = found };
+        },
+        .claim_lost => |claim| {
+            try store.db.exec("COMMIT");
+            return .{ .claim_lost = claim };
+        },
+    }
+
+    if (comptime builtin.is_test) {
+        if (between_ownership_and_removal) |probe| probe();
+    }
+
+    const ledger: LedgerResult = switch (commit.ledger) {
+        .settle => |s| switch (try receipts.settleLocked(store, s.execution.id(), s.terminal, s.extra, at)) {
+            .recorded => |record| .{ .recorded = record },
+            .already_settled => |winner| switch (s.on_rival) {
+                .decline => {
+                    // Nothing was written by the settlement either — see
+                    // `settleLocked`'s three non-writing exits — so this commits
+                    // for the same reason the refusals above do.
+                    try store.db.exec("COMMIT");
+                    s.execution.settled = true;
+                    s.execution.status = winner.status;
+                    return .{ .already_settled = winner };
+                },
+                .destroy_anyway => .{ .rival = winner },
+            },
+        },
+        .none => |absent| .{ .absent = absent },
+    };
+
+    const destroyed: Destroyed = switch (commit.destroys) {
+        .session_row => |name| .{
+            .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },
+        },
+        .job_row => |forget| .{ .job_row = try removeUnderGrounds(store, forget) },
+    };
+
+    try store.db.exec("COMMIT");
+
+    switch (commit.ledger) {
+        .settle => |s| switch (ledger) {
+            .recorded => |record| {
+                s.execution.settled = true;
+                s.execution.status = record.status;
+            },
+            .rival => |winner| {
+                s.execution.settled = true;
+                s.execution.status = winner.status;
+            },
+            .absent => {},
+        },
+        .none => {},
+    }
+
+    return .{ .done = .{ .destroyed = destroyed, .ledger = ledger } };
+}
+
+/// What a `job rm`'s one transaction did.
+///
+/// A sibling of `SessionRemoval` rather than the same type: the destruction it
+/// reports is a compare-and-swap against a row the caller read, and `had_row` is
+/// not a thing a `jobs` delete can answer.
+///
+/// No `already_settled` arm, and that is a property rather than an omission:
+/// `job rm` destroys either way (`Ledger.Rival.destroy_anyway`), and
+/// `settleAndForgetJob` — not its caller — is what says so, so the state cannot
+/// be asked for.
+pub const JobRemoval = union(enum) {
+    /// The row and the ledger write landed together.
+    forgotten: struct { write: jobs.Write, ledger: LedgerResult },
+    refused: Blocker,
+    claim_lost: leases.ClaimState,
+};
+
+/// `job rm`'s ledger half: the attempt to settle in the removal's transaction, or
+/// the stated reason there is none.
+///
+/// Two of `job rm`'s three branches have no terminal to write — the `jobs` row
+/// names no attempt, or the attempt is already terminal — and both of those used
+/// to reach `jobs.remove` directly, which opened a `BEGIN IMMEDIATE` of its own
+/// with no terminal beside it and no authority check in it. Stating *which* of the
+/// two applies is what keeps "there is nothing to settle" from being expressed as
+/// a null that also covers "we forgot to settle it".
+pub const JobSettlement = union(enum) {
+    /// Settle this attempt in the transaction that forgets the row.
+    attempt: struct {
+        execution: *Execution,
+        terminal: op_state.Terminal,
+        extra: receipts.TerminalExtra,
+    },
+    /// No terminal accompanies the removal.
+    absent: Ledger.Absent,
+
+    fn ledger(s: JobSettlement) Ledger {
+        return switch (s) {
+            .attempt => |a| .{
+                .settle = .{
+                    .execution = a.execution,
+                    .terminal = a.terminal,
+                    .extra = a.extra,
+                    // Decided here rather than asked of the caller. `job rm` forgets
+                    // a name, which asserts nothing about how the job ended, so a
+                    // removal that declined because a peer settled the attempt first
+                    // would leave the row behind for good. Fixing it here is also
+                    // what makes `Committed.already_settled` unreachable from
+                    // `settleAndForgetJob`, which is why `JobRemoval` has no arm for
+                    // it.
+                    .on_rival = .destroy_anyway,
+                },
+            },
+            .absent => |absent| .{ .none = absent },
+        };
+    }
+};
+
+/// `job rm`'s destructive commit: settle the target attempt when there is one to
+/// settle, and forget the cache row, in one transaction under the authority the
+/// caller names.
+///
+/// A free function rather than a method, because two of `job rm`'s three branches
+/// have no live `Execution` to hang it off — see `JobSettlement`.
+///
+/// `authority` is the lease owner minted by `cmd_job.claimJobScope`, which is
+/// **not** `execution.id()`. Passing the attempt here would key the claim read on
+/// an id that never took a lease — `never_taken`, every time — and hand the overlap
+/// check an owner that does not match our own lease, so our own claim would be
+/// reported as a peer's. Passing the lease owner to the *operation* half would
+/// report the target attempt as a peer blocking its own removal. See
+/// `AuthorityOwner`; this is the identity problem that made a copy of
+/// `settleAndRemoveSession` the wrong answer here.
+pub fn settleAndForgetJob(
+    store: *Store,
+    arena: Allocator,
+    io: std.Io,
+    server_id: i64,
+    scope: Scope,
+    authority: AuthorityOwner,
+    settlement: JobSettlement,
+    forget: JobForget,
+    rollback: *Rollback,
+) (DestructiveError || ContractError)!JobRemoval {
+    switch (try commitDestruction(store, arena, io, .{
+        .server_id = server_id,
+        .scope = scope,
+        .authority = authority,
+        .ledger = settlement.ledger(),
+        .destroys = .{ .job_row = forget },
+    }, rollback)) {
+        .refused => |blocker| return .{ .refused = blocker },
+        .claim_lost => |claim| return .{ .claim_lost = claim },
+        // `JobSettlement.ledger` pins `on_rival` to `destroy_anyway`, which is the
+        // only thing that can produce this arm, so reaching it means this file's
+        // dispatch and its wrapper have drifted apart.
+        .already_settled => return error.ContractAnsweredAboutSomethingElse,
+        .done => |done| switch (done.destroyed) {
+            .job_row => |write| return .{ .forgotten = .{ .write = write, .ledger = done.ledger } },
+            .session_row => return error.ContractAnsweredAboutSomethingElse,
+        },
+    }
 }
 
 pub const Execution = struct {
@@ -412,8 +1039,7 @@ pub const Execution = struct {
     }
 
     fn now(self: *const Execution) i64 {
-        const ts = std.Io.Timestamp.now(self.io, .real);
-        return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+        return nowFrom(self.io);
     }
 
     /// Moves to `connecting`. Call immediately before dialing.
@@ -453,7 +1079,12 @@ pub const Execution = struct {
         // directly, because a null server names the local realm and not "no
         // guard". A `fetch` writes a local path and used to skip this
         // entirely.
-        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at)) |blocker| {
+        //
+        // `coincident`, because at this point the acting attempt is both the
+        // thing that would hold a lease on this scope and the thing being
+        // recorded. A destructive control verb is the shape where they part
+        // company; see `Identity`.
+        if (try blockerLocked(self.store, self.arena, self.server_id, self.scope, .coincident(self.id()), at)) |blocker| {
             if (self.mutating and !self.force) {
                 // Nothing of ours was written, so committing only keeps
                 // the lease expiry pass that the check performed.
@@ -760,16 +1391,17 @@ pub const Execution = struct {
     /// and the row is what `run --name X` checks *before* the scope guard, so
     /// the divergence was visible as a refusal the ledger could not explain.
     ///
-    /// The cache is written only when *this* call recorded the terminal —
-    /// except for `.forget`, which is written either way. `already_settled`
-    /// means a peer got there first and the ledger holds their verdict, not
-    /// ours; the cache's two settled words each assert something specific
-    /// (`exited` carries an exit code, `killed` says somebody stopped it) and
-    /// neither is a fact this call established. A removal asserts nothing about
-    /// the outcome — it is the operator forgetting a name — so refusing to
-    /// forget it because somebody else settled the attempt first would leave
-    /// the row behind for good. The caller is told which happened and reports
-    /// it: see `CacheResult`.
+    /// The cache is written only when *this* call recorded the terminal.
+    /// `already_settled` means a peer got there first and the ledger holds their
+    /// verdict, not ours; the cache's two settled words each assert something
+    /// specific (`exited` carries an exit code, `killed` says somebody stopped
+    /// it) and neither is a fact this call established. The caller is told which
+    /// happened and reports it: see `CacheResult`.
+    ///
+    /// The destructive counterpart — `job rm` forgetting the row — is *not*
+    /// reachable here, and that is the point of the split. Destroying a row
+    /// requires an authority to license it and this function has none to check;
+    /// see `settleAndForgetJob`.
     ///
     /// A refused cache write does *not* roll the settlement back. The ledger is
     /// the record and it is now correct; what the refusal says is that the row
@@ -809,10 +1441,6 @@ pub const Execution = struct {
                     .refused => |conflict| .{ .refused = conflict },
                 },
             },
-            .forget => |g| switch (try removeUnderGrounds(self.store, g)) {
-                .applied => .synced,
-                .refused => |conflict| .{ .refused = conflict },
-            },
         };
 
         try self.store.db.exec("COMMIT");
@@ -820,13 +1448,12 @@ pub const Execution = struct {
     }
 
     /// Settles this attempt and deletes the local session row it names — one
-    /// transaction, re-validating on the way in that the scope is still ours.
+    /// transaction, under the shared destructive contract.
     ///
     /// This is `session rm`'s last three acts, and they used to be three:
     /// `stillOurs` renewed the lease, then `execution.settle` ran a whole
     /// transaction of its own writing the proven cancellation, and only then
-    /// `sessions.remove` deleted the row. Two defects fell out of that order and
-    /// this closes both.
+    /// `sessions.remove` deleted the row. Two defects fell out of that order.
     ///
     /// **The window.** A peer's takeover landing between the renewal and the
     /// delete was never re-checked, so the command went on to drop the row — and
@@ -839,50 +1466,24 @@ pub const Execution = struct {
     /// removal while the row, its memories and possibly the pane log were all
     /// still there — and a terminal is frozen, so nothing could correct it.
     ///
-    /// So: one `BEGIN IMMEDIATE` holding the ownership check, the terminal and
-    /// the delete. If it cannot commit, the `errdefer` puts it back — nothing is
-    /// deleted and no terminal is written; the attempt stays unsettled, the scope
-    /// stays barred, and that is the correct fail-closed outcome rather than a
-    /// missing record. Whether that undo actually happened is reported through
-    /// `rollback` rather than assumed, because a `ROLLBACK` whose own statement
-    /// failed establishes nothing; see `Rollback`.
+    /// Both are closed by `commitDestruction`, which this delegates to rather than
+    /// reimplementing. It was the reference for that contract, and the copy that
+    /// lived here was the fourth per-verb version of the same machinery; keeping
+    /// the copy would have meant the next fix landing on one of the two.
     ///
-    /// **What the ownership check is.** Two conjuncts, and they answer two
-    /// different questions that neither one can answer alone.
+    /// **The one identity decision this wrapper makes.** `session rm`'s authority
+    /// owner and its target operation are the *same* value — `cmd_session.claimScope`
+    /// holds the lease under `execution.id()`, and the operation being settled is
+    /// that same control attempt — so `Identity.coincident` describes it. `job
+    /// kill` and `job rm` are the shape where the two part company, which is
+    /// exactly why a copy of this function on the job side would have looked up a
+    /// lease no id ever took and read its own target attempt as a peer. See
+    /// `AuthorityOwner`.
     ///
-    /// `blockerLocked`, keyed on this attempt's own `request_id`, answers *has
-    /// anything else claimed this scope* — the same definition `begin` and
-    /// `submitted` use, exempting only the id it is handed. A `--force` takeover
-    /// writes the incumbent's row `released` and inserts its own, so it is
-    /// exactly what this sees.
-    ///
-    /// `leases.claimStateLocked`, keyed the same way, answers *is our own lease
-    /// still live and ours*. It used to be missing, and its absence was a hole
-    /// rather than a rough edge: if this command's lease expires during the last
-    /// remote round trip and **no successor takes it**, the expiry pass sweeps
-    /// the row, `blockerLocked` finds nothing to report — there genuinely is
-    /// nothing — and the terminal plus the cascading delete committed anyway. A
-    /// session's row and its memories were destroyed by a command that held
-    /// nothing. The `stillOurs` renewal on the far side of the last remote call
-    /// narrows that window and cannot close it; only a check inside this
-    /// transaction can.
-    ///
-    /// **The claim read comes first, and the refusal it drives comes second.**
-    /// Reading it first is forced: `blockerLocked` runs the lazy expiry pass on
-    /// its way through, which turns our own `lapsed` row into a `swept` one, so
-    /// asking afterwards could only ever report somebody's housekeeping — here,
-    /// this transaction's own — and never "we found it expired". Refusing on it
-    /// *second* is a separate choice: both refusals decline the identical act, so
-    /// the order only decides which fact the caller reports, and a peer's request
-    /// id is more use than "our lease is not ours". A `--force` takeover satisfies
-    /// both readings at once and is reported as the blocker it is.
-    ///
-    /// The terminal goes in before the delete, because it is the write that can
-    /// still be refused — `canSettle`, `canTransition` and `terminalDescribesKind`
-    /// all run inside `settleLocked`. A refusal there rolls back through the
-    /// `errdefer` with nothing deleted; and an `already_settled` answer means the
-    /// verdict on record is not the one this call was going to write, so the row
-    /// is deliberately kept rather than deleted against somebody else's terminal.
+    /// `Ledger.Rival.decline` is the other: the verdict on record is not the one
+    /// this call was going to write, so the row is deliberately kept rather than
+    /// deleted against somebody else's terminal. `job rm` answers
+    /// `destroy_anyway` to the same question, for the reason `Ledger.Rival` gives.
     pub fn settleAndRemoveSession(
         self: *Execution,
         session: []const u8,
@@ -894,87 +1495,49 @@ pub const Execution = struct {
         rollback: *Rollback,
     ) SessionRemovalError!SessionRemoval {
         // Before anything can fail, so a caller that got an error is reading an
-        // answer rather than whatever was in the variable.
+        // answer rather than whatever was in the variable. Written again inside
+        // `commitDestruction`; the duplication is deliberate, because the refusal
+        // below returns without ever reaching it.
         rollback.* = .none;
 
         // A session row is keyed on a host (`sessions.server_id` is NOT NULL), so
         // an attempt with no server cannot name the row it is about. Refused
         // rather than defaulted: picking a server here would delete somebody
-        // else's row.
+        // else's row. It is also what lets `authorityLocked` take a non-optional
+        // `server_id`: there is no lease row shape for the local realm, so an
+        // attempt with no host has no authority for it to read.
         const server_id = self.server_id orelse return error.SessionRemovalHasNoServer;
-        const at = self.now();
 
-        try self.store.db.exec("BEGIN IMMEDIATE");
-        // Declared after `BEGIN`, so a `BEGIN` that failed leaves `rollback` at
-        // `.none` — which is the truth: no transaction opened, so nothing needed
-        // undoing.
-        errdefer {
-            if (self.store.db.exec("ROLLBACK")) |_| {
-                rollback.* = .confirmed;
-            } else |err| {
-                rollback.* = .{ .unconfirmed = @errorName(err) };
-            }
-        }
-
-        // Our own claim, read before the pass that would rewrite what it says.
-        const claim = try leases.claimStateLocked(
-            self.store,
-            self.arena,
-            server_id,
-            self.scope,
-            self.id(),
-            at,
-        );
-
-        const blocker = try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at);
-
-        // A peer, when there is one to name. Both refusals are the same act — the
-        // whole composite is declined and nothing is written — so what the order
-        // decides is only which fact the caller reports, and a blocking request id
-        // is strictly more use to an operator than "our lease is not ours". A
-        // `--force` takeover shows up in both readings at once, and this is the
-        // arm that can say who did it.
-        if (blocker) |found| {
-            // Nothing of ours was written, so the commit only keeps the lease
-            // expiry pass the check performed on its way through — the same
-            // thing `begin` and `submitted` commit on their refusal paths.
-            try self.store.db.exec("COMMIT");
-            return .{ .refused = found };
-        }
-
-        // And our own claim when there is nobody to name, which is the state this
-        // conjunct was added for: nothing else holds the scope, so the check above
-        // is clear and correct, and the lease this command has been acting under
-        // stopped being live anyway.
-        if (!claim.holds()) {
-            // Commits for the same reason the arm above does: nothing of ours was
-            // written, and the expiry pass `blockerLocked` ran on its way through
-            // is worth keeping.
-            try self.store.db.exec("COMMIT");
-            return .{ .claim_lost = claim };
-        }
-
-        if (comptime builtin.is_test) {
-            if (between_ownership_and_removal) |probe| probe();
-        }
-
-        const outcome = try receipts.settleLocked(self.store, self.id(), terminal, extra, at);
-        switch (outcome) {
-            .already_settled => |winner| {
-                // Nothing was written by the settlement either — see
-                // `settleLocked`'s three non-writing exits — so this commits for
-                // the same reason the refusal above does.
-                try self.store.db.exec("COMMIT");
-                self.settled = true;
-                self.status = winner.status;
-                return .{ .already_settled = winner };
-            },
-            .recorded => |record| {
-                const had_row = try sessions.removeLocked(self.store, server_id, session);
-                try self.store.db.exec("COMMIT");
-                self.settled = true;
-                self.status = record.status;
-                return .{ .removed = .{ .had_row = had_row, .recorded = record } };
+        switch (try commitDestruction(self.store, self.arena, self.io, .{
+            .server_id = server_id,
+            .scope = self.scope,
+            // The one verb where the authority owner and the target operation are
+            // the same value; see the doc comment above.
+            .authority = .{ .lease_owner_request_id = self.id() },
+            .ledger = .{ .settle = .{
+                .execution = self,
+                .terminal = terminal,
+                .extra = extra,
+                .on_rival = .decline,
+            } },
+            .destroys = .{ .session_row = session },
+        }, rollback)) {
+            .refused => |blocker| return .{ .refused = blocker },
+            .claim_lost => |claim| return .{ .claim_lost = claim },
+            .already_settled => |winner| return .{ .already_settled = winner },
+            .done => |done| {
+                const row = switch (done.destroyed) {
+                    .session_row => |r| r,
+                    .job_row => return error.ContractAnsweredAboutSomethingElse,
+                };
+                const record = switch (done.ledger) {
+                    .recorded => |r| r,
+                    // A `.settle` request with `on_rival = .decline` produces
+                    // exactly one of `recorded` and `Committed.already_settled`,
+                    // so neither of these is reachable from the request above.
+                    .rival, .absent => return error.ContractAnsweredAboutSomethingElse,
+                };
+                return .{ .removed = .{ .had_row = row.had_row, .recorded = record } };
             },
         }
     }
@@ -1189,7 +1752,7 @@ pub fn begin(
     // no lease either. So nothing is exempted here, which is correct for a
     // brand new attempt and is why this call needed no separate "exclude"
     // argument once the owner became the request id.
-    if (try blockerLocked(store, arena, opts.server_id, opts.scope, &request_id, opts.now)) |blocker| {
+    if (try blockerLocked(store, arena, opts.server_id, opts.scope, .coincident(&request_id), opts.now)) |blocker| {
         if (opts.mutating and !opts.force) {
             // Nothing was inserted; the commit only keeps the lease
             // expiry pass the check performed on its way through.

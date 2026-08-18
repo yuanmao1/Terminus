@@ -376,8 +376,9 @@ pub const ClaimState = union(enum) {
 /// erases the difference between `lapsed` and `swept`, and that difference is a
 /// reading — "we found it expired" against "somebody else's housekeeping had
 /// already retired it". A caller that wants both readings therefore has to take
-/// this one *before* anything that sweeps; `settleAndRemoveSession` fixes that
-/// order and says so.
+/// this one *before* anything that sweeps. There is one caller —
+/// `execution.authorityLocked`, the check every destructive commit in the tree
+/// runs — and it fixes that order and says so.
 ///
 /// Returns the state, never a verdict. Whether a given state may act, and what
 /// it refuses with, belongs to the caller — see `ClaimState.holds`.

@@ -1881,7 +1881,6 @@ fn settleObserved(
                 f.exit_code,
                 f.at,
             ) catch |err| Cli.storeFatal(store, err)),
-            .forget => |g| resultOf(forgetRow(store, g) catch |err| Cli.storeFatal(store, err)),
         };
         return .{ .status = null, .settlement = settlementOf(terminal, .no_attempt), .cache = cache };
     };
@@ -1903,13 +1902,14 @@ fn settleObserved(
     // we set out to write.
     //
     // A finish is skipped here: this observation recorded nothing, so it has
-    // no verdict to copy into the row. A removal is not, for the reason
-    // `settleAttachedAndSyncJob` gives — forgetting a name says nothing about
-    // how the job ended, and `job rm` that declined to forget it because
-    // somebody else settled the attempt first would leave the row for good.
+    // no verdict to copy into the row. A *removal* used to be the exception —
+    // forgetting a name says nothing about how the job ended — and it no longer
+    // arrives here at all: `job rm` destroys through
+    // `Core.execution.settleAndForgetJob`, which is the only route that can name
+    // an authority for the delete. An exhaustive switch, so the day a third sync
+    // arm appears it has to say what it does on this branch.
     const cache: Core.execution.CacheResult = switch (sync) {
         .none, .finish => .ledger_already_settled,
-        .forget => |g| resultOf(forgetRow(store, g) catch |err| Cli.storeFatal(store, err)),
     };
     const effective = recordedEffective(ctx, store, a.request_id) orelse
         return .{ .status = null, .settlement = settlementOf(terminal, .unknown_request), .cache = cache };
@@ -1927,14 +1927,47 @@ fn resultOf(write: Store.jobs.Write) Core.execution.CacheResult {
     };
 }
 
-/// `jobs.remove` renders its state list from the grounds, so they have to be
-/// comptime; a sync request carries them as a value. One `inline else`.
-fn forgetRow(
+/// What `job rm`'s destructive transaction established, in the vocabulary the
+/// report is built from.
+///
+/// The sibling of `settleObserved` for the one path that destroys, and it exists
+/// because that path no longer goes through it: destroying a row needs an authority
+/// and `settleObserved` has none to check. What the two must keep in common is the
+/// *rule* — every answer goes through `settlementOf`, so a caller cannot report an
+/// outcome the ledger does not hold by forgetting to ask what it holds.
+fn removalObserved(
+    ctx: *Cli.Ctx,
     store: *Store,
-    forget: Core.execution.JobCacheSync.Forget,
-) Store.jobs.WriteError!Store.jobs.Write {
-    return switch (forget.grounds) {
-        inline else => |grounds| Store.jobs.remove(store, forget.expected, grounds),
+    terminal: Core.Store.op_state.Terminal,
+    ledger: Core.execution.LedgerResult,
+    write: Store.jobs.Write,
+) Observed {
+    const answer: LedgerAnswer = switch (ledger) {
+        .recorded => |record| .{ .status = record.status },
+        // A peer settled the attempt before this transaction could. The removal
+        // went ahead — forgetting a name asserts nothing about how the job ended —
+        // and what gets reported is the verdict on record, not the one this
+        // command asked for.
+        .rival => |winner| .{ .status = winner.status },
+        .absent => |absent| switch (absent) {
+            .no_operation => .no_attempt,
+            // The attempt was already terminal when this removal started, so ask
+            // the ledger what it holds rather than reporting the terminal that was
+            // never written. A request the ledger does not have is a dangling
+            // reference nobody may read an outcome out of.
+            .already_on_record => |request_id| if (recordedEffective(ctx, store, request_id)) |status|
+                .{ .status = status }
+            else
+                .unknown_request,
+        },
+    };
+    return .{
+        .status = switch (answer) {
+            .status => |status| status,
+            .no_attempt, .unknown_request => null,
+        },
+        .settlement = settlementOf(terminal, answer),
+        .cache = resultOf(write),
     };
 }
 
@@ -2684,6 +2717,196 @@ fn refuseRemoval(
         },
     }
     ctx.out.flush() catch {};
+    Cli.exitNow(Cli.exit_code.failure);
+}
+
+/// What the removal's own transaction found when it declined the whole composite.
+///
+/// Two arms, and the counterparty is the difference. `blocked` names a peer;
+/// `claim_lost` frequently has none to name — the state it exists for is a lease
+/// that lapsed during the last round trip and was swept by somebody's ordinary
+/// housekeeping, leaving the scope genuinely clear. That is exactly the state the
+/// overlap check reads as "nothing is in your way", which is true, and which used
+/// to be enough to delete a row.
+///
+/// The two `error_code` words are the ones `session rm` already publishes for the
+/// same two facts (`cmd_session.code`), so this adds no vocabulary to the tree: the
+/// receipt is where they land here, because `RemovalJson` has no `errorCode` key
+/// and adding one is a change to a published document.
+const CommitRefusal = union(enum) {
+    blocked: Core.execution.Blocker,
+    claim_lost: Store.leases.ClaimState,
+
+    fn errorCode(r: CommitRefusal) []const u8 {
+        return switch (r) {
+            .blocked => "SCOPE_TAKEN_BEFORE_COMMIT",
+            .claim_lost => "CLAIM_LOST_BEFORE_COMMIT",
+        };
+    }
+
+    /// What the transaction saw, in one clause, for the sentence that carries it.
+    fn found(r: CommitRefusal, ctx: *Cli.Ctx) []const u8 {
+        return switch (r) {
+            .blocked => |blocker| switch (blocker) {
+                .unsettled => |op| std.fmt.allocPrint(
+                    ctx.arena,
+                    "request {s} is {s} on an overlapping scope",
+                    .{ op.request_id, op.status.text() },
+                ) catch "another attempt is unsettled on an overlapping scope",
+                .lease => |lease| std.fmt.allocPrint(
+                    ctx.arena,
+                    "request {s} (on {s}) holds a lease on an overlapping scope until {d}",
+                    .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
+                ) catch "another request holds a lease on an overlapping scope",
+            },
+            .claim_lost => |claim| std.fmt.allocPrint(
+                ctx.arena,
+                "this command's own lease on the scope is {s}",
+                .{claim.code()},
+            ) catch "this command's own lease on the scope is no longer live and ours",
+        };
+    }
+};
+
+/// Refused by the transaction that was to record the removal, with every remote
+/// step already behind it.
+///
+/// A sibling of `refuseRemoval` rather than a flag on it, and which side of the
+/// kill the loss fell on is the difference. `refuseRemoval` fires *before* the
+/// kill, off a renewal: the session is untouched, nothing was deleted, and its
+/// hint says so. This fires when every renewal held and the transaction that was
+/// to write the terminal and forget the row found either a peer's claim on the
+/// scope or this command's own claim no longer live. The session is stopped, the
+/// evidence may already be gone, and the row is kept — so the sentence has to say
+/// all three, which is why `stopped_at` is built from what actually happened
+/// rather than from the flag that asked for it.
+///
+/// `authority` stays whatever the renewals answered — `held`, on the path that
+/// gets here — for the reason `cmd_session.refuseAfterKill` gives: it reports what
+/// the renewals said, and they said it truthfully about the moments they were
+/// asked. What refused this is the read inside the transaction, and the receipt's
+/// `error_code` is where that is said.
+///
+/// Nothing was written by that transaction, so the attempt is still ours to
+/// settle, and it is settled here rather than left open: an attempt this command
+/// reached the host under and then abandoned silently would bar this job's scope
+/// with nothing in the ledger saying why.
+///
+/// Exit 75, not 1. The kill went out, so what happened to the work really is
+/// unknown *because of this command* — the opposite of `refuseRemoval`, which
+/// changed nothing.
+fn refuseRemovalAtCommit(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    job: Store.jobs.Job,
+    attempt: ?Store.job_attempts.Attempt,
+    execution: ?*Core.execution.Execution,
+    authority: Authority,
+    probe: Tmux.JobProbe,
+    log_discarded: bool,
+    result_discarded: bool,
+    /// The terminal the removal had chosen. Carried in rather than reinvented,
+    /// because whether it survives the refusal is a question only it can answer —
+    /// see below.
+    terminal: Core.Store.op_state.Terminal,
+    refusal: CommitRefusal,
+) noreturn {
+    // What this removal actually did before it was stopped, stated in full. An
+    // operator told only "not removed" does not know which of the three
+    // destructive steps happened.
+    const stopped_at: []const u8 = if (!log_discarded)
+        "its session was stopped and nothing was deleted, so its log, its result record and its local row are all still there"
+    else if (!result_discarded and attempt != null)
+        "its session was stopped and its log was deleted before the refusal; its result record and its local row were not touched"
+    else
+        "its session was stopped and its evidence was deleted before the refusal; its local row was not touched";
+    const reason = std.fmt.allocPrint(
+        ctx.arena,
+        "this command stopped job '{s}''s session and the transaction that was to record the removal found that {s} ({s}); nothing was deleted and no terminal was written by it, so {s}",
+        .{ job.name, refusal.found(ctx), refusal.errorCode(), stopped_at },
+    ) catch "this command stopped this job's session and then found it could not record the removal; the local row was kept";
+
+    // **Which terminal survives the refusal**, and it is the same rule the
+    // removal's own arms follow rather than a new one. An exit code read from a
+    // document at this attempt's own request id is not made false by a scope that
+    // moved — no peer can write to that address without starting a new attempt
+    // under a new id — so a proven outcome stands and only the *deletion* is
+    // refused. Every other terminal the removal had chosen opens with "job
+    // removed", and nothing was removed, so those become the refusal's own
+    // `indeterminate` carrying the code that says which read declined it.
+    const settle_with: Core.Store.op_state.Terminal = switch (terminal) {
+        .exited => terminal,
+        else => .{ .indeterminate = .{
+            .reason = reason,
+            .last_observed = if (execution) |e| e.status else .remote_started,
+            .error_code = refusal.errorCode(),
+        } },
+    };
+
+    // The composite wrote nothing, so the attempt is still ours to settle — and it
+    // is settled here rather than left open: an attempt this command reached the
+    // host under and then abandoned silently would bar this job's scope with
+    // nothing in the ledger saying why.
+    var status_text: []const u8 = "unchanged";
+    var proven = false;
+    if (execution) |e| {
+        const outcome = e.settle(settle_with, .{}) catch |err|
+            Cli.receiptFatal(e.id(), err, "recording a refused job removal");
+        status_text = settledText(outcome);
+        proven = settledStatus(outcome) != .indeterminate;
+    } else if (attempt) |a| {
+        // Nothing to settle: the ledger already holds this attempt's verdict, or
+        // the row names a request the ledger does not have. Report what is there.
+        if (recordedEffective(ctx, store, a.request_id)) |status| {
+            status_text = status.text();
+            proven = status != .indeterminate;
+        } else {
+            status_text = "unknown";
+        }
+    }
+
+    const hint = std.fmt.allocPrint(
+        ctx.arena,
+        "{s}. Find out who else is acting on this job, then re-run once the scope is free, or re-run with --force to take the scope over; a peer attempt that is not running any more has to be settled first with 'terminus request reconcile <request-id>'",
+        .{reason},
+    ) catch "the removal was refused when it was about to be recorded; the local row was kept";
+    const lease = Cli.releaseClaimReporting();
+    switch (ctx.out.format) {
+        .json => ctx.out.json(RemovalJson{
+            .ok = false,
+            .action = "not_removed",
+            .job = job.name,
+            .status = status_text,
+            .outcomeProven = proven,
+            .rowRemoved = false,
+            // What was actually retained, not what the flag asked for.
+            .evidenceRetained = !log_discarded,
+            .attemptRetained = attempt != null,
+            .conflict = ConflictJson.from(probe.conflict),
+            .resultRecord = probe.sidecar.code(),
+            .resultRecordError = resultRecordError(ctx, probe.sidecar),
+            .requestId = if (attempt) |a| a.request_id else null,
+            .cacheError = null,
+            .authority = authority.code(),
+            .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
+            .hint = hint,
+        }) catch {},
+        .human => {
+            ctx.out.print(
+                "job '{s}' was NOT removed: {s}\n",
+                .{ job.name, hint },
+            ) catch {};
+            if (lease.detail) |text| ctx.out.print("  note: {s}\n", .{text}) catch {};
+        },
+    }
+    ctx.out.flush() catch {};
+    // The exit code follows the settlement, not the refusal — the same split
+    // `refuseKillAfterSettlement` makes. An attempt left `indeterminate` needs a
+    // reconcile and earns 75; a proven outcome needs none and earns 1, because
+    // what failed there is only this command's standing to delete a row.
+    if (!proven) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
     Cli.exitNow(Cli.exit_code.failure);
 }
 
@@ -4172,36 +4395,104 @@ fn removeJob(
                 "job removed before its outcome was established; the log is retained for 'request reconcile --from-log'",
             .last_observed = if (execution) |e| e.status else .remote_started,
         } };
-    const settled = settleObserved(
+    const extra: Core.Store.receipts.TerminalExtra = .{
+        .finished_at = probe.finished_at,
+        // The reading goes into the receipt on every removal path, not
+        // only the refused one. `job rm` deletes the local row, so the
+        // receipt is the only record that outlives the command — and a
+        // removal that never mentions the document the second look read is
+        // how an operator comes to find nothing on the host and no note
+        // saying anybody had looked. Null on the two blind branches alone,
+        // because there the field's question — what was at the address when
+        // this settled — has no answer this command obtained.
+        .result_record = if (final.blind()) null else resultRecordOf(ctx, reading),
+    };
+    // The row is deleted only while the scope is ours, and never over a look that
+    // came back blind. Forgetting a name this command no longer speaks for — or
+    // one whose outcome it could not establish because the record it needed would
+    // not open, or because the look that was going to read it never happened — is
+    // the one local step that cannot be undone by re-running it: the row is what a
+    // later `job status`, `job kill` or `run --name` reads, and it is the last
+    // thing pointing at the evidence still sitting on the host.
+    //
+    // Two checks and not one, and they answer different questions. `authority`
+    // here is the *renewal's* answer, taken outside any transaction, and it is
+    // what lets this command decline before it opens one. The check that licenses
+    // the delete runs inside the transaction, in
+    // `Core.execution.settleAndForgetJob`, and it is what a `--force` takeover or
+    // a suspended process landing in between cannot get past. This branch used to
+    // be the whole of it: `.forget` was handed to `settleObserved`, which reached
+    // `jobs.remove`'s own `BEGIN IMMEDIATE` on two of its three paths with no
+    // authority check inside it at all.
+    const settled: Observed = if (authority.holds() and !final.blind()) forget: {
+        var rollback: Core.execution.Rollback = .none;
+        const settlement: Core.execution.JobSettlement = if (execution) |*e|
+            .{ .attempt = .{ .execution = e, .terminal = terminal, .extra = extra } }
+        else if (attempt) |a|
+            // `attach` returned null, so the ledger already holds a terminal for
+            // this attempt. It is still the *target*, so it still has to be
+            // exempted from the peer check — an unsettled operation is not what
+            // makes it the target.
+            .{ .absent = .{ .already_on_record = a.request_id } }
+        else
+            .{ .absent = .no_operation };
+        const removal = Core.execution.settleAndForgetJob(
+            store,
+            ctx.arena,
+            ctx.io,
+            // The claim's host and scope, not the attempt's: the lease is what the
+            // authority check reads, and it is keyed on the scope this command
+            // took.
+            claim.server_id,
+            claim.scope,
+            // The lease owner minted by `claimJobScope`, which is not the attempt
+            // being settled. See `Core.execution.AuthorityOwner`.
+            .{ .lease_owner_request_id = claim.owner_request_id },
+            settlement,
+            .{ .expected = job.removeExpectation(), .grounds = .session_proven_gone },
+            &rollback,
+        ) catch |err| Cli.receiptFatal(
+            if (attempt) |a| a.request_id else job.name,
+            err,
+            "recording a job removal",
+        );
+        break :forget switch (removal) {
+            .forgotten => |done| removalObserved(ctx, store, terminal, done.ledger, done.write),
+            .refused => |blocker| refuseRemovalAtCommit(
+                ctx,
+                store,
+                job,
+                attempt,
+                if (execution) |*e| e else null,
+                authority,
+                probe,
+                log_discarded,
+                result_discarded,
+                terminal,
+                .{ .blocked = blocker },
+            ),
+            .claim_lost => |lost| refuseRemovalAtCommit(
+                ctx,
+                store,
+                job,
+                attempt,
+                if (execution) |*e| e else null,
+                authority,
+                probe,
+                log_discarded,
+                result_discarded,
+                terminal,
+                .{ .claim_lost = lost },
+            ),
+        };
+    } else settleObserved(
         ctx,
         store,
         if (execution) |*e| e else null,
         attempt,
         terminal,
-        .{
-            .finished_at = probe.finished_at,
-            // The reading goes into the receipt on every removal path, not
-            // only the refused one. `job rm` deletes the local row, so the
-            // receipt is the only record that outlives the command — and a
-            // removal that never mentions the document the second look read is
-            // how an operator comes to find nothing on the host and no note
-            // saying anybody had looked. Null on the two blind branches alone,
-            // because there the field's question — what was at the address when
-            // this settled — has no answer this command obtained.
-            .result_record = if (final.blind()) null else resultRecordOf(ctx, reading),
-        },
-        // The row is deleted only while the scope is ours, and never over a look
-        // that came back blind. Forgetting a name this command no longer speaks
-        // for — or one whose outcome it could not establish because the record it
-        // needed would not open, or because the look that was going to read it
-        // never happened — is the one local step that cannot be undone by
-        // re-running it: the row is what a later `job status`, `job kill` or
-        // `run --name` reads, and it is the last thing pointing at the evidence
-        // still sitting on the host.
-        if (authority.holds() and !final.blind()) .{ .forget = .{
-            .expected = job.removeExpectation(),
-            .grounds = .session_proven_gone,
-        } } else .none,
+        extra,
+        .none,
     );
     // Every deletion this verb was going to make is behind it, so the scope goes
     // back here — and the answer is published below. On this verb the leak has one
@@ -4693,20 +4984,21 @@ test "gate: every destructive remote call is renewed on the line above it" {
 // they have no document to put an answer in.
 
 /// The functions that hold a `Claim` and publish a document. `killJob` and
-/// `removeJob` are the verbs; the other four are the endings they delegate to.
+/// `removeJob` are the verbs; the others are the endings they delegate to.
 const claim_reporting_bodies = [_][]const u8{
     "\nfn refuseKill(",
     "\nfn refuseKillAfterSettlement(",
     "\nfn refuseRemoval(",
+    "\nfn refuseRemovalAtCommit(",
     "\nfn killJob(",
     "\nfn reportFinishedDuringKill(",
     "\nfn removeJob(",
 };
 
-/// How many `KillJson` / `RemovalJson` documents those six write between them.
+/// How many `KillJson` / `RemovalJson` documents those seven write between them.
 /// Asserted for the reason `destructive_remote_call_count` is: a scan that found
 /// nothing must fail rather than pass over an empty region.
-const claim_reporting_document_count = 9;
+const claim_reporting_document_count = 10;
 
 test "gate: every kill and removal document is written after the release it publishes" {
     const t = std.testing;

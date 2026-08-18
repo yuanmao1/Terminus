@@ -2060,6 +2060,155 @@ test "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill 
     try readFailureAfterTheKill("read_error_rm_discard", "rm", "--discard-evidence");
 }
 
+// The barrier `job rm` never had, reached through the only door a black-box
+// fixture can open.
+//
+// `job rm` does not call `Execution.submitted`, so the unsettled-operation half of
+// the scope guard never ran for it, and the two branches that deleted the row
+// through `jobs.remove` opened a transaction of their own with no check in it at
+// all. Now the delete runs under `execution.commitDestruction`, whose peer check is
+// the same one `begin` and `submitted` use — keyed so that the attempt this removal
+// is *settling* is not read as a peer blocking its own removal.
+//
+// A peer's unsettled attempt is what this seeds, and not a lease seizure, because
+// a lease can only be lost across a round trip: `job rm`'s last renewal sits
+// immediately above the commit with nothing between them, so a `FakeHost` seizure
+// is caught by that renewal and never reaches the transaction. The claim-state half
+// of the check is therefore only reachable in-process, and that is where it is
+// gated — `gate: every destructive path answers every authority scenario the same
+// way`, in `src/core/store/gates_test.zig`.
+//
+// Everything before the commit succeeds, and the assertions say so: the lease is
+// acquired cleanly, every renewal answers `held`, and the kill goes out. What is
+// refused is the deletion.
+test "blackbox: `job rm` keeps the row when a peer's unsettled attempt claims the scope at the commit" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "job_rm_peer_at_commit");
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01MMMMMMMM0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_7__";
+    try seedRunningJob(&f, request_id, "deploy", sentinel);
+
+    // The peer: a second attempt, unsettled and mutating, on the *same* job scope
+    // and holding no lease. Seeded through the store rather than by running a
+    // second command, because a second command could not get here — our lease
+    // refuses it at `submitted`. This is the shape a crashed `run --force` leaves.
+    const peer_id = "01NNNNNNNN0123456789ABCDEF";
+    {
+        var store = try f.open();
+        defer store.close();
+        try Store.operations.create(&store, .{
+            .request_id = peer_id,
+            .server_id = 1,
+            .server_name = "box",
+            .kind = .job,
+            .scope_kind = .job,
+            .scope_key = "deploy",
+            .alias = "deploy",
+            .mutating = true,
+            .now = 1100,
+        });
+        try Store.operations.advance(&store, peer_id, .connecting, 1101);
+        try Store.operations.advance(&store, peer_id, .submitted, 1102);
+    }
+
+    // The discriminating control: the same fixture, the same verb, the same
+    // branch, and no peer on its scope. Without it every assertion below would
+    // hold just as well against a `job rm` that had stopped removing anything.
+    const control_id = "01PPPPPPPP0123456789ABCDEF";
+    try seedRunningJob(&f, control_id, "release", sentinel);
+
+    const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    const finished = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":0\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "job-deploy.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-deploy.log", .stdout = finished },
+        .{ .needle = "job-release.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-release.log", .stdout = finished },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    {
+        var refused = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "deploy", "--json", "--db", f.db,
+        }, &environ);
+        defer refused.deinit(f.allocator);
+
+        // The traffic first, so a regression names its cause: the kill really did
+        // go out — this is not a command that stopped short of it — and no
+        // deletion followed.
+        try host.expectSent("kill-session");
+        try host.expectNeverSent("rm -f");
+        try host.expectFullyScripted();
+
+        // 1 and not 75: the second look read this attempt's own sentinel, so the
+        // outcome is not in doubt. What failed is this command's standing to
+        // delete a row, which is a plain failure.
+        try refused.expectCode(1);
+        try refused.expectSays("\"action\": \"not_removed\"");
+        try refused.expectSays("\"rowRemoved\": false");
+        try refused.expectSays("\"ok\": false");
+        // An exit code read from a document at this attempt's own address is not
+        // made false by a scope that moved, so the outcome stands and only the
+        // deletion is refused.
+        try refused.expectSays("\"outcomeProven\": true");
+        // Every renewal answered truthfully about the moment it was asked. What
+        // refused this is the read inside the transaction, and the code for it
+        // travels in the sentence and in the receipt.
+        try refused.expectSays("\"authority\": \"held\"");
+        try refused.expectSays("SCOPE_TAKEN_BEFORE_COMMIT");
+        try refused.expectSays(peer_id);
+        // Nothing was discarded, and the report must not read as if it had been.
+        try refused.expectSays("\"evidenceRetained\": true");
+    }
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Out of the store, not parsed out of stdout: the row this removal was
+        // about is still there.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+        // …and the attempt is settled with the outcome the host reported, rather
+        // than left unsettled to bar the scope with nothing saying why.
+        const op = (try Store.operations.get(&store, arena, request_id)).?;
+        try t.expectEqualStrings("completed", op.status.text());
+    }
+
+    {
+        var removed = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "release", "--json", "--db", f.db,
+        }, &environ);
+        defer removed.deinit(f.allocator);
+        try host.expectFullyScripted();
+        try removed.expectCode(0);
+        try removed.expectSays("\"action\": \"removed\"");
+        try removed.expectSays("\"rowRemoved\": true");
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        try t.expectEqual(
+            @as(?Store.jobs.Job, null),
+            try Store.jobs.getByName(&store, arena, 1, "release"),
+        );
+        const op = (try Store.operations.get(&store, arena, control_id)).?;
+        try t.expectEqualStrings("completed", op.status.text());
+    }
+}
+
 /// How the look after the kill fails, when it fails without ever reading the
 /// address.
 ///

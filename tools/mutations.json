@@ -381,8 +381,8 @@
       "id": "M9-read-error-keeps-the-row",
       "rule": "`job rm` keeps the local row when the post-kill read failed: the row is the last thing pointing at the evidence still on the host.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        if (authority.holds() and !final.blind()) .{ .forget = .{",
-      "replace": "        if (authority.holds()) .{ .forget = .{",
+      "find": "    const settled: Observed = if (authority.holds() and !final.blind()) forget: {",
+      "replace": "    const settled: Observed = if (authority.holds()) forget: {",
       "expect_gate": "blackbox: `job rm` keeps the row when the post-kill read of its record fails"
     },
     {
@@ -445,8 +445,8 @@
       "id": "M10-probe-error-keeps-the-row",
       "rule": "`job rm` keeps the local row when the look after the kill never happened: the row is the last thing pointing at the evidence still on the host.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        if (authority.holds() and !final.blind()) .{ .forget = .{",
-      "replace": "        if (authority.holds() and !final.unreadable) .{ .forget = .{",
+      "find": "    const settled: Observed = if (authority.holds() and !final.blind()) forget: {",
+      "replace": "    const settled: Observed = if (authority.holds() and !final.unreadable) forget: {",
       "expect_gate": "blackbox: `job rm` keeps the row when the look after the kill never happens"
     },
     {
@@ -555,10 +555,10 @@
     },
     {
       "id": "M3b-session-removal-revalidates-owner",
-      "rule": "The scope is re-validated inside the transaction that deletes the local session row, so a takeover landing after the last renewal cannot destroy that row or the memories its delete cascades.",
+      "rule": "The scope is re-validated inside the transaction that destroys local state, so a takeover landing after the last renewal cannot destroy a session row and the memories its delete cascades, or a job row.",
       "file": "src/core/execution.zig",
-      "find": "        const blocker = try blockerLocked(self.store, self.arena, self.server_id, self.scope, self.id(), at);\n",
-      "replace": "        const blocker = @as(?Blocker, null);\n",
+      "find": "    // A peer, when there is one to name.\n    if (try blockerLocked(store, arena, server_id, scope, identity, now)) |found|\n        return .{ .blocked = found };\n",
+      "replace": "    // A peer, when there is one to name.\n    if (@as(?Blocker, null)) |found|\n        return .{ .blocked = found };\n",
       "expect_gate": "gate: a peer's claim refuses `session rm`'s composite whole, and writes no terminal"
     },
     {
@@ -603,10 +603,10 @@
     },
     {
       "id": "M3b-session-removal-one-transaction",
-      "rule": "The terminal that records a session removal and the delete of the local row are one commit, so a delete that cannot happen leaves no terminal claiming it did.",
+      "rule": "The terminal that records a destruction and the local destruction itself are one commit, so a delete that cannot happen leaves no terminal claiming it did.",
       "file": "src/core/execution.zig",
-      "find": "                const had_row = try sessions.removeLocked(self.store, server_id, session);\n                try self.store.db.exec(\"COMMIT\");\n",
-      "replace": "                try self.store.db.exec(\"COMMIT\");\n                const had_row = try sessions.removeLocked(self.store, server_id, session);\n",
+      "find": "    const destroyed: Destroyed = switch (commit.destroys) {\n        .session_row => |name| .{\n            .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },\n        },\n        .job_row => |forget| .{ .job_row = try removeUnderGrounds(store, forget) },\n    };\n\n    try store.db.exec(\"COMMIT\");\n",
+      "replace": "    try store.db.exec(\"COMMIT\");\n\n    const destroyed: Destroyed = switch (commit.destroys) {\n        .session_row => |name| .{\n            .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },\n        },\n        .job_row => |forget| .{ .job_row = try removeUnderGrounds(store, forget) },\n    };\n",
       "expect_gate": "gate: a `session rm` whose local delete fails leaves no terminal claiming it"
     },
     {
@@ -651,10 +651,10 @@
     },
     {
       "id": "M3b-session-removal-proves-own-claim",
-      "rule": "The transaction that writes the terminal and deletes the local session row proves this command's own lease is still live and ours, not merely that nothing else claims the scope — a lease that lapsed with no successor leaves every overlap check clear.",
+      "rule": "The transaction that writes the terminal and performs a local destruction proves the authority owner's own claim is still live and theirs, not merely that nothing else claims the scope — a lease that lapsed with no successor leaves every overlap check clear.",
       "file": "src/core/execution.zig",
-      "find": "        if (!claim.holds()) {\n",
-      "replace": "        if (false) {\n",
+      "find": "    if (!claim.holds()) return .{ .claim_lost = claim };",
+      "replace": "    if (false) return .{ .claim_lost = claim };",
       "expect_gate": "gate: `session rm`'s composite refuses when its own lease is no longer live"
     },
     {
@@ -707,10 +707,10 @@
     },
     {
       "id": "M3b-session-removal-rollback-reported",
-      "rule": "Whether the composite's rollback succeeded is reported to the caller rather than swallowed, so the caller can tell a proven-untouched local row from an unknown one.",
+      "rule": "Whether a destructive commit's rollback succeeded is reported to the caller rather than swallowed, so the caller can tell a proven-untouched local state from an unknown one.",
       "file": "src/core/execution.zig",
-      "find": "        errdefer {\n            if (self.store.db.exec(\"ROLLBACK\")) |_| {\n                rollback.* = .confirmed;\n            } else |err| {\n                rollback.* = .{ .unconfirmed = @errorName(err) };\n            }\n        }\n",
-      "replace": "        errdefer self.store.db.exec(\"ROLLBACK\") catch {};\n",
+      "find": "    errdefer {\n        if (store.db.exec(\"ROLLBACK\")) |_| {\n            rollback.* = .confirmed;\n        } else |err| {\n            rollback.* = .{ .unconfirmed = @errorName(err) };\n        }\n    }\n",
+      "replace": "    errdefer store.db.exec(\"ROLLBACK\") catch {};\n",
       "expect_gate": "gate: a `session rm` whose rollback cannot be confirmed says so instead of claiming the row is untouched"
     },
     {
@@ -760,6 +760,38 @@
       "find": "`authority`,\n`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).\nNullable: `exitCode`",
       "replace": "`authority`,\n`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_behind`).\nNullable: `exitCode`",
       "expect_gate": "gate: SKILL.md publishes exactly the leaseRelease vocabulary, everywhere it publishes it"
+    },
+    {
+      "id": "W3-authority-owner-keys-the-claim-read",
+      "rule": "A destructive commit reads its *authority owner's* own claim, not the target operation's. They are the same value only for `session rm`; for `job kill` / `job rm` the lease is held under a control id minted per invocation and the target is somebody else's attempt.",
+      "file": "src/core/execution.zig",
+      "find": "    // Our own claim, read before the pass that would rewrite what it says.\n    const claim = try leases.claimStateLocked(\n        store,\n        arena,\n        server_id,\n        scope,\n        identity.authority.lease_owner_request_id,\n        now,\n    );\n",
+      "replace": "    // Our own claim, read before the pass that would rewrite what it says.\n    const claim = try leases.claimStateLocked(\n        store,\n        arena,\n        server_id,\n        scope,\n        identity.target.requestId() orelse identity.authority.lease_owner_request_id,\n        now,\n    );\n",
+      "expect_gate": "gate: every destructive path answers every authority scenario the same way"
+    },
+    {
+      "id": "W3-peer-check-exempts-the-target-operation",
+      "rule": "The peer check exempts the target operation as well as the authority owner, so a `job rm` does not read the very attempt it is settling as a peer blocking its own removal.",
+      "file": "src/core/execution.zig",
+      "find": "        if (std.mem.eql(u8, self.authority.lease_owner_request_id, request_id)) return true;\n        if (self.target.requestId()) |target| return std.mem.eql(u8, target, request_id);\n        return false;\n",
+      "replace": "        if (std.mem.eql(u8, self.authority.lease_owner_request_id, request_id)) return true;\n        return false;\n",
+      "expect_gate": "gate: every destructive path answers every authority scenario the same way"
+    },
+    {
+      "id": "W3-claim-read-precedes-the-expiry-pass",
+      "rule": "The claim state is read before the peer check, because the peer check runs the lazy lease-expiry pass: asked afterwards, a lease this command found lapsed is reported as swept by this transaction’s own housekeeping.",
+      "file": "src/core/execution.zig",
+      "find": "    // Our own claim, read before the pass that would rewrite what it says.\n    const claim = try leases.claimStateLocked(\n        store,\n        arena,\n        server_id,\n        scope,\n        identity.authority.lease_owner_request_id,\n        now,\n    );\n\n    // A peer, when there is one to name.\n    if (try blockerLocked(store, arena, server_id, scope, identity, now)) |found|\n        return .{ .blocked = found };\n",
+      "replace": "    // A peer, when there is one to name.\n    if (try blockerLocked(store, arena, server_id, scope, identity, now)) |found|\n        return .{ .blocked = found };\n\n    // Our own claim, read before the pass that would rewrite what it says.\n    const claim = try leases.claimStateLocked(\n        store,\n        arena,\n        server_id,\n        scope,\n        identity.authority.lease_owner_request_id,\n        now,\n    );\n",
+      "expect_gate": "gate: every destructive path answers every authority scenario the same way"
+    },
+    {
+      "id": "W3-job-rm-hands-over-the-lease-owner",
+      "rule": "`job rm` names its *lease owner* as the authority for the delete, not the target attempt. The lease is held under a control id minted per invocation; keyed on the attempt, the claim read answers `never_taken` on every run and the overlap check reports this command's own lease as a peer's.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .{ .lease_owner_request_id = claim.owner_request_id },\n",
+      "replace": "            .{ .lease_owner_request_id = if (attempt) |a| a.request_id else claim.owner_request_id },\n",
+      "expect_gate": "blackbox: `job rm` keeps the row when a peer's unsettled attempt claims the scope at the commit"
     }
   ]
 }
