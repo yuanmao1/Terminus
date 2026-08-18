@@ -391,3 +391,22 @@ pub fn renewalsAreAdjacent(
     }
     return found;
 }
+
+// Compile-checks every declaration in *this* module.
+//
+// Nothing here is exercised by a test of its own: the behaviour is proved end to
+// end (`test/blackbox.zig`) and by each caller's own adjacency gate
+// (`cmd_job.zig`, `cmd_session.zig`), which reach this file only through the
+// decls they alias. A decl nothing aliases is never analysed, so a future
+// addition here — a third `Subject` arm's `note` sentence, a helper added ahead
+// of its call site — could stop compiling and no test would say so. This
+// references them all, which is the whole of what it claims to do: it does not
+// assert behaviour and it does not run anything.
+//
+// `refAllDecls`, not a recursive variant: this Zig standard library has no
+// `refAllDeclsRecursive` (`std/testing.zig` defines `refAllDecls` only), and a
+// single level is the gap that matters here — the modules this file imports have
+// their own tests.
+test "every decl in this module is compile-checked" {
+    std.testing.refAllDecls(@This());
+}

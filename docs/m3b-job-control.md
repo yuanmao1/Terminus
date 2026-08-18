@@ -1,29 +1,95 @@
 # M3b — `ControlAuthority`: who may destroy what, and what they must prove
 
-> Status: **contract for review. Nothing here is implemented.** No schema has
-> been changed, no state machine has been touched, no code has been written.
-> The v13 migration in §5 is a *proposal inside a design document*, not a
-> migration. Sections §1–§6 are the shape the programmer has chosen; §7 is
-> everything still open, and no item in §7 may be read as settled.
+> Status: **partly implemented.** This was a contract for review; the first
+> slice of it is now code, and the rest is not. Read the three lists below
+> before trusting any tense in the sections that follow.
 >
-> Every claim about current behaviour carries a `file:line` read at `7d2e72a`.
-> Where a claim could not be verified it is marked as such or absent.
+> **Implemented.**
+> * `d3bef52` — `session rm` gained a `control` operation
+>   (`operations.Kind.control`, `operations.zig:62`; taken at
+>   `cmd_session.zig:196-204`), a `.job`-scope lease derived from the session
+>   name (`contentionScope`, `cmd_session.zig:592`; acquired at `:224`), and a
+>   renewal immediately before every step that changes the host or the local
+>   record (`cmd_session.zig:241`, `:270`, `:280`, `:303`). This is §1.2's first
+>   half and §7's "Implementation order" slice — **half of it.** See the open
+>   half below.
+> * `ae9c261` — the lease-renewal barrier moved into `src/core/control.zig` and
+>   is now owned once: `Claim` (`:69`), `Authority` (`:111`), `holdClaim`
+>   (`:217`), `stillOurs` (`:269`), `wallClockSeconds` (`:199`) and the
+>   adjacency scan `renewalsAreAdjacent` (`:345`) over one shared
+>   `destructive_remote_calls` vocabulary (`:330`). That settles §7.6 as option
+>   (c). `cmd_job.zig:35-39` and `cmd_session.zig:35-38` are aliases onto it,
+>   not second copies.
+> * `8c068b2` — `stillOurs` latches: once a renewal has answered "not ours" the
+>   later steps are forbidden and no later answer may overwrite the first loss
+>   (`control.zig:269-273`). The same commit converged the two verbs' divergent
+>   wording onto naming *the scope for* the subject rather than the subject,
+>   because for `session rm` those are different strings (`Subject`,
+>   `control.zig:28-57`; the sentences at `:152-180`).
+>
+> **Decided but unbuilt.** §7's eleven items were decided in `b33e4ec` and §7
+> already reads as decisions, not options — but a decision is not an
+> implementation. Nothing in §4 (per-attempt session identity) exists. Nothing
+> in §5 exists: the newest migration in the frozen list is v12
+> (`migrate.zig:520`, `leases_reowned_version = 12` at `:604`,
+> `latest_version = migrations.len` at `:588`), so there is no `session` scope
+> kind and no `target_*` column, and §3.3's target relation still travels in
+> `alias` (`cmd_session.zig:201`). `job kill` and `job rm` still have no
+> operation row of their own (§1.1).
+>
+> **Still open.** §1.3 (the scope vocabulary), §1.4, §1.5, §1.6 — untouched.
+> And the other half of §1.2, which is the one thing most likely to be misread:
+>
+> > **`session new` has no authority at all.** `newSession`
+> > (`cmd_session.zig:75-111`) takes no operation, makes no claim, holds no
+> > lease, and still reports `action: "created"` unconditionally (`:100`). So it
+> > can run `Tmux.ensure` (`:90`) and `sessions.ensure` (`:91`) under the same
+> > name *while* `session rm` is between its kill (`:271`), its log deletion
+> > (`:285`) and its row deletion (`:317`) — recreating the shell, and the local
+> > row, that `session rm` is in the middle of removing. Nothing displaces
+> > `session rm`'s lease in that sequence, so its renewals at `:280` and `:303`
+> > answer `held` and refuse nothing. §1.2 is **not** closed end-to-end. Do not
+> > read the implemented half as the whole.
+>
+> **A review of the merged slice found further defects, being addressed
+> separately.** Reported: the composite delete is not transactional (the kill at
+> `cmd_session.zig:271`, the log at `:285` and the row at `:317` are three
+> independent steps); the ledger can record success before the delete completes
+> (`execution.settle` at `:305` precedes `sessions.remove` at `:317`); a refused
+> attempt is not audited; a failed lease release is not reported; and the
+> `--json` key set does not match the documentation (`RemovalJson` carries
+> twelve fields, `cmd_session.zig:149-171`, where `skill/SKILL.md:528-532` says
+> eleven keys). None of these are fixed as of `3e18d23`, and this document does
+> not record an outcome for them.
+>
+> Claims about current behaviour carry a `file:line`. Those written before the
+> first slice landed were read at `7d2e72a` and some of their line numbers have
+> since moved; every citation added or changed by this status pass was read at
+> `3e18d23`. Where a claim could not be verified it is marked as such or absent.
 
 ---
 
 ## 0. The shape in one page
 
 Six verbs destroy or seize something on a host. Each answers "may I?" its own
-way, and two of them do not answer at all.
+way, and when this was written two of them did not answer at all. `session rm`
+now answers (`d3bef52`); `session new` still does not.
 
 | verb | contends on | proves identity | proves the act | records the act |
 |---|---|---|---|---|
 | `job kill` | lease `.job:<job>` | no — aims by name | yes (`killSession` bool) | no operation row |
 | `job rm` | lease `.job:<job>` | no — aims by name | yes | no operation row |
-| `session rm` | **nothing** | no | yes (`gone` before delete) | **nothing** |
+| `session rm` | lease on the `.job` scope for the session | no | yes (`gone` before delete) | a `control` operation |
 | `session new` | **nothing** | no | n/a (adopts silently) | no operation row |
 | `run` cleanup | `jobs.remove` CAS | no | partially | **nothing** — see below |
 | `write --force` | bypasses both | no | n/a | the force is recorded |
+
+The `session rm` row is the one line of this table that `d3bef52` changed: its
+contention and record cells were both **nothing** when this was written, and are
+now a lease taken at `cmd_session.zig:224` over `contentionScope(name)` (`:592`)
+and a `control` operation taken at `:196-204`. Its identity cell is unchanged —
+it still aims by name. Every other row is as first written, `session new`
+included, which is why §1.2 is only half closed.
 
 The `run`-cleanup cell needs its footnote, because the code reads as if it
 records something: `jobs.remove(..., .superseded_by_relaunch)`
@@ -44,8 +110,9 @@ four:
    destruction still licensed? Answered well today for `job kill`/`job rm`,
    answered well for `session rm`, not answered at all elsewhere. §2.2.
 4. **Record** — can anyone ask later what was attempted and what came of it?
-   Answered for `run` and `write`; not answered for any of the four
-   destructive verbs. §3.
+   Answered for `run` and `write`, and — since `d3bef52` — for `session rm`
+   (`cmd_session.zig:196-204`). Still unanswered for `job kill`, `job rm` and
+   `session new`. §3.
 
 The verbs are not six problems. They are three primitives used six ways, and
 naming them once is most of this document: `stopSession`, `discardEvidence`,
@@ -77,32 +144,64 @@ only `correlation_id` in the schema is on `operation_events`
 (`migrate.zig:173`), which is the wrong grain: relating two operations should
 not require walking one's event stream.
 
-### 1.2 `session rm` is a destructive remote mutation with no authority of any kind
+### 1.2 `session rm` had no authority of any kind — `session rm` is fixed, `session new` is the open half
 
-`cmd_session.zig:77-109`. No lease, no operation, no scope guard, no `--force`,
-no request id. It kills the remote session, deletes the pane log, and deletes
-the local row — whose delete cascades the session's memories
-(`sessions.zig:64-75`).
+**As written (`7d2e72a`).** `cmd_session.zig:77-109`. No lease, no operation, no
+scope guard, no `--force`, no request id. It kills the remote session, deletes
+the pane log, and deletes the local row — whose delete cascades the session's
+memories (`sessions.zig:64-75`).
 
-Two things it does are **right and must survive any redesign**:
+**Fixed for `session rm` in `d3bef52`.** It now takes a `control` operation
+before it dials (`cmd_session.zig:196-204`), takes a lease over the `.job` scope
+its session name maps to (`:224`, `contentionScope` at `:592`), and renews that
+lease with nothing between the renewal and the act it gates — before submitting
+(`:241`), before the kill (`:270`, `:271`), before the log deletion (`:280`,
+`:285`) and before the row deletion (`:303`, `:317`). A refusal before the kill
+sends nothing to the host; a refusal after it keeps both the log and the local
+row.
+
+**Not fixed: `session new`, and that is the open half of this item.**
+`newSession` (`cmd_session.zig:75-111`) has no operation, no claim and no lease,
+and reports `action: "created"` unconditionally (`:100`). It calls `Tmux.ensure`
+(`:90`) and `sessions.ensure` (`:91`) with nothing contending, so it can create
+or adopt a session under the very name `session rm` is removing, at any point
+between that command's kill (`:271`), log deletion (`:285`) and row deletion
+(`:317`). Nothing in that sequence displaces `session rm`'s lease, so its
+renewals at `:280` and `:303` answer `held` and refuse nothing: the recreated
+shell keeps running, its `pipe-pane` log is deleted underneath it, and the local
+row `session new` just wrote is deleted too — the orphan this section's own
+reasoning says must not exist. Closing this needs `session new` to hold the same
+claim, which is the second half of the slice §7's "Implementation order"
+describes and which is not written.
+
+Two things `session rm` did right and that survived the change:
 
 * it proves the kill before deleting anything and refuses if the session
-  survived (`cmd_session.zig:84-88`);
+  survived (as written: `cmd_session.zig:84-88`; now `:271-272`, with
+  `refuseSurvivedKill` at `:399`);
 * it deletes the log only after that proof, because a live pane recreates its
   log through `pipe-pane`, so a log deleted under a surviving session comes back
-  holding a partial history (`cmd_session.zig:90-95`, `Tmux.zig:726-734`).
+  holding a partial history (as written: `cmd_session.zig:90-95`; now `:285`,
+  with `Tmux.zig:726-734` unchanged).
 
-The discarded bool from `sessions.remove` is documented at
-`cmd_session.zig:96-103` as *not* a swallowed refusal — false means only that
-this machine had no metadata row, an ordinary state for a session started
-outside Terminus. That reasoning stands.
+The discarded bool from `sessions.remove` was documented as *not* a swallowed
+refusal — false means only that this machine had no metadata row, an ordinary
+state for a session started outside Terminus. That reasoning stands, and
+`d3bef52` went further: the bool is no longer discarded but reported, as
+`localRow: removed | absent | kept` (`cmd_session.zig:317`, the field at
+`:162-166`).
 
-**The sharp case.** A job's tmux session is `job-<name>`
+**The sharp case, now refused.** A job's tmux session is `job-<name>`
 (`cmd_job.zig:64-66`), and `Tmux.list` strips the `t-` prefix
 (`Tmux.zig:639-641`), so a running job appears in `session ls` as a session
-named `job-deploy`. `session rm web job-deploy` will therefore kill a running
-job's shell — taking no lease, contending with nothing, and writing nothing —
-while `job kill web deploy` holds a lease on `.job:"deploy"` and never sees it.
+named `job-deploy`. `session rm web job-deploy` used to kill that running job's
+shell while `job kill web deploy` held a lease on `.job:"deploy"` and never saw
+it. `contentionScope` maps the session name `job-deploy` onto the scope
+`.job:deploy` (`cmd_session.zig:592-597`, asserted at `:599-613`), so the two now
+collide and the removal is refused before anything is sent — gated end to end at
+`test/blackbox.zig:3781`. The collision is derived by string surgery on a name,
+not by a scope vocabulary that can spell "session"; that is still §1.3, and it
+over-refuses in the other direction as §1.3 describes.
 
 ### 1.3 The scope vocabulary conflates sessions with jobs, in both directions
 
@@ -187,11 +286,16 @@ than assumed. `Tmux.killSession` already returns it (`Tmux.zig:670-681`) and
 **Record.** An `operations` row of this command's own, with a request id, a
 typed action, and the target it acted on. §3.
 
-The existing `Authority` union in `cmd_job.zig:4309-4381` is exactly question 2,
-and only question 2, for exactly one scope kind. Its three answers — `held`,
-`lapsed`, `unreadable` — and its rule that "a question we could not ask is not a
-yes" (`cmd_job.zig:4307-4308`) are the right shape and should be kept verbatim
-as `ControlAuthority`'s contention arm. Its name is the collision: see §7.6.
+The `Authority` union that was in `cmd_job.zig` when this was written is exactly
+question 2, and only question 2, for exactly one scope kind. Its three answers —
+`held`, `lapsed`, `unreadable` — and its rule that "a question we could not ask
+is not a yes" are the right shape and are kept verbatim as `ControlAuthority`'s
+contention arm. §7.6 has since been decided and built: `ae9c261` moved it to
+`src/core/control.zig:111-181` alongside `Claim` (`:69`), `holdClaim` (`:217`)
+and `stillOurs` (`:269`), which is where the two verbs that hold a claim now
+read it from (`cmd_job.zig:35-39`, `cmd_session.zig:35-38`). The name collision
+that §7.6 was about is gone; the remaining three questions are still not part of
+it.
 
 ### 2.2 What each verb needs
 
@@ -203,13 +307,17 @@ sameness is the design.
   session incarnation.
 * *must prove before acting*: the lease was ours on the line above the kill.
   Already true, and held by a gate that reads this file's own source
-  (`cmd_job.zig:4490-4539`), asserting seven sites
-  (`destructive_remote_call_count`, `cmd_job.zig:4472`). Note the gate's reach:
+  (`cmd_job.zig:4541-4551`), asserting seven sites
+  (`destructive_remote_call_count`, `cmd_job.zig:4532`). Note the gate's reach:
   it scans `killJob` and `removeJob` only (`claim_holding_bodies`,
-  `cmd_job.zig:4479`), so the `Tmux.killSession` in `runCmd`
-  (`cmd_job.zig:282`) and the one in `session rm` (`cmd_session.zig:84`) are
-  outside it. Plus: the session it is about to kill is the one this job's live
-  attempt created.
+  `cmd_job.zig:4539`), so the `Tmux.killSession` in `runCmd`
+  (`cmd_job.zig:282`) is outside it — it runs under a reservation and takes no
+  lease, so it has no renewal to be adjacent to (`cmd_job.zig:4534-4538`).
+  `session rm` is no longer outside it either: since `ae9c261` the *scan* is
+  shared (`Control.renewalsAreAdjacent`) and `cmd_session.zig` keeps its own
+  gate over its own body, asserting two sites
+  (`cmd_session.zig:707`, `:710`, the test at `:712-722`). Plus: the session it
+  is about to kill is the one this job's live attempt created.
 * *may destroy*: the tmux session and the work in its shell.
 * *must refuse*: a lost or unreadable lease (nothing sent); an identity
   mismatch; `killSession` returning false (`cmd_job.zig:3649-3652` does this
@@ -229,33 +337,40 @@ sameness is the design.
 * *records*: as `job kill`. The control operation is the **only** durable
   record that the removal happened, because the target row is gone.
 
-**`session rm`**
+**`session rm`** — *built (`d3bef52`), except for the identity arm.*
 * *needs exactly what `job rm` needs.* This is the point of the whole
   document: aimed at a job's session it destroys the same three things in the
-  same order with the same failure modes, and today it holds none of the four
-  answers (§1.2). It is not a smaller act than `job rm`; it is `job rm` with the
-  ledger removed.
+  same order with the same failure modes, and when this was written it held none
+  of the four answers (§1.2). It is not a smaller act than `job rm`; it is
+  `job rm` with the ledger removed.
+* It now holds contention (`cmd_session.zig:224`), proof (`:271-272`) and record
+  (`:196-204`). **Identity it still does not hold**, and cannot until §4 exists:
+  it kills by the name it was handed (`:271`).
 * *may destroy*: the session, the log, the local `sessions` row and its
   cascaded memories.
-* *must refuse*: a session under a live claim — which today it cannot even ask
-  about, for want of a `session` scope (§5); a session that survived the kill
-  (already right, `cmd_session.zig:85-88`).
+* *must refuse*: a session under a live claim — done, on the derived `.job`
+  scope rather than the `session` scope §5 would give it
+  (`cmd_session.zig:210-213`, `reportBlocked` at `:546`); a session that
+  survived the kill (already right when written, now `:272`).
 * *records*: a control operation, and which of the two `sessions.remove`
   answers it got — so the discarded bool becomes reported rather than merely
-  justified.
+  justified. Done: `localRow` (`cmd_session.zig:162-166`, written at `:317`).
 
-**`session new`**
+**`session new`** — *not built. This is the open half of §1.2.*
 * Destroys nothing, and is still an authority act, because `Tmux.ensure` is
   idempotent (`Tmux.zig:607`): on an existing session it hands the caller
   somebody else's live shell and reports `action: "created"` unconditionally
-  (`cmd_session.zig:47-54`). Adopting is not creating, and saying "created" for
+  (`cmd_session.zig:100`). Adopting is not creating, and saying "created" for
   an adoption is a false statement about a remote state.
 * *needs*: contention on the session scope, so a `new` cannot land inside an
   `rm`; and, once identity exists, the right to *refuse* adoption of a session
   whose incarnation belongs to a live job attempt.
 * *must prove*: whether it created or adopted, and say which.
 * *records*: at minimum the truthful verb. Whether it gets an operation row of
-  its own is §7.3.
+  its own is §7.3, decided as (a) — yes.
+* **None of the above is written.** `newSession` (`cmd_session.zig:75-111`)
+  takes no operation, no claim and no lease, so the "cannot land inside an `rm`"
+  half of §1.2 is still open in exactly the way §1.2 now describes.
 
 **`run` stale cleanup (`reclaimable()`)**
 * Destroys two things: a local row (`jobs.remove ... superseded_by_relaunch`,
@@ -295,8 +410,12 @@ returns a value the caller must consume.
 * **`stopSession(authority, incarnation) -> gone`** — used by `job kill`,
   `job rm`, `session rm`, and `run`'s cleanup. Renews contention, checks
   identity, sends the kill, returns the remote's own answer. Four call sites
-  today do this four ways; one of them (`session rm`) does it with no authority
-  at all.
+  still do this four ways. The *renewal* half is no longer duplicated —
+  `ae9c261` put it in `src/core/control.zig` and all three claim-holding call
+  sites read it from there — but the primitive itself does not exist: each verb
+  still writes its own renew/kill/consume sequence inline
+  (`cmd_session.zig:270-272`, and `job kill`/`job rm` in `cmd_job.zig`), and
+  `run`'s cleanup still kills with no claim at all.
 * **`discardEvidence(authority, incarnation, reading)`** — used by
   `job rm --discard-evidence` and `session rm`. Requires `gone == true` and a
   *readable* sidecar reading. `job rm` already enforces both
@@ -382,19 +501,54 @@ Consequences, stated so they are not re-litigated:
   `failed` — it provably changed nothing. The target is untouched.
 * A control operation whose kill was sent and whose confirmation was lost
   settles `indeterminate`, carrying the `AUTHORITY_LOST` code that
-  `cmd_job.zig:4361` already defines. The target is untouched unless the job's
-  own evidence says otherwise.
+  `Authority.lost_code` already defines (`control.zig:128`, moved there by
+  `ae9c261`). The target is untouched unless the job's own evidence says
+  otherwise.
 * A proven target exit code survives a lost control lease, because they are
   different subjects. This is the rule `fdd1144` reached by hand; here it falls
   out of the model.
 * `job rm` deletes the target's row. The control operation and its receipt are
   the only durable record that the removal happened.
 
-No new `Terminal` variant is proposed. Every outcome above is expressible with
-`exited`, `never_submitted`, `local_abandon`, `remote_cancel_confirmed`,
-`input_refused` and `indeterminate` as they stand (`op_state.zig:228-335`). An
-identity mismatch is a proven refusal by the remote, not an unknown — which
-variant carries it is §7.5.
+No new `Terminal` variant is proposed *for the outcomes above*. Every one of
+them is expressible with `exited`, `never_submitted`, `local_abandon`,
+`remote_cancel_confirmed`, `input_refused` and `indeterminate` as they stand
+(`src/core/store/op_state.zig:228-335`) — and the built slice bears that out:
+`session rm` settles `remote_cancel_confirmed` on a proven kill
+(`cmd_session.zig:360-378`), `never_submitted` on a lease lost before the kill
+(`refuseBeforeKill`, `:447`) and `indeterminate` carrying
+`Authority.lost_code = "AUTHORITY_LOST"` (`control.zig:128`) on a lease lost
+after it (`refuseAfterKill`, `:493`). An identity mismatch is a proven refusal by
+the remote, not an unknown; §7.5 decided that it gets a variant of its own, and
+that variant does not exist yet because §4 does not.
+
+**Known gap: `remote_cancel_confirmed`'s `term_sent` and `kill_sent` are not
+persisted.** Both are required fields of the payload
+(`src/core/store/op_state.zig:276-277`) and both callers set them deliberately —
+`job kill` writes `true`/`true` (`cmd_job.zig:3104-3105`), `session rm` writes
+`true`/`false` with a comment explaining that `tmux kill-session` hangs the pane
+up and nothing sends SIGKILL (`cmd_session.zig:350-370`). `receipts.terminalEvent`
+then drops them: its `remote_cancel_confirmed` arm
+(`src/core/store/receipts.zig:684-708`) carries `verification_method` into
+`cancel_method`, the pid/token pair, and `absence_verified_at` into
+`finished_at`, and reads neither bool. There is no column for them —
+`operation_events` (`migrate.zig:135-175`) has `cancel_method` (`:160`) and
+nothing else cancel-shaped — so nothing downstream can recover them: the
+receipt's own read-back lists the same columns (`receipts.zig:3160`, `:3200`).
+What survives is only whatever the free-text `verification_method` happens to
+say, which is prose and not a field a reader may branch on.
+
+Cost to close: **a schema change.** Two nullable `INTEGER` columns on
+`operation_events` in the next migration (v13 or later — the frozen list stops
+at v12, `migrate.zig:604`), plus the column list and binds in
+`receipts.insert` (`receipts.zig:348-356`), the `Event` field beside
+`cancel_method` (`:110`), the read-back projection (`:3160`, `:3200`) and the
+`hasColumn` drift probe pattern (`migrate.zig:906-907`). It is additive and
+carries no data rewrite, so it is the §9.4-style exception rather than a rebuild.
+`detail_json` is not an alternative channel: it is caller-owned, already refuses
+to coexist with a result record (`ConflictingTerminalDetail`, `receipts.zig:604`),
+and putting a module-owned field inside a document whose shape this module does
+not control is the thing that comment exists to forbid.
 
 ---
 
@@ -526,7 +680,12 @@ physical and per-attempt (`job-deploy-<id>`).
 
 ## 5. Proposal: a v13 `session` scope
 
-**This is a proposal, not a migration.** Nothing below has been applied.
+**This is a proposal, not a migration.** Nothing below has been applied: the
+frozen migration list still stops at v12 (`migrate.zig:520`,
+`leases_reowned_version = 12` at `:604`, `latest_version = migrations.len` at
+`:588`), and `scope.Kind` still has no `session` variant. The first slice
+(`d3bef52`) deliberately avoided all of this by deriving a `.job` scope from the
+session name (`cmd_session.zig:592-597`).
 
 ### 5.1 What changes
 
@@ -588,8 +747,8 @@ learn the v13 slices too.
   claimed `.job:<name>`. A live lease row written by an older binary under the
   old key stops overlapping a new binary's claim. The exposure is one store
   driven by two binary versions inside one TTL — 120 seconds
-  (`cmd_job.zig:4157`) — after which the stale row expires. Real, small, and
-  stated rather than hidden.
+  (`Claim.ttl_secs`, `control.zig:85`) — after which the stale row expires. Real,
+  small, and stated rather than hidden.
 * **`job kill`'s scope key changes**, and how is §7.10 — it is the one part of
   this proposal with more than one defensible answer.
 
@@ -776,30 +935,50 @@ terminal or a new kind for a class of act this document did not survey.
 
 ## 8. How this would be verified
 
-Listed so the contract is judged with its cost attached. None of it is written.
+Listed so the contract is judged with its cost attached. Written for the
+`session rm` slice only; everything else on this list is still unwritten. The
+gates that exist are named inline below, and the slice's mutation entries are
+`tools/mutations.json:517-603` (the nine `M3b-session-rm-*` ids), with the
+shared barrier's two at `:164-179` (`M4-still-ours-always`,
+`M4-authority-latch`, both over `src/core/control.zig`).
 
 * A control operation exists, is queryable by request id, and settles
   independently of its target — asserted by reading both rows out of the store,
-  not out of the report.
+  not out of the report. **Done for `session rm`**
+  (`test/blackbox.zig:3366`); its target is a session with no attempt row, so
+  the independent-settlement half is still unexercised.
 * Lease lost before the kill: control `failed`, target untouched, and **zero**
-  remote commands asserted on the fake host's received list.
+  remote commands asserted on the fake host's received list. **Done for
+  `session rm`** (`test/blackbox.zig:3502`), which needed a seizure on the
+  version handshake because its first remote call *is* the kill
+  (`test/blackbox.zig:948-967`).
 * Lease lost after the kill: control `indeterminate` carrying `AUTHORITY_LOST`,
-  target's proven exit code intact.
+  target's proven exit code intact. **Done for `session rm`**, in both windows —
+  after the kill (`test/blackbox.zig:3577`) and inside the log deletion
+  (`:3643`).
 * Incarnation mismatch: the kill is refused, the session survives, the control
   operation records the refusal as a *proven* outcome, not an unknown. Driven by
-  launching, killing and relaunching under one job name.
+  launching, killing and relaunching under one job name. **Unwritten** — §4 does
+  not exist.
 * `session rm` under a held session lease is refused and records the refusal.
+  **Done** on the derived `.job` scope (`test/blackbox.zig:3436`), not on the
+  `session` scope §5 would give it.
 * `session rm web job-deploy` against a running job is refused — the case that
-  today succeeds silently (§1.2).
+  used to succeed silently (§1.2). **Done** (`test/blackbox.zig:3781`).
+* A `session new` cannot land inside a `session rm`. **Unwritten**, because the
+  behaviour is unwritten (§1.2's open half).
 * `write web:job-deploy` against a running job is refused without `--force`
-  — the false miss in §1.3.
+  — the false miss in §1.3. **Unwritten.**
 * A second attempt's `job read --from-cursor` returns none of the first
-  attempt's bytes (§1.6).
+  attempt's bytes (§1.6). **Unwritten.**
 * An orphan session from a killed launcher is found and stopped by the next
   `run` of the same job name, by recorded incarnation and not by name.
+  **Unwritten.**
 * A pre-v6 `jobs` row with no attempt is **refused** by `job kill`, with a
-  message naming the row.
+  message naming the row. **Unwritten.**
 * v13: a v12 store carrying live lease rows opens, migrates, keeps every row,
   and passes the version-gated drift probes; a v13 store opened by a v12 binary
   is refused by the existing future-version check (`migrate.zig:775-781`).
-* Every new gate mutation-tested and added to `tools/mutations.json`.
+  **Unwritten** — there is no v13.
+* Every new gate mutation-tested and added to `tools/mutations.json`. **Done for
+  the gates this slice added**; the rule stands for the rest.
