@@ -11367,17 +11367,27 @@ fn runAuthorityCell(
             switch (want) {
                 .committed => switch (done) {
                     // No write to read: a compare-and-swap that matched nothing
-                    // leaves as `row_moved`, and `matrixSubjectPresent` below is
-                    // what says the row really went.
+                    // leaves as `Refusal.row_moved`, and `matrixSubjectPresent`
+                    // below is what says the row really went.
                     .forgotten => {},
                     else => return error.CellDidNotCommit,
                 },
+                // One refusal arm now, carrying which read declined it — so the
+                // cell has to assert the *reason* as well as the refusal. A cell
+                // that expected a peer and got a lost claim used to be two
+                // different arms and is now one, and this is what keeps them apart.
                 .refused => switch (done) {
-                    .refused => |blocker| try expectPeerNamed(peer, blocker),
+                    .refused => |why| switch (why) {
+                        .scope_taken => |blocker| try expectPeerNamed(peer, blocker),
+                        .claim_lost, .row_moved => return error.CellWasNotRefused,
+                    },
                     else => return error.CellWasNotRefused,
                 },
                 .claim_lost => switch (done) {
-                    .claim_lost => |state| try t.expectEqualStrings(claimCode(claim), state.code()),
+                    .refused => |why| switch (why) {
+                        .claim_lost => |state| try t.expectEqualStrings(claimCode(claim), state.code()),
+                        .scope_taken, .row_moved => return error.CellDidNotReportALostClaim,
+                    },
                     else => return error.CellDidNotReportALostClaim,
                 },
                 .unreachable_because => return error.UnreachableCellWasRun,
@@ -11531,16 +11541,20 @@ test "gate: a `job rm` whose compare-and-swap is refused leaves no terminal clai
         .{ .expected = stale, .grounds = .session_proven_gone },
         &rollback,
     )) {
-        .row_moved => |conflict| switch (conflict) {
-            .status_moved => |moved| {
-                try t.expectEqual(Store.jobs.Status.pending, moved.expected);
-                try t.expectEqual(Store.jobs.Status.running, moved.found);
+        .refused => |why| switch (why) {
+            .row_moved => |conflict| switch (conflict) {
+                .status_moved => |moved| {
+                    try t.expectEqual(Store.jobs.Status.pending, moved.expected);
+                    try t.expectEqual(Store.jobs.Status.running, moved.found);
+                },
+                else => return error.RefusedForTheWrongReason,
             },
-            else => return error.RefusedForTheWrongReason,
+            // The authority held: neither of these is what declined this call.
+            .scope_taken, .claim_lost => return error.RefusedForTheWrongReason,
         },
-        // Every one of these would mean the CAS answer reached a caller as
-        // something other than a refusal — which is the defect.
-        .forgotten, .refused, .claim_lost => return error.RefusedRemovalWasNotReported,
+        // This would mean the CAS answer reached a caller as something other than
+        // a refusal — which is the defect.
+        .forgotten => return error.RefusedRemovalWasNotReported,
     }
 
     // The assertion. No terminal, because the destruction did not happen; the

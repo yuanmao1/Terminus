@@ -824,6 +824,54 @@
       "find": ") catch |err| removalUnrecordable(\n            ctx,\n            if (attempt) |a| a.request_id else job.name,\n            if (execution) |*e| e.status.text() else \"unchanged\",\n            rollback,\n            err,\n        );\n",
       "replace": ") catch |err| Cli.receiptFatal(\n            if (attempt) |a| a.request_id else job.name,\n            err,\n            \"recording a job removal\",\n        );\n",
       "expect_gate": "blackbox: a `job rm` whose rollback cannot be confirmed says the row is unknown"
+    },
+    {
+      "id": "W5-rm-error-code-is-the-refusal-s-own",
+      "rule": "`job rm --json` publishes, in `errorCode`, the word for the read that actually refused it. Before this key the three commit refusals travelled only in the `hint` prose and the receipt's `error_code` column, and neither is reachable for a caller reading the document.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .errorCode = refusal.errorCode(),\n",
+      "replace": "            .errorCode = error_code.none,\n",
+      "expect_gate": "blackbox: a `job rm` over a row that moved keeps it, and its exit code follows the settlement"
+    },
+    {
+      "id": "W5-row-moved-exit-follows-the-settlement",
+      "rule": "A `job rm` refused at the commit exits on what its *settlement* established, not on the refusal: 1 for a proven outcome, 75 for an unproven one. A flat 1 tells a script the remote state is settled when the kill went out and nothing recorded what became of the work.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    // what failed there is only this command's standing to delete a row.\n    if (!proven) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);\n",
+      "replace": "    // what failed there is only this command's standing to delete a row.\n",
+      "expect_gate": "blackbox: a `job rm` over a row that moved keeps it, and its exit code follows the settlement"
+    },
+    {
+      "id": "W5-refusal-code-is-the-transactions-own-word",
+      "rule": "The machine word for a destructive refusal is minted by the transaction that refused it (`execution.Refusal.codes`), so the report and the receipt cannot spell the same fact two ways.",
+      "file": "src/core/execution.zig",
+      "find": "            .row_moved => codes.row_moved,\n",
+      "replace": "            .row_moved => codes.claim_lost,\n",
+      "expect_gate": "blackbox: a `job rm` over a row that moved keeps it, and its exit code follows the settlement"
+    },
+    {
+      "id": "W5-rm-success-publishes-the-success-value",
+      "rule": "`errorCode` carries an explicit value for \"nothing went wrong\" on the branch that removed the row, the way `resultRecord` carries `not_requested`. Without it a caller has to decide whether a missing or unfamiliar key means success.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        .{ .code = error_code.none, .hint = null }\n",
+      "replace": "        .{ .code = error_code.records_disagree, .hint = null }\n",
+      "expect_gate": "blackbox: a `job rm` over a row that moved keeps it, and its exit code follows the settlement"
+    },
+    {
+      "id": "W5-skill-rm-error-code-vocabulary",
+      "rule": "skill/SKILL.md's `job rm` `errorCode` vocabulary is the `error_code` namespace's own words. The key-set gate reads keys and skips parentheticals, so a value documented in prose has nothing behind it until this gate reads it.",
+      "file": "skill/SKILL.md",
+      "find": "`ROW_MOVED_BEFORE_COMMIT`, `RESULT_RECORD_UNREADABLE`, `PROBE_FAILED`,\n",
+      "replace": "`ROW_MOVED_AT_COMMIT`, `RESULT_RECORD_UNREADABLE`, `PROBE_FAILED`,\n",
+      "expect_gate": "gate: SKILL.md publishes exactly `job rm`'s errorCode vocabulary"
+    },
+    {
+      "id": "W5-pre-kill-recovery-picks-its-blocker",
+      "rule": "The pre-kill refusal's recovery is chosen from what refused it. A renewal that could not be *performed* establishes nothing about who holds the scope, so offering a takeover there advises forcing past a question nobody could ask.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        .unreadable => \"the store could not be asked whether the scope is still ours, so --force would take the lease over on the strength of the same answer nobody got: fix the store error named above, then re-run\",\n",
+      "replace": "        .unreadable => \"Wait for the other holder to finish and re-run, or re-run with --force to take the scope over\",\n",
+      "expect_gate": "preKillRecovery"
     }
   ]
 }

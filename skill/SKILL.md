@@ -426,6 +426,32 @@ performed at all counts as a loss, not a yes. Both report `authority`
   taken at all. Both report `action:"not_removed"`, `rowRemoved:false` and exit
   75; the first sends you to `--override` (the document itself will not open), the
   second to `--from-log` (the documents are intact; the wire was not).
+- **Refused when it was about to be recorded.** Every renewal held and the kill
+  went out, and then the one transaction that was to write the terminal and forget
+  the row declined it. Three reads can decline it and each names itself in
+  `errorCode`: a peer's claim on the scope (`SCOPE_TAKEN_BEFORE_COMMIT`), this
+  command's own lease no longer being live and ours (`CLAIM_LOST_BEFORE_COMMIT`),
+  and the compare-and-swap matching nothing (`ROW_MOVED_BEFORE_COMMIT`). On all
+  three: `action:"not_removed"`, `rowRemoved:false`, the row is **kept**, and
+  `authority` still reads `held` — the renewals answered truthfully about the
+  moments they were asked, and what refused this is the read inside the
+  transaction, which is exactly what `errorCode` is for. The attempt is still this
+  command's to settle and is settled on the way out, and **the exit code follows
+  that settlement, not the refusal**: an exit status this command actually read is
+  not made false by a scope that moved, so a proven outcome exits **1** and an
+  unproven one exits **75**. `hint` carries the recovery that can actually work,
+  which is not the same sentence for all three — `--force` takes a scope *lease*
+  over and does nothing to an unsettled peer operation or to a row that moved.
+- **The row moved under it** is the third of those and the one with no `session rm`
+  counterpart, because a session delete has no expectation to lose. The `jobs` row
+  on disk is not the row this command read — the name was relaunched into, a peer
+  settled it, or it is already gone — so the delete matches nothing and the whole
+  transaction goes back: nothing was deleted and no terminal was written by it.
+  `errorCode:"ROW_MOVED_BEFORE_COMMIT"`, the row stays, and `cacheError` carries
+  the conflict, which is this key set's one signal that the local row was not
+  updated. Exit **1** with a proven outcome and **75** without one, as above.
+  Re-read the job with `job ls` before acting on it again; no takeover helps,
+  because no lease is what refused it.
 - `job rm --discard-evidence` additionally deletes the pane log and then the
   result file, each behind its own lease renewal and only once the session is
   proven gone. Unless the outcome was provable, discarding is not a success: it
@@ -462,14 +488,31 @@ outcome), `finishedAt`, `conflict`, `requestId` (null when the row names no
 attempt), `resultRecordError`, `cacheError`, `authorityError`,
 `leaseReleaseError`, `hint`.
 
-`job rm` — 18 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
-`job`, `status`, `outcomeProven`, `rowRemoved`, `evidenceRetained`,
+`job rm` — 19 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
+`errorCode`, `job`, `status`, `outcomeProven`, `rowRemoved`, `evidenceRetained`,
 `attemptRetained`, `resultRecord`, `authority`,
 `leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
 Nullable: `conflict`, `requestId`, `resultRecordError`, `cacheError`,
 `authorityError`, `leaseReleaseError`, `hint`.
 `resultRecord` / `resultRecordError` are on this verb too — `job rm` deletes the
 local row, so this line and the receipt are the only places the reading survives.
+
+`job rm --json`'s `errorCode` is one of `none`, `AUTHORITY_LOST_BEFORE_KILL`,
+`AUTHORITY_LOST`, `SCOPE_TAKEN_BEFORE_COMMIT`, `CLAIM_LOST_BEFORE_COMMIT`,
+`ROW_MOVED_BEFORE_COMMIT`, `RESULT_RECORD_UNREADABLE`, `PROBE_FAILED`,
+`RECORDS_DISAGREE`, `RESULT_RECORD_UNUSABLE`, `EVIDENCE_DISCARDED_UNPROVEN`,
+`CACHE_REFUSED`, `RECEIPT_PERSIST_FAILED`. It is never null and never absent:
+`none` is the value on the branches that removed the row with nothing to report —
+including the ordinary unproven removal that keeps the log for
+`reconcile --from-log`, which is `ok:true` — so a caller never has to decide
+whether a missing key means success or an older binary. It is the same
+vocabulary `session rm` publishes wherever the two verbs describe the same fact.
+`RECEIPT_PERSIST_FAILED` is the one word that never arrives inside this key set:
+that branch could not write the transaction carrying the terminal and the delete,
+so it reports the fatal envelope
+(`{ok, error, errorCode, requestId, cause, remoteStatus, localRow, hint}`) and
+exits **76** — read `localRow` there, which is `kept` when the undo was proved and
+`unknown` when it was not.
 
 `leaseRelease` is the same key `session rm` publishes, and it answers a different
 question from `authority`: that one says whether the scope lease was still ours

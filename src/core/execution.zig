@@ -991,11 +991,36 @@ pub const JobRemoval = union(enum) {
     /// The row and the ledger write landed together.
     ///
     /// The row really is gone: a compare-and-swap that did not match leaves as
-    /// `row_moved`, so this arm carries no write for a caller to read a refusal
-    /// off. It used to, and `job rm` then reported `not_removed` off a
+    /// `Refusal.row_moved`, so this arm carries no write for a caller to read a
+    /// refusal off. It used to, and `job rm` then reported `not_removed` off a
     /// transaction that had already committed the terminal.
     forgotten: struct { ledger: LedgerResult },
-    refused: Blocker,
+    /// Nothing was destroyed and no terminal of this call's survives, and the
+    /// value says which read declined it.
+    refused: Refusal,
+};
+
+/// Why a destructive commit declined, as one value.
+///
+/// Three arms, and what refused the act is the difference. `scope_taken` names a
+/// peer; `claim_lost` frequently has none to name — the state it exists for is a
+/// lease that lapsed during the last round trip and was swept by somebody's
+/// ordinary housekeeping, leaving the scope genuinely clear. That is exactly the
+/// state the overlap check reads as "nothing is in your way", which is true, and
+/// which used to be enough to delete a row. `row_moved` is about neither: the
+/// authority held and the compare-and-swap still matched nothing, because the row
+/// on disk is not the row the caller read.
+///
+/// One value rather than three sibling arms on `JobRemoval`, because the caller
+/// was rebuilding exactly this union out of those arms to have something to
+/// switch on. The three facts are this transaction's own, and so is the word for
+/// each: a caller that had to name them itself is a caller that can name them
+/// differently from the next one.
+pub const Refusal = union(enum) {
+    /// A peer's unsettled operation or lease covered the scope when the
+    /// transaction opened.
+    scope_taken: Blocker,
+    /// The authority owner's *own* claim is no longer live and theirs.
     claim_lost: leases.ClaimState,
     /// The `jobs` row on disk is not the row the caller read, so the delete
     /// matched nothing. **Nothing was written**: the terminal went back with the
@@ -1004,6 +1029,27 @@ pub const JobRemoval = union(enum) {
     /// name", "it moved on" and "it is already gone" send an operator to three
     /// different places.
     row_moved: jobs.Conflict,
+
+    /// The stable machine word for each, named here rather than at the report.
+    ///
+    /// The transaction is what knows which of the three refused it, so this is
+    /// where the word for it belongs: a report that spelled them itself would be
+    /// a second list to keep in step with this union, and `job rm` and
+    /// `session rm` already publish the first two under the same names.
+    pub const codes = struct {
+        pub const scope_taken = "SCOPE_TAKEN_BEFORE_COMMIT";
+        pub const claim_lost = "CLAIM_LOST_BEFORE_COMMIT";
+        /// No session counterpart: a session delete has no expectation to lose.
+        pub const row_moved = "ROW_MOVED_BEFORE_COMMIT";
+    };
+
+    pub fn errorCode(r: Refusal) []const u8 {
+        return switch (r) {
+            .scope_taken => codes.scope_taken,
+            .claim_lost => codes.claim_lost,
+            .row_moved => codes.row_moved,
+        };
+    }
 };
 
 /// `job rm`'s ledger half: the attempt to settle in the removal's transaction, or
@@ -1080,13 +1126,13 @@ pub fn settleAndForgetJob(
         .ledger = settlement.ledger(),
         .destroys = .{ .job_row = forget },
     }, rollback)) {
-        .refused => |blocker| return .{ .refused = blocker },
-        .claim_lost => |claim| return .{ .claim_lost = claim },
+        .refused => |blocker| return .{ .refused = .{ .scope_taken = blocker } },
+        .claim_lost => |claim| return .{ .refused = .{ .claim_lost = claim } },
         // `JobSettlement.ledger` pins `on_rival` to `destroy_anyway`, which is the
         // only thing that can produce this arm, so reaching it means this file's
         // dispatch and its wrapper have drifted apart.
         .already_settled => return error.ContractAnsweredAboutSomethingElse,
-        .destruction_refused => |conflict| return .{ .row_moved = conflict },
+        .destruction_refused => |conflict| return .{ .refused = .{ .row_moved = conflict } },
         .done => |done| switch (done.destroyed) {
             .job_row => return .{ .forgotten = .{ .ledger = done.ledger } },
             .session_row => return error.ContractAnsweredAboutSomethingElse,

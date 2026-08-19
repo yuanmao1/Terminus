@@ -2209,6 +2209,191 @@ test "blackbox: `job rm` keeps the row when a peer's unsettled attempt claims th
     }
 }
 
+// The third way the removal's own transaction can decline it, and the one with no
+// `session rm` counterpart: every renewal held, the kill went out, and the
+// compare-and-swap that was to forget the row matched nothing, because the row on
+// disk is not the row this command read. The whole transaction goes back — the
+// terminal written two statements earlier with it — so nothing was deleted and
+// nothing was recorded by it, and the row stays.
+//
+// **The exit code is what this gate is for, and it is not one code.** The refusal
+// settles the attempt itself, and the code follows *that settlement* rather than
+// the refusal: an exit status this command actually read came from a document at
+// this attempt's own request id, an address no peer can write to without starting
+// a new attempt under a new id, so a scope that moved does not make it false. A
+// proven outcome therefore exits **1** — a plain failure, safe to re-run — and an
+// unproven one exits **75**, because the caller owes a reconcile. Reporting 1 for
+// both would tell a script the outcome was settled; reporting 75 for both would
+// bill it for an unknown it does not have. Neither sub-case was gated, and
+// `skill/SKILL.md` did not describe the branch at all.
+//
+// The row is moved by a real sqlite trigger keyed on this attempt's own terminal
+// event, which is the statement `commitDestruction` runs immediately before the
+// delete — the exact window a relaunch, a peer's kill or a name takeover lands in.
+// Arranged rather than faked: nothing outside the process can write between two
+// statements of a `BEGIN IMMEDIATE`, and a seam that could would be measuring the
+// seam.
+//
+// Every assertion is read from the store or from the host's own traffic, except
+// the two that are *about* the document — `errorCode` exists nowhere else.
+test "blackbox: a `job rm` over a row that moved keeps it, and its exit code follows the settlement" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "job_rm_row_moved");
+    defer f.deinit();
+    try f.seedServer();
+
+    const sentinel = "__TERMINUS_JOB_13__";
+    const proven_id = "01XXXXXXXX0123456789ABCDEF";
+    const unproven_id = "01YYYYYYYY0123456789ABCDEF";
+    const control_id = "01ZZZZZZZZ0123456789ABCDEF";
+    try seedRunningJob(&f, proven_id, "deploy", sentinel);
+    try seedRunningJob(&f, unproven_id, "hold", sentinel);
+    try seedRunningJob(&f, control_id, "release", sentinel);
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // One trigger per attempt, each keyed on its *own* request id. A single
+        // trigger over both names would move the second job's row during the first
+        // job's run, and the second leg would then be reading a row that had
+        // already moved before it started — a different branch wearing this one's
+        // name.
+        try store.db.exec(
+            \\CREATE TRIGGER move_deploy AFTER INSERT ON operation_events
+            \\WHEN NEW.is_terminal = 1 AND NEW.request_id = '01XXXXXXXX0123456789ABCDEF'
+            \\BEGIN UPDATE jobs SET status = 'exited' WHERE name = 'deploy' AND status = 'running'; END
+        );
+        try store.db.exec(
+            \\CREATE TRIGGER move_hold AFTER INSERT ON operation_events
+            \\WHEN NEW.is_terminal = 1 AND NEW.request_id = '01YYYYYYYY0123456789ABCDEF'
+            \\BEGIN UPDATE jobs SET status = 'exited' WHERE name = 'hold' AND status = 'running'; END
+        );
+    }
+
+    const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    const finished = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":0\n";
+    var rules = [_]FakeHost.Rule{
+        // `deploy` and `release` reach their own end during the kill, so the look
+        // after it reads a real exit status. `hold` never does, so nothing about
+        // its outcome is ever established.
+        .{ .needle = "job-deploy.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-deploy.log", .stdout = finished },
+        .{ .needle = "job-hold.log", .stdout = running },
+        .{ .needle = "job-release.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-release.log", .stdout = finished },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    // Leg one: the row moved and the outcome is not in doubt.
+    {
+        var moved = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "deploy", "--json", "--db", f.db,
+        }, &environ);
+        defer moved.deinit(f.allocator);
+
+        // The traffic first, so a regression names its cause: the kill really went
+        // out — this is not a command that stopped short of it — and no deletion
+        // followed.
+        try host.expectSent("kill-session");
+        try host.expectNeverSent("rm -f");
+
+        // **1, not 75.** The second look read this attempt's own sentinel, so the
+        // outcome is settled and only this command's standing to delete a row
+        // failed.
+        try moved.expectCode(1);
+        try moved.expectSays("\"errorCode\": \"ROW_MOVED_BEFORE_COMMIT\"");
+        try moved.expectSays("\"action\": \"not_removed\"");
+        try moved.expectSays("\"rowRemoved\": false");
+        try moved.expectSays("\"outcomeProven\": true");
+        // Every renewal answered truthfully about the moment it was asked; what
+        // refused this is the read inside the transaction, which is the whole
+        // reason `errorCode` had to exist.
+        try moved.expectSays("\"authority\": \"held\"");
+        // The one key whose non-null says the local row was not updated.
+        try moved.expectSaysNot("\"cacheError\": null");
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Out of the store, not parsed out of stdout: the row is still there.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+        // …and the attempt carries the outcome the host reported rather than being
+        // abandoned unsettled to bar this job's scope with nothing saying why.
+        const op = (try Store.operations.get(&store, arena, proven_id)).?;
+        try t.expectEqualStrings("completed", op.status.text());
+    }
+
+    // Leg two: the same refusal with nothing established about the work.
+    {
+        var moved = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "hold", "--json", "--db", f.db,
+        }, &environ);
+        defer moved.deinit(f.allocator);
+
+        try host.expectSent("kill-session");
+        try host.expectNeverSent("rm -f");
+
+        // **75, not 1.** The kill went out and no record says what became of the
+        // work, so the caller owes a reconcile — and a 1 here would tell a script
+        // the state was untouched.
+        try moved.expectCode(75);
+        try moved.expectSays("\"errorCode\": \"ROW_MOVED_BEFORE_COMMIT\"");
+        try moved.expectSays("\"outcomeProven\": false");
+        try moved.expectSays("\"rowRemoved\": false");
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "hold")) != null);
+        const op = (try Store.operations.get(&store, arena, unproven_id)).?;
+        try t.expectEqualStrings("indeterminate", op.status.text());
+        // The ledger says which read refused it, in the column a receipt has for
+        // exactly that. The document's key and this column are the same word.
+        const written = (try terminalErrorCode(&store, arena, unproven_id)).?;
+        try t.expectEqualStrings("ROW_MOVED_BEFORE_COMMIT", written);
+    }
+
+    // The discriminating control: the same fixture, the same triggers, and a job
+    // neither of them names. Without it every assertion above is satisfied by a
+    // binary that had started refusing every removal — and it is the branch that
+    // proves `errorCode` publishes a success value rather than only failures.
+    {
+        var removed = try runWithEnvironment(&f, &.{
+            "job", "rm", "box", "release", "--json", "--db", f.db,
+        }, &environ);
+        defer removed.deinit(f.allocator);
+
+        try host.expectFullyScripted();
+        try removed.expectCode(0);
+        try removed.expectSays("\"errorCode\": \"none\"");
+        try removed.expectSays("\"action\": \"removed\"");
+        try removed.expectSays("\"rowRemoved\": true");
+
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        try t.expectEqual(
+            @as(?Store.jobs.Job, null),
+            try Store.jobs.getByName(&store, arena, 1, "release"),
+        );
+        const op = (try Store.operations.get(&store, arena, control_id)).?;
+        try t.expectEqualStrings("completed", op.status.text());
+    }
+}
+
 /// How the removal's post-kill look differs from the one before it.
 ///
 /// Two, because the two halves of the evidence a refused removal has to carry

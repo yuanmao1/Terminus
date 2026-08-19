@@ -1061,12 +1061,87 @@ const KillJson = struct {
     hint: ?[]const u8,
 };
 
+/// `job rm`'s stable `errorCode` vocabulary, named once so the branches cannot
+/// spell it two ways and `skill/SKILL.md` has something to be held against.
+///
+/// The three commit words are `Core.execution.Refusal`'s own, aliased rather than
+/// transcribed: the transaction is what knows which read refused it, and a second
+/// spelling here is exactly the drift a published enumeration cannot afford.
+/// `session rm` publishes the first two under the same names for the same two
+/// facts, which is deliberate — one vocabulary across the destructive verbs.
+///
+/// `error_code` and not `code`, which is what the session side calls it: this file
+/// captures `|code|` off an exit status in five places, and a namespace by that
+/// name shadows every one of them.
+const error_code = struct {
+    /// The removal completed. Present rather than null, for the reason
+    /// `resultRecord` publishes `not_requested`: a caller must never have to
+    /// decide whether a missing key means success or an older binary.
+    pub const none = "none";
+    /// A renewal answered that the scope is no longer ours, before the kill.
+    /// Nothing was sent to the host and nothing local was written.
+    pub const authority_lost_before_kill = "AUTHORITY_LOST_BEFORE_KILL";
+    /// A renewal answered that the scope is no longer ours, after the kill. The
+    /// same word the terminal receipt carries for it.
+    pub const authority_lost = Authority.lost_code;
+    /// Every renewal held, and the transaction that was to record the removal
+    /// found a peer's claim on the scope.
+    pub const scope_taken_before_commit = Core.execution.Refusal.codes.scope_taken;
+    /// …and found *this command's own* lease no longer live and ours.
+    pub const claim_lost_before_commit = Core.execution.Refusal.codes.claim_lost;
+    /// …and the compare-and-swap matched nothing: the row on disk is not the row
+    /// this command read.
+    pub const row_moved_before_commit = Core.execution.Refusal.codes.row_moved;
+    /// The look after the kill found a document at this attempt's own address and
+    /// the host could not obtain its bytes. Nothing was destroyed.
+    pub const result_record_unreadable = "RESULT_RECORD_UNREADABLE";
+    /// The look after the kill never happened at all. Nothing was destroyed.
+    pub const probe_failed = "PROBE_FAILED";
+    /// The row is gone and the job's two durable records disagree, so no
+    /// mechanical reconcile can settle it.
+    pub const records_disagree = "RECORDS_DISAGREE";
+    /// The row is gone and the result record was present and unusable, so the
+    /// sentinel beside it could not be checked against it.
+    pub const result_record_unusable = "RESULT_RECORD_UNUSABLE";
+    /// The row is gone, `--discard-evidence` deleted the log, and the outcome was
+    /// never proven — an override the caller now owes.
+    pub const evidence_discarded_unproven = "EVIDENCE_DISCARDED_UNPROVEN";
+    /// The settlement stands and the local row does not describe it. The one
+    /// signal `cacheError` carries, under a word a caller can branch on.
+    ///
+    /// Not reachable on this verb today, and named anyway: `removeJob`'s note
+    /// chain has an arm for a refused cache write, and the two settlements it can
+    /// reach — `removalObserved` and a `settleObserved` with `JobCacheSync.none` —
+    /// cannot produce one. Leaving that arm without a code would mean the chain
+    /// that picks the sentence and the chain that picks the word were not the same
+    /// chain, which is the drift `RemovalNote` exists to prevent. Deleting the arm
+    /// is a separate question about `cacheError`'s reachability on `job rm`.
+    pub const cache_refused = "CACHE_REFUSED";
+    /// A write this command needed could not be made. Reported in
+    /// `removalUnrecordable`'s envelope rather than in `RemovalJson`, because
+    /// that branch has a fourth fact — what became of the row — and exits 76.
+    /// The tree-wide code, reused rather than renamed.
+    pub const receipt_persist_failed = "RECEIPT_PERSIST_FAILED";
+};
+
 /// Everything `job rm --json` says, on every branch it can take. Same rule and
 /// same reason as `KillJson`.
 const RemovalJson = struct {
     ok: bool,
     /// `removed` or `not_removed`.
     action: []const u8,
+    /// Why this document is not a clean success, as one word out of `code`.
+    ///
+    /// Non-null on every branch, `none` on the one that removed the row and had
+    /// nothing to report — the pattern `resultRecord` already follows with
+    /// `not_requested`, and for the same reason: a caller must never have to
+    /// decide whether a missing key means success.
+    ///
+    /// Before this key the commit refusals published their code only through the
+    /// receipt's `error_code` column and the `hint` prose. Neither is reachable
+    /// for a caller reading this document, and on the branches that write no
+    /// receipt at all there was nowhere for it to be.
+    errorCode: []const u8,
     job: []const u8,
     status: []const u8,
     outcomeProven: bool,
@@ -1421,6 +1496,38 @@ test "gate: SKILL.md's --json key sets are the ones these structs emit" {
     );
 }
 
+// `errorCode`'s vocabulary is published as prose, and the key-set gate above
+// cannot read it: that one reads *keys* and skips every parenthetical, because
+// parentheticals hold values. So a word could be added to `error_code` with the
+// document still listing twelve, or the document could invent a thirteenth no
+// branch emits, and both would stay green — which is exactly how `leaseRelease`
+// and `session rm`'s step states came to be documented with nothing behind them.
+//
+// Held against the `error_code` namespace rather than a transcription of it, so a
+// renamed constant rewrites the check along with the code. Three of those
+// constants are aliases for `Core.execution.Refusal.codes`, which is what keeps
+// the word this document publishes and the word the transaction mints from being
+// two different strings.
+test "gate: SKILL.md publishes exactly `job rm`'s errorCode vocabulary" {
+    const gpa = std.testing.allocator;
+    const what = "`job rm`'s errorCode values";
+    const opened = try skillAfter(
+        skill_md,
+        "\n`job rm --json`'s `errorCode` is ",
+        "the errorCode vocabulary paragraph",
+    );
+    const para = opened[0..skillParagraphEnd(opened)];
+    const documented = try skillEntries(gpa, try skillSegment(para, "one of ", null, what), what);
+    defer gpa.free(documented);
+
+    var actual: std.ArrayList([]const u8) = .empty;
+    defer actual.deinit(gpa);
+    inline for (@typeInfo(error_code).@"struct".decls) |decl| {
+        try actual.append(gpa, @field(error_code, decl.name));
+    }
+    try expectSkillList(what, documented, actual.items);
+}
+
 // `resultRecord`'s values are `@tagName` on `SidecarReading`, so renaming a
 // variant rewrites the published vocabulary from three files away. The split
 // the document draws — three ordinary readings, four that say a document at
@@ -1714,6 +1821,21 @@ const RemovalReport = struct {
     removed: bool,
     ok: bool,
     action: []const u8,
+};
+
+/// The machine word and the human sentence a finished `job rm` earns, as one
+/// value.
+///
+/// One value because they are one decision. The `errorCode` and the `hint` are
+/// chosen by the same predicates in the same order, and had they been two chains
+/// the day one gained a branch would be the day a caller branched on a code that
+/// disagreed with the sentence printed beside it — which is the whole reason the
+/// code exists.
+const RemovalNote = struct {
+    /// One of `error_code`'s words. Never null; `none` is the success value.
+    code: []const u8,
+    /// Prose beside it. Null where the keys already say everything.
+    hint: ?[]const u8,
 };
 
 fn removalReport(
@@ -2495,6 +2617,45 @@ fn settledStatus(outcome: Core.Store.receipts.SettleOutcome) Core.Store.op_state
     };
 }
 
+/// What actually gets the operator out of a refusal taken *before* the kill,
+/// chosen from what refused it rather than fixed.
+///
+/// The sentence used to offer `--force` unconditionally, and that was true only
+/// because of what can reach here: the step is guarded by a renewal of this
+/// command's own lease, so a lease is the only thing that can decline it. The
+/// commit-side sentence made the same assumption and was already found to be
+/// misleading — `--force` takes a scope *lease* over and does nothing to an
+/// unsettled peer operation — so `refusalRecovery` now picks its clause from the
+/// blocker. This is that rule one step earlier, and it is what keeps the day an
+/// operation can bar this step from being a day the advice silently goes wrong.
+///
+/// The two live answers differ. `lapsed` is an answer: somebody may be holding the
+/// scope, and a takeover is the instrument for that. `unreadable` is the absence
+/// of one — the store could not be asked — and a takeover made on the strength of
+/// an answer nobody got is the same guess under a flag.
+fn preKillRecovery(authority: Authority) []const u8 {
+    return switch (authority) {
+        // Not reachable from the two callers below, which are entered precisely
+        // because the renewal did not answer `held`. Answered rather than left to
+        // `unreachable`, and answered with the only clause that would be true of
+        // it: there is nothing to wait for and nothing to take over.
+        .held => "re-run: this command still holds the scope",
+        .lapsed => "Wait for the other holder to finish and re-run, or re-run with --force to take the scope over",
+        .unreadable => "the store could not be asked whether the scope is still ours, so --force would take the lease over on the strength of the same answer nobody got: fix the store error named above, then re-run",
+    };
+}
+
+test preKillRecovery {
+    const t = std.testing;
+    // The one that may offer a takeover, and the one that may not. A takeover is
+    // an instrument against a *holder*; on `unreadable` there is no answer saying
+    // there is one, and telling an operator to force past a question nobody could
+    // ask is how a lease gets displaced over a store fault.
+    try t.expect(std.mem.indexOf(u8, preKillRecovery(.lapsed), "--force") != null);
+    try t.expect(std.mem.indexOf(u8, preKillRecovery(.{ .unreadable = "Sqlite" }), "--force to take the scope over") == null);
+    try t.expect(std.mem.indexOf(u8, preKillRecovery(.held), "--force") == null);
+}
+
 /// The sentence a refused destructive step earns: what was lost, what was not
 /// done, and what to do next.
 ///
@@ -2509,9 +2670,14 @@ fn settledStatus(outcome: Core.Store.receipts.SettleOutcome) Core.Store.op_state
 fn refusalHint(ctx: *Cli.Ctx, authority: Authority, job_name: []const u8, what: []const u8) []const u8 {
     return std.fmt.allocPrint(
         ctx.arena,
-        "{s}; no command that changes anything was sent to the host and nothing local was written, so job '{s}' is exactly as it was. Wait for the other holder to finish and re-run, or re-run with --force to take the scope over{s}",
-        .{ authority.note(ctx.arena, .{ .job = job_name }) orelse "the scope lease is not ours", job_name, what },
-    ) catch "this command no longer holds the scope lease for this job; nothing on the host was changed and nothing local was written. Wait, or re-run with --force";
+        "{s}; no command that changes anything was sent to the host and nothing local was written, so job '{s}' is exactly as it was. {s}{s}",
+        .{
+            authority.note(ctx.arena, .{ .job = job_name }) orelse "the scope lease is not ours",
+            job_name,
+            preKillRecovery(authority),
+            what,
+        },
+    ) catch "this command no longer holds the scope lease for this job; nothing on the host was changed and nothing local was written";
 }
 
 /// Refuses a destructive step this command no longer holds the scope for,
@@ -2697,6 +2863,10 @@ fn refuseRemoval(
         .json => ctx.out.json(RemovalJson{
             .ok = false,
             .action = "not_removed",
+            // The renewal answered, and it answered no — before the kill, so
+            // nothing was sent and nothing was written. The same word `session rm`
+            // publishes for the same moment.
+            .errorCode = error_code.authority_lost_before_kill,
             .job = job.name,
             .status = if (attempt) |a| recordedStatus(ctx, store, a.request_id) else "unchanged",
             .outcomeProven = false,
@@ -2726,102 +2896,79 @@ fn refuseRemoval(
     Cli.exitNow(Cli.exit_code.failure);
 }
 
-/// What the removal's own transaction found when it declined the whole composite.
+/// What the removal's own transaction found when it declined the whole composite,
+/// in one clause, for the sentence that carries it.
 ///
-/// Three arms, and what refused the act is the difference. `blocked` names a peer;
-/// `claim_lost` frequently has none to name — the state it exists for is a lease
-/// that lapsed during the last round trip and was swept by somebody's ordinary
-/// housekeeping, leaving the scope genuinely clear. That is exactly the state the
-/// overlap check reads as "nothing is in your way", which is true, and which used
-/// to be enough to delete a row. `row_moved` is about neither: the authority held
-/// and the compare-and-swap still matched nothing, because the row on disk is not
-/// the row this command read.
-///
-/// The first two `error_code` words are the ones `session rm` already publishes for
-/// the same two facts (`cmd_session.code`). The third has no session counterpart —
-/// a session delete has no expectation to lose — and the receipt is where all three
-/// land, because `RemovalJson` has no `errorCode` key and adding one is a change to
-/// a published document.
-const CommitRefusal = union(enum) {
-    blocked: Core.execution.Blocker,
-    claim_lost: Store.leases.ClaimState,
-    row_moved: Store.jobs.Conflict,
-
-    fn errorCode(r: CommitRefusal) []const u8 {
-        return switch (r) {
-            .blocked => "SCOPE_TAKEN_BEFORE_COMMIT",
-            .claim_lost => "CLAIM_LOST_BEFORE_COMMIT",
-            .row_moved => "ROW_MOVED_BEFORE_COMMIT",
-        };
-    }
-
-    /// What the transaction saw, in one clause, for the sentence that carries it.
-    fn found(r: CommitRefusal, ctx: *Cli.Ctx, job_name: []const u8) []const u8 {
-        return switch (r) {
-            .blocked => |blocker| switch (blocker) {
-                .unsettled => |op| std.fmt.allocPrint(
-                    ctx.arena,
-                    "request {s} is {s} on an overlapping scope",
-                    .{ op.request_id, op.status.text() },
-                ) catch "another attempt is unsettled on an overlapping scope",
-                .lease => |lease| std.fmt.allocPrint(
-                    ctx.arena,
-                    "request {s} (on {s}) holds a lease on an overlapping scope until {d}",
-                    .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
-                ) catch "another request holds a lease on an overlapping scope",
-            },
-            .claim_lost => |claim| std.fmt.allocPrint(
+/// The three-arm union this used to open with lived here and was rebuilt, arm for
+/// arm, out of `JobRemoval`'s own answer — the CLI naming facts the transaction
+/// had already named. It is `Core.execution.Refusal` now, and so is the
+/// `errorCode` word for each; what stays here is what only a report needs: the
+/// prose, the recovery and the one refusal that earns a `cacheError`.
+fn refusalFound(r: Core.execution.Refusal, ctx: *Cli.Ctx, job_name: []const u8) []const u8 {
+    return switch (r) {
+        .scope_taken => |blocker| switch (blocker) {
+            .unsettled => |op| std.fmt.allocPrint(
                 ctx.arena,
-                "this command's own lease on the scope is {s}",
-                .{claim.code()},
-            ) catch "this command's own lease on the scope is no longer live and ours",
-            .row_moved => |conflict| conflictText(ctx.arena, job_name, conflict),
-        };
-    }
+                "request {s} is {s} on an overlapping scope",
+                .{ op.request_id, op.status.text() },
+            ) catch "another attempt is unsettled on an overlapping scope",
+            .lease => |lease| std.fmt.allocPrint(
+                ctx.arena,
+                "request {s} (on {s}) holds a lease on an overlapping scope until {d}",
+                .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
+            ) catch "another request holds a lease on an overlapping scope",
+        },
+        .claim_lost => |claim| std.fmt.allocPrint(
+            ctx.arena,
+            "this command's own lease on the scope is {s}",
+            .{claim.code()},
+        ) catch "this command's own lease on the scope is no longer live and ours",
+        .row_moved => |conflict| conflictText(ctx.arena, job_name, conflict),
+    };
+}
 
-    /// What actually gets the operator out of this — which is **not** one sentence,
-    /// and telling them `--force` for all four was worse than telling them nothing.
-    ///
-    /// `--force` takes the scope *lease* over (`leases.takeover`) and does nothing
-    /// else. Against a peer's lease that is exactly the right instrument. Against an
-    /// unsettled peer *operation* it is not: the operation barrier is a separate,
-    /// fail-closed check that no flag bypasses — deliberately, because an attempt
-    /// nobody settled may still be running — so a caller who follows that advice
-    /// re-runs and is refused in the same words. The peer has to be reconciled
-    /// first, and the id to reconcile is one we already have. Against our own lost
-    /// claim there is usually nothing to take over at all, and against a row that
-    /// moved there is nothing a lease can fix.
-    fn recovery(r: CommitRefusal, ctx: *Cli.Ctx) []const u8 {
-        return switch (r) {
-            .blocked => |blocker| switch (blocker) {
-                .unsettled => |op| std.fmt.allocPrint(
-                    ctx.arena,
-                    "settle that attempt first with 'terminus request reconcile {s}' and then re-run; --force will not clear it, because it takes the scope lease over and an unsettled operation bars the scope on its own",
-                    .{op.request_id},
-                ) catch "settle the blocking attempt with 'terminus request reconcile <request-id>' and then re-run; --force takes over a lease and does not clear an unsettled operation",
-                .lease => "wait for that lease to lapse and re-run, or re-run with --force to take the scope over",
-            },
-            .claim_lost => "nothing else is holding the scope, so re-run to finish the removal; if somebody has taken it since, the re-run will name them",
-            .row_moved => "re-read the job with 'terminus job ls' before acting on it again: this removal was made against the row this command read, and that is not the row on disk",
-        };
-    }
+/// What actually gets the operator out of this — which is **not** one sentence,
+/// and telling them `--force` for all four was worse than telling them nothing.
+///
+/// `--force` takes the scope *lease* over (`leases.takeover`) and does nothing
+/// else. Against a peer's lease that is exactly the right instrument. Against an
+/// unsettled peer *operation* it is not: the operation barrier is a separate,
+/// fail-closed check that no flag bypasses — deliberately, because an attempt
+/// nobody settled may still be running — so a caller who follows that advice
+/// re-runs and is refused in the same words. The peer has to be reconciled
+/// first, and the id to reconcile is one we already have. Against our own lost
+/// claim there is usually nothing to take over at all, and against a row that
+/// moved there is nothing a lease can fix.
+fn refusalRecovery(r: Core.execution.Refusal, ctx: *Cli.Ctx) []const u8 {
+    return switch (r) {
+        .scope_taken => |blocker| switch (blocker) {
+            .unsettled => |op| std.fmt.allocPrint(
+                ctx.arena,
+                "settle that attempt first with 'terminus request reconcile {s}' and then re-run; --force will not clear it, because it takes the scope lease over and an unsettled operation bars the scope on its own",
+                .{op.request_id},
+            ) catch "settle the blocking attempt with 'terminus request reconcile <request-id>' and then re-run; --force takes over a lease and does not clear an unsettled operation",
+            .lease => "wait for that lease to lapse and re-run, or re-run with --force to take the scope over",
+        },
+        .claim_lost => "nothing else is holding the scope, so re-run to finish the removal; if somebody has taken it since, the re-run will name them",
+        .row_moved => "re-read the job with 'terminus job ls' before acting on it again: this removal was made against the row this command read, and that is not the row on disk",
+    };
+}
 
-    /// The `cacheError` this refusal earns, and only one of the three earns one.
-    ///
-    /// `RemovalJson` publishes non-null there as the one signal that the local row
-    /// was not updated, and a compare-and-swap that matched nothing is precisely
-    /// that. The other two never reached the row: they were declined by the
-    /// authority check, and `rowRemoved:false` is what says so. Carried here
-    /// because the refused write used to be reported through this key before the
-    /// destruction learned to decline the whole transaction, and a consumer
-    /// branching on it must not lose the signal in the move.
-    fn cacheNote(r: CommitRefusal, ctx: *Cli.Ctx, job_name: []const u8) ?[]const u8 {
-        return switch (r) {
-            .blocked, .claim_lost => null,
-            .row_moved => |conflict| conflictText(ctx.arena, job_name, conflict),
-        };
-    }
-};
+/// The `cacheError` this refusal earns, and only one of the three earns one.
+///
+/// `RemovalJson` publishes non-null there as the one signal that the local row
+/// was not updated, and a compare-and-swap that matched nothing is precisely
+/// that. The other two never reached the row: they were declined by the
+/// authority check, and `rowRemoved:false` is what says so. Carried here
+/// because the refused write used to be reported through this key before the
+/// destruction learned to decline the whole transaction, and a consumer
+/// branching on it must not lose the signal in the move.
+fn refusalCacheNote(r: Core.execution.Refusal, ctx: *Cli.Ctx, job_name: []const u8) ?[]const u8 {
+    return switch (r) {
+        .scope_taken, .claim_lost => null,
+        .row_moved => |conflict| conflictText(ctx.arena, job_name, conflict),
+    };
+}
 
 /// Refused by the transaction that was to record the removal, with every remote
 /// step already behind it.
@@ -2877,7 +3024,7 @@ fn refuseRemovalAtCommit(
     /// because whether it survives the refusal is a question only it can answer —
     /// see below.
     terminal: Core.Store.op_state.Terminal,
-    refusal: CommitRefusal,
+    refusal: Core.execution.Refusal,
 ) noreturn {
     // What this removal actually did before it was stopped, stated in full. An
     // operator told only "not removed" does not know which of the three
@@ -2891,7 +3038,7 @@ fn refuseRemovalAtCommit(
     const reason = std.fmt.allocPrint(
         ctx.arena,
         "this command stopped job '{s}''s session and the transaction that was to record the removal found that {s} ({s}); nothing was deleted and no terminal was written by it, so {s}",
-        .{ job.name, refusal.found(ctx, job.name), refusal.errorCode(), stopped_at },
+        .{ job.name, refusalFound(refusal, ctx, job.name), refusal.errorCode(), stopped_at },
     ) catch "this command stopped this job's session and then found it could not record the removal; the local row was kept";
 
     // **Which terminal survives the refusal**, and it is the same rule the
@@ -2941,13 +3088,18 @@ fn refuseRemovalAtCommit(
     const hint = std.fmt.allocPrint(
         ctx.arena,
         "{s}. {s}",
-        .{ reason, refusal.recovery(ctx) },
+        .{ reason, refusalRecovery(refusal, ctx) },
     ) catch "the removal was refused when it was about to be recorded; the local row was kept";
     const lease = Cli.releaseClaimReporting();
     switch (ctx.out.format) {
         .json => ctx.out.json(RemovalJson{
             .ok = false,
             .action = "not_removed",
+            // Which read inside the transaction declined this, as the machine word
+            // the transaction itself minted. It used to travel only in the
+            // `reason` prose above and in the receipt's `error_code` column — and
+            // the receipt is not reachable from this document.
+            .errorCode = refusal.errorCode(),
             .job = job.name,
             .status = status_text,
             .outcomeProven = proven,
@@ -2962,7 +3114,7 @@ fn refuseRemovalAtCommit(
             .resultRecord = record_keys.record,
             .resultRecordError = record_keys.note,
             .requestId = if (attempt) |a| a.request_id else null,
-            .cacheError = refusal.cacheNote(ctx, job.name),
+            .cacheError = refusalCacheNote(refusal, ctx, job.name),
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
             .leaseRelease = lease.code,
@@ -3060,7 +3212,7 @@ fn removalUnrecordable(
         .json => ctx.out.json(.{
             .ok = false,
             .@"error" = "could not persist the operation receipt",
-            .errorCode = "RECEIPT_PERSIST_FAILED",
+            .errorCode = error_code.receipt_persist_failed,
             .requestId = request_id,
             .cause = @errorName(cause),
             .remoteStatus = known_remote_status,
@@ -4626,7 +4778,18 @@ fn removeJob(
         );
         break :forget switch (removal) {
             .forgotten => |done| removalObserved(ctx, store, terminal, done.ledger),
-            .refused => |blocker| refuseRemovalAtCommit(
+            // One arm for all three refusals, because the transaction hands back
+            // which one it was. This used to be three copies of the same twelve
+            // arguments, differing only in the arm they rebuilt out of the answer
+            // they had just been given — and on `row_moved` the compare-and-swap
+            // matched nothing, so the whole transaction went back, including the
+            // terminal already written in it. The attempt is therefore still
+            // unsettled and still ours on every one of the three, and it is settled
+            // in there: an attempt this command reached the host under and then
+            // abandoned silently would bar this job's scope with nothing in the
+            // ledger saying why. What it must *not* be settled with is the terminal
+            // above, which opens with "job removed" over a row still on disk.
+            .refused => |why| refuseRemovalAtCommit(
                 ctx,
                 store,
                 job,
@@ -4639,45 +4802,7 @@ fn removeJob(
                 log_discarded,
                 result_discarded,
                 terminal,
-                .{ .blocked = blocker },
-            ),
-            .claim_lost => |lost| refuseRemovalAtCommit(
-                ctx,
-                store,
-                job,
-                attempt,
-                if (execution) |*e| e else null,
-                authority,
-                probe,
-                record_keys,
-                extra,
-                log_discarded,
-                result_discarded,
-                terminal,
-                .{ .claim_lost = lost },
-            ),
-            // The compare-and-swap matched nothing, so the whole transaction went
-            // back — including the terminal that had already been written in it.
-            // The attempt is therefore still unsettled and still ours, and it is
-            // settled here for the reason the other two arms are: an attempt this
-            // command reached the host under and then abandoned silently would bar
-            // this job's scope with nothing in the ledger saying why. What it must
-            // *not* be settled with is the terminal above, which opens with "job
-            // removed" over a row that is still on disk.
-            .row_moved => |conflict| refuseRemovalAtCommit(
-                ctx,
-                store,
-                job,
-                attempt,
-                if (execution) |*e| e else null,
-                authority,
-                probe,
-                record_keys,
-                extra,
-                log_discarded,
-                result_discarded,
-                terminal,
-                .{ .row_moved = conflict },
+                why,
             ),
         };
     } else settleObserved(
@@ -4734,37 +4859,64 @@ fn removeJob(
         ) catch "its exit status was read before the loss and is recorded as its outcome"
     else
         "the outcome is recorded as unknown";
-    const hint: ?[]const u8 = if (final.unreadable)
+    // The code and the sentence, from one chain. Two chains over the same
+    // predicates in the same order is two chains to keep in step, and the one a
+    // caller branches on is the one that must not drift from the one it reads.
+    const note: RemovalNote = if (final.unreadable)
         // First, and for the reason the terminal above is ordered this way: the
         // ledger's reason and the caller's next step are one claim. `--from-log`
         // is what this branch used to offer — beside `{"action":"removed","ok":
         // true}` — and it reads this same document through this same reader, so
         // it could only ever have stopped where this removal did.
-        readFailureHint(ctx, if (attempt) |a| a.request_id else null)
+        .{
+            .code = error_code.result_record_unreadable,
+            .hint = readFailureHint(ctx, if (attempt) |a| a.request_id else null),
+        }
     else if (final.probe_error) |err|
         // …and here `--from-log` is the honest answer rather than a dead end,
         // which is the whole difference between the two words this branch and the
         // one above publish. Nothing was deleted and nothing was read, so both
         // records are sitting on the host exactly as the job left them.
-        probeFailureHint(ctx, err, if (attempt) |a| a.request_id else null)
+        .{
+            .code = error_code.probe_failed,
+            .hint = probeFailureHint(ctx, err, if (attempt) |a| a.request_id else null),
+        }
     else if (!authority.holds())
-        std.fmt.allocPrint(
-            ctx.arena,
-            "{s}. {s}, and {s}. Check who else was acting on this job before you act on it again; settle anything still unknown with 'terminus request reconcile <request-id> --override'",
-            .{ authority.note(ctx.arena, .{ .job = job.name }) orelse "the scope lease is not ours", stopped_at, outcome_at },
-        ) catch "this command lost the scope lease for this job, so it stopped short of removing anything"
+        .{
+            .code = error_code.authority_lost,
+            .hint = std.fmt.allocPrint(
+                ctx.arena,
+                "{s}. {s}, and {s}. Check who else was acting on this job before you act on it again; settle anything still unknown with 'terminus request reconcile <request-id> --override'",
+                .{ authority.note(ctx.arena, .{ .job = job.name }) orelse "the scope lease is not ours", stopped_at, outcome_at },
+            ) catch "this command lost the scope lease for this job, so it stopped short of removing anything",
+        }
     else if (cache_error) |text|
-        text
+        .{ .code = error_code.cache_refused, .hint = text }
     else if (proven)
-        null
+        .{ .code = error_code.none, .hint = null }
     else if (probe.conflict != null)
-        "the job's two durable records disagree; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'"
+        .{
+            .code = error_code.records_disagree,
+            .hint = "the job's two durable records disagree; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'",
+        }
     else if (declined != null)
-        "the job's result record is present and unusable, so the exit status in its log could not be checked against it; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'"
+        .{
+            .code = error_code.result_record_unusable,
+            .hint = "the job's result record is present and unusable, so the exit status in its log could not be checked against it; no mechanical reconcile can settle this — use 'terminus request reconcile <request-id> --override'",
+        }
     else if (log_discarded)
-        null
+        // The row went and the evidence went with it, with nothing proven: an
+        // override the caller now owes, which is why this is not `none` even
+        // though there is no sentence to add to what the keys already say.
+        .{ .code = error_code.evidence_discarded_unproven, .hint = null }
     else
-        "outcome still unknown; settle it with 'terminus request reconcile <request-id> --from-log'";
+        // Removed, log retained, outcome unknown — and `ok:true`, so nothing
+        // went wrong. `outcomeProven:false` is what says the outcome is open.
+        .{
+            .code = error_code.none,
+            .hint = "outcome still unknown; settle it with 'terminus request reconcile <request-id> --from-log'",
+        };
+    const hint = note.hint;
     switch (ctx.out.format) {
         .json => try ctx.out.json(RemovalJson{
             .ok = ok,
@@ -4773,6 +4925,7 @@ fn removeJob(
             // the shape that had `job rm` claim it had forgotten another
             // launcher's running job.
             .action = report.action,
+            .errorCode = note.code,
             .job = job.name,
             .status = settled_status,
             .outcomeProven = proven,
