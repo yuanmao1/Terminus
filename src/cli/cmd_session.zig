@@ -241,6 +241,21 @@ const RemovalJson = struct {
     hint: ?[]const u8,
 };
 
+/// `session rm --json`'s `action` vocabulary, named once for the same reason
+/// `code` and `state` are: the document publishes these two words in a
+/// parenthetical, and a parenthetical nothing parses is how three other
+/// vocabularies came to drift.
+///
+/// Its own namespace rather than `cmd_job.zig`'s identical pair: the two verbs
+/// publish their own key sets, and one namespace reaching across two commands would
+/// make a rename in either look like a rename in both.
+const action_word = struct {
+    /// The local row is gone, and so is the session it named.
+    pub const removed = "removed";
+    /// It is still there, and every branch that says so also says why.
+    pub const not_removed = "not_removed";
+};
+
 /// The stable `errorCode` vocabulary, named once so the branches cannot spell it
 /// two ways and `skill/SKILL.md` has something to be held against.
 const code = struct {
@@ -616,7 +631,7 @@ fn removeSession(
     switch (ctx.out.format) {
         .json => try ctx.out.json(RemovalJson{
             .ok = true,
-            .action = "removed",
+            .action = action_word.removed,
             .errorCode = code.none,
             .session = name,
             .server = server_name,
@@ -819,7 +834,7 @@ fn refuseSurvivedKill(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = code.survived,
         .session = session,
         .server = server_name,
@@ -925,7 +940,7 @@ fn refuseKillNeverRan(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = code.kill_never_ran,
         .session = session,
         .server = server_name,
@@ -1024,7 +1039,7 @@ fn refuseKillUnanswered(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = code.kill_unanswered,
         .session = session,
         .server = server_name,
@@ -1134,7 +1149,7 @@ fn refuseWithNothingSent(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = error_code,
         .session = session,
         .server = server_name,
@@ -1190,7 +1205,7 @@ fn refuseAfterKill(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = error_code,
         .session = session,
         .server = server_name,
@@ -1252,7 +1267,7 @@ fn refuseClaimLost(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = code.claim_lost_before_commit,
         .session = session,
         .server = server_name,
@@ -1362,7 +1377,7 @@ fn refuseLogUndeleted(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = code.log_delete_failed,
         .session = session,
         .server = server_name,
@@ -1527,7 +1542,7 @@ fn refuseLedgerUnrecordable(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = error_code,
         .session = session,
         .server = server_name,
@@ -1572,7 +1587,7 @@ fn refuseAlreadySettled(
     const lease = Cli.releaseClaimReporting();
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = code.already_settled,
         .session = session,
         .server = server_name,
@@ -1669,7 +1684,7 @@ fn refuseBeforeOpening(
     // claim a hand-back that never happened.
     report(ctx, .{
         .ok = false,
-        .action = "not_removed",
+        .action = action_word.not_removed,
         .errorCode = code.scope_held,
         .session = session,
         .server = server_name,
@@ -2057,9 +2072,13 @@ test "gate: SKILL.md publishes exactly `session rm`'s errorCode vocabulary" {
 // exist for this: flat, the union of the three had `not_attempted` in it twice and
 // there was nothing a documented list could be compared with.
 //
+// `action` joined them, for the same reason and a step later: it was two string
+// literals at eleven emit sites with a documented parenthetical nobody parsed, which
+// is exactly what the census in `skill_doc.zig` now refuses to let happen quietly.
+//
 // `authority` and `leaseRelease` are published in this same paragraph and are
 // *not* here: those two vocabularies belong to no single verb, so both are held
-// against the code for all three paragraphs at once, in `cmd_job.zig`.
+// against the code for every key-set paragraph at once, in `cmd_job.zig`.
 test "gate: SKILL.md publishes exactly `session rm`'s step-state vocabularies" {
     const gpa = std.testing.allocator;
     const para = try SkillDoc.paragraphAfter(
@@ -2067,25 +2086,33 @@ test "gate: SKILL.md publishes exactly `session rm`'s step-state vocabularies" {
         "the key-set paragraph it opens",
     );
 
+    // Every label through `SkillDoc.gatedKey`, not written out. That is what ties
+    // these three gates to the census in `skill_doc.zig`: a key nothing claims does
+    // not compile here, and a claim deleted from the list takes this gate with it.
     const session_what = "`sessionState`'s values";
-    const session_values = try SkillDoc.list(gpa, para, "`sessionState` (", ")", session_what);
+    const session_values = try SkillDoc.list(gpa, para, SkillDoc.gatedKey("sessionState"), ")", session_what);
     defer gpa.free(session_values);
     const log_what = "`logState`'s values";
-    const log_values = try SkillDoc.list(gpa, para, "`logState` (", ")", log_what);
+    const log_values = try SkillDoc.list(gpa, para, SkillDoc.gatedKey("logState"), ")", log_what);
     defer gpa.free(log_values);
     const row_what = "`localRow`'s values";
-    const row_values = try SkillDoc.list(gpa, para, "`localRow` (", ")", row_what);
+    const row_values = try SkillDoc.list(gpa, para, SkillDoc.gatedKey("localRow"), ")", row_what);
     defer gpa.free(row_values);
+    const action_what = "`session rm`'s action values";
+    const action_values = try SkillDoc.list(gpa, para, SkillDoc.gatedKey("action"), ")", action_what);
+    defer gpa.free(action_values);
 
-    // All three before any is raised, for the reason the key-set gate gives: a
+    // All four before any is raised, for the reason the key-set gate gives: a
     // value that moved from one key to another is one complaint from each list,
     // and reporting half of that sends the reader after a rename that never was.
     const session_verdict = SkillDoc.expectVocabulary(gpa, session_what, session_values, state.session);
     const log_verdict = SkillDoc.expectVocabulary(gpa, log_what, log_values, state.log);
     const row_verdict = SkillDoc.expectVocabulary(gpa, row_what, row_values, state.row);
+    const action_verdict = SkillDoc.expectVocabulary(gpa, action_what, action_values, action_word);
     try session_verdict;
     try log_verdict;
     try row_verdict;
+    try action_verdict;
 }
 
 // `status` has no parenthetical to read, because its ordinary values are whatever

@@ -1002,6 +1002,38 @@ const ConflictJson = struct {
     }
 };
 
+/// `job kill --json`'s `action` vocabulary, named once so the branches cannot
+/// spell it two ways and `skill/SKILL.md` has something to be held against.
+///
+/// The same reason `error_code` and `Cli.ClaimRelease.codes` are namespaces: the
+/// document publishes these four words in a parenthetical, and a parenthetical
+/// nothing parses is how three other vocabularies came to drift. Held against the
+/// namespace rather than a transcription of it, so renaming a word here rewrites
+/// the check along with the code.
+const kill_action = struct {
+    /// The session was stopped by this command.
+    pub const killed = "killed";
+    /// The job had already reached its own end before the kill was sent.
+    pub const already_finished = "already_finished";
+    /// It reached its own end *during* the kill, which is neither of the above:
+    /// nothing was cancelled and the exit status is real.
+    pub const finished_during_kill = "finished_during_kill";
+    /// Nothing was sent, or nothing that mattered was: the scope moved first.
+    pub const not_killed = "not_killed";
+};
+
+/// `job rm --json`'s `action` vocabulary. Two words, for the same reason.
+///
+/// Separate from `session rm`'s identical pair rather than shared with it: the two
+/// verbs publish their own key sets, and one namespace reaching across two commands
+/// would make a rename in either look like a rename in both.
+const removal_action = struct {
+    /// The local row is gone.
+    pub const removed = "removed";
+    /// It is still there, and every branch that says so also says why.
+    pub const not_removed = "not_removed";
+};
+
 /// Everything `job kill --json` says, on every branch it can take.
 ///
 /// A named struct with **no defaults**, and that is the substance rather than
@@ -1385,10 +1417,18 @@ test "gate: SKILL.md publishes the resultRecord values that are not readings" {
 /// One key's documented value vocabulary, held against the code, in every
 /// key-set paragraph that publishes it.
 ///
-/// All three paragraphs in one call, because each of these is one vocabulary
-/// shared by three verbs: `job kill`'s, `job rm`'s and — since neither module owns
-/// the words — `session rm`'s. A gate that read only two of them would let the
-/// third go stale beside them.
+/// Every paragraph the *document* has, found by `SkillDoc.keySets`, rather than
+/// three headings written out here. The three used to be a literal in this
+/// function, and that was the hole: `leaseRelease` and `authority` belong to no
+/// single verb, so a fourth claim-holding verb would have published both with
+/// nothing reading either — the same shape as a vocabulary published in prose that
+/// no gate parses, one level up.
+///
+/// `paragraphs` is how many of them are expected to publish this key. Stated for
+/// the reason every count in these gates is stated: a paragraph that quietly
+/// dropped its parenthetical would otherwise reduce the check's reach in silence,
+/// and the census in `skill_doc.zig` cannot see it either — the key is still
+/// published by the siblings.
 ///
 /// Every paragraph is read before any verdict is raised, for the reason the
 /// key-set gate gives: a word that was renamed is one complaint from each of the
@@ -1397,23 +1437,50 @@ fn expectPublishedVocabulary(
     gpa: std.mem.Allocator,
     comptime key: []const u8,
     actual: []const []const u8,
+    paragraphs: usize,
 ) !void {
-    const published = [_]struct { heading: []const u8, what: []const u8 }{
-        .{ .heading = "\n`job kill` — ", .what = "`job kill`'s " ++ key ++ " values" },
-        .{ .heading = "\n`job rm` — ", .what = "`job rm`'s " ++ key ++ " values" },
-        .{ .heading = "\n`session rm --json` — ", .what = "`session rm`'s " ++ key ++ " values" },
-    };
+    // Through `gatedKey`, not written out: that is what ties this gate to the
+    // census, so the entry claiming this key cannot be deleted while the gate
+    // reading it stays.
+    const label = SkillDoc.gatedKey(key);
+    const sets = try SkillDoc.keySets(gpa);
+    defer gpa.free(sets);
+
+    var read: usize = 0;
     var drifted: ?anyerror = null;
-    inline for (published) |p| {
-        const para = try SkillDoc.paragraphAfter(p.heading, "the key-set paragraph it opens");
-        const documented = try SkillDoc.list(gpa, para, "`" ++ key ++ "` (", ")", p.what);
+    for (sets) |set| {
+        if (std.mem.indexOf(u8, set.para, label) == null) continue;
+        const what = try std.fmt.allocPrint(gpa, "`{s}`'s {s} values", .{ set.verb, key });
+        defer gpa.free(what);
+        const documented = try SkillDoc.list(gpa, set.para, label, ")", what);
         defer gpa.free(documented);
-        SkillDoc.expectList(p.what, documented, actual) catch |err| {
+        SkillDoc.expectList(what, documented, actual) catch |err| {
             drifted = err;
         };
+        read += 1;
     }
     if (drifted) |err| return err;
+    std.testing.expectEqual(paragraphs, read) catch |err| {
+        std.debug.print(
+            \\
+            \\{d} of skill/SKILL.md's key-set paragraphs publish a `{s}` vocabulary; {d} were
+            \\expected. A paragraph that dropped its parenthetical stops publishing the values
+            \\to anybody while its siblings go on doing so, which neither this gate nor the
+            \\census in skill_doc.zig can see from the words alone.
+            \\
+        , .{ read, key, paragraphs });
+        return err;
+    };
 }
+
+/// How many key-set paragraphs publish a vocabulary that belongs to no single verb.
+///
+/// Three, because three verbs take a scope lease: `authority` and `leaseRelease`
+/// are one enumeration shared by `job kill`, `job rm` and — since neither module
+/// owns the words — `session rm`. Deliberately *not* `SkillDoc.key_set_count`: a
+/// fourth verb with a key set need not be a claim-holding one, and tying the two
+/// together would demand `leaseRelease` from a verb that never takes a lease.
+const shared_vocabulary_paragraphs = 3;
 
 test "gate: SKILL.md publishes exactly the leaseRelease vocabulary, everywhere it publishes it" {
     const gpa = std.testing.allocator;
@@ -1423,7 +1490,7 @@ test "gate: SKILL.md publishes exactly the leaseRelease vocabulary, everywhere i
     inline for (@typeInfo(Cli.ClaimRelease.codes).@"struct".decls) |decl| {
         try actual.append(gpa, @field(Cli.ClaimRelease.codes, decl.name));
     }
-    try expectPublishedVocabulary(gpa, "leaseRelease", actual.items);
+    try expectPublishedVocabulary(gpa, "leaseRelease", actual.items, shared_vocabulary_paragraphs);
 }
 
 // Read off `Authority.code()` rather than off `@tagName`, and the difference
@@ -1449,7 +1516,35 @@ test "gate: SKILL.md publishes exactly the authority vocabulary, everywhere it p
         const value: Authority = @unionInit(Authority, f.name, payload);
         try actual.append(gpa, value.code());
     }
-    try expectPublishedVocabulary(gpa, "authority", actual.items);
+    try expectPublishedVocabulary(gpa, "authority", actual.items, shared_vocabulary_paragraphs);
+}
+
+// `action` is the third vocabulary in those paragraphs and the one nothing was
+// reading — which is what the census in `skill_doc.zig` now says out loud rather
+// than leaving to be noticed. It is not `expectPublishedVocabulary`'s shape,
+// because the word is *not* one enumeration shared by the verbs: `job kill` has
+// four and the two removals have two, so each paragraph is held against its own
+// namespace.
+//
+// The namespaces are new, and they are the point rather than bookkeeping: the four
+// words used to be string literals at the emit sites, so there was nothing a
+// documented list could be compared with.
+test "gate: SKILL.md publishes exactly `job kill`'s action vocabulary" {
+    const gpa = std.testing.allocator;
+    const what = "`job kill`'s action values";
+    const para = try SkillDoc.paragraphAfter("\n`job kill` — ", "the key-set paragraph it opens");
+    const documented = try SkillDoc.list(gpa, para, SkillDoc.gatedKey("action"), ")", what);
+    defer gpa.free(documented);
+    try SkillDoc.expectVocabulary(gpa, what, documented, kill_action);
+}
+
+test "gate: SKILL.md publishes exactly `job rm`'s action vocabulary" {
+    const gpa = std.testing.allocator;
+    const what = "`job rm`'s action values";
+    const para = try SkillDoc.paragraphAfter("\n`job rm` — ", "the key-set paragraph it opens");
+    const documented = try SkillDoc.list(gpa, para, SkillDoc.gatedKey("action"), ")", what);
+    defer gpa.free(documented);
+    try SkillDoc.expectVocabulary(gpa, what, documented, removal_action);
 }
 
 /// `fatalTmux`, plus the one error only a result-record reader can raise.
@@ -1621,7 +1716,7 @@ fn removalReport(
     return .{
         .removed = removed,
         .ok = removed and (proven or (!evidence_discarded and !unreconcilable)),
-        .action = if (removed) "removed" else "not_removed",
+        .action = if (removed) removal_action.removed else removal_action.not_removed,
     };
 }
 
@@ -2499,7 +2594,7 @@ fn refuseKill(
     switch (ctx.out.format) {
         .json => ctx.out.json(KillJson{
             .ok = false,
-            .action = "not_killed",
+            .action = kill_action.not_killed,
             .job = job.name,
             .status = if (attempt) |a| recordedStatus(ctx, store, a.request_id) else "unknown",
             // What the probe read, reported because it is a fact about the host
@@ -2592,7 +2687,7 @@ fn refuseKillAfterSettlement(
     switch (ctx.out.format) {
         .json => ctx.out.json(KillJson{
             .ok = false,
-            .action = "not_killed",
+            .action = kill_action.not_killed,
             .job = job.name,
             // The settlement this command just wrote, not a re-read: these are
             // the two halves of one report and a second look could disagree
@@ -2649,7 +2744,7 @@ fn refuseRemoval(
     switch (ctx.out.format) {
         .json => ctx.out.json(RemovalJson{
             .ok = false,
-            .action = "not_removed",
+            .action = removal_action.not_removed,
             // The renewal answered, and it answered no — before the kill, so
             // nothing was sent and nothing was written. The same word `session rm`
             // publishes for the same moment.
@@ -2881,7 +2976,7 @@ fn refuseRemovalAtCommit(
     switch (ctx.out.format) {
         .json => ctx.out.json(RemovalJson{
             .ok = false,
-            .action = "not_removed",
+            .action = removal_action.not_removed,
             // Which read inside the transaction declined this, as the machine word
             // the transaction itself minted. It used to travel only in the
             // `reason` prose above and in the receipt's `error_code` column — and
@@ -3214,7 +3309,7 @@ fn killJob(
         switch (ctx.out.format) {
             .json => try ctx.out.json(KillJson{
                 .ok = false,
-                .action = "killed",
+                .action = kill_action.killed,
                 .job = job.name,
                 .status = settled.statusText(),
                 // A contradiction has no exit code by construction:
@@ -3299,7 +3394,7 @@ fn killJob(
         switch (ctx.out.format) {
             .json => try ctx.out.json(KillJson{
                 .ok = false,
-                .action = "killed",
+                .action = kill_action.killed,
                 .job = job.name,
                 .status = settled.statusText(),
                 // The declined code is deliberately not published here as
@@ -3416,7 +3511,7 @@ fn killJob(
         switch (ctx.out.format) {
             .json => try ctx.out.json(KillJson{
                 .ok = ok,
-                .action = "already_finished",
+                .action = kill_action.already_finished,
                 .job = job.name,
                 .status = settled_status,
                 .exitCode = code,
@@ -3650,7 +3745,7 @@ fn killJob(
     switch (ctx.out.format) {
         .json => try ctx.out.json(KillJson{
             .ok = proven and cache_error == null,
-            .action = "killed",
+            .action = kill_action.killed,
             .job = job.name,
             .status = settled_status,
             .exitCode = null,
@@ -4206,7 +4301,7 @@ fn reportFinishedDuringKill(
     switch (ctx.out.format) {
         .json => try ctx.out.json(KillJson{
             .ok = proven and cache_error == null and authority.holds(),
-            .action = "finished_during_kill",
+            .action = kill_action.finished_during_kill,
             .job = job.name,
             .status = settled_status,
             .exitCode = code,
@@ -5133,8 +5228,23 @@ test "gate: every destructive remote call is renewed on the line above it" {
 // The void `Cli.releaseClaim()` is banned from these bodies outright. It is what
 // every one of these branches used before this pass: it drops the answer, so the
 // document above it went out saying nothing about a scope that may still be
-// barred. The process-ending paths in `cli.zig` still use it, and correctly —
-// they have no document to put an answer in.
+// barred.
+//
+// **What this gate deliberately does not try to cover is the seventeen *indirect*
+// routes out of these same bodies** — `Cli.storeFatal`, `fatalTmux`, `fatalProbe`
+// and the bare `fatal`, which end the process through `Cli.fail` with the claim
+// still held. Banning those by name was the obvious extension and it is the wrong
+// one twice over: the list would have to be maintained (a new helper that reaches
+// `Cli.fail` is unbanned until somebody notices), and it cannot be enforced by any
+// type — Zig has no effect on a signature to check, and a local shadow of a
+// container-level declaration is itself a compile error, so the void form cannot be
+// made unnameable from inside a body that holds a claim.
+//
+// It is closed at the other end instead. `Cli.fail` releases through
+// `releaseClaimReporting` and publishes `leaseRelease` / `leaseReleaseError`
+// whenever a lease was held, so every one of those seventeen carries the answer
+// without knowing it does — and `cli.zig`'s own gate pins the void form at one
+// caller, the one that has already published. See `Cli.releaseClaim`.
 
 /// The functions that hold a `Claim` and publish a document. `killJob` and
 /// `removeJob` are the verbs; the others are the endings they delegate to.

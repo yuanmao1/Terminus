@@ -372,3 +372,288 @@ pub fn expectKeySet(
     try never_null_verdict;
     try nullable_verdict;
 }
+
+// --- The other direction: is anything reading the vocabularies at all? ---------
+//
+// Everything above answers one question: *what the document claims must match the
+// code*. Each gate names a paragraph, a label and a namespace, and holds them
+// together. That direction has now been fixed three times one instance at a time —
+// `resultRecord`'s codes, the `leaseRelease` state words, `authority` — and each
+// time the fault was the same and it was not drift. It was that a vocabulary had
+// been published in prose and **no gate was reading it**, so there was nothing to
+// drift from. A gate that does not exist cannot fail.
+//
+// So the missing direction is a census: every value vocabulary the key-set
+// paragraphs publish must be claimed by some gate, and one that is not must fail
+// naming it. That is what makes the *next* vocabulary protected by default rather
+// than protected if somebody remembers.
+//
+// Both halves of the census are derived from the document rather than listed
+// beside it:
+//
+//   * the key-set paragraphs are found by their own headings, so a fourth
+//     claim-holding verb's key set is covered the day it is written — the old
+//     reader hard-coded three headings, and a fourth would have gone unread;
+//   * the value parentheticals inside them are found by their own shape, so a key
+//     that gains one is covered without anybody adding it to a list.
+//
+// What is *not* derived is `gated_value_keys` — the answer to "is anything reading
+// this". It cannot be: the checks live in the files that own the namespaces, and no
+// amount of document-reading can see them. It is held symmetric instead, and it
+// cannot be shrunk quietly either, because the gates take their labels from it
+// through `gatedKey` and deleting an entry stops them compiling.
+
+/// One `--json` key-set paragraph, found by its own heading.
+pub const KeySet = struct {
+    /// The verb as the document spells it: `job kill`, `session rm --json`.
+    verb: []const u8,
+    /// How many keys the paragraph claims. Held against the emitting struct by
+    /// `expectKeySet`; carried here so the census can say it read a real one.
+    keys: usize,
+    /// Everything after the heading, up to the next blank line.
+    para: []const u8,
+};
+
+/// How many key-set paragraphs the document publishes.
+///
+/// Stated so a scan that found fewer fails rather than quietly checking less than
+/// it says — and so a fourth cannot arrive unnoticed. A new claim-holding verb's
+/// key set lands here first, and the census below then refuses every value
+/// parenthetical in it until some gate holds it against the code.
+pub const key_set_count = 3;
+
+/// Every key-set paragraph in the document, in the order it publishes them.
+///
+/// A heading is a line that opens with a code-spanned verb, an em dash, and a key
+/// count — `` `job rm` — 19 keys ``. Recognised by that shape rather than by a list
+/// of the three we happen to have, which is the whole point: the reader that came
+/// before this took its three headings as parameters, so a fourth verb could
+/// publish a whole key set with no gate looking at it.
+pub fn keySets(gpa: std.mem.Allocator) (ParseError || std.mem.Allocator.Error)![]const KeySet {
+    var out: std.ArrayList(KeySet) = .empty;
+    errdefer out.deinit(gpa);
+
+    const dash = " — ";
+    var i: usize = 0;
+    // `\n` first: a heading is a line of its own, and a verb named in backticks
+    // mid-sentence is not a heading.
+    while (std.mem.indexOfPos(u8, text, i, "\n`")) |nl| {
+        i = nl + 2;
+        const close = std.mem.indexOfScalarPos(u8, text, i, '`') orelse break;
+        const verb = text[i..close];
+        const rest = text[close + 1 ..];
+        if (!std.mem.startsWith(u8, rest, dash)) continue;
+        const opened = rest[dash.len..];
+        const para = opened[0..paragraphEnd(opened)];
+
+        var digits: usize = 0;
+        while (digits < para.len and para[digits] >= '0' and para[digits] <= '9') digits += 1;
+        if (digits == 0) continue;
+        if (!std.mem.startsWith(u8, para[digits..], " keys")) continue;
+        const keys = std.fmt.parseInt(usize, para[0..digits], 10) catch continue;
+
+        try out.append(gpa, .{ .verb = verb, .keys = keys, .para = para });
+    }
+
+    if (out.items.len != key_set_count) {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md: found {d} `--json` key-set paragraph(s), and the gates expect
+            \\{d}. A heading is a line of the shape "`<verb>` — <n> keys"; if one was
+            \\reworded the census below is now reading fewer vocabularies than it says it is.
+            \\If a verb was genuinely added or removed, update `key_set_count` — and then the
+            \\census will tell you which of its value vocabularies nothing is holding.
+            \\
+        , .{ out.items.len, key_set_count });
+        return error.SkillAnchorMissing;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Whether a parenthetical publishes a *vocabulary* rather than an aside.
+///
+/// Mechanical, so it needs no list of key names: a vocabulary is `code spans`,
+/// `|` and whitespace, and nothing else. `sessionCleanedUp` (the same boolean under
+/// the older name…) and `exitCode` (null when no record answered…) are prose and
+/// hold no values for a gate to check; `authority` (`held` | `lapsed` |
+/// `unreadable`) is three words the code has to spell the same way.
+fn isVocabulary(inside: []const u8) bool {
+    var i: usize = 0;
+    while (i < inside.len) : (i += 1) {
+        switch (inside[i]) {
+            '`' => i = std.mem.indexOfScalarPos(u8, inside, i + 1, '`') orelse return false,
+            '|', ' ', '\t', '\r', '\n' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Every key in `para` that publishes a value vocabulary in a parenthetical.
+///
+/// The keys, not the values: what the census asks is whether anything is *reading*
+/// each one, and the values are what the gate that reads it holds against the code.
+pub fn vocabularyKeys(
+    gpa: std.mem.Allocator,
+    para: []const u8,
+    what: []const u8,
+) (ParseError || std.mem.Allocator.Error)![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < para.len) : (i += 1) {
+        if (para[i] != '`') continue;
+        const close = std.mem.indexOfScalarPos(u8, para, i + 1, '`') orelse {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: an unclosed `code span` in {s}.
+                \\
+            , .{what});
+            return error.SkillCodeSpanUnterminated;
+        };
+        const key = para[i + 1 .. close];
+        i = close;
+        // The document breaks lines inside these paragraphs, so `job kill`'s
+        // `action` and its values sit on two lines. Any whitespace, then `(`.
+        var j = close + 1;
+        while (j < para.len and (para[j] == ' ' or para[j] == '\t' or para[j] == '\r' or para[j] == '\n')) j += 1;
+        if (j >= para.len or para[j] != '(') continue;
+        const end = std.mem.indexOfScalarPos(u8, para, j, ')') orelse {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: the parenthetical after `{s}` in {s} is never closed, so the
+                \\gate cannot tell where its values stop.
+                \\
+            , .{ key, what });
+            return error.SkillParensUnbalanced;
+        };
+        // Past the whole parenthetical either way: the words inside it are values,
+        // and reading them as keys would find `not_killed` looking for a list of
+        // its own.
+        defer i = end;
+        if (isVocabulary(para[j + 1 .. end])) try out.append(gpa, key);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Every key some gate in this tree holds against the code, and the file it lives
+/// in.
+///
+/// **This is the one list the document cannot supply**, and it is why the census is
+/// a list at all: whether anything is *reading* a vocabulary is a fact about the
+/// gates, and the gates live in the files that own the namespaces — `cmd_job.zig`
+/// for the two that belong to no single verb, `cmd_session.zig` for that verb's own
+/// step words. Nothing here can be inferred from prose.
+///
+/// It is held to the document in both directions by the census below, and it cannot
+/// be shrunk without breaking a build: every gate takes its label from `gatedKey`,
+/// which is a compile error for a key that is not here.
+pub const gated_value_keys = [_]struct { key: []const u8, by: []const u8 }{
+    .{ .key = "action", .by = "cmd_job.zig and cmd_session.zig" },
+    .{ .key = "authority", .by = "cmd_job.zig, for all three paragraphs at once" },
+    .{ .key = "leaseRelease", .by = "cmd_job.zig, for all three paragraphs at once" },
+    .{ .key = "sessionState", .by = "cmd_session.zig" },
+    .{ .key = "logState", .by = "cmd_session.zig" },
+    .{ .key = "localRow", .by = "cmd_session.zig" },
+};
+
+/// How many value parentheticals the key-set paragraphs publish between them.
+///
+/// Six keys over three paragraphs, and not six: `action`, `authority` and
+/// `leaseRelease` are published by all three verbs, the three step words by
+/// `session rm` alone. Stated for the reason `key_set_count` is — a paragraph that
+/// quietly *lost* its parenthetical still satisfies both directions of the census,
+/// because the other two paragraphs still publish that key.
+pub const vocabulary_parenthetical_count = 12;
+
+/// The label a gate parses a documented vocabulary out of: `` "`action` (" ``.
+///
+/// Obtained through here rather than written out, so the census and the gates cannot
+/// come apart. A key that nothing has claimed does not compile; a claim that is
+/// deleted takes the gate that used it with it.
+pub fn gatedKey(comptime key: []const u8) []const u8 {
+    comptime {
+        var claimed = false;
+        for (gated_value_keys) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) claimed = true;
+        }
+        if (!claimed) @compileError(
+            "skill_doc.gatedKey(\"" ++ key ++ "\"): no entry in `gated_value_keys` claims that key." ++
+                " A gate reading a documented vocabulary has to be listed there, because that list is" ++
+                " the only thing the census can ask whether anything is reading this.",
+        );
+    }
+    return "`" ++ key ++ "` (";
+}
+
+fn claims(key: []const u8) bool {
+    for (gated_value_keys) |entry| if (std.mem.eql(u8, entry.key, key)) return true;
+    return false;
+}
+
+// The census. Symmetric on purpose, and the asymmetry would have been wrong in
+// both directions: a parenthetical nothing reads is the defect this closes, and an
+// entry for a key the document no longer publishes is a gate reading a paragraph
+// that has moved on — it will fail with `SkillAnchorMissing` and send the reader
+// looking for a rename, when what happened is that the document dropped the values.
+//
+// Every complaint is collected before any is raised, for the reason the key-set
+// gate gives: a key renamed on both sides is one complaint from each direction, and
+// reporting one of them hides that the other says the same thing.
+test "gate: every value vocabulary the key sets publish is held against the code" {
+    const gpa = std.testing.allocator;
+    const sets = try keySets(gpa);
+    defer gpa.free(sets);
+
+    var seen: [gated_value_keys.len]bool = @splat(false);
+    var total: usize = 0;
+    var unclaimed = false;
+
+    for (sets) |set| {
+        const what = "the key-set paragraph for the published vocabularies";
+        const keys = try vocabularyKeys(gpa, set.para, what);
+        defer gpa.free(keys);
+        total += keys.len;
+        for (keys) |key| {
+            if (!claims(key)) {
+                std.debug.print(
+                    \\
+                    \\skill/SKILL.md publishes a value vocabulary for `{s}` in `{s}`'s key set, and
+                    \\no gate in this tree reads it. A list of words in prose that nothing parses is
+                    \\how `resultRecord`, `leaseRelease` and `authority` each came to publish a
+                    \\vocabulary the code did not have — three times, one at a time.
+                    \\  Fix it by adding the gate, not by deleting the parenthetical: name the
+                    \\  key in `skill_doc.gated_value_keys`, then hold the documented list against
+                    \\  the namespace the branches spell it from (`SkillDoc.expectVocabulary`).
+                    \\
+                , .{ key, set.verb });
+                unclaimed = true;
+                continue;
+            }
+            for (gated_value_keys, 0..) |entry, k| {
+                if (std.mem.eql(u8, entry.key, key)) seen[k] = true;
+            }
+        }
+    }
+
+    for (gated_value_keys, seen) |entry, found| {
+        if (found) continue;
+        std.debug.print(
+            \\
+            \\`skill_doc.gated_value_keys` claims `{s}` (held in {s}), and no key-set paragraph
+            \\in skill/SKILL.md publishes a value vocabulary for it. Either the document dropped
+            \\the parenthetical — in which case the gate that reads it is about to fail looking
+            \\for a label that is gone, and the values are no longer published to anybody — or
+            \\the entry is stale and the gate with it.
+            \\
+        , .{ entry.key, entry.by });
+        unclaimed = true;
+    }
+
+    if (unclaimed) return error.SkillVocabularyUnheld;
+
+    // A scan that found nothing must fail rather than pass over an empty region.
+    // This also catches the one shape both directions above are blind to: a
+    // paragraph that lost its parenthetical while its two siblings kept theirs.
+    try std.testing.expectEqual(@as(usize, vocabulary_parenthetical_count), total);
+}

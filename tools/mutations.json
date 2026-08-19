@@ -952,6 +952,38 @@
       "find": "    _ = execution.settle(.{ .proven_failure = .{\n        .observation = observation,\n        .error_code = code.survived,\n    } }, .{}) catch |err| refuseLedgerUnrecordable(",
       "replace": "    _ = execution.settle(.{ .indeterminate = .{\n        .reason = observation,\n        .last_observed = execution.status,\n        .error_code = code.survived,\n    } }, .{}) catch |err| refuseLedgerUnrecordable(",
       "expect_gate": "blackbox: `session rm` deletes nothing when the session survives the kill"
+    },
+    {
+      "id": "S2c-refusal-publishes-the-lease-it-was-holding",
+      "rule": "The shared refusal envelope publishes what became of the scope lease whenever one was held, so the seventeen call sites that end `job kill` / `job rm` through `Cli.storeFatal`, `fatalTmux`, `fatalProbe` or the bare `fatal` cannot strand a lease under a document that never mentions one. `always` alone restores the defect while keeping the documented four-key connect envelope intact.",
+      "file": "src/cli/cli.zig",
+      "find": "    const publish = always or !lease.tookNothing();",
+      "replace": "    const publish = always;",
+      "expect_gate": "blackbox: a `job kill` whose store write fails under a claim says what became of the scope"
+    },
+    {
+      "id": "S2c-void-release-has-one-caller",
+      "rule": "The answer-dropping `releaseClaim()` has exactly one caller in cli.zig, and it is `failIndeterminateAfterOutput` — reached after the caller has published its own `leaseRelease`. Every other process-ending path there writes a document, which is somewhere the answer can go.",
+      "file": "src/cli/cli.zig",
+      "find": "    clearExecution(); // already settled by the execution itself\n    releaseClaim();",
+      "replace": "    clearExecution(); // already settled by the execution itself\n    _ = releaseClaimReporting();",
+      "expect_gate": "gate: the answer-dropping release has one caller, and it has already published"
+    },
+    {
+      "id": "S2c-published-vocabularies-are-all-read",
+      "rule": "Every `key` (...) value parenthetical in SKILL.md's key-set paragraphs is claimed by a gate that holds it against the code, and the claim list is symmetric with the document. A vocabulary published in prose that nothing parses is how `resultRecord`, `leaseRelease` and `authority` each drifted; a claim for a key the document no longer publishes is a gate about to fail looking for a label that is gone.",
+      "file": "src/cli/skill_doc.zig",
+      "find": "    .{ .key = \"localRow\", .by = \"cmd_session.zig\" },\n};",
+      "replace": "    .{ .key = \"localRow\", .by = \"cmd_session.zig\" },\n    .{ .key = \"nonesuch\", .by = \"nowhere at all\" },\n};",
+      "expect_gate": "gate: every value vocabulary the key sets publish is held against the code"
+    },
+    {
+      "id": "S2c-kill-action-vocabulary-is-a-namespace",
+      "rule": "`job kill --json`'s `action` words live in a namespace the emit sites spell them from, so the documented parenthetical has something to be held against. As string literals at the branches there was nothing a documented list could be compared with, and the parenthetical went unread.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    /// Nothing was sent, or nothing that mattered was: the scope moved first.\n    pub const not_killed = \"not_killed\";",
+      "replace": "    /// Nothing was sent, or nothing that mattered was: the scope moved first.\n    pub const not_killed = \"not_killed\";\n    pub const invented = \"invented\";",
+      "expect_gate": "gate: SKILL.md publishes exactly `job kill`'s action vocabulary"
     }
   ]
 }

@@ -476,9 +476,10 @@ every key of its set — the emitter structs have no defaults, so a missing key 
 a compile error rather than a shape you discover at runtime. Absent is never a
 signal; `null` means "there is no such reading", never "we did not look".
 
-`job kill` — 21 keys. Never null: `ok`, `action`
-(`killed` | `already_finished` | `finished_during_kill` | `not_killed`), `job`,
-`status`, `outcomeProven`, `observedAt`, `sessionGone`, `sessionCleanedUp` (the
+`job kill` — 21 keys. Never null: `ok`,
+`action` (`killed` | `already_finished` | `finished_during_kill` | `not_killed`),
+`job`, `status`, `outcomeProven`, `observedAt`, `sessionGone`,
+`sessionCleanedUp` (the
 same boolean under the older name, published everywhere so it means one thing),
 `cancellationProven`, `resultRecord`,
 `authority` (`held` | `lapsed` | `unreadable`),
@@ -528,13 +529,14 @@ did complete and is durably recorded, so exiting non-zero would say otherwise an
 send you into a retry the leaked lease would refuse. Branch on `leaseRelease`;
 `leaseReleaseError` is prose.
 
-**`leaseRelease` is also on the two envelopes that are not a verb's key set.** All
+**`leaseRelease` is on every envelope these verbs can exit through.** All
 three claim-holding verbs — `job kill`, `job rm`, `session rm` — take the scope
 lease *before* they dial, on purpose: a peer's live claim then refuses them with
-nothing sent, not even a dial. The cost is that a connect or authentication failure
-happens with the lease already held, and so does every ledger write the command
-makes afterwards. Both used to hand the lease back through a path that dropped the
-answer onto stderr, under JSON that never mentioned a lease. They now carry it:
+nothing sent, not even a dial. The cost is that every failure from there on happens
+with the lease already held — a connect that never opened, a ledger write that could
+not be made, a store call that was refused, a `tmux` the host does not have. All of
+them used to hand the lease back through a path that dropped the answer onto
+stderr, under JSON that never mentioned a lease. They now carry it:
 
 - **The connection could not be opened or authenticated**:
   `{ok, error, leaseRelease, leaseReleaseError}`, exit **1**. Not the verb's key
@@ -545,6 +547,14 @@ answer onto stderr, under JSON that never mentioned a lease. They now carry it:
   leaseReleaseError, hint}` with `errorCode:"RECEIPT_PERSIST_FAILED"`, exit **76**.
   `job rm`'s composite adds `localRow` to that, as above. `session rm` does not use
   this envelope at all: every ledger failure of that verb emits its own 16 keys.
+- **Any other failure while the lease was held** — the store refused a write, the
+  host has no `tmux`, a result record could not be read, a session survived its
+  cleanup: `{ok, error, leaseRelease, leaseReleaseError}`, exit **1**, plus
+  `errorCode` where the refusal has one. This is the shared refusal envelope the
+  whole CLI uses, and the two lease keys are present on it **exactly when a lease
+  was held**. A command that never took one — every non-destructive verb, and these
+  three before they claim the scope — emits `{ok, error}` as it always did, so
+  absence here means "no lease was involved" and never "we did not say".
 
 `left_held` means the same thing on all of them, and it is the reason to read it
 here: the recovery each of these branches recommends is a retry, and a lease this

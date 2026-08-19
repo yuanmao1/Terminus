@@ -5997,3 +5997,251 @@ test "blackbox: a `session rm` whose scope lease cannot be written reports the f
         try t.expectEqual(@as(usize, 0), held.len);
     }
 }
+
+// --- The shared refusal envelope, on the routes that reach it under a claim ---
+//
+// The gates above drive the two paths that had *named* reporting siblings. What was
+// left were the ordinary refusals: seventeen call sites inside `killJob`,
+// `removeJob`, `reportFinishedDuringKill` and the shared `settleObserved` that end
+// the process through `Cli.storeFatal`, `fatalTmux`, `fatalProbe` or the bare
+// `fatal` while the claim is held. All of them arrive at `Cli.fail`, and `Cli.fail`
+// released through the `void` `Cli.releaseClaim()` — so a leaked lease reached
+// stderr under `{ok, error}` and the operator's next command on that job was
+// refused for the lease's whole TTL with no explanation in the document.
+//
+// They were not closed one at a time. `Cli.fail` — and `failWithCode`,
+// `failIndeterminate` and `receiptFatal` with it — now releases through
+// `releaseClaimReporting` and carries `leaseRelease` / `leaseReleaseError`
+// **exactly when a lease was held**, which is what keeps the tree-wide route usable
+// by the hundred refusals that never take one: a bad `--limit` and an unknown
+// server still emit the two keys they always did.
+//
+// Two gates, on two different routes into that envelope, because they fail in
+// different places: one before the host is touched at all and one on the host's own
+// answer. Each carries its control in the same fixture — the same failure with a
+// writable `leases` table answers `released`, so a binary that had started
+// reporting a leak unconditionally fails both.
+
+/// `seedRunningJob`, minus the attempt row.
+///
+/// Not an invalid fixture: a job row whose `job_attempts` row is absent is the
+/// state `Observed.no_attempt` and `markFinishedUnattached` exist for — there is no
+/// operation to settle, so the local row is the only record of how the job ended.
+/// It is also the one branch of `job kill` that writes to the store with the claim
+/// held and no `Execution` to route the failure through, which is why the
+/// `Cli.storeFatal` gate below is built on it.
+fn seedRunningJobWithoutAttempt(f: *Fixture, request_id: []const u8, name: []const u8, sentinel: []const u8) !void {
+    var store = try f.open();
+    defer store.close();
+    _ = try Store.jobs.create(&store, 1, name, "make deploy", sentinel, request_id, 1002);
+    if (!try Store.jobs.markStarted(&store, request_id)) return error.RowWasNotReserved;
+}
+
+/// The trigger that makes the local row unwritable, and nothing else.
+fn arrangeRefusedJobUpdate(f: *Fixture) !void {
+    var store = try f.open();
+    defer store.close();
+    try store.db.exec(
+        \\CREATE TRIGGER refuse_job_update BEFORE UPDATE ON jobs
+        \\BEGIN SELECT RAISE(ABORT, 'the local job row cannot be updated'); END
+    );
+}
+
+// The `Cli.storeFatal` route: a store write this command needed, under a claim,
+// before it had touched the host.
+//
+// `arrangeRefusedRelease` rather than the fake host's `strand`, for the reason the
+// connect gate gives — and here it is sharper than "there is no round trip to ride".
+// A strand pushes the binary's own lease row an hour into the future, and this
+// branch renews *after* the probe the strand would have to ride: the renewal would
+// be refused for the same contradiction, `stillOurs` would answer false, and the
+// gate would be measuring a lost authority rather than a leaked lease.
+test "blackbox: a `job kill` whose store write fails under a claim says what became of the scope" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "kill_store_fatal_lease");
+    defer f.deinit();
+    try f.seedServer();
+
+    // One sentinel for both jobs, so one scripted probe answers both legs. The
+    // difference between them is the trigger, and nothing else.
+    const sentinel = "__TERMINUS_JOB_24__";
+    try seedRunningJobWithoutAttempt(&f, "01TTTTTTTT0123456789ABCDEF", "deploy", sentinel);
+    try seedRunningJobWithoutAttempt(&f, "01UUUUUUUU0123456789ABCDEF", "ship", sentinel);
+
+    const finished = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":0\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .stdout = finished },
+        // `probeTail` asks whether the pane is still there in a second call.
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    try arrangeRefusedJobUpdate(&f);
+    try arrangeRefusedRelease(&f);
+
+    var stranded = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer stranded.deinit(f.allocator);
+
+    // The traffic first: the write that failed sits *above* the kill on this
+    // branch, so nothing destructive was sent and a retry is safe — once the scope
+    // is free, which is the whole point of the key below.
+    try host.expectNeverSent("kill-session");
+    try host.expectFullyScripted();
+
+    try stranded.expectCode(1);
+    try stranded.expectSays("\"ok\": false");
+    // The real reason, unchanged: this is still a command whose store refused it.
+    // The refusal's own sentence is not here, and that is a property of
+    // `Cli.storeFatal` rather than of this gate — `markFinishedUnattached` rolls its
+    // transaction back on the way out, which resets the connection's error string
+    // before anybody reads it. What survives is the class, and it is asserted so a
+    // report that lost even that would fail.
+    try stranded.expectSays("database error");
+    try stranded.expectSays("Constraint");
+    // The assertion.
+    try stranded.expectSays("\"leaseRelease\": \"left_held\"");
+    try stranded.expectSaysNot("\"leaseReleaseError\": null");
+    try stranded.expectSays("will block further changes to that scope until its TTL lapses");
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Read from the store rather than believed from the report.
+    try expectScopeStillHeld(&f, arena);
+    {
+        var store = try f.open();
+        defer store.close();
+        // The write really was refused, so the row still says the job is live —
+        // which is what makes the leaked lease the operator's next problem.
+        const row = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+        try t.expectEqualStrings("running", @tagName(row.status));
+    }
+
+    // And the consequence the word warns about, performed.
+    var again = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer again.deinit(f.allocator);
+    try again.expectCode(1);
+    try again.expectSays("holds a lease on an overlapping scope");
+
+    try allowRelease(&f);
+
+    // The discriminating control: the same unwritable row on a job whose release
+    // can be recorded answers `released`. Without it, everything above is satisfied
+    // by a binary that reports a leak on every store failure.
+    var clean = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "ship", "--json", "--db", f.db,
+    }, &environ);
+    defer clean.deinit(f.allocator);
+    try host.expectFullyScripted();
+    try clean.expectCode(1);
+    try clean.expectSays("database error");
+    try clean.expectSays("\"leaseRelease\": \"released\"");
+    try clean.expectSays("\"leaseReleaseError\": null");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // One row still held — `deploy`'s — and `ship`'s handed back. Counted,
+        // because "the control released" and "the control never took one" are
+        // different facts and only one of them makes it a control.
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 1), held.len);
+        try t.expectEqualStrings("deploy", held[0].scope_key);
+    }
+}
+
+// The `fatalTmux` route, and the reason it could not be closed with a sibling of
+// its own: `fatalTmux` lives in `cmd_exec.zig` and is shared with `exec`, `read`
+// and `write`, none of which takes a lease. Its five call sites inside `killJob`
+// and `removeJob` are claim-holding all the same, and a second copy of its error
+// vocabulary — the five sentences that tell an operator whether tmux is missing, the
+// session is gone or the command timed out — is exactly the drift these gates exist
+// to prevent. Publishing in `Cli.fail` closes all five without touching it.
+//
+// Exit 41 from the kill script is the host answering "I have no tmux", which
+// `Tmux.killSession` raises as `error.TmuxMissing` rather than reporting a session
+// proven gone. The command really was sent; what came back proves the kill never
+// ran.
+test "blackbox: a `job kill` whose kill cannot run says what became of the scope it took" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "kill_tmux_fatal_lease");
+    defer f.deinit();
+    try f.seedServer();
+
+    const sentinel = "__TERMINUS_JOB_25__";
+    try seedRunningJob(&f, "01VVVVVVVV0123456789ABCDEF", "deploy", sentinel);
+    try seedRunningJob(&f, "01WWWWWWWW0123456789ABCDEF", "ship", sentinel);
+
+    // Still running: no result record and no sentinel, so nothing here settles an
+    // outcome and the kill is the next step. That is the branch whose `killSession`
+    // failure has no document of its own to fall back on.
+    const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .stdout = running },
+        // Before `has-session`: the kill's script contains both words.
+        .{ .needle = "kill-session", .exit_code = 41 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    try arrangeRefusedRelease(&f);
+
+    var stranded = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer stranded.deinit(f.allocator);
+
+    try host.expectSent("kill-session");
+    try host.expectFullyScripted();
+
+    try stranded.expectCode(1);
+    try stranded.expectSays("\"ok\": false");
+    // `fatalTmux`'s own sentence, unchanged and still the one an operator acts on.
+    try stranded.expectSays("tmux is not installed on the remote server");
+    // The assertion.
+    try stranded.expectSays("\"leaseRelease\": \"left_held\"");
+    try stranded.expectSaysNot("\"leaseReleaseError\": null");
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectScopeStillHeld(&f, arena);
+
+    var again = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer again.deinit(f.allocator);
+    try again.expectCode(1);
+    try again.expectSays("holds a lease on an overlapping scope");
+
+    try allowRelease(&f);
+
+    // The control, in the same fixture and on the same route.
+    var clean = try runWithEnvironment(&f, &.{
+        "job", "kill", "box", "ship", "--json", "--db", f.db,
+    }, &environ);
+    defer clean.deinit(f.allocator);
+    try host.expectFullyScripted();
+    try clean.expectCode(1);
+    try clean.expectSays("tmux is not installed on the remote server");
+    try clean.expectSays("\"leaseRelease\": \"released\"");
+    try clean.expectSays("\"leaseReleaseError\": null");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 1), held.len);
+        try t.expectEqualStrings("deploy", held[0].scope_key);
+    }
+}

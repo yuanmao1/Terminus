@@ -16,6 +16,10 @@ pub const Setup = @import("cmd_setup.zig");
 pub const skill_doc = @import("skill_doc.zig");
 
 const Core = @import("../core/core.zig");
+/// The shared lease-renewal barrier, for `bodyOf` — the one source reader the
+/// gates in this tree hold text-level rules with. See `cmd_job.zig`, which uses
+/// the same one for the renewal-adjacency and release-ordering rules.
+const Control = @import("../core/control.zig");
 const Store = Core.Store;
 const Ssh = Core.Ssh;
 const DaemonClient = Core.DaemonClient;
@@ -94,19 +98,88 @@ pub fn closeDaemonSocket() void {
     stream.close(open.io);
 }
 
-/// Fail-loud exit: in JSON mode emits `{"ok":false,"error":...}` on stdout
-/// (agents parse one stream); in human mode writes stderr. Always exit 1.
-pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+/// Everything the three refusals below do before they have a document to write:
+/// end the daemon conversation, settle the execution, give the job name back, and
+/// give the scope back.
+///
+/// The scope release is *returned* rather than dropped, and that is the whole
+/// point of this function existing. Every refusal in the tree comes through one of
+/// the three, and until now all three released through the `void` `releaseClaim()`
+/// — so a `job kill` whose store call failed under a held lease exited 1 with
+/// `{ok, error}`, and the leaked lease that would refuse the operator's next
+/// command for its whole TTL reached stderr and nothing else. There is no
+/// shortage of routes to here: `storeFatal`, `fatalTmux`, `fatalProbe` and the
+/// bare `fatal` between them account for seventeen call sites inside bodies that
+/// hold a claim. Publishing at each of them is seventeen chances to forget;
+/// publishing here is none.
+fn refusalCleanup() ClaimRelease {
     closeDaemonSocket();
     settleActiveExecution("command failed before recording an outcome");
     releaseReservation();
-    releaseClaim();
+    // Above the document, like every other reporter of this answer: a value
+    // written before the release has happened is a prediction, and the whole
+    // point of the key is that it is the answer.
+    return releaseClaimReporting();
+}
+
+/// The refusal envelope, in the one place that decides its shape.
+///
+/// Four shapes from two independent questions — does the caller have a stable
+/// `errorCode`, and is there a lease answer to publish — written out rather than
+/// composed, because `Output.json` takes a struct and a struct's key set is its
+/// type.
+///
+/// **The lease keys are present exactly when a lease was held.** Not always: `fail`
+/// is the tree-wide route and almost none of its callers ever take one, so two keys
+/// on every bad `--limit` and every unknown server would say `not_taken` and
+/// nothing else. Not never: that was the defect. A verb that publishes the keys as
+/// part of a fixed set passes `always`, which is what `failReportingClaim` is.
+fn writeRefusal(
+    ctx: *Ctx,
+    message: []const u8,
+    code: ?[]const u8,
+    lease: ClaimRelease,
+    always: bool,
+) void {
+    const publish = always or !lease.tookNothing();
+    if (code) |named| {
+        if (publish) {
+            ctx.out.json(.{
+                .ok = false,
+                .@"error" = message,
+                .errorCode = named,
+                .leaseRelease = lease.code,
+                .leaseReleaseError = lease.detail,
+            }) catch {};
+        } else {
+            ctx.out.json(.{ .ok = false, .@"error" = message, .errorCode = named }) catch {};
+        }
+    } else if (publish) {
+        ctx.out.json(.{
+            .ok = false,
+            .@"error" = message,
+            .leaseRelease = lease.code,
+            .leaseReleaseError = lease.detail,
+        }) catch {};
+    } else {
+        ctx.out.json(.{ .ok = false, .@"error" = message }) catch {};
+    }
+    ctx.out.flush() catch {};
+}
+
+/// Fail-loud exit: in JSON mode emits `{"ok":false,"error":...}` on stdout
+/// (agents parse one stream); in human mode writes stderr. Always exit 1.
+///
+/// Two more keys when — and only when — this command was holding a scope lease
+/// when it failed. See `writeRefusal`; human mode needs no extra line, because
+/// `releaseClaimReporting` has already written the sentence for every answer that
+/// is not an ordinary hand-back.
+pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    const lease = refusalCleanup();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
-            const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
-            ctx.out.json(.{ .ok = false, .@"error" = message }) catch {};
-            ctx.out.flush() catch {};
-            std.process.exit(1);
+            writeRefusal(ctx, std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt, null, lease, false);
+            std.process.exit(exit_code.failure);
         }
     }
     std.process.fatal(fmt, args);
@@ -124,35 +197,31 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 /// one they will want to search for, and a code that only exists in `--json`
 /// is a code half the callers never see.
 pub fn failWithCode(code: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
-    closeDaemonSocket();
-    settleActiveExecution("command failed before recording an outcome");
-    releaseReservation();
-    releaseClaim();
+    const lease = refusalCleanup();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
-            const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
-            ctx.out.json(.{ .ok = false, .@"error" = message, .errorCode = code }) catch {};
-            ctx.out.flush() catch {};
-            std.process.exit(1);
+            writeRefusal(ctx, std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt, code, lease, false);
+            std.process.exit(exit_code.failure);
         }
     }
     std.process.fatal(fmt ++ "\n  code: {s}", args ++ .{code});
 }
 
-/// `fail`, for a command that took a scope lease before it could fail.
+/// `fail`, for a command whose key set publishes the lease answer unconditionally.
 ///
 /// Same stream, same exit status and the same `settleActiveExecution` /
-/// `releaseReservation` discipline as `fail`. The difference is two keys: what
-/// became of the lease, as a value rather than as a line on stderr.
+/// `releaseReservation` discipline as `fail`. The difference is one word:
+/// `always`. `fail` publishes the two keys when a lease was held and omits them
+/// when none was; this publishes them either way, including `not_taken`.
 ///
-/// **Why this is not `fail` itself.** `fail` is the tree-wide route and almost none
-/// of its callers ever take a lease, so widening its envelope would put two keys on
-/// every refusal in the CLI — a bad `--limit`, an unknown server, a missing key —
-/// where the answer is `not_taken` and says nothing. Three verbs hold a claim
-/// across a remote step (`job kill`, `job rm`, `session rm`), and on their paths
-/// the answer is the difference between a scope that is free and one that refuses
-/// the operator's next command for its whole TTL. So the two keys go where the
-/// question exists.
+/// **Why that distinction is worth a second entry point.** `fail` is the tree-wide
+/// route and almost none of its callers ever take a lease, so unconditional keys
+/// would put `not_taken` on every refusal in the CLI — a bad `--limit`, an unknown
+/// server, a missing key — where the answer says nothing. Conditional keys are
+/// wrong for the opposite kind of caller: `Cli.connectReportingClaim`'s failures are
+/// a documented envelope of exactly four keys, and a caller that has been told to
+/// read `leaseRelease` there must find it whatever it says. Hence both, over one
+/// emitter.
 ///
 /// **Why this is not the verb's own fixed key set either.** The paths that reach
 /// here fail before the verb has established anything: `Cli.connect` could not
@@ -162,23 +231,10 @@ pub fn failWithCode(code: []const u8, comptime fmt: []const u8, args: anytype) n
 /// closes. What these paths *can* state, and now do, is what happened to the lease
 /// they were holding.
 pub fn failReportingClaim(comptime fmt: []const u8, args: anytype) noreturn {
-    closeDaemonSocket();
-    settleActiveExecution("command failed before recording an outcome");
-    releaseReservation();
-    // Above the document, like every other reporter of this answer: a value
-    // written before the release has happened is a prediction, and the whole
-    // point of the key is that it is the answer.
-    const lease = releaseClaimReporting();
+    const lease = refusalCleanup();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
-            const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
-            ctx.out.json(.{
-                .ok = false,
-                .@"error" = message,
-                .leaseRelease = lease.code,
-                .leaseReleaseError = lease.detail,
-            }) catch {};
-            ctx.out.flush() catch {};
+            writeRefusal(ctx, std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt, null, lease, true);
             std.process.exit(exit_code.failure);
         }
     }
@@ -367,6 +423,17 @@ pub const ClaimRelease = struct {
     pub fn holdsScope(r: ClaimRelease) bool {
         return std.mem.eql(u8, r.code, codes.left_held);
     }
+
+    /// This command registered no claim, so there is nothing here to publish.
+    ///
+    /// The question the shared refusal envelopes branch on: `not_taken` beside a
+    /// bad `--limit` is two keys of noise, and every other answer is a fact about
+    /// a scope the caller is about to be told to retry on. Read through the code
+    /// rather than by comparing against `not_taken` at each site, for the reason
+    /// `holdsScope` exists.
+    pub fn tookNothing(r: ClaimRelease) bool {
+        return std.mem.eql(u8, r.code, codes.not_taken);
+    }
 };
 
 /// Gives the scope back, and says what happened.
@@ -461,29 +528,27 @@ pub fn releaseClaimReporting() ClaimRelease {
     return if (released) .released else .not_ours;
 }
 
-/// Gives the scope back, if this command still holds it.
+/// Gives the scope back and throws the answer away.
 ///
-/// Called from the process-ending paths below that have no document of their own
-/// to put the answer in. A claim that is no longer ours — a peer took it over with
-/// `--force` — matches no row and is left exactly where it is.
+/// **One caller, and it is the only one that can have this be correct.**
+/// `failIndeterminateAfterOutput` is reached after the caller has written its whole
+/// document — including its own `leaseRelease`, from its own
+/// `releaseClaimReporting` — so by the time it runs there is no claim registered and
+/// this answers `not_taken`. It is a no-op that keeps the hook total rather than a
+/// route that drops anything.
 ///
-/// The form for a caller that has already written its report, or has none: the
-/// answer is dropped, and a failure reaches the operator through the stderr line
-/// `releaseClaimReporting` writes. No verb reports through this any more — the
-/// three that take a scope lease all publish `leaseRelease` — and a new one that
-/// did would be reintroducing the defect: a leaked lease refuses the next command
-/// on that scope for its whole TTL, and the caller must be able to read that off
-/// the document rather than off a terminal. See `ClaimRelease`.
+/// **Every other process-ending path in this file publishes.** `fail`,
+/// `failWithCode`, `failIndeterminate` and `receiptFatal` write a document, and a
+/// document is somewhere the answer can go: each of them now releases through
+/// `releaseClaimReporting` and carries `leaseRelease` / `leaseReleaseError` when a
+/// lease was held. That is what closed the seventeen call sites in `cmd_job.zig`
+/// that reach one of them under a claim — through `storeFatal`, `fatalTmux`,
+/// `fatalProbe` and the bare `fatal` — without touching one of them: the answer
+/// travels with the envelope, so a new site cannot forget to bring it.
 ///
-/// **Two of the paths that used to end here now have reporting siblings**, because
-/// "no document of its own" was not true of them: `failReportingClaim` (the connect
-/// and auth failures of a command that claimed the scope before it dialled) and
-/// `receiptFatalReportingClaim` (a ledger write made under a claim). Both write
-/// JSON an agent parses, and both were dropping the answer into it. What is left
-/// here is `fail`, `failWithCode`, `failIndeterminate` and
-/// `failIndeterminateAfterOutput`: the first two are the tree-wide routes shared
-/// with every non-claiming verb, and the last two are reached after the caller has
-/// already published its own `leaseRelease`.
+/// A claim that is no longer ours — a peer took it over with `--force` — matches no
+/// row and is left exactly where it is. See `ClaimRelease`, and the gate at the
+/// bottom of this file that holds this function to its single caller.
 pub fn releaseClaim() void {
     _ = releaseClaimReporting();
 }
@@ -519,20 +584,40 @@ pub const exit_code = struct {
 /// Never collapses into `fail`: reporting an indeterminate result as a plain
 /// error would invite exactly the blind retry that can double-apply a remote
 /// side effect.
+///
+/// Carries the lease answer when a lease was held, on the same rule as `fail`, and
+/// this is the envelope where it matters most: the hint tells the caller to
+/// reconcile and then retry, and a lease this command could not hand back refuses
+/// exactly that until its TTL lapses.
 pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observed: []const u8) noreturn {
     closeDaemonSocket();
-    releaseClaim();
+    // Above the document that publishes it.
+    const lease = releaseClaimReporting();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
-            ctx.out.json(.{
-                .ok = false,
-                .status = "indeterminate",
-                .@"error" = reason,
-                .errorCode = "INDETERMINATE",
-                .requestId = request_id,
-                .lastObserved = last_observed,
-                .hint = "the remote outcome is unknown; reconcile with 'terminus request reconcile <request-id>' before retrying",
-            }) catch {};
+            if (lease.tookNothing()) {
+                ctx.out.json(.{
+                    .ok = false,
+                    .status = "indeterminate",
+                    .@"error" = reason,
+                    .errorCode = "INDETERMINATE",
+                    .requestId = request_id,
+                    .lastObserved = last_observed,
+                    .hint = indeterminate_hint,
+                }) catch {};
+            } else {
+                ctx.out.json(.{
+                    .ok = false,
+                    .status = "indeterminate",
+                    .@"error" = reason,
+                    .errorCode = "INDETERMINATE",
+                    .requestId = request_id,
+                    .lastObserved = last_observed,
+                    .leaseRelease = lease.code,
+                    .leaseReleaseError = lease.detail,
+                    .hint = indeterminate_hint,
+                }) catch {};
+            }
             ctx.out.flush() catch {};
             std.process.exit(exit_code.indeterminate);
         }
@@ -544,6 +629,8 @@ pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observ
     }
     std.process.exit(exit_code.indeterminate);
 }
+
+const indeterminate_hint = "the remote outcome is unknown; reconcile with 'terminus request reconcile <request-id>' before retrying";
 
 /// Ends a command whose response has already been written.
 ///
@@ -607,75 +694,82 @@ const receipt_fatal_hint = "the remote action may have taken effect; the local l
 /// signal that the audit trail is incomplete.
 ///
 /// The route for every caller that holds no scope lease: `exec`, `read`/`write`,
-/// `run`, `request reconcile`, and the observing `job` verbs. A caller that *does*
-/// hold one wants `receiptFatalReportingClaim` — see there for why the two
-/// envelopes are not one.
+/// `run`, `request reconcile`, and the observing `job` verbs. It is safe for a
+/// caller that *does* hold one — the lease answer travels with the envelope on the
+/// same rule as `fail`'s — and `receiptFatalReportingClaim` is the form for a
+/// caller whose key set publishes it unconditionally.
 pub fn receiptFatal(
     request_id: []const u8,
     err: anyerror,
     known_remote_status: ?[]const u8,
 ) noreturn {
     closeDaemonSocket();
-    releaseClaim();
-    if (active_ctx) |ctx| {
-        if (ctx.out.format == .json) {
-            ctx.out.json(ReceiptFatalJson{
-                .ok = false,
-                .@"error" = receipt_fatal_error,
-                .errorCode = "RECEIPT_PERSIST_FAILED",
-                .requestId = request_id,
-                .cause = @errorName(err),
-                .remoteStatus = known_remote_status,
-                .hint = receipt_fatal_hint,
-            }) catch {};
-            ctx.out.flush() catch {};
-            std.process.exit(exit_code.receipt_persist_failed);
-        }
-        ctx.out.print(
-            "RECEIPT_PERSIST_FAILED: {s}\n  request: {s}\n  remote status: {s}\n  the remote action may have taken effect; the local ledger is incomplete\n",
-            .{ @errorName(err), request_id, known_remote_status orelse "unknown" },
-        ) catch {};
-        ctx.out.flush() catch {};
-    }
-    std.process.exit(exit_code.receipt_persist_failed);
+    // Above the document that publishes it.
+    writeReceiptFatal(request_id, err, known_remote_status, releaseClaimReporting(), false);
 }
 
-/// `receiptFatal`, for a caller that was holding a scope lease.
+/// `receiptFatal`, for a caller whose key set publishes the lease answer
+/// unconditionally.
 ///
 /// The ledger write that failed here was made *under* a claim, so the claim is
-/// given back on the way out — and until now through the `void` `releaseClaim()`,
-/// which drops the answer. That is the worst place to drop it: this is the branch
-/// where the remote step already happened, the ledger does not have it, and the
-/// caller is about to be told to reconcile. A `left_held` on top of that means the
-/// reconcile-then-retry the hint asks for is refused for the lease's whole TTL,
-/// and the only warning was a line on stderr under a JSON document that never
-/// mentioned a lease.
+/// given back on the way out — and it used to go through the `void`
+/// `releaseClaim()`, which drops the answer. That is the worst place to drop it:
+/// this is the branch where the remote step already happened, the ledger does not
+/// have it, and the caller is about to be told to reconcile. A `left_held` on top of
+/// that means the reconcile-then-retry the hint asks for is refused for the lease's
+/// whole TTL, and the only warning was a line on stderr under a JSON document that
+/// never mentioned a lease.
 ///
-/// A sibling rather than a widening of `receiptFatal`, for the reason
-/// `failReportingClaim` gives: `receiptFatal` is shared with `cmd_exec`,
-/// `cmd_read_write`, `cmd_request` and the observing `job` verbs, none of which
-/// takes a lease, and their envelopes are not this question's business.
+/// The difference from `receiptFatal` is `always`, for the reason
+/// `failReportingClaim` gives: `settleObserved` reads the claim it was handed and
+/// picks between the two, so a verb that documents the two keys on every ledger
+/// failure gets them even when the answer is `not_taken`.
 pub fn receiptFatalReportingClaim(
     request_id: []const u8,
     err: anyerror,
     known_remote_status: ?[]const u8,
 ) noreturn {
     closeDaemonSocket();
-    // Above the document that publishes it.
-    const lease = releaseClaimReporting();
+    writeReceiptFatal(request_id, err, known_remote_status, releaseClaimReporting(), true);
+}
+
+/// One body for both, so the two envelopes cannot be filled differently.
+///
+/// The `ReceiptFatalJson` / `ReceiptFatalWithClaimJson` gate at the bottom of this
+/// file holds their key sets to each other; this holds their *values* to each
+/// other, which two hand-written call sequences did not.
+fn writeReceiptFatal(
+    request_id: []const u8,
+    err: anyerror,
+    known_remote_status: ?[]const u8,
+    lease: ClaimRelease,
+    always: bool,
+) noreturn {
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
-            ctx.out.json(ReceiptFatalWithClaimJson{
-                .ok = false,
-                .@"error" = receipt_fatal_error,
-                .errorCode = "RECEIPT_PERSIST_FAILED",
-                .requestId = request_id,
-                .cause = @errorName(err),
-                .remoteStatus = known_remote_status,
-                .leaseRelease = lease.code,
-                .leaseReleaseError = lease.detail,
-                .hint = receipt_fatal_hint,
-            }) catch {};
+            if (always or !lease.tookNothing()) {
+                ctx.out.json(ReceiptFatalWithClaimJson{
+                    .ok = false,
+                    .@"error" = receipt_fatal_error,
+                    .errorCode = "RECEIPT_PERSIST_FAILED",
+                    .requestId = request_id,
+                    .cause = @errorName(err),
+                    .remoteStatus = known_remote_status,
+                    .leaseRelease = lease.code,
+                    .leaseReleaseError = lease.detail,
+                    .hint = receipt_fatal_hint,
+                }) catch {};
+            } else {
+                ctx.out.json(ReceiptFatalJson{
+                    .ok = false,
+                    .@"error" = receipt_fatal_error,
+                    .errorCode = "RECEIPT_PERSIST_FAILED",
+                    .requestId = request_id,
+                    .cause = @errorName(err),
+                    .remoteStatus = known_remote_status,
+                    .hint = receipt_fatal_hint,
+                }) catch {};
+            }
             ctx.out.flush() catch {};
             std.process.exit(exit_code.receipt_persist_failed);
         }
@@ -1485,15 +1579,15 @@ const Scratch = struct {
 //
 // Both ends have since moved onto live clocks and the claim carries no
 // timestamp at all, so the acquisition below is written by hand: what this gate
-// pins is `releaseClaim`'s stamp, and it has to be able to state the
+// pins is the release's stamp, and it has to be able to state the
 // acquisition it is measured against.
 //
 // The gate reconstructs the shape rather than describing it: a claim taken by a
 // process that started a minute ago, renewed thirty seconds in off a fresh
 // clock (what `holdClaim` does today), then released through the real
-// `releaseClaim` — the same function `fail`, `failWithCode`,
-// `failIndeterminate`, `failIndeterminateAfterOutput` and `receiptFatal` all
-// route through, because `std.process.exit` skips defers.
+// `releaseClaimReporting` — the one route every process-ending path in this file
+// now takes, `fail`, `failWithCode`, `failIndeterminate` and `receiptFatal`
+// included, because `std.process.exit` skips defers.
 test "gate: a released claim records the time the scope was actually held" {
     const t = std.testing;
     var scratch = try Scratch.init(t.allocator, "cli_claim_holding_period");
@@ -1534,7 +1628,7 @@ test "gate: a released claim records the time the scope was actually held" {
     // `holdClaim`'s renewal, which already reads a fresh clock.
     try t.expect(try Store.leases.renew(&store, 1, scope, owner, 120, start + 30));
 
-    releaseClaim();
+    _ = releaseClaimReporting();
 
     var stmt = try store.db.prepare(
         \\SELECT acquired_at, renewed_at, released_at, release_reason FROM leases
@@ -1642,6 +1736,173 @@ test "gate: a release that could not be recorded reports the lease as still held
     // Nothing registered: not the same answer as a release, and not an error.
     const nothing = releaseClaimReporting();
     try t.expectEqualStrings("not_taken", nothing.code);
+}
+
+// --- The refusal envelope carries the answer, so no call site has to -----------
+//
+// Seventeen call sites in `cmd_job.zig` end the process while a claim is held —
+// `Cli.storeFatal` ×6, `fatalTmux` ×5, `fatalProbe` ×2 and the bare `fatal` ×3,
+// spread across `killJob`, `removeJob`, `reportFinishedDuringKill` and the shared
+// `settleObserved`. Every one of them reaches `fail`, and `fail` dropped the
+// release answer, so each was a leaked lease under `{ok, error}` with the warning
+// on stderr.
+//
+// They are not fixed one at a time. The two gates below are the two halves of
+// fixing them all at once: the envelope publishes the answer whenever there is one,
+// and the form that throws it away has exactly one caller left — the one that has
+// already published.
+
+/// An `Output` over a buffer, so a gate can read a document instead of an exit code.
+///
+/// The exit is what makes these paths untestable in-process; it is also the one
+/// part no gate needs. `writeRefusal` is the whole document-writing half of `fail`,
+/// `failWithCode` and `failReportingClaim`, split out for exactly this.
+const Captured = struct {
+    writer: std.Io.Writer,
+    out: Output,
+    ctx: Ctx,
+
+    fn init(buffer: []u8) Captured {
+        return .{ .writer = std.Io.Writer.fixed(buffer), .out = undefined, .ctx = undefined };
+    }
+
+    /// Wired after `init` because all three fields point at each other.
+    fn ctxPtr(c: *Captured) *Ctx {
+        c.out = .{ .writer = &c.writer, .format = .json };
+        // Every other field is `undefined` on purpose: `writeRefusal` reads
+        // `ctx.out` and nothing else, and a fixture that invented an `io` or an
+        // `environ` would be claiming this path uses them.
+        c.ctx = .{ .io = undefined, .arena = undefined, .environ = undefined, .out = &c.out, .now = 0 };
+        return &c.ctx;
+    }
+
+    fn text(c: *Captured) []const u8 {
+        return c.writer.buffered();
+    }
+};
+
+// The rule the seventeen sites now inherit, and its control in the same fixture.
+// Both directions matter: an envelope that published `not_taken` on every bad
+// `--limit` is the noise `fail` is shared too widely to carry, and one that
+// published nothing on a held lease is the defect.
+test "gate: a refusal publishes the lease answer exactly when there was a lease" {
+    const t = std.testing;
+    const held = ClaimRelease.leftHeld("the store refused the release");
+    const gave_back: ClaimRelease = .released;
+    const none: ClaimRelease = .not_taken;
+
+    {
+        // A leaked lease, on the shared envelope every `storeFatal`, `fatalTmux`
+        // and `fatalProbe` in a claim-holding body ends up in.
+        var buffer: [4096]u8 = undefined;
+        var captured: Captured = .init(&buffer);
+        writeRefusal(captured.ctxPtr(), "database error: disk I/O error", null, held, false);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "\"leaseRelease\": \"left_held\"") != null);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "the store refused the release") != null);
+    }
+    {
+        // The discriminating control: the same envelope with the lease handed
+        // back says so, rather than saying nothing or saying `left_held`.
+        var buffer: [4096]u8 = undefined;
+        var captured: Captured = .init(&buffer);
+        writeRefusal(captured.ctxPtr(), "database error: disk I/O error", null, gave_back, false);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "\"leaseRelease\": \"released\"") != null);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "\"leaseReleaseError\": null") != null);
+    }
+    {
+        // …and the other control: a verb that never took a lease keeps the two-key
+        // envelope it has always had. This is why `fail` may be the shared route.
+        var buffer: [4096]u8 = undefined;
+        var captured: Captured = .init(&buffer);
+        writeRefusal(captured.ctxPtr(), "unknown server 'box'", null, none, false);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "leaseRelease") == null);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "\"ok\": false") != null);
+    }
+    {
+        // `failWithCode`'s shape: the code comes before the lease keys, and the
+        // lease keys still come and go with the lease.
+        var buffer: [4096]u8 = undefined;
+        var captured: Captured = .init(&buffer);
+        writeRefusal(captured.ctxPtr(), "refused", "SCOPE_HELD_BY_PEER", held, false);
+        const at_code = std.mem.indexOf(u8, captured.text(), "errorCode") orelse return error.CodeMissing;
+        const at_lease = std.mem.indexOf(u8, captured.text(), "leaseRelease") orelse return error.LeaseMissing;
+        try t.expect(at_code < at_lease);
+    }
+    {
+        var buffer: [4096]u8 = undefined;
+        var captured: Captured = .init(&buffer);
+        writeRefusal(captured.ctxPtr(), "refused", "INVALID_PARAM", none, false);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "leaseRelease") == null);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "INVALID_PARAM") != null);
+    }
+    {
+        // `failReportingClaim`'s: a documented four-key envelope, so the keys are
+        // there even when the answer is that nothing was taken. A caller told to
+        // read `leaseRelease` must find it.
+        var buffer: [4096]u8 = undefined;
+        var captured: Captured = .init(&buffer);
+        writeRefusal(captured.ctxPtr(), "cannot connect to 10.0.0.1:22", null, none, true);
+        try t.expect(std.mem.indexOf(u8, captured.text(), "\"leaseRelease\": \"not_taken\"") != null);
+    }
+}
+
+// The other half, and the one that answers "what stops the eighteenth site".
+//
+// Nothing in Zig's type system can stop a function from calling a `void` one: there
+// is no effect on a signature to check, and a local shadow of a container-level
+// declaration is itself a compile error, so the void form cannot be made
+// unnameable from inside a claim-holding body. What *can* be made structural is the
+// other end. `releaseClaim()` is the only way to throw the answer away, and every
+// path in this file that writes a document now releases through
+// `releaseClaimReporting` instead — so the void form's caller list is the whole
+// audit, and this pins it at one.
+//
+// `failIndeterminateAfterOutput` is that one, and it is correct there: it runs after
+// the caller has written its own document, including its own `leaseRelease` from its
+// own `releaseClaimReporting`, so no claim is registered by the time it releases and
+// the answer it discards is `not_taken`. A new caller here is a new dropped answer,
+// and it fails this gate rather than shipping.
+test "gate: the answer-dropping release has one caller, and it has already published" {
+    const t = std.testing;
+    const source = @embedFile("cli.zig");
+    // Assembled rather than written out, so this gate's own text is not one of the
+    // call sites it counts. The doc comments that mention the function by name are
+    // excluded for free: they carry no semicolon.
+    const void_release = "release" ++ "Claim();";
+
+    var found: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, source, i, void_release)) |at| : (i = at + 1) found += 1;
+    if (found != 1) {
+        std.debug.print(
+            \\
+            \\cli.zig calls the void `releaseClaim()` at {d} sites. It may have exactly one,
+            \\in `failIndeterminateAfterOutput`, which runs after its caller has already
+            \\published its own `leaseRelease`. Every other process-ending path here writes a
+            \\document, and a document is somewhere the answer can go: release through
+            \\`releaseClaimReporting()` and put its `code` and `detail` in the envelope, the
+            \\way `fail`, `failWithCode`, `failIndeterminate` and `receiptFatal` do. A leaked
+            \\lease goes on refusing the next command on that scope for its whole TTL.
+            \\
+        , .{found});
+        return error.AnswerDroppedOnADocumentPath;
+    }
+
+    const body = try Control.bodyOf(source, "\npub fn failIndeterminateAfterOutput(");
+    if (std.mem.indexOf(u8, body, void_release) == null) {
+        std.debug.print(
+            \\
+            \\the one void `releaseClaim()` in cli.zig has moved out of
+            \\`failIndeterminateAfterOutput`. That is the only body it can be correct in —
+            \\everywhere else there is a document waiting for the answer.
+            \\
+        , .{});
+        return error.AnswerDroppedOnADocumentPath;
+    }
+    // A body that stopped releasing at all would satisfy the count above by
+    // deleting the site rather than by publishing: the claim would then survive
+    // the process and lapse at its TTL with nothing said about it anywhere.
+    try t.expect(std.mem.indexOf(u8, body, "clearExecution()") != null);
 }
 
 test {
