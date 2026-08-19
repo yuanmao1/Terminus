@@ -27,9 +27,9 @@
 //! `Cli.receiptFatal` or `Cli.storeFatal`, whose envelopes say nothing about the
 //! session, the log, the local row or a lease this command could not hand back.
 //! Those paths are now this verb's own (`refuseKillUnanswered`,
-//! `refuseLedgerUnrecordable`); the shared helpers are untouched and still serve
-//! every other verb. The exits that remain outside the document are named in
-//! `removeSession`.
+//! `refuseKillNeverRan`, `refuseLedgerUnrecordable`); the shared helpers are
+//! untouched and still serve every other verb. The exits that remain outside the
+//! document are named in `removeSession`.
 
 const std = @import("std");
 const fatal = Cli.fail;
@@ -260,6 +260,13 @@ const code = struct {
     pub const claim_lost_before_commit = "CLAIM_LOST_BEFORE_COMMIT";
     /// The kill went out and the host still reports the session present.
     pub const survived = "SESSION_SURVIVED_KILL";
+    /// The host answered that it has no tmux, so the kill provably never ran.
+    ///
+    /// Separate from `kill_unanswered` because the two exit differently — a proven
+    /// failure exits 1 and a lost answer exits 75 — and one code carrying both
+    /// would force a caller that branches on it to read the exit status to find
+    /// out which it got.
+    pub const kill_never_ran = "KILL_NEVER_RAN";
     /// The kill went out and no answer to it came back.
     pub const kill_unanswered = "KILL_UNANSWERED";
     /// The session is gone and its pane log could not be deleted.
@@ -503,8 +510,19 @@ fn removeSession(
     // interval after the renewal answered, and only a session identity the host
     // itself can check would close it (§2.4).
     if (!stillOurs(claim, ctx.io, &authority)) refuseBeforeKill(ctx, &execution, server_name, name, authority);
-    const gone = Tmux.killSession(executor, ctx.arena, name) catch |err|
-        refuseKillUnanswered(ctx, &execution, server_name, name, authority, executor, err);
+    const gone = Tmux.killSession(executor, ctx.arena, name) catch |err| switch (err) {
+        // The one `killSession` error whose proof the *host* carries. Its script
+        // opens with `command -v tmux >/dev/null || exit 41`, above the
+        // `kill-session` on the next line, so exit 41 says the script ran and
+        // stopped before the kill. Nothing was killed, nothing was read, nothing
+        // was touched — a proven failure, not a lost answer.
+        error.TmuxMissing => refuseKillNeverRan(ctx, &execution, server_name, name, authority),
+        // Every other error leaves the question open. A transport loss can fall on
+        // either side of the host acting, and `error.ExecFailed` in particular is
+        // what the daemon executor returns for "connection lost mid-request" —
+        // after the command may well have been delivered.
+        else => refuseKillUnanswered(ctx, &execution, server_name, name, authority, executor, err),
+    };
     if (!gone) refuseSurvivedKill(ctx, &execution, server_name, name, authority);
     // When the host answered, so the receipt's `absence_verified_at` is the
     // moment of the reading rather than this process's start time.
@@ -803,6 +821,108 @@ fn refuseSurvivedKill(
     Cli.exitNow(Cli.exit_code.failure);
 }
 
+/// The host answered that it has no tmux, so the kill never ran.
+///
+/// `error.TmuxMissing` is `killSession`'s script exiting 41 from its own first
+/// line — `command -v tmux >/dev/null || exit 41` — which sits *above* the
+/// `kill-session` on its second. So the script was delivered, the host answered,
+/// and what it answered establishes that the act this command exists to perform
+/// did not happen: there was no tmux to run it, nothing was read about the
+/// session, and nothing was deleted on the strength of it.
+///
+/// Settled `proven_failure`, for the reason `refuseSurvivedKill` settles it — the
+/// host's own answer establishes the failure — and it is the second half of the
+/// change that variant was added for. It used to arrive here as `indeterminate`,
+/// along with every other `killSession` error, which said "we could not establish
+/// what happened" about the one error that establishes it, and barred this
+/// session's scope over a settled question.
+///
+/// **Its own `errorCode`, and that is the point of the split.** "The host gave no
+/// usable answer" and "the host answered that it has no tmux" are different
+/// branches with different exit codes — a proven failure exits **1**, a lost
+/// answer exits **75** — and one code cannot carry both without lying to whichever
+/// caller branches on it. So `code.kill_never_ran` is published beside
+/// `code.kill_unanswered` rather than folded into it.
+///
+/// Exit 1 is honest twice: nothing on the host was touched, so a retry is safe,
+/// and this is a failure a caller can act on — install tmux — which is what the
+/// hint says rather than making an operator infer it.
+///
+/// **No `executor.errorMessage()` in the reason, unlike the unanswered branch.**
+/// There was no transport failure to describe: the round trip succeeded and the
+/// answer it carried was exit 41. Quoting the executor's last error here would
+/// attach a stale or empty transport message to a clean exchange.
+///
+/// `sessionState: "unknown"`, not `gone`. Nothing probed the session — the script
+/// stopped before `has-session` — and "a host with no tmux has no tmux sessions"
+/// is an inference, not a reading. `gone` is also the word that licenses deletion
+/// elsewhere in this verb, and nothing here has earned it. `not_attempted` is this
+/// verb's published word for "nothing was sent", which is false: a script did
+/// reach the host and did answer.
+fn refuseKillNeverRan(
+    ctx: *Cli.Ctx,
+    execution: *Core.execution.Execution,
+    server_name: []const u8,
+    session: []const u8,
+    authority: Authority,
+) noreturn {
+    const facts: Facts = .{
+        .session_state = state.session.unknown,
+        .log_state = state.log.not_attempted,
+        .local_row = state.row.kept,
+    };
+    const target = Tmux.targetName(ctx.arena, session) catch
+        fatal("out of memory reporting that the kill for session '{s}' never ran", .{session});
+    const reason = std.fmt.allocPrint(
+        ctx.arena,
+        "tmux is not installed on server '{s}' — the kill script's own 'command -v tmux' guard answered before its kill-session line — so the kill for session '{s}' provably never ran; nothing was deleted, not the pane log and not the local row",
+        .{ server_name, session },
+    ) catch "tmux is not installed on the host, so the kill provably never ran; nothing was deleted";
+    // The observation, not the conclusion, for the reason `proven_failure` demands
+    // one: this is the reading a later operator gets to disagree with.
+    const observation = std.fmt.allocPrint(
+        ctx.arena,
+        "the kill script's 'command -v tmux' guard exited 41, so tmux kill-session -t ={s} was never run",
+        .{target},
+    ) catch "the kill script's 'command -v tmux' guard exited 41, so tmux kill-session was never run";
+    _ = execution.settle(.{ .proven_failure = .{
+        .observation = observation,
+        .error_code = code.kill_never_ran,
+    } }, .{}) catch |err| refuseLedgerUnrecordable(
+        ctx,
+        execution.id(),
+        server_name,
+        session,
+        execution.status.text(),
+        authority,
+        facts,
+        code.receipt_persist_failed,
+        "the host answered that it has no tmux, so the kill never ran, and the record of that could not be written",
+        "nothing was sent to a tmux server and nothing was deleted; the attempt is left unsettled and bars this session's scope until it is reconciled",
+        err,
+    );
+    const lease = Cli.releaseClaimReporting();
+    report(ctx, .{
+        .ok = false,
+        .action = "not_removed",
+        .errorCode = code.kill_never_ran,
+        .session = session,
+        .server = server_name,
+        .requestId = execution.id(),
+        .status = execution.status.text(),
+        .sessionState = facts.session_state,
+        .logState = facts.log_state,
+        .localRow = facts.local_row,
+        .authority = authority.code(),
+        .authorityError = authority.note(ctx.arena, .{ .session = session }),
+        .leaseRelease = lease.code,
+        .leaseReleaseError = lease.detail,
+        .reason = reason,
+        .hint = "install tmux on the host, or put it on the PATH a non-interactive shell sees, then run the removal again; nothing was deleted and this session's scope is free",
+    });
+    Cli.exitNow(Cli.exit_code.failure);
+}
+
 /// The kill was sent and nothing came back to say what it did.
 ///
 /// A transport failure on that round trip, or a tmux error the host raised in
@@ -823,21 +943,27 @@ fn refuseSurvivedKill(
 /// would report something the host never said and `not_attempted` would deny a
 /// command that was sent.
 ///
-/// **One imprecision, named rather than hidden, and now half-closed.**
-/// `error.TmuxMissing` is the host answering that tmux is not installed, which
-/// *proves* the kill did not run — and this still records `indeterminate`. The
-/// missing piece is no longer the terminal: `op_state.Terminal.proven_failure`
-/// exists, is admissible for a control act from `submitted`, and
-/// `refuseSurvivedKill` writes it. What this branch would need is a published
-/// **`errorCode` of its own**, because "the host gave no usable answer" and "the
-/// host answered that it has no tmux" are different branches with different exit
-/// codes — a proven failure exits 1 and a lost answer exits 75 — and one code
-/// cannot carry both without lying to whichever caller branches on it. That code
-/// would have to be added to `code` above *and* to the list `skill/SKILL.md`
-/// publishes, which the gate below holds against each other, so it is a protocol
-/// addition rather than an implementation detail. Until it is made, the error name
-/// travels in `reason`, so an operator reading it is not left guessing; what the
-/// ledger cannot do is say it in a column.
+/// **What no longer arrives here.** `error.TmuxMissing` used to, and recording it
+/// `indeterminate` was the one imprecision this branch named against itself: that
+/// error is the host answering that tmux is not installed, which *proves* the kill
+/// never ran. It now goes to `refuseKillNeverRan`, settles `proven_failure`,
+/// carries `code.kill_never_ran` and exits 1. The split needed a published code of
+/// its own rather than a terminal, and adding one is a protocol addition — the
+/// value had to reach both `code` above and the list `skill/SKILL.md` publishes,
+/// which the gate below holds against each other in both directions.
+///
+/// **What still arrives here, and why it must.** Every remaining `killSession`
+/// error is an `Ssh.ExecError`, and none of them can say which side of the host
+/// acting they fell on. `error.ChannelOpenFailed` looks like a proof — libssh2
+/// opens the channel before it sends the command, so nothing was delivered — but
+/// that proof lives in this process's call ordering rather than in anything the
+/// host said, no test pins it, and `DaemonClient.exec` cannot even express it: it
+/// answers `error.ExecFailed` for "daemon connection lost mid-request", which is
+/// the post-delivery case wearing the same name a failed channel open would wear.
+/// `error.OutOfMemory` is ambiguous in the same way — it can come from building the
+/// script or from duplicating the reply. So they stay `indeterminate`, which is
+/// what `op_state.terminalForTransportLoss` says a transport loss after submission
+/// is, and the barrier stays up until somebody looks.
 fn refuseKillUnanswered(
     ctx: *Cli.Ctx,
     execution: *Core.execution.Execution,

@@ -645,9 +645,17 @@
       "id": "M3b-skill-session-rm-error-codes",
       "rule": "skill/SKILL.md's published `errorCode` vocabulary for `session rm` is held against the constants the branches actually emit.",
       "file": "skill/SKILL.md",
-      "find": "`LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`, `LEDGER_WRITE_FAILED`,\n",
-      "replace": "`LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,\n",
+      "find": "`KILL_UNANSWERED`, `LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,\n",
+      "replace": "`KILL_UNANSWERED`, `LOG_DELETE_FAILED`,\n",
       "expect_gate": "gate: SKILL.md publishes exactly `session rm`'s errorCode vocabulary"
+    },
+    {
+      "id": "M3b-skill-session-rm-exit-codes",
+      "rule": "skill/SKILL.md's published exit code for each of `session rm`'s kill outcomes is held against the status the binary really exits with; a number in prose that no gate reads is how the survived-kill bullet came to publish 75 for a branch that exits 1.",
+      "file": "skill/SKILL.md",
+      "find": "- `SESSION_SURVIVED_KILL` exits **1**",
+      "replace": "- `SESSION_SURVIVED_KILL` exits **75**",
+      "expect_gate": "blackbox: `session rm` deletes nothing when the session survives the kill"
     },
     {
       "id": "M3b-session-removal-proves-own-claim",
@@ -677,9 +685,17 @@
       "id": "M3b-session-rm-kill-unanswered",
       "rule": "A kill that gets no answer emits `session rm`'s own fixed key set and exits 75, matching the `indeterminate` the ledger records for it; exit 1 would tell an agent nothing happened.",
       "file": "src/cli/cmd_session.zig",
-      "find": "    const gone = Tmux.killSession(executor, ctx.arena, name) catch |err|\n        refuseKillUnanswered(ctx, &execution, server_name, name, authority, executor, err);\n",
-      "replace": "    const gone = Tmux.killSession(executor, ctx.arena, name) catch |err| fatalTmux(err, executor, name);\n",
+      "find": "        else => refuseKillUnanswered(ctx, &execution, server_name, name, authority, executor, err),\n",
+      "replace": "        else => fatalTmux(err, executor, name),\n",
       "expect_gate": "blackbox: `session rm` reports 75 and the full document when the kill gets no answer"
+    },
+    {
+      "id": "M3b-session-rm-kill-never-ran",
+      "rule": "`error.TmuxMissing` is the one `killSession` error the host's own answer proves, so it settles `proven_failure`/`KILL_NEVER_RAN` and exits 1 with the scope free; folding it back into the unanswered branch would bar a session's scope over a settled question and report 75 for a kill that never left the guard.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "        error.TmuxMissing => refuseKillNeverRan(ctx, &execution, server_name, name, authority),\n",
+      "replace": "        error.TmuxMissing => refuseKillUnanswered(ctx, &execution, server_name, name, authority, executor, err),\n",
+      "expect_gate": "blackbox: `session rm` proves the kill never ran when the host has no tmux"
     },
     {
       "id": "M3b-session-rm-ledger-failure-exit-code",

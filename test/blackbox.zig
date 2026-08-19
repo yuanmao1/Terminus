@@ -922,6 +922,21 @@ const FakeHost = struct {
         /// why no public lease writer can leave this row behind, and for what a
         /// real machine does to produce it.
         strand: bool = false,
+        /// Answer this command with a protocol-level refusal instead of a result,
+        /// which `DaemonClient.exec` turns into `error.ExecFailed`.
+        ///
+        /// The only deterministic route left to a *transport* failure on a named
+        /// command. It used to be unnecessary here: the kill-unanswered gate
+        /// arranged exit 41, and every `killSession` error — `error.TmuxMissing`
+        /// included — settled `indeterminate`. Now that 41 proves the kill never
+        /// ran and settles `failed`, an "answer we cannot read" needs its own
+        /// arrangement, and the two gates are each other's control.
+        ///
+        /// Deliberately not the unscripted path, which produces the same
+        /// `ok:false` reply: that one is counted as a fault and fails
+        /// `expectFullyScripted`, so a gate riding on it could not also assert that
+        /// nothing unscripted happened.
+        refuse: bool = false,
     };
 
     /// The job whose scope a `seize` rule takes, and who takes it. Fixed rather
@@ -1313,6 +1328,15 @@ const FakeHost = struct {
                 if (rule.uses != std.math.maxInt(u32)) rule.uses -= 1;
                 if (rule.seize) host.seize();
                 if (rule.strand) host.strand();
+                // A scripted refusal: the daemon protocol's way of saying the
+                // command produced no readable result, which the client raises as
+                // `error.ExecFailed`. Recorded as traffic (the command *was*
+                // delivered) and not counted as unscripted, because it is.
+                if (rule.refuse) return .{
+                    .v = protocol.version,
+                    .ok = false,
+                    .@"error" = "the gate's fake host refused to answer this command",
+                };
                 return .{
                     .v = protocol.version,
                     .ok = true,
@@ -4936,6 +4960,11 @@ test "blackbox: `session rm` deletes nothing when the session survives the kill"
     try refused.expectCode(1);
     try refused.expectSays("\"action\": \"not_removed\"");
     try refused.expectSays("\"errorCode\": \"SESSION_SURVIVED_KILL\"");
+    // The number the shipped document publishes for this code, against the one the
+    // binary just used. This is the branch that proved the gap was real: it moved
+    // from `indeterminate`/75 to `failed`/1 and SKILL.md went on saying 75, with
+    // every gate green, because no gate read the prose number.
+    try expectDocumentedExit(&f, "SESSION_SURVIVED_KILL", refused);
     try refused.expectSays("\"sessionState\": \"present\"");
     try refused.expectSays("\"logState\": \"not_attempted\"");
     try refused.expectSays("\"localRow\": \"kept\"");
@@ -5201,6 +5230,81 @@ fn operationCount(store: *Store) !i64 {
     return stmt.columnInt(0);
 }
 
+/// The agent-facing skill text, read from the checkout the gates run in.
+///
+/// Read rather than `@embedFile`d because this module's package root is `test/` and
+/// the document lives outside it; the build wires `skill/SKILL.md` into the library
+/// module only, which no public declaration re-exports. Repo-relative paths are
+/// already load-bearing throughout this file — every fixture lives under
+/// `.zig-cache/tmp` — so this adds no assumption that was not here already.
+fn readSkillDocument(f: *Fixture, arena: std.mem.Allocator) ![]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(f.io, "skill/SKILL.md", arena, .limited(1 << 20)) catch |err| {
+        std.debug.print(
+            "could not read skill/SKILL.md from the checkout ({t}); these gates run with the repository root as their working directory\n",
+            .{err},
+        );
+        return err;
+    };
+}
+
+/// Asserts that the exit code this run produced is the one the shipped document
+/// publishes for `error_code`.
+///
+/// **What this catches that nothing did.** The four in-process gates in
+/// `cmd_session.zig` hold the document's *key sets and value vocabularies* against
+/// the code, and the gates here assert the binary's exit code — but no gate read the
+/// exit *number in the prose*. So when the survived-kill branch moved from
+/// `indeterminate`/75 to `failed`/1, the document went on publishing 75 and the whole
+/// suite stayed green. An agent branching on the document acts on the number the
+/// document printed.
+///
+/// Reads the number out of the skill text rather than taking it as a parameter,
+/// which is the point: a gate handed the number twice only checks that the author
+/// typed it twice. `expectCode` beside this is not redundant — that one pins the
+/// behaviour, this one pins the publication to it.
+fn expectDocumentedExit(f: *Fixture, error_code: []const u8, r: Run) !void {
+    var arena_state = std.heap.ArenaAllocator.init(f.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const skill_md = try readSkillDocument(f, arena);
+
+    const needle = try std.fmt.allocPrint(arena, "`{s}` exits **", .{error_code});
+    const at = std.mem.indexOf(u8, skill_md, needle) orelse {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md does not publish an exit code for `{s}`.
+            \\  looked for the literal: "{s}"
+            \\Each of `session rm`'s three kill outcomes publishes its exit status, and this
+            \\gate holds that number against the one the binary really used. If the list was
+            \\reworded or reflowed, fix the text — but do not drop the entry: an unread number
+            \\is how the survived-kill bullet came to publish 75 for a branch that exits 1.
+            \\
+        , .{ error_code, needle });
+        return error.SkillPublishesNoExitCode;
+    };
+    const rest = skill_md[at + needle.len ..];
+    const end = std.mem.indexOf(u8, rest, "**") orelse return error.SkillExitCodeUnterminated;
+    const documented = std.fmt.parseInt(u8, rest[0..end], 10) catch {
+        std.debug.print(
+            "skill/SKILL.md publishes \"{s}\" as `{s}`'s exit code, which is not a number\n",
+            .{ rest[0..end], error_code },
+        );
+        return error.SkillExitCodeNotANumber;
+    };
+    std.testing.expectEqual(documented, r.code) catch |err| {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md publishes exit {d} for `{s}`; the binary exited {d}.
+            \\One of the two is wrong, and an agent that branches on the document acts on
+            \\the number it published.
+            \\--- stdout ---
+            \\{s}
+            \\
+        , .{ documented, error_code, r.code, r.stdout });
+        return err;
+    };
+}
+
 // The kill went out and nothing came back to say what it did.
 //
 // This used to leave the process exiting **1** through `fatalTmux` → `Cli.fail`
@@ -5210,11 +5314,15 @@ fn operationCount(store: *Store) !i64 {
 // safe*. On the one call in this verb that cannot be taken back, that is the worst
 // thing the two could disagree about.
 //
-// Arranged with exit 41 from the kill script, which is its `command -v tmux` guard
-// failing — a real answer this verb can get from a real host, and the one shape
-// that reaches `killSession`'s error path deterministically. `fatalTmux` itself is
-// untouched and still serves `session new`, `session ls`, `exec`, `job` and
-// `read`/`write`.
+// Arranged with a scripted protocol refusal (`Rule.refuse`), which the daemon
+// client raises as `error.ExecFailed` — the command was delivered and what came
+// back is not a reading of anything. This gate used to arrange exit 41 instead,
+// because back then *every* `killSession` error settled `indeterminate` and 41 was
+// the one shape that reached the error path deterministically. 41 now means
+// something else entirely — see the `KILL_NEVER_RAN` gate below, which is this
+// one's discriminating control and the reason the arrangement had to change.
+// `fatalTmux` itself is untouched and still serves `session new`, `session ls`,
+// `exec`, `job` and `read`/`write`.
 //
 // Two legs on one fixture and one host. Without the second, every assertion here
 // would hold against a binary that had started refusing every kill.
@@ -5229,7 +5337,7 @@ test "blackbox: `session rm` reports 75 and the full document when the kill gets
     var rules = [_]FakeHost.Rule{
         // Keyed on the target, because both legs' kill scripts carry
         // `kill-session` and this gate needs them answered differently.
-        .{ .needle = "kill-session -t =t-shell", .exit_code = 41 },
+        .{ .needle = "kill-session -t =t-shell", .refuse = true },
         .{ .needle = "kill-session -t =t-other", .exit_code = 0 },
         .{ .needle = "rm -f", .exit_code = 0 },
     };
@@ -5265,7 +5373,11 @@ test "blackbox: `session rm` reports 75 and the full document when the kill gets
     try blind.expectSays("\"leaseRelease\": \"released\"");
     // The error name reaches the operator, which is the one thing `fatalTmux`'s
     // per-error sentences carried that a fixed key set must not lose.
-    try blind.expectSays("TmuxMissing");
+    try blind.expectSays("ExecFailed");
+    // And the exit code the shipped document publishes for this code is the one the
+    // binary just used. The prose number went unread by any gate until now, which is
+    // how the survived-kill bullet came to publish 75 for a branch that exits 1.
+    try expectDocumentedExit(&f, "KILL_UNANSWERED", blind);
 
     {
         var store = try f.open();
@@ -5282,6 +5394,11 @@ test "blackbox: `session rm` reports 75 and the full document when the kill gets
             return error.RemovalRecordedNoOperation;
         try t.expectEqualStrings("control", op.kind);
         try t.expectEqualStrings("indeterminate", op.status.text());
+        // And it *does* bar the scope — the half of this outcome that separates it
+        // from the two proven failures. `KILL_NEVER_RAN` and
+        // `SESSION_SURVIVED_KILL` settle `failed` and bar nothing; this one holds
+        // the barrier because the question is genuinely open.
+        try t.expect(op.status.blocksScope());
         // Its own code on the receipt, so this is distinguishable from a survived
         // kill and from a lost lease — three unknowns that send an operator to
         // three different places.
@@ -5297,6 +5414,124 @@ test "blackbox: `session rm` reports 75 and the full document when the kill gets
 
     // The discriminating control: the same fixture, the same host, a session whose
     // kill is answered. It still removes, still deletes the log, still exits 0.
+    var fine = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "other", "--json", "--db", f.db,
+    }, &environ);
+    defer fine.deinit(f.allocator);
+
+    try host.expectSent("kill-session -t =t-other");
+    try host.expectSent("rm -f");
+    try host.expectFullyScripted();
+    try fine.expectCode(0);
+    try fine.expectSays("\"action\": \"removed\"");
+    try fine.expectSays("\"errorCode\": \"none\"");
+    try fine.expectSays("\"sessionState\": \"gone\"");
+}
+
+// The host answered that it has no tmux, so the kill provably never ran.
+//
+// `killSession`'s script opens with `command -v tmux >/dev/null || exit 41`, a line
+// above the `kill-session` it guards, so exit 41 is the host saying the script ran
+// and stopped before the kill. That *proves* the act did not happen, and it used to
+// be recorded `indeterminate` with `KILL_UNANSWERED` and exit 75 along with every
+// other `killSession` error — "we could not establish what happened" about the one
+// error that establishes it, holding this session's scope over a settled question.
+//
+// This gate and the unanswered one above are each other's discriminating control,
+// and that is the whole point of the split: same verb, same fixture shape, same
+// untouched host state, and every axis that matters comes out opposite —
+// `failed` against `indeterminate`, a scope free against a scope barred, exit 1
+// against exit 75, `KILL_NEVER_RAN` against `KILL_UNANSWERED`. Without the pair, a
+// binary that had collapsed the two back into one code would still pass whichever
+// gate was left.
+test "blackbox: `session rm` proves the kill never ran when the host has no tmux" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_kill_never_ran");
+    defer f.deinit();
+    try f.seedServer();
+    const session_id = try seedSessionWithMemory(&f, "shell", "the shell runbook");
+    try seedSessionRow(&f, "other");
+
+    var rules = [_]FakeHost.Rule{
+        // 41 is `command -v tmux` failing. Keyed on the target for the reason the
+        // unanswered gate keys on it: both legs' scripts carry `kill-session`.
+        .{ .needle = "kill-session -t =t-shell", .exit_code = 41 },
+        .{ .needle = "kill-session -t =t-other", .exit_code = 0 },
+        .{ .needle = "rm -f", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var missing = try runWithEnvironment(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--db", f.db,
+    }, &environ);
+    defer missing.deinit(f.allocator);
+
+    // The script was delivered and nothing after it was. Named before the exit
+    // code, because the regression that matters is "it deleted the log anyway".
+    try host.expectSent("kill-session -t =t-shell");
+    try host.expectNeverSent("rm -f");
+    // 1, not 75. The host answered, so there is nothing to reconcile, and nothing
+    // was touched, so a retry is safe — it will fail the same way until tmux is
+    // installed, which is what the hint has to say.
+    try missing.expectCode(1);
+    try expectFixedRemovalDocument(missing);
+    try missing.expectSays("\"action\": \"not_removed\"");
+    try missing.expectSays("\"errorCode\": \"KILL_NEVER_RAN\"");
+    // `unknown`, not `gone`: the script stopped before `has-session`, so nothing
+    // read the session. `gone` is also the word that licenses deletion in this
+    // verb, and nothing here earned it.
+    try missing.expectSays("\"sessionState\": \"unknown\"");
+    try missing.expectSays("\"logState\": \"not_attempted\"");
+    try missing.expectSays("\"localRow\": \"kept\"");
+    // The lease was never lost on this path; the report must not blame the wrong
+    // barrier.
+    try missing.expectSays("\"authority\": \"held\"");
+    try missing.expectSays("\"leaseRelease\": \"released\"");
+    // A user-actionable failure says how to act on it.
+    try missing.expectSays("install tmux");
+    try expectDocumentedExit(&f, "KILL_NEVER_RAN", missing);
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Nothing local was destroyed, memories included.
+        try t.expectEqual(@as(?i64, session_id), try Store.sessions.idByName(&store, 1, "shell"));
+        try t.expectEqual(@as(usize, 1), try sessionMemoryCount(&store, arena, session_id));
+
+        const op = (try Store.operations.latestByAlias(&store, arena, 1, "shell")) orelse
+            return error.RemovalRecordedNoOperation;
+        try t.expectEqualStrings("control", op.kind);
+        // `failed`, from the store rather than from stdout, and the status is
+        // load-bearing twice: it is what the host proved, and it is what keeps this
+        // row from barring the scope of a session nothing touched.
+        try t.expectEqualStrings("failed", op.status.text());
+        try t.expect(!op.status.blocksScope());
+        const recorded = (try terminalErrorCode(&store, arena, op.request_id)) orelse
+            return error.RemovalLeftNoTerminalReceipt;
+        try t.expectEqualStrings("KILL_NEVER_RAN", recorded);
+        // The reading that justifies the claim, on the receipt: `proven_failure`
+        // refuses to be constructed without one, and a receipt that dropped it
+        // would leave the claim unarguable.
+        const observation = (try terminalTransportError(&store, arena, op.request_id)) orelse
+            return error.RemovalLeftNoObservation;
+        if (std.mem.indexOf(u8, observation, "command -v tmux") == null)
+            return error.ReceiptDidNotSayWhatWasRead;
+
+        // The scope was handed back even though the act failed.
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 0), held.len);
+    }
+
+    // The discriminating control on the host axis: the same fixture, the same
+    // binary, a session whose kill is answered. It still removes and still exits 0,
+    // so none of the above holds against a binary that refuses every kill.
     var fine = try runWithEnvironment(&f, &.{
         "session", "rm", "box", "other", "--json", "--db", f.db,
     }, &environ);

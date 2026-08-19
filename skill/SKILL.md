@@ -562,10 +562,12 @@ something.
   under a surviving session comes back holding a partial history.
   If the host still reports the session present after the kill, **nothing** is
   removed — not the log, not the local row — and the record says so: status
-  `indeterminate` with `error_code:"SESSION_SURVIVED_KILL"`, exit **75**. It is
-  75 rather than 1 because that record blocks this session's scope until you
-  reconcile it, so a plain "retry" would walk into a refusal. Go and look
-  (`tmux attach -t t-<name>`), then `terminus request reconcile <request-id>`.
+  `failed` with `error_code:"SESSION_SURVIVED_KILL"`, exit **1**. It is 1 rather
+  than 75 because the host *answered*: what it answered proves this removal did not
+  happen, so the ledger records a proven failure rather than an unknown, that
+  record bars nothing, and the scope is free — a retry walks into no refusal. Go
+  and look (`tmux attach -t t-<name>`) to find out why the kill did not take, then
+  run the removal again.
 - **Lease lost *before* the kill**: nothing is sent, nothing local is written.
   `action:"not_removed"`, `errorCode:"AUTHORITY_LOST_BEFORE_KILL"`,
   `sessionState:"not_attempted"`, `localRow:"kept"`, and the exit code is **1, not
@@ -604,6 +606,16 @@ something.
   `localRow` both untouched, exit **75**. The ledger records `indeterminate`
   carrying the same code, so the scope stays barred until you reconcile it. Look
   at the host before re-running.
+- **The host has no tmux**: the kill script's own `command -v tmux` guard answered
+  before its `kill-session` line, so the kill provably never ran and nothing was
+  touched. `errorCode:"KILL_NEVER_RAN"`, `sessionState:"unknown"` — the script
+  stopped before `has-session`, so nothing read the session, and a host without
+  tmux is *inferred* to have no sessions rather than observed to — `logState` and
+  `localRow` both untouched, exit **1**. The ledger records `failed` carrying the
+  same code. This is the discriminating pair with `KILL_UNANSWERED`: both mean the
+  kill produced no result, but this one bars nothing and needs no reconcile,
+  because the host answered and its answer settles the question. Install tmux, or
+  put it on the PATH a non-interactive shell sees, then run the removal again.
 - **This command's own lease stopped being live before the record was written**:
   every renewal held, and the one transaction that re-validates then writes found
   *this command's* lease no longer live and ours — it lapsed during the last round
@@ -649,13 +661,28 @@ prose, do not match their text.
 
 `session rm --json`'s `errorCode` is one of `none`, `SCOPE_HELD_BY_PEER`,
 `AUTHORITY_LOST_BEFORE_KILL`, `AUTHORITY_LOST`, `SCOPE_TAKEN_BEFORE_COMMIT`,
-`CLAIM_LOST_BEFORE_COMMIT`, `SESSION_SURVIVED_KILL`, `KILL_UNANSWERED`,
-`LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`, `LEDGER_WRITE_FAILED`,
-`RECEIPT_PERSIST_FAILED`, `OWNER_COLLISION`. It is never null and never absent:
-`none` is the value on the one branch that completed the removal, so a caller
-never has to decide whether a missing key means success. `LEDGER_WRITE_FAILED` and
-`RECEIPT_PERSIST_FAILED` both exit **76**: a write this command needed could not be
-made, so reconcile before acting on that session again.
+`CLAIM_LOST_BEFORE_COMMIT`, `SESSION_SURVIVED_KILL`, `KILL_NEVER_RAN`,
+`KILL_UNANSWERED`, `LOG_DELETE_FAILED`, `LEDGER_ALREADY_SETTLED`,
+`LEDGER_WRITE_FAILED`, `RECEIPT_PERSIST_FAILED`, `OWNER_COLLISION`. It is never
+null and never absent: `none` is the value on the one branch that completed the
+removal, so a caller never has to decide whether a missing key means success.
+`LEDGER_WRITE_FAILED` and `RECEIPT_PERSIST_FAILED` both exit **76**: a write this
+command needed could not be made, so reconcile before acting on that session again.
+
+Exit codes for the three kill outcomes, by what the ledger settled. Each is gated
+against the binary's real exit status, so this list cannot drift the way the
+survived-kill bullet above once did — it published 75 for a branch that exits 1, and
+no gate read the number.
+
+- `KILL_UNANSWERED` exits **75** — the one kill outcome nothing can establish, so
+  the record bars this session's scope until you reconcile it.
+- `SESSION_SURVIVED_KILL` exits **1** — the host answered that the session is still
+  present, which proves the removal did not happen.
+- `KILL_NEVER_RAN` exits **1** — the host answered that it has no tmux, which proves
+  the kill never ran.
+
+The two proven failures settle `failed`, bar nothing and are safe to re-run; the
+unknown settles `indeterminate` and is not.
 
 `session rm --json`'s `status` is the ledger's word for this attempt, except on the
 one branch where the write that would have created the row is what failed — there
