@@ -10774,8 +10774,9 @@ const DestructivePath = enum {
 };
 
 /// What the authority owner's own claim is in when the transaction opens. The six
-/// members of `leases.ClaimState`, by name, so a claim state added there without a
-/// column here fails to compile.
+/// members of `leases.ClaimState`, by name — the gate below holds the two lists
+/// against each other, so a claim state added there without a column here fails —
+/// plus one that is not a state at all but a *moment*.
 const ClaimScenario = enum {
     held,
     lapsed,
@@ -10783,7 +10784,61 @@ const ClaimScenario = enum {
     displaced,
     handed_back,
     never_taken,
+    /// Live when the transaction asks for the write lock, out of date by the time
+    /// it has it.
+    ///
+    /// Not a seventh `ClaimState` — it ends in `lapsed` like the second column
+    /// does — and it is its own column because *when* the lapse happens is the
+    /// thing being tested. `BEGIN IMMEDIATE` waits up to `Db.busy_timeout` for the
+    /// lock, and a process suspend, a resumed VM or a forward clock jump can land
+    /// in that wait: exactly the three deaths `execution.authorityLocked`
+    /// documents. A clock sampled before the wait reports `held` about a claim
+    /// that is gone by the time the guard evaluates it, and the destruction
+    /// commits under it. Driven through `execution.between_lock_and_clock`,
+    /// because time passing inside that window is not something a fixture can
+    /// arrange from outside.
+    lapses_under_the_lock,
 };
+
+/// The `leases.ClaimState` word this scenario ends in.
+///
+/// One line rather than `@tagName`, because the columns are no longer one-to-one
+/// with the states: two of them arrive at `lapsed` and differ only in when.
+fn claimCode(claim: ClaimScenario) []const u8 {
+    return switch (claim) {
+        .held => "held",
+        .lapsed, .lapses_under_the_lock => "lapsed",
+        .swept => "swept",
+        .displaced => "displaced",
+        .handed_back => "handed_back",
+        .never_taken => "never_taken",
+    };
+}
+
+test "gate: every claim state `leases` can report has a column in the authority matrix" {
+    // The property the column list used to get by spelling `@tagName`: a state
+    // added to `leases.ClaimState` and not answered here would leave a row of the
+    // table untested and nothing would say so.
+    inline for (@typeInfo(Store.leases.ClaimState).@"union".fields) |field| {
+        if (!@hasField(ClaimScenario, field.name)) {
+            std.debug.print("\nleases.ClaimState.{s} has no column in ClaimScenario\n", .{field.name});
+            return error.ClaimStateHasNoColumn;
+        }
+    }
+    // …and the mapping is onto: every column names a word `ClaimState.code` can
+    // actually produce, so a cell cannot assert against a string nothing returns.
+    for (std.enums.values(ClaimScenario)) |claim| {
+        const want = claimCode(claim);
+        var found = false;
+        inline for (@typeInfo(Store.leases.ClaimState).@"union".fields) |field| {
+            if (std.mem.eql(u8, field.name, want)) found = true;
+        }
+        if (!found) {
+            std.debug.print("\nClaimScenario.{s} maps to \"{s}\", which is not a ClaimState\n", .{ @tagName(claim), want });
+            return error.ColumnNamesNoClaimState;
+        }
+    }
+}
 
 /// What else claims the scope at the same moment.
 ///
@@ -10827,6 +10882,10 @@ fn expectedCell(path: DestructivePath, claim: ClaimScenario, peer: PeerScenario)
         // past and we read `swept`. A takeover instead reads `displaced`. Neither
         // leaves `lapsed` standing beside a live foreign lease.
         .lapsed => return .{ .unreachable_because = "a lease writer sweeps our lapsed row before it inserts, so a peer's overlapping lease leaves us `swept` (or `displaced`), never `lapsed`" },
+        // This column's claim is *live* while the fixture is being built — that is
+        // the whole shape of it — so it is unreachable for the reason `held` is,
+        // and for no additional one.
+        .lapses_under_the_lock => return .{ .unreachable_because = "this column's claim is live and unreleased when the peer would have to acquire, so it is refused exactly as it is under `held`" },
         .swept, .displaced, .handed_back, .never_taken => {},
     };
 
@@ -10837,7 +10896,11 @@ fn expectedCell(path: DestructivePath, claim: ClaimScenario, peer: PeerScenario)
 
     return switch (claim) {
         .held => .committed,
-        .lapsed, .swept, .displaced, .handed_back, .never_taken => .claim_lost,
+        // `lapses_under_the_lock` sits with the rest deliberately. The contract has
+        // one answer to "our claim is not live", and *when* it stopped being live
+        // may not change it — a clock read before the lock is what made this column
+        // answer `committed` instead.
+        .lapsed, .swept, .displaced, .handed_back, .never_taken, .lapses_under_the_lock => .claim_lost,
     };
 }
 
@@ -11032,7 +11095,11 @@ fn arrangeMatrixClaim(
         // Nothing acquired. Not the same as a claim taken and lost, which is why
         // `ClaimState` keeps the two apart.
         .never_taken => {},
-        .held => try mustAcquireMatrixClaim(store, arena, owner, 600, now),
+        // Both start as a plain live claim. What separates them is what happens
+        // inside `commitDestruction`: `lapses_under_the_lock` installs a probe that
+        // expires this row and waits for the wall clock to pass it, in the window
+        // between taking the write lock and reading the clock.
+        .held, .lapses_under_the_lock => try mustAcquireMatrixClaim(store, arena, owner, 600, now),
         // A claim taken an hour ago with a two-minute TTL: the shape of a command
         // whose last round trip hung. Nothing runs a lease writer afterwards, so
         // the row is still sitting there unreleased and out of date.
@@ -11099,6 +11166,63 @@ fn seedForeignMatrixLease(store: *Store, arena: std.mem.Allocator, now: i64) !vo
         .renewed, .conflict => return error.ForeignLeaseDidNotTake,
     }
 }
+
+/// The probe `execution.between_lock_and_clock` installs for the
+/// `lapses_under_the_lock` column.
+///
+/// It runs with the removal's own write lock held, on the removal's own
+/// connection, and does two things in order:
+///
+///  1. expires the authority owner's claim, dated one second ahead of the clock's
+///     *current* reading. Written as a bare `UPDATE` because no lease API expires
+///     a live row in place, and the value is computed here rather than passed in
+///     so the arithmetic is anchored to a reading taken strictly after the
+///     transaction opened;
+///  2. waits until the wall clock has passed that second.
+///
+/// Together those two make the column deterministic rather than a race. A clock
+/// sampled before the lock was taken is necessarily at or below the reading in
+/// step 1, so it is *below* the new expiry and reports `held`; a clock sampled
+/// after step 2 is at or above it and reports `lapsed`. No fixture timing decides
+/// which — the probe establishes both bounds itself.
+///
+/// The wait is bounded by the fraction of a second remaining, because the expiry
+/// is one tick away rather than a fixed number of seconds.
+const ClockCrossesTheTtl = struct {
+    var store: ?*Store = null;
+    var io: ?std.Io = null;
+    var fired: bool = false;
+    var failure: ?anyerror = null;
+
+    fn reset() void {
+        store = null;
+        io = null;
+        fired = false;
+        failure = null;
+    }
+
+    fn expireAndWait() void {
+        cross() catch |err| {
+            failure = err;
+            return;
+        };
+        fired = true;
+    }
+
+    fn cross() !void {
+        const db = store orelse return error.NoStoreForTheClockProbe;
+        const clock = io orelse return error.NoIoForTheClockProbe;
+        const expires_at = (try Store.leases.clockSeconds(db)) + 1;
+        var buf: [128]u8 = undefined;
+        try db.db.exec(try std.fmt.bufPrintZ(
+            &buf,
+            "UPDATE leases SET expires_at = {d} WHERE released_at IS NULL",
+            .{expires_at},
+        ));
+        while ((try Store.leases.clockSeconds(db)) < expires_at)
+            std.Io.sleep(clock, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake) catch {};
+    }
+};
 
 fn expectPeerNamed(peer: PeerScenario, blocker: execution.Blocker) !void {
     switch (peer) {
@@ -11173,6 +11297,19 @@ fn runAuthorityCell(
     if (peer == .foreign_lease and claim != .displaced)
         try seedForeignMatrixLease(&store, arena, now);
 
+    // The one column whose arrangement is not a row on disk but a moment in time.
+    // Installed last, so nothing in the seeding above can trip it.
+    ClockCrossesTheTtl.reset();
+    defer {
+        execution.between_lock_and_clock = null;
+        ClockCrossesTheTtl.reset();
+    }
+    if (claim == .lapses_under_the_lock) {
+        ClockCrossesTheTtl.store = &store;
+        ClockCrossesTheTtl.io = scratch.io;
+        execution.between_lock_and_clock = ClockCrossesTheTtl.expireAndWait;
+    }
+
     var rollback: execution.Rollback = .none;
     switch (path) {
         .session_rm => {
@@ -11192,7 +11329,7 @@ fn runAuthorityCell(
                     else => return error.CellWasNotRefused,
                 },
                 .claim_lost => switch (done) {
-                    .claim_lost => |state| try t.expectEqualStrings(@tagName(claim), state.code()),
+                    .claim_lost => |state| try t.expectEqualStrings(claimCode(claim), state.code()),
                     else => return error.CellDidNotReportALostClaim,
                 },
                 .unreachable_because => return error.UnreachableCellWasRun,
@@ -11229,7 +11366,10 @@ fn runAuthorityCell(
             );
             switch (want) {
                 .committed => switch (done) {
-                    .forgotten => |f| try t.expect(f.write == .applied),
+                    // No write to read: a compare-and-swap that matched nothing
+                    // leaves as `row_moved`, and `matrixSubjectPresent` below is
+                    // what says the row really went.
+                    .forgotten => {},
                     else => return error.CellDidNotCommit,
                 },
                 .refused => switch (done) {
@@ -11237,13 +11377,20 @@ fn runAuthorityCell(
                     else => return error.CellWasNotRefused,
                 },
                 .claim_lost => switch (done) {
-                    .claim_lost => |state| try t.expectEqualStrings(@tagName(claim), state.code()),
+                    .claim_lost => |state| try t.expectEqualStrings(claimCode(claim), state.code()),
                     else => return error.CellDidNotReportALostClaim,
                 },
                 .unreachable_because => return error.UnreachableCellWasRun,
             }
         },
     }
+
+    // The probe fired if this column installed one, and did not fail while it was
+    // in there. `not_run` fails too: a cell that never reached the window has not
+    // been shown to close it.
+    if (ClockCrossesTheTtl.failure) |err| return err;
+    if (claim == .lapses_under_the_lock and !ClockCrossesTheTtl.fired)
+        return error.TheClockProbeNeverRan;
 
     // The destruction, or its absence. A refusal that wrote no terminal and
     // deleted the row anyway would satisfy every assertion above.
@@ -11303,11 +11450,146 @@ test "gate: every destructive path answers every authority scenario the same way
     }
 
     // The counts, so a table that stopped covering something fails rather than
-    // passing over an empty loop: four paths, six claim states, three peer
-    // scenarios, less the two foreign-lease columns `leases.zig` makes impossible.
-    try t.expectEqual(@as(usize, 4 * 6 * 3), decided + stated_unreachable);
-    try t.expectEqual(@as(usize, 4 * 2), stated_unreachable);
-    try t.expectEqual(@as(usize, 64), decided);
+    // passing over an empty loop: four paths, seven claim scenarios, three peer
+    // scenarios, less the three foreign-lease columns `leases.zig` makes
+    // impossible.
+    try t.expectEqual(@as(usize, 4 * 7 * 3), decided + stated_unreachable);
+    try t.expectEqual(@as(usize, 4 * 3), stated_unreachable);
+    try t.expectEqual(@as(usize, 72), decided);
+}
+
+// The destruction's own refusal, which is **not** a column in the matrix above and
+// could not be one: that table's dimensions are authority scenarios, and this is a
+// fact about the target row rather than about anybody's claim. It is also
+// orthogonal to every one of those columns — the authority check refuses first in
+// all six of the declining ones, so a compare-and-swap can only be reached in the
+// `held`/`none` cell, where the matrix already asserts the opposite outcome.
+//
+// What it is about: `jobs.removeLocked` can answer `refused`, and that answer is a
+// plain return value rather than an error. The contract stored it into `destroyed`
+// and ran `COMMIT` regardless, so the terminal written two statements earlier
+// landed over a row that is still on disk. On a non-exit-code terminal that
+// receipt carries removal wording, and a terminal is frozen — nothing can correct
+// it afterwards. Durable pseudo-success, in the ledger, which is the one thing this
+// subsystem exists to prevent.
+//
+// Three legs: the refusal writes nothing and destroys nothing, its rollback is
+// reported as the proof it is, and the same fixture with a matching expectation
+// still removes — without which every assertion here would hold against a contract
+// that had stopped removing anything.
+test "gate: a `job rm` whose compare-and-swap is refused leaves no terminal claiming it" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_job_removal_cas_refused");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    const now = try Store.leases.clockSeconds(&store);
+    var subject = try seedMatrixSubject(&store, arena, scratch.io, .job_rm_attached, now);
+    defer if (subject.execution) |*e| e.deinit();
+    try arrangeMatrixClaim(&store, arena, subject.authority, .held, .none, now);
+
+    const job = subject.job.?;
+    // The row is `running`; this expectation says `pending`, which is the shape a
+    // removal has when the row moved on between the read and the write — a
+    // relaunch, a peer's kill, a name taken over. Built from the real row so only
+    // the one field the CAS turns on differs.
+    const stale: Store.jobs.RemoveExpectation = .{
+        .id = job.removeExpectation().id,
+        .owner = job.removeExpectation().owner,
+        .status = .pending,
+    };
+    try t.expectEqual(Store.jobs.Status.running, job.status);
+
+    const settlement: execution.JobSettlement = .{
+        .attempt = .{
+            .execution = &subject.execution.?,
+            // The terminal that made this worth closing: `indeterminate`'s reason is
+            // prose that opens with "job removed", and no later write can revise it.
+            .terminal = .{ .indeterminate = .{
+                .reason = "job removed before its outcome was established",
+                .last_observed = .submitted,
+            } },
+            .extra = .{},
+        },
+    };
+
+    var rollback: execution.Rollback = .none;
+    switch (try execution.settleAndForgetJob(
+        &store,
+        arena,
+        scratch.io,
+        1,
+        matrix_scope,
+        .{ .lease_owner_request_id = subject.authority },
+        settlement,
+        .{ .expected = stale, .grounds = .session_proven_gone },
+        &rollback,
+    )) {
+        .row_moved => |conflict| switch (conflict) {
+            .status_moved => |moved| {
+                try t.expectEqual(Store.jobs.Status.pending, moved.expected);
+                try t.expectEqual(Store.jobs.Status.running, moved.found);
+            },
+            else => return error.RefusedForTheWrongReason,
+        },
+        // Every one of these would mean the CAS answer reached a caller as
+        // something other than a refusal — which is the defect.
+        .forgotten, .refused, .claim_lost => return error.RefusedRemovalWasNotReported,
+    }
+
+    // The assertion. No terminal, because the destruction did not happen; the
+    // attempt is where it was, still `submitted`, still barring the scope, still
+    // this command's to settle with something honest.
+    try t.expectEqual(
+        @as(?Store.receipts.TerminalRecord, null),
+        try Store.receipts.terminalOf(&store, subject.target.?),
+    );
+    const op = (try Store.operations.get(&store, arena, subject.target.?)).?;
+    try t.expectEqual(op_state.Status.submitted, op.status);
+    try t.expect(op.status.blocksScope());
+    try t.expect(!subject.execution.?.settled);
+
+    // …and the row is still there, which is the other half of "neither or both".
+    try t.expect((try Store.jobs.getByName(&store, arena, 1, matrix_name)) != null);
+
+    // The undo is *reported*, not left to be inferred. A caller that could not tell
+    // "the transaction went back" from "nothing needed undoing" would have nothing
+    // to say about the row.
+    try t.expectEqualStrings("confirmed", @tagName(rollback));
+
+    // Leg three, the discriminating control: the same store, the same attempt, the
+    // same claim, and the expectation the caller actually read. Without it every
+    // assertion above is satisfied by a contract that refuses everything.
+    const fresh = (try Store.jobs.getByName(&store, arena, 1, matrix_name)).?;
+    switch (try execution.settleAndForgetJob(
+        &store,
+        arena,
+        scratch.io,
+        1,
+        matrix_scope,
+        .{ .lease_owner_request_id = subject.authority },
+        settlement,
+        .{ .expected = fresh.removeExpectation(), .grounds = .session_proven_gone },
+        &rollback,
+    )) {
+        .forgotten => |done| switch (done.ledger) {
+            .recorded => |record| try t.expectEqual(op_state.Status.indeterminate, record.status),
+            .rival, .absent => return error.ControlWroteNoTerminal,
+        },
+        else => return error.ControlDidNotRemove,
+    }
+    try t.expectEqualStrings("none", @tagName(rollback));
+    try t.expectEqual(
+        @as(?Store.jobs.Job, null),
+        try Store.jobs.getByName(&store, arena, 1, matrix_name),
+    );
+    try t.expect((try Store.receipts.terminalOf(&store, subject.target.?)) != null);
 }
 
 // `job kill` is the fifth destructive verb, and it is deliberately *not* a row in

@@ -229,11 +229,18 @@ pub const Rollback = union(enum) {
     /// opened. Set before the transaction begins, so a failure on the way in
     /// reads as what it is.
     none,
-    /// The transaction failed and `ROLLBACK` succeeded. Nothing this call would
-    /// have written is on disk — a proof, and the one the caller may report a
-    /// known local state from.
+    /// The transaction was undone and `ROLLBACK` succeeded. Nothing this call
+    /// would have written is on disk — a proof, and the one the caller may report
+    /// a known local state from.
+    ///
+    /// Two ways to arrive here, and both are the same fact about the disk: the
+    /// transaction failed, or it was deliberately undone because the destruction
+    /// it existed for was refused (`Committed.destruction_refused`). The second is
+    /// not an error and comes back as a value, so a caller reading this beside a
+    /// successful return is reading "the transaction went back", not "something
+    /// broke".
     confirmed,
-    /// The transaction failed and `ROLLBACK` failed too, carrying `@errorName`.
+    /// `ROLLBACK` was issued and failed too, carrying `@errorName`.
     /// Whether the terminal and the local delete landed is genuinely not known.
     unconfirmed: []const u8,
 };
@@ -297,6 +304,23 @@ pub var between_settle_and_cache: if (builtin.is_test) ?*const fn () void else v
 /// `void` outside a test build, so the shipped binary contains neither the
 /// variable nor the branch.
 pub var between_ownership_and_removal: if (builtin.is_test) ?*const fn () void else void =
+    if (builtin.is_test) null else {};
+
+/// Called after `commitDestruction` has the write lock and before it reads the
+/// clock it evaluates authority against.
+///
+/// A test seam, and the property it exists for is one no fixture can arrange from
+/// outside: *time passing between the two*. A process suspend, a VM resumed after
+/// a pause and a forward clock jump are the three ways a live claim dies under a
+/// command that believes its last renewal (see `authorityLocked`), and every one
+/// of them lands in exactly this window — after the caller asked for the lock,
+/// before the transaction that acts on it can read anything. The gate installs a
+/// probe that expires the claim and then waits for the wall clock to pass it, so a
+/// clock sampled ahead of the lock reports `held` about a claim that is gone.
+///
+/// `void` outside a test build, so the shipped binary contains neither the
+/// variable nor the branch.
+pub var between_lock_and_clock: if (builtin.is_test) ?*const fn () void else void =
     if (builtin.is_test) null else {};
 
 /// `jobs.removeLocked` takes its grounds at comptime — the statement's state
@@ -654,8 +678,14 @@ pub const Destroyed = union(enum) {
     /// than discarded, because "there was no row" and "the row is gone" are
     /// different facts and only one of them means a memory cascade happened.
     session_row: struct { had_row: bool },
-    /// The CAS answer: applied, or refused with the conflict that refused it.
-    job_row: jobs.Write,
+    /// The `jobs` row is gone, and that is the only thing this arm can say.
+    ///
+    /// It used to carry `jobs.Write`, so a compare-and-swap that *refused* was a
+    /// value handed back beside a committed terminal — a caller could ignore it,
+    /// and the ledger then held a removal over a row still sitting on disk. A
+    /// refusal now takes the transaction down with it and leaves as
+    /// `Committed.destruction_refused`, so there is no answer here to ignore.
+    job_row,
 };
 
 /// What a destructive commit writes to the ledger beside the destruction.
@@ -763,6 +793,21 @@ pub const Committed = union(enum) {
     /// The ledger already held a terminal for the target and the caller asked to
     /// `decline` over one. Nothing was destroyed.
     already_settled: receipts.TerminalRecord,
+    /// The local compare-and-swap did not match the row the caller read.
+    ///
+    /// The destruction did not happen, so the terminal that had already been
+    /// written beside it in this transaction went back with it: the transaction is
+    /// rolled back rather than committed, which is the one refusal here that
+    /// cannot commit. The other three are refused *before* anything of ours is
+    /// written and so commit the lazy lease-expiry pass on their way out; this one
+    /// has a terminal on the wire already, and keeping the housekeeping would mean
+    /// keeping that too — a durable receipt saying a row was removed, over a row
+    /// that is still there. The expiry pass is housekeeping any later command
+    /// redoes; a frozen terminal is not correctable at all.
+    ///
+    /// Only `Destruction.job_row` produces this: `sessions.removeLocked` has no
+    /// owner, no expectation and no compare-and-swap to lose.
+    destruction_refused: jobs.Conflict,
 };
 
 /// A wrapper read an arm of the contract's answer that its own request could not
@@ -803,7 +848,21 @@ fn nowFrom(io: std.Io) i64 {
 /// A refusal at (1) or (2) commits rather than rolls back, and that is deliberate:
 /// nothing of ours was written, so the commit only keeps the lazy lease-expiry
 /// pass the check performed on its way through — the same thing `begin` and
-/// `submitted` commit on their refusal paths.
+/// `submitted` commit on their refusal paths. A refusal at (3) is the one that
+/// cannot: the terminal is already on the wire behind it, so the transaction goes
+/// back whole. See `Committed.destruction_refused`.
+///
+/// **The clock is read after the lock, not before it.** `BEGIN IMMEDIATE` waits up
+/// to `Db.busy_timeout` for the write lock, and a process suspend, a resumed VM or
+/// a forward clock jump can land in that wait — the three things `authorityLocked`
+/// names as the ways an authority dies. A stamp taken ahead of the wait is
+/// evidence about a moment that has passed by the time the guard evaluates it, so
+/// an expired lease reads `held` and the destruction commits under it. One reading
+/// serves both uses inside the transaction, and deliberately: the second is the
+/// terminal's `observed_at`, whose question is "when did we look", and this
+/// transaction looked *here*. A separate earlier stamp there would date the
+/// receipt before the check that licensed it and would answer for a moment nothing
+/// in this function acted on.
 ///
 /// A *failure* anywhere takes the whole thing down through the `errdefer`, and
 /// whether that undo happened is reported through `rollback` rather than assumed:
@@ -822,12 +881,11 @@ pub fn commitDestruction(
     rollback: *Rollback,
 ) DestructiveError!Committed {
     rollback.* = .none;
-    const at = nowFrom(io);
 
+    // The `errdefer` below is declared after `BEGIN`, so a `BEGIN` that failed
+    // leaves `rollback` at `.none` — which is the truth: no transaction opened, so
+    // nothing needed undoing.
     try store.db.exec("BEGIN IMMEDIATE");
-    // Declared after `BEGIN`, so a `BEGIN` that failed leaves `rollback` at
-    // `.none` — which is the truth: no transaction opened, so nothing needed
-    // undoing.
     errdefer {
         if (store.db.exec("ROLLBACK")) |_| {
             rollback.* = .confirmed;
@@ -835,7 +893,10 @@ pub fn commitDestruction(
             rollback.* = .{ .unconfirmed = @errorName(err) };
         }
     }
-
+    if (comptime builtin.is_test) {
+        if (between_lock_and_clock) |probe| probe();
+    }
+    const at = nowFrom(io);
     switch (try authorityLocked(store, arena, commit.server_id, commit.scope, commit.identity(), at)) {
         .cleared => {},
         .blocked => |found| {
@@ -871,11 +932,29 @@ pub fn commitDestruction(
         .none => |absent| .{ .absent = absent },
     };
 
+    // The destruction, last, and the only step here that can decline by value
+    // rather than by error. When it does, the terminal above it has already been
+    // written, so the transaction goes back whole: a `COMMIT` over a refused
+    // compare-and-swap leaves a receipt saying this row was removed, over a row
+    // still on disk, and a terminal is frozen — no later command can correct it.
+    //
+    // The `ROLLBACK` is issued here rather than left to the `errdefer` because
+    // this is not an error: it is an answer, and the caller has to be handed the
+    // conflict that refused it. A `ROLLBACK` that itself fails leaves through the
+    // `errdefer`, which tries once more and reports `unconfirmed` — the honest
+    // word for a transaction nobody could prove went back.
     const destroyed: Destroyed = switch (commit.destroys) {
         .session_row => |name| .{
             .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },
         },
-        .job_row => |forget| .{ .job_row = try removeUnderGrounds(store, forget) },
+        .job_row => |forget| switch (try removeUnderGrounds(store, forget)) {
+            .applied => .job_row,
+            .refused => |conflict| {
+                try store.db.exec("ROLLBACK");
+                rollback.* = .confirmed;
+                return .{ .destruction_refused = conflict };
+            },
+        },
     };
 
     try store.db.exec("COMMIT");
@@ -910,9 +989,21 @@ pub fn commitDestruction(
 /// be asked for.
 pub const JobRemoval = union(enum) {
     /// The row and the ledger write landed together.
-    forgotten: struct { write: jobs.Write, ledger: LedgerResult },
+    ///
+    /// The row really is gone: a compare-and-swap that did not match leaves as
+    /// `row_moved`, so this arm carries no write for a caller to read a refusal
+    /// off. It used to, and `job rm` then reported `not_removed` off a
+    /// transaction that had already committed the terminal.
+    forgotten: struct { ledger: LedgerResult },
     refused: Blocker,
     claim_lost: leases.ClaimState,
+    /// The `jobs` row on disk is not the row the caller read, so the delete
+    /// matched nothing. **Nothing was written**: the terminal went back with the
+    /// transaction, the row is still there, and the attempt is still this
+    /// command's to settle. Carries the conflict, because "somebody took the
+    /// name", "it moved on" and "it is already gone" send an operator to three
+    /// different places.
+    row_moved: jobs.Conflict,
 };
 
 /// `job rm`'s ledger half: the attempt to settle in the removal's transaction, or
@@ -995,8 +1086,9 @@ pub fn settleAndForgetJob(
         // only thing that can produce this arm, so reaching it means this file's
         // dispatch and its wrapper have drifted apart.
         .already_settled => return error.ContractAnsweredAboutSomethingElse,
+        .destruction_refused => |conflict| return .{ .row_moved = conflict },
         .done => |done| switch (done.destroyed) {
-            .job_row => |write| return .{ .forgotten = .{ .write = write, .ledger = done.ledger } },
+            .job_row => return .{ .forgotten = .{ .ledger = done.ledger } },
             .session_row => return error.ContractAnsweredAboutSomethingElse,
         },
     }
@@ -1525,6 +1617,10 @@ pub const Execution = struct {
             .refused => |blocker| return .{ .refused = blocker },
             .claim_lost => |claim| return .{ .claim_lost = claim },
             .already_settled => |winner| return .{ .already_settled = winner },
+            // A session delete has no owner, no expectation and no
+            // compare-and-swap, so there is nothing for it to lose and nothing
+            // this request could have asked for that produces this arm.
+            .destruction_refused => return error.ContractAnsweredAboutSomethingElse,
             .done => |done| {
                 const row = switch (done.destroyed) {
                     .session_row => |r| r,

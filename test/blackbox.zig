@@ -2209,6 +2209,356 @@ test "blackbox: `job rm` keeps the row when a peer's unsettled attempt claims th
     }
 }
 
+/// How the removal's post-kill look differs from the one before it.
+///
+/// Two, because the two halves of the evidence a refused removal has to carry
+/// arrive on different branches. A refused reading is the case where the pre-kill
+/// probe is deliberately *not* upgraded, so the two readings genuinely disagree
+/// and the report has to pick the later one. A clean record is the case where the
+/// remote's own finish time exists at all — a sentinel-only outcome has none.
+const EvidenceArriving = enum {
+    /// A document with an impossible exit status turns up during the kill. The
+    /// removal declines it, keeps the log sentinel's verdict out of the ledger,
+    /// and settles `indeterminate`.
+    refused_reading,
+    /// A clean document turns up during the kill, carrying the remote finish time.
+    clean_record,
+};
+
+/// A `job rm` refused at the commit, over evidence it had already gathered.
+///
+/// The refusal path settles the attempt itself — the composite wrote nothing, so
+/// the attempt is still this command's — and it used to settle it with an **empty**
+/// `TerminalExtra`. Everything the removal had collected for exactly this
+/// settlement went in the bin: the remote finish time, and the reading of the
+/// document at this attempt's own address. `job rm` is the verb that deletes the
+/// local row, so the receipt is the only record that outlives it, and on this
+/// branch it is the only record that will ever exist — the removal is refused, so
+/// there is no successful run later to write a better one.
+///
+/// The report had the matching defect from the other end: it published
+/// `probe.sidecar`, the reading taken *before* the kill. On the `refused_reading`
+/// branch the pre-kill probe is deliberately not upgraded (a `JobProbe` whose
+/// `exit_code` is set beside a defective reading is a value nothing may
+/// construct), so that key described a moment the removal did not act on.
+///
+/// Every assertion below is read from the store or from the host's own traffic,
+/// never from the report that is on trial — except the two that are *about* the
+/// report.
+fn refusedAtCommitOverEvidence(
+    fixture_name: []const u8,
+    job_name: []const u8,
+    arriving: EvidenceArriving,
+) !void {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, fixture_name);
+    defer f.deinit();
+    try f.seedServer();
+
+    const request_id = "01RRRRRRRR0123456789ABCDEF";
+    const sentinel = "__TERMINUS_JOB_9__";
+    try seedRunningJob(&f, request_id, job_name, sentinel);
+
+    // The peer: a second attempt, unsettled and mutating, on the same job scope and
+    // holding no lease. Seeded through the store because a second command could not
+    // get here — our lease refuses it at `submitted`. This is the shape a crashed
+    // `run --force` leaves, and it is what the in-transaction check finds.
+    const peer_id = "01SSSSSSSS0123456789ABCDEF";
+    {
+        var store = try f.open();
+        defer store.close();
+        try Store.operations.create(&store, .{
+            .request_id = peer_id,
+            .server_id = 1,
+            .server_name = "box",
+            .kind = .job,
+            .scope_kind = .job,
+            .scope_key = job_name,
+            .alias = job_name,
+            .mutating = true,
+            .now = 1100,
+        });
+        try Store.operations.advance(&store, peer_id, .connecting, 1101);
+        try Store.operations.advance(&store, peer_id, .submitted, 1102);
+    }
+
+    const exit_code: []const u8 = switch (arriving) {
+        // No shell produces this, so the reading is refused and the sentinel beside
+        // it may not answer in its place.
+        .refused_reading => "9000",
+        .clean_record => "0",
+    };
+    const after = try std.fmt.allocPrint(
+        f.allocator,
+        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":{s},\"finishedAt\":1750}}\n{s}\n20\nwork done\n{s}:0\n",
+        .{ request_id, exit_code, probe_split, sentinel },
+    );
+    defer f.allocator.free(after);
+
+    var rules = [_]FakeHost.Rule{
+        // The look before the kill: nothing at the address, nothing in the log.
+        .{ .needle = probe_split, .stdout = "\n" ++ probe_split ++ "\n12\nbuilding...\n", .uses = 1 },
+        // Every look after it: the job reached its own end while we were stopping
+        // it, and killing the session does not remove what it left behind.
+        .{ .needle = probe_split, .stdout = after },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var refused = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", job_name, "--json", "--db", f.db,
+    }, &environ);
+    defer refused.deinit(f.allocator);
+
+    // The traffic first, so a regression names its cause: the kill went out, and no
+    // deletion followed it.
+    try host.expectSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+
+    try refused.expectSays("\"action\": \"not_removed\"");
+    try refused.expectSays("\"rowRemoved\": false");
+    try refused.expectSays("SCOPE_TAKEN_BEFORE_COMMIT");
+    // The recovery, and it has to be one that can work. `--force` takes the scope
+    // *lease* over; the blocker here is an unsettled peer operation, and that
+    // barrier is fail-closed and bypasses for nobody, so a caller who followed the
+    // old advice re-ran and was refused in the same words.
+    try refused.expectSays("terminus request reconcile 01SSSSSSSS0123456789ABCDEF");
+    try refused.expectSaysNot("--force to take the scope over");
+
+    switch (arriving) {
+        .refused_reading => {
+            // The reading the removal actually acted on, not the one it took before
+            // the kill. `absent` is what the pre-kill probe saw and what this line
+            // used to publish.
+            try refused.expectSays("\"resultRecord\": \"exit_code_out_of_range\"");
+            try refused.expectSaysNot("\"resultRecord\": \"absent\"");
+            // Nothing was established, so the caller owes a reconcile: 75.
+            try refused.expectCode(75);
+            try refused.expectSays("\"outcomeProven\": false");
+        },
+        .clean_record => {
+            try refused.expectSays("\"resultRecord\": \"present\"");
+            // An exit code read from a document at this attempt's own address is not
+            // made false by a scope that moved, so the outcome stands and only the
+            // deletion is refused: exit 1, not 75.
+            try refused.expectCode(1);
+            try refused.expectSays("\"outcomeProven\": true");
+        },
+    }
+
+    var store = try f.open();
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The row this removal was about is still there, out of the store rather than
+    // parsed out of stdout.
+    try t.expect((try Store.jobs.getByName(&store, arena, 1, job_name)) != null);
+
+    // **The receipt**, which is the assertion. Read back out of the ledger, because
+    // that is what survives the process and, on this branch, the only record of the
+    // removal there will ever be.
+    const rows = try Store.receipts.list(&store, arena, request_id);
+    var terminal_detail: ?[]const u8 = null;
+    var terminal_finished_at: ?i64 = null;
+    var found_terminal = false;
+    for (rows) |row| if (row.is_terminal) {
+        terminal_detail = row.detail_json;
+        terminal_finished_at = row.finished_at;
+        found_terminal = true;
+    };
+    if (!found_terminal) return error.RefusedRemovalLeftNoTerminalReceipt;
+
+    const detail = terminal_detail orelse return error.RefusedRemovalDroppedTheReading;
+    switch (arriving) {
+        .refused_reading => {
+            try expectContains(detail, "exit_code_out_of_range");
+            // A sentinel-only outcome has no remote finish time and the refused
+            // document's is not one this settlement may quote, so null is correct
+            // here — asserted so the fixture cannot be read as covering it.
+            try t.expectEqual(@as(?i64, null), terminal_finished_at);
+        },
+        .clean_record => {
+            try expectContains(detail, "\"reading\":\"present\"");
+            // The remote's own clock, carried through the refusal. With `.{}` this
+            // is null and nothing anywhere records when the work ended.
+            try t.expectEqual(@as(?i64, 1750), terminal_finished_at);
+        },
+    }
+}
+
+test "blackbox: a `job rm` refused at the commit records the reading it took after the kill" {
+    try refusedAtCommitOverEvidence("rm_refused_evidence_defect", "deploy", .refused_reading);
+}
+
+test "blackbox: a `job rm` refused at the commit keeps the finish time it had already read" {
+    try refusedAtCommitOverEvidence("rm_refused_evidence_clean", "ship", .clean_record);
+}
+
+// The removal's one transaction could not be written, and what that leaves behind
+// is **two** different local states — which is the whole reason core hands the
+// rollback back through an out-parameter instead of swallowing it.
+//
+// `RAISE(ABORT)` ends the statement and leaves the transaction alive, so the
+// `ROLLBACK` that follows has something to undo and succeeds: a proof that nothing
+// was written, and the one branch entitled to report a known row. `RAISE(ROLLBACK)`
+// unwinds the transaction itself, so the explicit `ROLLBACK` afterwards finds none
+// active and fails — nothing about the local row is then established by this
+// process, and the honest word is `unknown`.
+//
+// `job rm` handed this error to `Cli.receiptFatal`, whose envelope has nowhere to
+// put the answer, so the distinction was thrown away at the last step and both
+// branches came out identical. `session rm` has honoured it since the composite
+// landed; this is the same rule in the verb that did not.
+//
+// Both triggers are real sqlite behaviour arranged, not a seam faked: the same
+// shapes arrive whenever the failure that killed a statement did or did not take
+// the transaction with it.
+test "blackbox: a `job rm` whose rollback cannot be confirmed says the row is unknown" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "rm_rollback_unknown");
+    defer f.deinit();
+    try f.seedServer();
+
+    const sentinel = "__TERMINUS_JOB_11__";
+    const unwound_id = "01TTTTTTTT0123456789ABCDEF";
+    const aborted_id = "01WWWWWWWW0123456789ABCDEF";
+    const control_id = "01VVVVVVVV0123456789ABCDEF";
+    try seedRunningJob(&f, unwound_id, "deploy", sentinel);
+    try seedRunningJob(&f, aborted_id, "hold", sentinel);
+    try seedRunningJob(&f, control_id, "release", sentinel);
+
+    const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    const finished = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":0\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "job-deploy.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-deploy.log", .stdout = finished },
+        .{ .needle = "job-hold.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-hold.log", .stdout = finished },
+        .{ .needle = "job-release.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-release.log", .stdout = finished },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    // Leg one: the delete takes the transaction with it, so nobody can prove what
+    // is on disk.
+    {
+        var store = try f.open();
+        defer store.close();
+        try store.db.exec(
+            \\CREATE TRIGGER unwind_on_job_delete BEFORE DELETE ON jobs
+            \\BEGIN SELECT RAISE(ROLLBACK, 'the delete takes the transaction with it'); END
+        );
+    }
+
+    var unknown = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer unknown.deinit(f.allocator);
+
+    // The kill really went out — this is not a command that stopped short of it —
+    // and no evidence was deleted.
+    try host.expectSent("kill-session");
+    try host.expectNeverSent("rm -f");
+
+    // 76, not 1 and not 75: a write this command needed could not be made.
+    try unknown.expectCode(76);
+    try unknown.expectSays("\"errorCode\": \"RECEIPT_PERSIST_FAILED\"");
+    // The assertion. `receiptFatal` could only ever have produced silence here.
+    try unknown.expectSays("\"localRow\": \"unknown\"");
+    try unknown.expectSays("\"requestId\": \"01TTTTTTTT0123456789ABCDEF\"");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // What sqlite actually did is beside the point of the report and is
+        // asserted anyway: this trigger really does unwind, so no terminal and no
+        // delete survived. The *report* may not claim that, because the process
+        // could not establish it — but a gate that did not check would not know
+        // whether it had arranged the shape it meant to.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+        try t.expectEqual(
+            @as(?Store.receipts.TerminalRecord, null),
+            try Store.receipts.terminalOf(&store, unwound_id),
+        );
+
+        try store.db.exec("DROP TRIGGER unwind_on_job_delete");
+        // Leg two's arrangement: the statement is refused and the transaction
+        // survives it, so the undo is provable.
+        try store.db.exec(
+            \\CREATE TRIGGER refuse_job_delete BEFORE DELETE ON jobs
+            \\BEGIN SELECT RAISE(ABORT, 'the local delete cannot happen'); END
+        );
+    }
+
+    var kept = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "hold", "--json", "--db", f.db,
+    }, &environ);
+    defer kept.deinit(f.allocator);
+
+    try kept.expectCode(76);
+    try kept.expectSays("\"errorCode\": \"RECEIPT_PERSIST_FAILED\"");
+    // The other half of the rule: this branch *can* prove the row is where it was,
+    // and saying `unknown` here would send an operator hunting a deletion that
+    // never happened.
+    try kept.expectSays("\"localRow\": \"kept\"");
+    try kept.expectSaysNot("\"localRow\": \"unknown\"");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "hold")) != null);
+        try t.expectEqual(
+            @as(?Store.receipts.TerminalRecord, null),
+            try Store.receipts.terminalOf(&store, aborted_id),
+        );
+        try store.db.exec("DROP TRIGGER refuse_job_delete");
+    }
+
+    // The discriminating control: the same fixture with a writable store removes,
+    // exits 0 and leaves no row. Without it, everything above is satisfied by a
+    // binary that had started answering 76 to every removal.
+    var fine = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "release", "--json", "--db", f.db,
+    }, &environ);
+    defer fine.deinit(f.allocator);
+
+    try host.expectFullyScripted();
+    try fine.expectCode(0);
+    try fine.expectSays("\"action\": \"removed\"");
+    try fine.expectSays("\"rowRemoved\": true");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        try t.expectEqual(
+            @as(?Store.jobs.Job, null),
+            try Store.jobs.getByName(&store, arena, 1, "release"),
+        );
+    }
+}
+
 /// How the look after the kill fails, when it fails without ever reading the
 /// address.
 ///

@@ -605,8 +605,8 @@
       "id": "M3b-session-removal-one-transaction",
       "rule": "The terminal that records a destruction and the local destruction itself are one commit, so a delete that cannot happen leaves no terminal claiming it did.",
       "file": "src/core/execution.zig",
-      "find": "    const destroyed: Destroyed = switch (commit.destroys) {\n        .session_row => |name| .{\n            .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },\n        },\n        .job_row => |forget| .{ .job_row = try removeUnderGrounds(store, forget) },\n    };\n\n    try store.db.exec(\"COMMIT\");\n",
-      "replace": "    try store.db.exec(\"COMMIT\");\n\n    const destroyed: Destroyed = switch (commit.destroys) {\n        .session_row => |name| .{\n            .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },\n        },\n        .job_row => |forget| .{ .job_row = try removeUnderGrounds(store, forget) },\n    };\n",
+      "find": "    const destroyed: Destroyed = switch (commit.destroys) {\n        .session_row => |name| .{\n            .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },\n        },\n        .job_row => |forget| switch (try removeUnderGrounds(store, forget)) {\n            .applied => .job_row,\n            .refused => |conflict| {\n                try store.db.exec(\"ROLLBACK\");\n                rollback.* = .confirmed;\n                return .{ .destruction_refused = conflict };\n            },\n        },\n    };\n\n    try store.db.exec(\"COMMIT\");\n",
+      "replace": "    try store.db.exec(\"COMMIT\");\n\n    const destroyed: Destroyed = switch (commit.destroys) {\n        .session_row => |name| .{\n            .session_row = .{ .had_row = try sessions.removeLocked(store, commit.server_id, name) },\n        },\n        .job_row => |forget| switch (try removeUnderGrounds(store, forget)) {\n            .applied => .job_row,\n            .refused => |conflict| {\n                try store.db.exec(\"ROLLBACK\");\n                rollback.* = .confirmed;\n                return .{ .destruction_refused = conflict };\n            },\n        },\n    };\n",
       "expect_gate": "gate: a `session rm` whose local delete fails leaves no terminal claiming it"
     },
     {
@@ -792,6 +792,38 @@
       "find": "            .{ .lease_owner_request_id = claim.owner_request_id },\n",
       "replace": "            .{ .lease_owner_request_id = if (attempt) |a| a.request_id else claim.owner_request_id },\n",
       "expect_gate": "blackbox: `job rm` keeps the row when a peer's unsettled attempt claims the scope at the commit"
+    },
+    {
+      "id": "W4-authority-clock-read-under-the-lock",
+      "rule": "The clock a destructive commit evaluates authority against is read *after* `BEGIN IMMEDIATE` has the write lock. A stamp taken before the wait is evidence about a moment that has passed: a process suspend, a resumed VM or a forward clock jump landing in the lock wait leaves an expired lease reading `held`, and the destruction commits under it.",
+      "file": "src/core/execution.zig",
+      "find": "    try store.db.exec(\"BEGIN IMMEDIATE\");\n    errdefer {\n        if (store.db.exec(\"ROLLBACK\")) |_| {\n            rollback.* = .confirmed;\n        } else |err| {\n            rollback.* = .{ .unconfirmed = @errorName(err) };\n        }\n    }\n    if (comptime builtin.is_test) {\n        if (between_lock_and_clock) |probe| probe();\n    }\n    const at = nowFrom(io);\n",
+      "replace": "    const at = nowFrom(io);\n    try store.db.exec(\"BEGIN IMMEDIATE\");\n    errdefer {\n        if (store.db.exec(\"ROLLBACK\")) |_| {\n            rollback.* = .confirmed;\n        } else |err| {\n            rollback.* = .{ .unconfirmed = @errorName(err) };\n        }\n    }\n    if (comptime builtin.is_test) {\n        if (between_lock_and_clock) |probe| probe();\n    }\n",
+      "expect_gate": "gate: every destructive path answers every authority scenario the same way"
+    },
+    {
+      "id": "W4-refused-cas-writes-no-terminal",
+      "rule": "A destruction that did not happen may not commit a terminal claiming it did. `jobs.removeLocked` answers `refused` as a plain value, and committing over it leaves a frozen receipt with removal wording beside a row still on disk.",
+      "file": "src/core/execution.zig",
+      "find": "            .refused => |conflict| {\n                try store.db.exec(\"ROLLBACK\");\n                rollback.* = .confirmed;\n                return .{ .destruction_refused = conflict };\n            },\n",
+      "replace": "            .refused => .job_row,\n",
+      "expect_gate": "gate: a `job rm` whose compare-and-swap is refused leaves no terminal claiming it"
+    },
+    {
+      "id": "W4-commit-refusal-carries-its-evidence",
+      "rule": "The settlement a refused `job rm` writes carries the evidence the removal had already gathered �� the remote finish time and the reading of the result record. It is the only terminal that attempt will get, and `job rm` is the verb that deletes the row the evidence was reachable through.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        const outcome = e.settle(settle_with, extra) catch |err|\n",
+      "replace": "        _ = extra;\n        const outcome = e.settle(settle_with, .{}) catch |err|\n",
+      "expect_gate": "blackbox: a `job rm` refused at the commit keeps the finish time it had already read"
+    },
+    {
+      "id": "W4-job-rm-reports-the-rollback-truth",
+      "rule": "`job rm` reports what the removal's failed transaction left behind, from the `rollback` out-parameter: an unconfirmed rollback is `localRow:\"unknown\"`, never `kept`. Routed through `Cli.receiptFatal` the answer has nowhere to go and both branches read as \"nothing local changed\".",
+      "file": "src/cli/cmd_job.zig",
+      "find": ") catch |err| removalUnrecordable(\n            ctx,\n            if (attempt) |a| a.request_id else job.name,\n            if (execution) |*e| e.status.text() else \"unchanged\",\n            rollback,\n            err,\n        );\n",
+      "replace": ") catch |err| Cli.receiptFatal(\n            if (attempt) |a| a.request_id else job.name,\n            err,\n            \"recording a job removal\",\n        );\n",
+      "expect_gate": "blackbox: a `job rm` whose rollback cannot be confirmed says the row is unknown"
     }
   ]
 }

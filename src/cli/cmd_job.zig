@@ -1935,12 +1935,18 @@ fn resultOf(write: Store.jobs.Write) Core.execution.CacheResult {
 /// and `settleObserved` has none to check. What the two must keep in common is the
 /// *rule* — every answer goes through `settlementOf`, so a caller cannot report an
 /// outcome the ledger does not hold by forgetting to ask what it holds.
+///
+/// The cache is `synced` and not a parameter, because reaching here means the row
+/// is gone: a compare-and-swap that matched nothing takes the whole transaction
+/// back and leaves as `JobRemoval.row_moved`, which is a refusal and does not come
+/// through this function. This used to take the `jobs.Write` and pass a refused one
+/// straight into `resultOf` — beside a terminal the same transaction had already
+/// committed.
 fn removalObserved(
     ctx: *Cli.Ctx,
     store: *Store,
     terminal: Core.Store.op_state.Terminal,
     ledger: Core.execution.LedgerResult,
-    write: Store.jobs.Write,
 ) Observed {
     const answer: LedgerAnswer = switch (ledger) {
         .recorded => |record| .{ .status = record.status },
@@ -1967,7 +1973,7 @@ fn removalObserved(
             .no_attempt, .unknown_request => null,
         },
         .settlement = settlementOf(terminal, answer),
-        .cache = resultOf(write),
+        .cache = .synced,
     };
 }
 
@@ -2722,30 +2728,35 @@ fn refuseRemoval(
 
 /// What the removal's own transaction found when it declined the whole composite.
 ///
-/// Two arms, and the counterparty is the difference. `blocked` names a peer;
+/// Three arms, and what refused the act is the difference. `blocked` names a peer;
 /// `claim_lost` frequently has none to name — the state it exists for is a lease
 /// that lapsed during the last round trip and was swept by somebody's ordinary
 /// housekeeping, leaving the scope genuinely clear. That is exactly the state the
 /// overlap check reads as "nothing is in your way", which is true, and which used
-/// to be enough to delete a row.
+/// to be enough to delete a row. `row_moved` is about neither: the authority held
+/// and the compare-and-swap still matched nothing, because the row on disk is not
+/// the row this command read.
 ///
-/// The two `error_code` words are the ones `session rm` already publishes for the
-/// same two facts (`cmd_session.code`), so this adds no vocabulary to the tree: the
-/// receipt is where they land here, because `RemovalJson` has no `errorCode` key
-/// and adding one is a change to a published document.
+/// The first two `error_code` words are the ones `session rm` already publishes for
+/// the same two facts (`cmd_session.code`). The third has no session counterpart —
+/// a session delete has no expectation to lose — and the receipt is where all three
+/// land, because `RemovalJson` has no `errorCode` key and adding one is a change to
+/// a published document.
 const CommitRefusal = union(enum) {
     blocked: Core.execution.Blocker,
     claim_lost: Store.leases.ClaimState,
+    row_moved: Store.jobs.Conflict,
 
     fn errorCode(r: CommitRefusal) []const u8 {
         return switch (r) {
             .blocked => "SCOPE_TAKEN_BEFORE_COMMIT",
             .claim_lost => "CLAIM_LOST_BEFORE_COMMIT",
+            .row_moved => "ROW_MOVED_BEFORE_COMMIT",
         };
     }
 
     /// What the transaction saw, in one clause, for the sentence that carries it.
-    fn found(r: CommitRefusal, ctx: *Cli.Ctx) []const u8 {
+    fn found(r: CommitRefusal, ctx: *Cli.Ctx, job_name: []const u8) []const u8 {
         return switch (r) {
             .blocked => |blocker| switch (blocker) {
                 .unsettled => |op| std.fmt.allocPrint(
@@ -2764,6 +2775,50 @@ const CommitRefusal = union(enum) {
                 "this command's own lease on the scope is {s}",
                 .{claim.code()},
             ) catch "this command's own lease on the scope is no longer live and ours",
+            .row_moved => |conflict| conflictText(ctx.arena, job_name, conflict),
+        };
+    }
+
+    /// What actually gets the operator out of this — which is **not** one sentence,
+    /// and telling them `--force` for all four was worse than telling them nothing.
+    ///
+    /// `--force` takes the scope *lease* over (`leases.takeover`) and does nothing
+    /// else. Against a peer's lease that is exactly the right instrument. Against an
+    /// unsettled peer *operation* it is not: the operation barrier is a separate,
+    /// fail-closed check that no flag bypasses — deliberately, because an attempt
+    /// nobody settled may still be running — so a caller who follows that advice
+    /// re-runs and is refused in the same words. The peer has to be reconciled
+    /// first, and the id to reconcile is one we already have. Against our own lost
+    /// claim there is usually nothing to take over at all, and against a row that
+    /// moved there is nothing a lease can fix.
+    fn recovery(r: CommitRefusal, ctx: *Cli.Ctx) []const u8 {
+        return switch (r) {
+            .blocked => |blocker| switch (blocker) {
+                .unsettled => |op| std.fmt.allocPrint(
+                    ctx.arena,
+                    "settle that attempt first with 'terminus request reconcile {s}' and then re-run; --force will not clear it, because it takes the scope lease over and an unsettled operation bars the scope on its own",
+                    .{op.request_id},
+                ) catch "settle the blocking attempt with 'terminus request reconcile <request-id>' and then re-run; --force takes over a lease and does not clear an unsettled operation",
+                .lease => "wait for that lease to lapse and re-run, or re-run with --force to take the scope over",
+            },
+            .claim_lost => "nothing else is holding the scope, so re-run to finish the removal; if somebody has taken it since, the re-run will name them",
+            .row_moved => "re-read the job with 'terminus job ls' before acting on it again: this removal was made against the row this command read, and that is not the row on disk",
+        };
+    }
+
+    /// The `cacheError` this refusal earns, and only one of the three earns one.
+    ///
+    /// `RemovalJson` publishes non-null there as the one signal that the local row
+    /// was not updated, and a compare-and-swap that matched nothing is precisely
+    /// that. The other two never reached the row: they were declined by the
+    /// authority check, and `rowRemoved:false` is what says so. Carried here
+    /// because the refused write used to be reported through this key before the
+    /// destruction learned to decline the whole transaction, and a consumer
+    /// branching on it must not lose the signal in the move.
+    fn cacheNote(r: CommitRefusal, ctx: *Cli.Ctx, job_name: []const u8) ?[]const u8 {
+        return switch (r) {
+            .blocked, .claim_lost => null,
+            .row_moved => |conflict| conflictText(ctx.arena, job_name, conflict),
         };
     }
 };
@@ -2775,11 +2830,13 @@ const CommitRefusal = union(enum) {
 /// kill the loss fell on is the difference. `refuseRemoval` fires *before* the
 /// kill, off a renewal: the session is untouched, nothing was deleted, and its
 /// hint says so. This fires when every renewal held and the transaction that was
-/// to write the terminal and forget the row found either a peer's claim on the
-/// scope or this command's own claim no longer live. The session is stopped, the
-/// evidence may already be gone, and the row is kept — so the sentence has to say
-/// all three, which is why `stopped_at` is built from what actually happened
-/// rather than from the flag that asked for it.
+/// to write the terminal and forget the row declined it — over a peer's claim on
+/// the scope, over this command's own claim no longer being live, or over a
+/// compare-and-swap that matched nothing because the row on disk is not the row
+/// this command read. The session is stopped, the evidence may already be gone,
+/// and the row is kept — so the sentence has to say all three, which is why
+/// `stopped_at` is built from what actually happened rather than from the flag
+/// that asked for it.
 ///
 /// `authority` stays whatever the renewals answered — `held`, on the path that
 /// gets here — for the reason `cmd_session.refuseAfterKill` gives: it reports what
@@ -2803,6 +2860,17 @@ fn refuseRemovalAtCommit(
     execution: ?*Core.execution.Execution,
     authority: Authority,
     probe: Tmux.JobProbe,
+    /// What the *second* look made of the result record, as the two published
+    /// keys. Not `probe.sidecar`: on the branch where a defective document turned
+    /// up during the kill the probe is deliberately not upgraded, so its reading
+    /// describes a moment before the kill and this one describes the moment the
+    /// removal actually acted on.
+    record_keys: RecordKeys,
+    /// The evidence the removal had already gathered for this settlement — the
+    /// remote finish time and the reading above. Carried in rather than dropped:
+    /// the refusal writes the only terminal this attempt will get, and it is the
+    /// same attempt, so a receipt without them loses facts this command held.
+    extra: Core.Store.receipts.TerminalExtra,
     log_discarded: bool,
     result_discarded: bool,
     /// The terminal the removal had chosen. Carried in rather than reinvented,
@@ -2823,7 +2891,7 @@ fn refuseRemovalAtCommit(
     const reason = std.fmt.allocPrint(
         ctx.arena,
         "this command stopped job '{s}''s session and the transaction that was to record the removal found that {s} ({s}); nothing was deleted and no terminal was written by it, so {s}",
-        .{ job.name, refusal.found(ctx), refusal.errorCode(), stopped_at },
+        .{ job.name, refusal.found(ctx, job.name), refusal.errorCode(), stopped_at },
     ) catch "this command stopped this job's session and then found it could not record the removal; the local row was kept";
 
     // **Which terminal survives the refusal**, and it is the same rule the
@@ -2850,7 +2918,12 @@ fn refuseRemovalAtCommit(
     var status_text: []const u8 = "unchanged";
     var proven = false;
     if (execution) |e| {
-        const outcome = e.settle(settle_with, .{}) catch |err|
+        // With the evidence, not with `.{}`. The removal collected a finish time
+        // and a reading for this settlement before it was refused; this is the
+        // same attempt and the same settlement, and dropping them here would put
+        // the only durable record of the removal on disk missing the two facts
+        // nobody can go back and re-read once the host has moved on.
+        const outcome = e.settle(settle_with, extra) catch |err|
             Cli.receiptFatal(e.id(), err, "recording a refused job removal");
         status_text = settledText(outcome);
         proven = settledStatus(outcome) != .indeterminate;
@@ -2867,8 +2940,8 @@ fn refuseRemovalAtCommit(
 
     const hint = std.fmt.allocPrint(
         ctx.arena,
-        "{s}. Find out who else is acting on this job, then re-run once the scope is free, or re-run with --force to take the scope over; a peer attempt that is not running any more has to be settled first with 'terminus request reconcile <request-id>'",
-        .{reason},
+        "{s}. {s}",
+        .{ reason, refusal.recovery(ctx) },
     ) catch "the removal was refused when it was about to be recorded; the local row was kept";
     const lease = Cli.releaseClaimReporting();
     switch (ctx.out.format) {
@@ -2883,10 +2956,13 @@ fn refuseRemovalAtCommit(
             .evidenceRetained = !log_discarded,
             .attemptRetained = attempt != null,
             .conflict = ConflictJson.from(probe.conflict),
-            .resultRecord = probe.sidecar.code(),
-            .resultRecordError = resultRecordError(ctx, probe.sidecar),
+            // The reading the removal acted on and wrote into the receipt above,
+            // so the line and the receipt cannot disagree about what was on the
+            // host — the same rule the ordinary paths follow.
+            .resultRecord = record_keys.record,
+            .resultRecordError = record_keys.note,
             .requestId = if (attempt) |a| a.request_id else null,
-            .cacheError = null,
+            .cacheError = refusal.cacheNote(ctx, job.name),
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
             .leaseRelease = lease.code,
@@ -2908,6 +2984,96 @@ fn refuseRemovalAtCommit(
     // what failed there is only this command's standing to delete a row.
     if (!proven) Cli.failIndeterminateAfterOutput(if (attempt) |a| a.request_id else job.name);
     Cli.exitNow(Cli.exit_code.failure);
+}
+
+/// What the local `jobs` row is, after the removal's one transaction failed.
+///
+/// Two words for three `Rollback` states, and which of the two you get is decided
+/// by whether the undo could be *proved*. `none` means the transaction never
+/// opened; `confirmed` means it opened and went back; either way the row is where
+/// it was. `unconfirmed` means the `ROLLBACK` statement itself failed, and then
+/// nothing about the row is established by this process — the delete and the
+/// terminal may be on disk and may not be, and the honest word is `unknown`.
+///
+/// The same rule `cmd_session.localRowAfterFailedCommit` states, in the verb that
+/// did not honour it: `job rm` handed this error to `Cli.receiptFatal`, whose
+/// envelope has nowhere to put the answer, so a caller was told the same thing on
+/// both paths and one of them was a claim about a row nobody had looked at.
+///
+/// Exhaustive, with no `else`: a fourth `Rollback` arm has to be answered here
+/// rather than defaulting into a word that says "we know".
+fn localRowAfterFailedRemoval(rollback: Core.execution.Rollback) []const u8 {
+    return switch (rollback) {
+        .none, .confirmed => "kept",
+        .unconfirmed => "unknown",
+    };
+}
+
+test localRowAfterFailedRemoval {
+    const t = std.testing;
+    // The two proofs, and the one absence of a proof. `unknown` must not be
+    // reachable from either of the first two: a branch that could prove the row is
+    // where it was and said "unknown" anyway would be as wrong in the other
+    // direction, and would send an operator hunting a deletion that never happened.
+    try t.expectEqualStrings("kept", localRowAfterFailedRemoval(.none));
+    try t.expectEqualStrings("kept", localRowAfterFailedRemoval(.confirmed));
+    try t.expectEqualStrings("unknown", localRowAfterFailedRemoval(.{ .unconfirmed = "Sqlite" }));
+}
+
+/// The removal's one transaction could not be written to the store.
+///
+/// **Why this is not `Cli.receiptFatal`.** That envelope is `{ok, error, errorCode,
+/// requestId, cause, remoteStatus, hint}` and it is the right one for every other
+/// ledger write in this file — none of the others carries a local delete. This one
+/// does, so there is a fourth fact: what became of the `jobs` row. Core answers it
+/// through the `rollback` out-parameter precisely so a caller can distinguish a
+/// proved undo from an unproved one, and `receiptFatal` has nowhere to put that, so
+/// the answer was dropped and every failure here read as "nothing local changed".
+/// The keys here are `receiptFatal`'s exactly, plus `localRow`: a consumer written
+/// against the old envelope keeps working and gains the fact it was missing.
+///
+/// **Exit 76**, the same code `receiptFatal` used here. The kill went out and the
+/// ledger does not have it; that is what `receipt_persist_failed` means, and
+/// downgrading it to 1 would let a caller read "nothing happened" off a stopped
+/// session.
+///
+/// The attempt is left unsettled on purpose — it goes on barring this job's scope
+/// until somebody reconciles it, because this command could not write what it
+/// established. `clearExecution` first, so the process-exit hook does not invent a
+/// verdict for it on the way out.
+fn removalUnrecordable(
+    ctx: *Cli.Ctx,
+    request_id: []const u8,
+    known_remote_status: []const u8,
+    rollback: Core.execution.Rollback,
+    cause: anyerror,
+) noreturn {
+    const local_row = localRowAfterFailedRemoval(rollback);
+    const unknown = std.mem.eql(u8, local_row, "unknown");
+    Cli.clearExecution();
+    Cli.releaseClaim();
+    const hint: []const u8 = if (unknown)
+        "the session was stopped and the transaction carrying the record of it and the delete of the local row could not be written — and the rollback of that transaction could not be confirmed either, so read the row with 'terminus job ls' before anything else, then settle the record with 'terminus request reconcile <request-id>'"
+    else
+        "the session was stopped and the local ledger is incomplete; the whole transaction went back, so the local row is still there. Settle the record with 'terminus request reconcile <request-id>', then re-run to clear the row";
+    switch (ctx.out.format) {
+        .json => ctx.out.json(.{
+            .ok = false,
+            .@"error" = "could not persist the operation receipt",
+            .errorCode = "RECEIPT_PERSIST_FAILED",
+            .requestId = request_id,
+            .cause = @errorName(cause),
+            .remoteStatus = known_remote_status,
+            .localRow = local_row,
+            .hint = hint,
+        }) catch {},
+        .human => ctx.out.print(
+            "RECEIPT_PERSIST_FAILED: {s}\n  request: {s}\n  remote status: {s}\n  local row: {s}\n  {s}\n",
+            .{ @errorName(cause), request_id, known_remote_status, local_row, hint },
+        ) catch {},
+    }
+    ctx.out.flush() catch {};
+    Cli.exitNow(Cli.exit_code.receipt_persist_failed);
 }
 
 /// Whether a kill may publish `remote_cancel_confirmed` — the one terminal on
@@ -4451,13 +4617,15 @@ fn removeJob(
             settlement,
             .{ .expected = job.removeExpectation(), .grounds = .session_proven_gone },
             &rollback,
-        ) catch |err| Cli.receiptFatal(
+        ) catch |err| removalUnrecordable(
+            ctx,
             if (attempt) |a| a.request_id else job.name,
+            if (execution) |*e| e.status.text() else "unchanged",
+            rollback,
             err,
-            "recording a job removal",
         );
         break :forget switch (removal) {
-            .forgotten => |done| removalObserved(ctx, store, terminal, done.ledger, done.write),
+            .forgotten => |done| removalObserved(ctx, store, terminal, done.ledger),
             .refused => |blocker| refuseRemovalAtCommit(
                 ctx,
                 store,
@@ -4466,6 +4634,8 @@ fn removeJob(
                 if (execution) |*e| e else null,
                 authority,
                 probe,
+                record_keys,
+                extra,
                 log_discarded,
                 result_discarded,
                 terminal,
@@ -4479,10 +4649,35 @@ fn removeJob(
                 if (execution) |*e| e else null,
                 authority,
                 probe,
+                record_keys,
+                extra,
                 log_discarded,
                 result_discarded,
                 terminal,
                 .{ .claim_lost = lost },
+            ),
+            // The compare-and-swap matched nothing, so the whole transaction went
+            // back — including the terminal that had already been written in it.
+            // The attempt is therefore still unsettled and still ours, and it is
+            // settled here for the reason the other two arms are: an attempt this
+            // command reached the host under and then abandoned silently would bar
+            // this job's scope with nothing in the ledger saying why. What it must
+            // *not* be settled with is the terminal above, which opens with "job
+            // removed" over a row that is still on disk.
+            .row_moved => |conflict| refuseRemovalAtCommit(
+                ctx,
+                store,
+                job,
+                attempt,
+                if (execution) |*e| e else null,
+                authority,
+                probe,
+                record_keys,
+                extra,
+                log_discarded,
+                result_discarded,
+                terminal,
+                .{ .row_moved = conflict },
             ),
         };
     } else settleObserved(
