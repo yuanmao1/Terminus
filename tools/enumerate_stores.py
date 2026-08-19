@@ -1110,9 +1110,9 @@ def path_coarsening() -> dict:
 # from the public document until someone decides it belongs in a public
 # repository, which is the opposite of how a redaction list fails.
 #
-# What it carries is what the claims in docs/m3a-artifact-transfer.md §7.0.1
-# rest on: the two verdicts, the coverage numbers, the filesystem effect, and
-# per store the three facts the migration argument turns on. What it drops is
+# What it carries is what the store census's claims rest on: the two verdicts,
+# the coverage numbers, the filesystem effect, and per store the three facts the
+# migration argument turns on. What it drops is
 # everything that is true of this machine rather than of the migration — file
 # sizes, how many servers and keys and memories and facts somebody has, and
 # the request ids of any checkpoint row found.

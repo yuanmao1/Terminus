@@ -5,19 +5,27 @@
 //!
 //! `rm` is the destructive one, and until now it was the only destructive
 //! remote verb in the tree with **no authority of any kind**: no lease, no
-//! operation row, no scope guard (`docs/m3b-job-control.md` §1.2). It killed a
-//! remote session, deleted its pane log and dropped the local row — whose
-//! delete cascades that session's memories — while contending with nothing and
-//! recording nothing. Because a job's tmux session is `job-<name>` and
-//! `session ls` shows it under that name, `session rm web job-deploy` would
-//! stop a running job's shell with `job kill web deploy` holding a lease it
-//! could not see.
+//! operation row, no scope guard. It killed a remote session, deleted its pane
+//! log and dropped the local row — whose delete cascades that session's
+//! memories — while contending with nothing and recording nothing. Because a
+//! job's tmux session is `job-<name>` and `session ls` shows it under that
+//! name, `session rm web job-deploy` would stop a running job's shell with
+//! `job kill web deploy` holding a lease it could not see.
 //!
 //! It now runs under a `control` operation and a scope lease, and renews that
 //! lease immediately before every step that changes the host. What it already
 //! got right is unchanged and is called out where it happens: the kill is
 //! *proven* before anything is deleted, and the log is deleted only after that
 //! proof.
+//!
+//! **The other half of that hole is still open, and it is `new`.**
+//! `newSession` takes no operation, no claim and no lease, and reports
+//! `action: "created"` unconditionally even when `Tmux.ensure` adopted a live
+//! shell somebody else is using. Nothing stops it creating a session under the
+//! very name an `rm` is midway through removing: `rm`'s lease is not displaced
+//! by it, so `rm`'s renewals still answer `held` and refuse nothing, and the
+//! recreated shell keeps running with its log and its local row deleted
+//! underneath it. Closing that needs `new` to hold the same claim.
 //!
 //! **Every exit reports the same document.** `RemovalJson` has no defaults, so a
 //! branch that stops reporting a key does not compile — but a branch that never
@@ -43,7 +51,9 @@ const fatalTmux = @import("cmd_exec.zig").fatalTmux;
 // `src/core/control.zig`. These are aliases, not a second copy: `job kill`,
 // `job rm` and `session rm` renew through the same `stillOurs`, latch on the
 // same `Authority`, and read the same clock, so a fix to any of them reaches
-// all three (`docs/m3b-job-control.md` §7.6).
+// all three. Keeping the barrier private to `cmd_job.zig` — where `Authority`
+// was first written — was rejected for exactly that reason: this file cannot
+// reach into a sibling command, so it grew a second copy instead.
 const Control = @import("../core/control.zig");
 const Claim = Control.Claim;
 const Authority = Control.Authority;
@@ -1591,11 +1601,11 @@ fn report(ctx: *Cli.Ctx, body: RemovalJson) void {
 /// created a row — and records that the refusal happened.
 ///
 /// `execution.begin` returns `.blocked` having inserted nothing, so until now a
-/// refused `session rm` left no trace of any kind: `docs/m3b-job-control.md` §8
-/// says a removal blocked by a held claim "is refused and records the refusal",
-/// and it recorded nothing. Five questions had no answer — whether anybody tried,
-/// who, when, how often, and what stopped them — for the single most destructive
-/// verb in the tree.
+/// refused `session rm` left no trace of any kind. The rule this verb is held to
+/// is that a removal blocked by a held claim is refused **and** records the
+/// refusal; it recorded nothing. Five questions had no answer — whether anybody
+/// tried, who, when, how often, and what stopped them — for the single most
+/// destructive verb in the tree.
 ///
 /// So the row is written here, through `execution.recordRefusal`, which creates
 /// and settles it in one transaction. The terminal is `local_abandon` and settles

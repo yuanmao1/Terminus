@@ -13,7 +13,23 @@
 //! copy and not the other shows up as a lost scope, which is the failure the
 //! barrier exists to prevent. `job kill`, `job rm`, `session new`, `run`'s
 //! stale cleanup and `write --force` are all queued to need the same thing,
-//! so this is where it lives (`docs/m3b-job-control.md` §2.3, §7.6).
+//! so this is where it lives.
+//!
+//! **Why a module, and not one of the two cheaper homes.** Renaming the
+//! `Authority` that `cmd_job.zig` already defined and leaving the barrier there
+//! is no module move at all — and it is the shape that produced the second copy,
+//! because `cmd_session.zig` cannot reach into a sibling command. Lifting the
+//! *type* alone into `src/core/` would let both verbs hold one value, and still
+//! leaves every call site writing out its own renew/check/act sequence. A module
+//! under `src/core/` that owns the whole barrier is the largest of the three and
+//! the only one that makes the duplication impossible rather than merely
+//! discouraged. That is a module boundary, so it was the programmer's call.
+//!
+//! **Only the renewal half is owned here.** The act itself is not: each verb
+//! still writes its own renew/kill/consume sequence inline, and `run`'s cleanup
+//! still kills with no claim at all. A `stopSession(authority, incarnation)`
+//! primitive that all four call sites shared would finish the job; it does not
+//! exist yet, and nothing here pretends otherwise.
 //!
 //! **What is shared here is the machinery and, since the wordings were
 //! reconciled, the words as well.** Every sentence the two verbs print names

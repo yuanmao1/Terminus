@@ -38,21 +38,27 @@ pub const Kind = enum {
     /// gap. See `op_state.Terminal.input_accepted`.
     session_write,
     /// A supervisory act on somebody else's session: stopping it, forgetting
-    /// it, reclaiming it (`docs/m3b-job-control.md` §3.1).
+    /// it, reclaiming it.
     ///
     /// `terminus session rm` is the first and, today, only producer. Until it
     /// had one of these, a command that killed a remote session, deleted its
     /// pane log and dropped its local row wrote **nothing** to the ledger —
     /// five questions with no answer: whether anyone tried, who, when, whether
-    /// it worked, and whether this was the first attempt or the third (§1.2).
+    /// it worked, and whether this was the first attempt or the third.
+    ///
+    /// Adding the variant cost no migration: `operations.kind` is bare
+    /// `TEXT NOT NULL` (`migrate.zig`), unlike `status` and `resolved_status`,
+    /// which carry CHECKs. What it did cost is the two admissibility matrices
+    /// below, which are exhaustive in both directions and so stopped the build
+    /// until every cell for this kind was answered on purpose.
     ///
     /// Named for the class of act rather than for the verb, and both
-    /// alternatives were considered (§7.1). `job_control` was rejected because
+    /// alternatives were considered. `job_control` was rejected because
     /// `session rm` is not a job. One variant per action — `kill_session`,
     /// `remove_session`, … — was rejected because it multiplies the two
     /// admissibility matrices in `receipts` by four and stops the action being
     /// a queryable column; what the operation acted on is carried by `alias`
-    /// today and by the `target_*` columns of §7.2 in v13.
+    /// today and by dedicated target columns (kind, key, request) in v13.
     ///
     /// A control operation settles from **its own** evidence — lease held or
     /// lost, kill sent or withheld, the host's answer — and never from the
@@ -298,7 +304,7 @@ pub const Kind = enum {
             //
             // A change that builds a producer for one of these sets this false and
             // declares what it actually does. Half-states are refused: the gate in
-            // `gates_test` holds that `judgement_undeclared` excludes every other
+            // `gates_admissibility_test.zig` holds that `judgement_undeclared` excludes every other
             // axis, so nobody can leave a kind claiming both that it publishes an
             // artifact and that nothing is known about it.
             .tunnel, .plan_phase, .audit, .cleanup => .{
@@ -322,11 +328,12 @@ pub const Kind = enum {
 /// `receipts.terminalDescribesKind` is 8 terminals × 11 kinds and
 /// `receipts.ResolutionEvidence.appliesToKind` is 9 evidence variants × 11
 /// kinds — 187 hand-decided booleans, each with an independently-transcribed
-/// mirror in `gates_test`, so 374 in total. Six of the eleven kinds are
+/// mirror in `gates_admissibility_test.zig`, so 374 in total. Six of the eleven kinds are
 /// constructed by nothing in this binary, and they accounted for 204 of them.
 /// The bill came due as a refusal to spend it: one new `Terminal` variant cost
-/// 22 answers, twelve about work that does not exist, and the variant
-/// `docs/m3b-job-control.md` §7.5 decided on was deferred three times over.
+/// 22 answers, twelve about work that does not exist, and the variant a proven
+/// post-submission failure needs — `op_state.Terminal.proven_failure` — was
+/// deferred three times over.
 ///
 /// What decides a cell was never the kind's *name*. It is whether the operation
 /// ran a command of ours, so an exit status is its verdict; whether something on

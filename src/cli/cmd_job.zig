@@ -30,7 +30,9 @@ const fatalTmux = @import("cmd_exec.zig").fatalTmux;
 // `src/core/control.zig`. These are aliases, not a second copy: `job kill`,
 // `job rm` and `session rm` renew through the same `stillOurs`, latch on the
 // same `Authority`, and read the same clock, so a fix to any of them reaches
-// all three (`docs/m3b-job-control.md` §7.6).
+// all three. Keeping the barrier private to this file — where `Authority` was
+// first written — was rejected for exactly that reason: `cmd_session.zig`
+// cannot reach into a sibling command, so it grew a second copy instead.
 const Control = @import("../core/control.zig");
 const Claim = Control.Claim;
 const Authority = Control.Authority;

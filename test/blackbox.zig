@@ -2100,7 +2100,7 @@ test "blackbox: `job rm --discard-evidence` destroys nothing when the post-kill 
 // is caught by that renewal and never reaches the transaction. The claim-state half
 // of the check is therefore only reachable in-process, and that is where it is
 // gated — `gate: every destructive path answers every authority scenario the same
-// way`, in `src/core/store/gates_test.zig`.
+// way`, in `src/core/store/gates_authority_test.zig`.
 //
 // Everything before the commit succeeds, and the assertions say so: the lease is
 // acquired cleanly, every renewal answers `held`, and the kill goes out. What is
@@ -4338,10 +4338,16 @@ test "blackbox: a `job rm` that could not give the scope back keeps the row and 
 
 // --- `session rm`: the destructive verb that had no authority at all --------
 //
-// `docs/m3b-job-control.md` §1.2. Until now this command killed a remote
+// Until now this command killed a remote
 // session, deleted its pane log and dropped the local row — cascading that
 // session's memories — with no lease, no operation and no scope guard. The five
-// gates below are the four questions §2.1 asks, driven through the real binary
+// gates below drive the four questions a destructive control act has to answer,
+// in order: **1 identity** — the physical thing it is entitled to act on, named
+// so it cannot be re-minted underneath it; **2 contention** — a lease over a
+// scope that actually covers that thing, plus the absence of an unsettled
+// overlapping writer; **3 proof** — the remote's own answer to "is it gone",
+// carried as a value rather than assumed; **4 record** — an `operations` row of
+// this command's own. Driven through the real binary
 // and asserted from the store and from the host's own traffic rather than from
 // stdout.
 //

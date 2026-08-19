@@ -339,12 +339,22 @@ pub const Terminal = union(enum) {
     /// known and sends an operator to reconcile a settled question.
     ///
     /// Three places wanted it and all three settled `indeterminate` instead: a
-    /// session identity mismatch (`docs/m3b-job-control.md` §7.5, which decided a
-    /// variant of its own rather than `input_refused` — reusing an input-named
-    /// terminal for an act that types nothing repeats `7d0898a`'s mistake one
-    /// level up), a `session rm` whose kill was sent and whose host reports the
-    /// session still present, and `error.TmuxMissing` after submission, which
-    /// proves the kill never ran.
+    /// session identity mismatch, a `session rm` whose kill was sent and whose
+    /// host reports the session still present, and `error.TmuxMissing` after
+    /// submission, which proves the kill never ran.
+    ///
+    /// **Why a variant of its own, rather than either cheaper answer.**
+    /// Reusing `input_refused` was rejected: it already means the right thing —
+    /// "the remote answered, and nothing of ours was touched" — but its *name*
+    /// is about input, and an identity mismatch types nothing. `input_accepted`
+    /// and `input_refused` exist in the first place because settling a write as
+    /// `.exited{0}` wrote a false word into the column an auditor reads first
+    /// (`7d0898a`); reusing an input-named terminal for an act that offers no
+    /// bytes repeats that mistake one level up. Reusing `indeterminate` with a
+    /// distinct `error_code` was rejected for the reason given above: a mismatch
+    /// is *proven*, and recording a proof as an unknown bars the scope. The cost
+    /// of the variant — the build stopping in `receipts.terminalDescribesKind`
+    /// for every kind — is the forcing function, not the objection.
     ///
     /// **Not for a kind whose verdict is an exit status.** For an `exec` or a
     /// `job` a proven post-submission failure is `exited` with the status that

@@ -1792,8 +1792,8 @@ pub const RecordedRefusal = struct {
 ///
 /// `begin` returns `.blocked` having inserted nothing, and for most verbs that is
 /// right: nothing happened to anything, so there is nothing to record. For a
-/// destructive control act it is not. `docs/m3b-job-control.md` §8 requires that a
-/// `session rm` refused by a held claim "records the refusal", and a refusal with
+/// destructive control act it is not. A `session rm` refused by a held claim has
+/// to record the refusal, because a refusal with
 /// no row leaves five questions with no answer: whether anybody tried to remove
 /// this session, who, when, how often, and what stopped them.
 ///
