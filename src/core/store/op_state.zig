@@ -326,6 +326,49 @@ pub const Terminal = union(enum) {
         reason: []const u8,
         error_code: []const u8 = "INPUT_REFUSED",
     },
+    /// The act was submitted, and the host's own answer establishes that it did
+    /// not take effect.
+    ///
+    /// The terminal for a failure that is **proven after submission**, which no
+    /// variant above could express. `never_submitted` claims the command never
+    /// left this machine and `canSettle` refuses it once anything has been handed
+    /// over, so an attempt that got an answer proving its own failure had only
+    /// `indeterminate` — "we could not establish what happened" — for something
+    /// that had been established. That is a lie in the conservative direction: it
+    /// never fakes success, but it blocks the scope of an attempt whose outcome is
+    /// known and sends an operator to reconcile a settled question.
+    ///
+    /// Three places wanted it and all three settled `indeterminate` instead: a
+    /// session identity mismatch (`docs/m3b-job-control.md` §7.5, which decided a
+    /// variant of its own rather than `input_refused` — reusing an input-named
+    /// terminal for an act that types nothing repeats `7d0898a`'s mistake one
+    /// level up), a `session rm` whose kill was sent and whose host reports the
+    /// session still present, and `error.TmuxMissing` after submission, which
+    /// proves the kill never ran.
+    ///
+    /// **Not for a kind whose verdict is an exit status.** For an `exec` or a
+    /// `job` a proven post-submission failure is `exited` with the status that
+    /// caused it, and for a `session_write` it is `input_refused`, which is this
+    /// same shape of claim one axis over. `receipts.terminalDescribesKind` admits
+    /// this only for a kind that supervises somebody else's subject, so it cannot
+    /// be used to record a failure without the number or the reason the kind's own
+    /// variant would have carried.
+    ///
+    /// `observation` is what was read, and `canSettle` refuses an empty one for
+    /// the reason `remote_cancel_confirmed.absence_verified_at` and
+    /// `destination_absent.verification_method` are required: "it failed" is a
+    /// conclusion, and a receipt carrying the conclusion with no reading behind it
+    /// cannot be argued with afterwards by anyone who doubts it. `error_code` has
+    /// **no default**, unlike every other code in this union: there is no generic
+    /// proven failure — each site knows which one it proved — and a default is how
+    /// three different proofs would come to file under one word.
+    proven_failure: struct {
+        /// The reading that establishes the failure, e.g. "tmux has-session
+        /// reported the session still present after kill-session".
+        observation: []const u8,
+        /// Machine word for *which* proven failure this is. Required.
+        error_code: []const u8,
+    },
     /// We cannot establish the remote outcome. Carries why, plus the last
     /// state we did observe, so reconcile knows where to look.
     indeterminate: struct {
@@ -346,6 +389,10 @@ pub const Terminal = union(enum) {
             // claimed, here or anywhere else on the receipt.
             .input_accepted => .completed,
             .input_refused => .failed,
+            // Proven, so it is a failure and not an unknown. That is the whole
+            // point of the variant: `indeterminate` here would block a scope over
+            // a question the host already answered.
+            .proven_failure => .failed,
             .indeterminate => .indeterminate,
         };
     }
@@ -358,6 +405,7 @@ pub const Terminal = union(enum) {
             .local_abandon, .remote_cancel_confirmed => null,
             .input_accepted => null,
             .input_refused => |r| r.error_code,
+            .proven_failure => |p| p.error_code,
             .indeterminate => |i| i.error_code,
         };
     }
@@ -432,6 +480,23 @@ pub fn canSettle(from: Status, terminal: Terminal) bool {
             .submitted, .remote_started => true,
             else => false,
         },
+        // A failure the host proved, so there has to have been something for it to
+        // answer about: the act must be out there. Before submission the accurate
+        // variant is `never_submitted` — the command did not leave this machine —
+        // and admitting this one there would let an attempt that never dialled
+        // record a *remote* proof of its failure.
+        //
+        // The observation is required to be non-empty here rather than only by the
+        // type, for the reason `resolve` refuses an empty `verification_method`: a
+        // field a caller can satisfy with `""` is the conclusion without the
+        // reading, and this is the only guard between "the host proved it" and a
+        // receipt that merely says so. The code is required for the same reason —
+        // it is the machine-readable half, and a settlement carrying an empty one
+        // would leave a caller branching on prose.
+        .proven_failure => |p| switch (from) {
+            .submitted, .remote_started => p.observation.len > 0 and p.error_code.len > 0,
+            else => false,
+        },
         // Only work that was in flight can become unknown, and the recorded
         // `last_observed` has to be the state we were actually in — otherwise
         // the field a reconciler navigates by would be fiction.
@@ -496,6 +561,32 @@ test canSettle {
     try t.expect(!canSettle(.connecting, accepted));
     try t.expect(!canSettle(.created, refused));
     try t.expect(!canSettle(.connecting, refused));
+
+    // A failure the host proved is admissible exactly where the answer could have
+    // come from: after submission. Before it, `never_submitted` is the accurate
+    // variant and this one would claim a remote proof for an attempt that never
+    // dialled — the same shape of mistake as `submitted` + `never_submitted`, in
+    // the other direction.
+    const proven: Terminal = .{ .proven_failure = .{
+        .observation = "tmux has-session reported the session still present after kill-session",
+        .error_code = "SESSION_SURVIVED_KILL",
+    } };
+    try t.expect(canSettle(.submitted, proven));
+    try t.expect(canSettle(.remote_started, proven));
+    try t.expect(!canSettle(.created, proven));
+    try t.expect(!canSettle(.connecting, proven));
+    try t.expect(!canSettle(.failed, proven));
+
+    // The reading and the machine word are both required, and "required" is
+    // enforced rather than documented: neither can be satisfied with `""`.
+    try t.expect(!canSettle(.submitted, .{ .proven_failure = .{
+        .observation = "",
+        .error_code = "SESSION_SURVIVED_KILL",
+    } }));
+    try t.expect(!canSettle(.submitted, .{ .proven_failure = .{
+        .observation = "tmux has-session reported the session still present",
+        .error_code = "",
+    } }));
 }
 
 test "terminalForTransportLoss always produces settleable evidence" {
@@ -578,6 +669,14 @@ test "terminal evidence maps to status" {
         "INPUT_REFUSED",
         (Terminal{ .input_refused = .{ .reason = "no such session" } }).errorCode().?,
     );
+    // A failure the host proved is `failed`, not `indeterminate`, and it carries
+    // the site's own word for what was proven rather than a shared default.
+    const proven: Terminal = .{ .proven_failure = .{
+        .observation = "tmux has-session reported the session still present after kill-session",
+        .error_code = "SESSION_SURVIVED_KILL",
+    } };
+    try t.expectEqual(Status.failed, proven.status());
+    try t.expectEqualStrings("SESSION_SURVIVED_KILL", proven.errorCode().?);
 }
 
 test canTransition {

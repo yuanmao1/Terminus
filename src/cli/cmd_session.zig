@@ -613,8 +613,9 @@ fn removeSession(
 /// `pid = null`: no process was identified and none could be. This operation
 /// names a *session*; the process in that pane belongs to whoever started it,
 /// and recording its pid would be a reading about one thing offered as a verdict
-/// on another — the mistake `receipts.appliesToKind` closed its `process_probe ×
-/// job` cell over.
+/// on another — the mistake `operations.Kind.capabilities` leaves
+/// `records_process_identity` false for a job and a control act over, and the
+/// reason `appliesToKind` admits no `process_probe` for either.
 ///
 /// `term_sent = true, kill_sent = false`: `tmux kill-session` hangs the pane up
 /// on our behalf, and nothing here sends SIGKILL to anything. Written as what
@@ -706,17 +707,30 @@ fn stopJson(arena: std.mem.Allocator, completed: bool) std.mem.Allocator.Error![
 /// the next command under this name would land in the shell we just claimed to
 /// have removed.
 ///
-/// Settled `indeterminate`, and the word is earned rather than convenient. The
-/// reading establishes that a session by this name exists *now*; it does not
-/// establish what `kill-session` did. Something recreated it, or tmux did not do
-/// what it was asked, and this command cannot tell those apart. What it
-/// definitely may not claim is `remote_cancel_confirmed`, whose whole content is
-/// a verified absence.
+/// Settled `proven_failure`, and every word of that is earned. What the host
+/// answered is that a session by this name is there *now*, and this command had
+/// asked for it to be gone — so the act it exists to perform provably did not take
+/// effect, and nothing was deleted on the strength of it. That is a failure, and a
+/// failure is what the ledger says.
 ///
-/// The consequence is stated in the hint rather than hidden: `indeterminate`
-/// blocks the scope, so the next removal of this session is refused until
-/// somebody reconciles the record. That is why this exits 75 and not 1 — telling
-/// an agent "plain failure, retry" would send it into a refusal it cannot read.
+/// What it does **not** say is why. Something recreated the session, or tmux did
+/// not do what it was asked, and this command cannot tell those apart; the receipt
+/// carries the reading (`observation`) rather than a cause, which is the whole
+/// reason `proven_failure` demands one. It also may not claim
+/// `remote_cancel_confirmed`, whose content is a verified *absence*.
+///
+/// This used to be `indeterminate`, because `op_state.canSettle` admits
+/// `never_submitted` only before submission and there was no other proven failure
+/// after it. That was the conservative lie: "we could not establish what happened"
+/// about something the host had just established, which barred this session's
+/// scope until somebody reconciled a settled question. `failed` releases the
+/// barrier, which is correct here rather than merely convenient — nothing was
+/// deleted, the session is where it was, and the next removal has nothing to be
+/// protected from.
+///
+/// So it exits **1**, not 75, and that inverts what this branch used to say for
+/// the reason the inversion is now true: 1 means "it did not work, and a retry is
+/// safe", and both halves hold. A caller re-running this walks into no refusal.
 fn refuseSurvivedKill(
     ctx: *Cli.Ctx,
     execution: *Core.execution.Execution,
@@ -733,12 +747,19 @@ fn refuseSurvivedKill(
         fatal("out of memory reporting that session '{s}' survived the kill", .{session});
     const reason = std.fmt.allocPrint(
         ctx.arena,
-        "the kill was sent for session '{s}' and the host still reports it present, so what that kill achieved cannot be established; nothing was deleted — not the pane log, not the local row",
+        "the kill was sent for session '{s}' and the host still reports it present, so this removal provably did not happen; nothing was deleted — not the pane log, not the local row",
         .{session},
-    ) catch "the kill was sent and the host still reports the session present; nothing was deleted";
-    _ = execution.settle(.{ .indeterminate = .{
-        .reason = reason,
-        .last_observed = execution.status,
+    ) catch "the kill was sent and the host still reports the session present, so this removal provably did not happen; nothing was deleted";
+    // The observation, not the conclusion. `tmux has-session` after
+    // `tmux kill-session` is the reading that establishes the failure, and it is
+    // the reading a later operator gets to disagree with.
+    const observation = std.fmt.allocPrint(
+        ctx.arena,
+        "tmux kill-session -t ={s} then has-session reported the session still present",
+        .{target},
+    ) catch "tmux kill-session then has-session reported the session still present";
+    _ = execution.settle(.{ .proven_failure = .{
+        .observation = observation,
         .error_code = code.survived,
     } }, .{}) catch |err| refuseLedgerUnrecordable(
         ctx,
@@ -775,11 +796,11 @@ fn refuseSurvivedKill(
         .reason = reason,
         .hint = std.fmt.allocPrint(
             ctx.arena,
-            "inspect it with 'tmux attach -t {s}' on the host, then settle the record with 'terminus request reconcile <request-id>' — until it is settled this session's scope stays barred",
+            "nothing was deleted and this session's scope is free again; look at it with 'tmux attach -t {s}' on the host to find out why the kill did not take, then run the removal again",
             .{target},
-        ) catch "inspect the session on the host, then settle the record with 'terminus request reconcile <request-id>'",
+        ) catch "nothing was deleted and the scope is free; inspect the session on the host, then run the removal again",
     });
-    Cli.failIndeterminateAfterOutput(execution.id());
+    Cli.exitNow(Cli.exit_code.failure);
 }
 
 /// The kill was sent and nothing came back to say what it did.
@@ -802,13 +823,21 @@ fn refuseSurvivedKill(
 /// would report something the host never said and `not_attempted` would deny a
 /// command that was sent.
 ///
-/// **One imprecision, named rather than hidden.** `error.TmuxMissing` is the host
-/// answering that tmux is not installed, which *proves* the kill did not run — and
-/// this still records `indeterminate`. There is no admissible proven-failure
-/// terminal from `submitted` (`op_state.canSettle` allows `never_submitted` only
-/// from `created`/`connecting`), and adding one is a new `Terminal` variant. The
-/// error name travels in `reason`, so an operator reading it is not left guessing;
-/// what the ledger cannot do is say it in a column.
+/// **One imprecision, named rather than hidden, and now half-closed.**
+/// `error.TmuxMissing` is the host answering that tmux is not installed, which
+/// *proves* the kill did not run — and this still records `indeterminate`. The
+/// missing piece is no longer the terminal: `op_state.Terminal.proven_failure`
+/// exists, is admissible for a control act from `submitted`, and
+/// `refuseSurvivedKill` writes it. What this branch would need is a published
+/// **`errorCode` of its own**, because "the host gave no usable answer" and "the
+/// host answered that it has no tmux" are different branches with different exit
+/// codes — a proven failure exits 1 and a lost answer exits 75 — and one code
+/// cannot carry both without lying to whichever caller branches on it. That code
+/// would have to be added to `code` above *and* to the list `skill/SKILL.md`
+/// publishes, which the gate below holds against each other, so it is a protocol
+/// addition rather than an implementation detail. Until it is made, the error name
+/// travels in `reason`, so an operator reading it is not left guessing; what the
+/// ledger cannot do is say it in a column.
 fn refuseKillUnanswered(
     ctx: *Cli.Ctx,
     execution: *Core.execution.Execution,

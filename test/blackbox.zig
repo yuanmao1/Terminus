@@ -4402,6 +4402,21 @@ fn terminalErrorCode(
     return null;
 }
 
+/// The terminal receipt's `transport_error` — the column this table uses for
+/// "what went wrong, in words". Read for `proven_failure`, whose `observation` is
+/// the reading that justifies the claim: the variant refuses to be constructed
+/// without one, and a receipt that dropped it on the way to the row would leave
+/// the claim unarguable.
+fn terminalTransportError(
+    store: *Store,
+    arena: std.mem.Allocator,
+    request_id: []const u8,
+) !?[]const u8 {
+    const rows = try Store.receipts.list(store, arena, request_id);
+    for (rows) |row| if (row.is_terminal) return row.transport_error;
+    return null;
+}
+
 /// The terminal receipt's `detail_json`, same shape and same reasoning.
 ///
 /// `session rm` settles two different partial shapes through one terminal variant
@@ -4882,9 +4897,10 @@ test "blackbox: `session rm` keeps the local row and its memories when the scope
 // command under that name lands in the shell this one claimed to have removed.
 //
 // The settlement is the new half. `remote_cancel_confirmed` is the one thing
-// this outcome may not claim, and there is no proven-failure terminal for a
-// control act after submission, so it records `indeterminate` — and says which
-// unknown it is, in the code beside it.
+// this outcome may not claim, and it no longer has to fall back on `indeterminate`
+// either: the host answered, and what it answered proves the removal did not
+// happen, so it records `proven_failure` carrying that reading — and says which
+// proven failure it is, in the code beside it.
 test "blackbox: `session rm` deletes nothing when the session survives the kill" {
     const t = std.testing;
     var f = try Fixture.init(t.allocator, "session_rm_survived");
@@ -4913,9 +4929,11 @@ test "blackbox: `session rm` deletes nothing when the session survives the kill"
     try host.expectSent("kill-session");
     try host.expectNeverSent("rm -f");
     try host.expectFullyScripted();
-    // 75, not 1: the record now blocks this session's scope until it is
-    // reconciled, so "plain failure, retry" would send a caller into a refusal.
-    try refused.expectCode(75);
+    // 1, not 75, and the inversion is the point. The host proved this removal did
+    // not happen, so the record is `failed` and not an unknown: it bars nothing,
+    // the scope is free, and "it did not work, a retry is safe" is true of both
+    // halves. 75 would send a caller to reconcile a settled question.
+    try refused.expectCode(1);
     try refused.expectSays("\"action\": \"not_removed\"");
     try refused.expectSays("\"errorCode\": \"SESSION_SURVIVED_KILL\"");
     try refused.expectSays("\"sessionState\": \"present\"");
@@ -4938,12 +4956,24 @@ test "blackbox: `session rm` deletes nothing when the session survives the kill"
     const op = (try Store.operations.latestByAlias(&store, arena, 1, "shell")) orelse
         return error.RefusalRecordedNoOperation;
     try t.expectEqualStrings("control", op.kind);
-    try t.expectEqualStrings("indeterminate", op.status.text());
+    // `failed`, and the status is load-bearing twice: it is what the host proved,
+    // and it is what stops this row barring the scope of a session nothing here
+    // touched. An `indeterminate` in its place would hold the barrier over a
+    // question that was answered.
+    try t.expectEqualStrings("failed", op.status.text());
+    try t.expect(!op.status.blocksScope());
     // Its own code, so this is distinguishable from a lost lease — the two send
     // an operator to completely different places.
     const code = (try terminalErrorCode(&store, arena, op.request_id)) orelse
         return error.RemovalLeftNoTerminalReceipt;
     try t.expectEqualStrings("SESSION_SURVIVED_KILL", code);
+    // The reading that justifies the claim, on the receipt rather than only in the
+    // report: `proven_failure` refuses to be constructed without one, and this is
+    // the column it lands in.
+    const observation = (try terminalTransportError(&store, arena, op.request_id)) orelse
+        return error.RemovalLeftNoObservation;
+    if (std.mem.indexOf(u8, observation, "has-session") == null)
+        return error.ReceiptDidNotSayWhatWasRead;
 
     // And the scope was handed back even though the act failed: a claim held by
     // a process that has exited would lock the operator out for its whole TTL.

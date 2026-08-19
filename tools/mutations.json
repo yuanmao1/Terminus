@@ -292,33 +292,33 @@
     {
       "id": "M7-transfer-exited",
       "rule": "A copier's exit status may not settle a transfer.",
-      "file": "src/core/store/receipts.zig",
-      "find": "            // variant and therefore not this change's to make.\n            .transfer_push, .transfer_pull, .fetch => false,",
-      "replace": "            // variant and therefore not this change's to make.\n            .transfer_push, .transfer_pull, .fetch => true,",
+      "file": "src/core/store/operations.zig",
+      "find": "            .transfer_push, .transfer_pull, .fetch => .{\n                .publishes_declared_artifact = true,\n                .runs_our_command = false,",
+      "replace": "            .transfer_push, .transfer_pull, .fetch => .{\n                .publishes_declared_artifact = true,\n                .runs_our_command = true,",
       "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M7-transfer-remote-deadline",
       "rule": "A remote-reported deadline may not settle a transfer.",
-      "file": "src/core/store/receipts.zig",
-      "find": "            // terminal that carries what it observed at the destination.\n            .transfer_push, .transfer_pull, .fetch => false,",
-      "replace": "            // terminal that carries what it observed at the destination.\n            .transfer_push, .transfer_pull, .fetch => true,",
+      "file": "src/core/store/operations.zig",
+      "find": "                .publishes_declared_artifact = true,\n                .runs_our_command = false,\n                .supervised_deadline = false,",
+      "replace": "                .publishes_declared_artifact = true,\n                .runs_our_command = false,\n                .supervised_deadline = true,",
       "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M7-transfer-cancel-confirmed",
       "rule": "A confirmed cancellation of a copier may not settle a transfer.",
-      "file": "src/core/store/receipts.zig",
-      "find": "            // nothing had been sent to one.\n            .transfer_push, .transfer_pull, .fetch => false,",
-      "replace": "            // nothing had been sent to one.\n            .transfer_push, .transfer_pull, .fetch => true,",
+      "file": "src/core/store/operations.zig",
+      "find": "                .offers_input_bytes = false,\n                .supervises_another_subject = false,",
+      "replace": "                .offers_input_bytes = false,\n                .supervises_another_subject = true,",
       "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M7-transfer-indeterminate",
       "rule": "`indeterminate` stays admissible for every kind, so a refused transfer cannot wedge.",
       "file": "src/core/store/receipts.zig",
-      "find": "        .indeterminate => switch (kind) {\n            .exec,\n            .job,\n            .session_write,\n            .control,\n            .transfer_push,",
-      "replace": "        .indeterminate => switch (kind) {\n            .transfer_push => false,\n            .exec,\n            .job,\n            .session_write,\n            .control,",
+      "find": "        .indeterminate => true,",
+      "replace": "        .indeterminate => !can.publishes_declared_artifact,",
       "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
@@ -572,17 +572,17 @@
     {
       "id": "M3b-control-terminal-exited",
       "rule": "A control operation may not be settled with an exit status: no command of the caller's ran, and `exit_code` is the column an auditor reads first.",
-      "file": "src/core/store/receipts.zig",
-      "find": "            // kind loses a word it could not have earned, not an outcome.\n            .control => false,",
-      "replace": "            // kind loses a word it could not have earned, not an outcome.\n            .control => true,",
+      "file": "src/core/store/operations.zig",
+      "find": "                .supervises_another_subject = true,\n                .runs_our_command = false,",
+      "replace": "                .supervises_another_subject = true,\n                .runs_our_command = true,",
       "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
       "id": "M3b-control-terminal-indeterminate",
       "rule": "`indeterminate` describes a control operation: a kind with no admissible terminal is unsettleable and holds its scope forever.",
       "file": "src/core/store/receipts.zig",
-      "find": "        .indeterminate => switch (kind) {\n            .exec,\n            .job,\n            .session_write,\n            .control,\n",
-      "replace": "        .indeterminate => switch (kind) {\n            .control => false,\n            .exec,\n            .job,\n            .session_write,\n",
+      "find": "        // terminal available after submission at all.\n        .indeterminate => true,",
+      "replace": "        // terminal available after submission at all.\n        .indeterminate => !can.supervises_another_subject,",
       "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
     },
     {
@@ -872,6 +872,30 @@
       "find": "        .unreadable => \"the store could not be asked whether the scope is still ours, so --force would take the lease over on the strength of the same answer nobody got: fix the store error named above, then re-run\",\n",
       "replace": "        .unreadable => \"Wait for the other holder to finish and re-run, or re-run with --force to take the scope over\",\n",
       "expect_gate": "preKillRecovery"
+    },
+    {
+      "id": "W6-proven-failure-needs-its-own-subject",
+      "rule": "A failure proven after submission may only settle a kind whose verdict is the state of somebody else's subject. For a command it is `exited` carrying the status that caused it, and admitting `proven_failure` there would record a failure without the number the host reported.",
+      "file": "src/core/store/receipts.zig",
+      "find": "        .proven_failure => can.supervises_another_subject,",
+      "replace": "        .proven_failure => can.runs_our_command or can.supervises_another_subject,",
+      "expect_gate": "gate: every kind × terminal cell is decided, and none of them by default"
+    },
+    {
+      "id": "W6-undeclared-kind-declares-nothing",
+      "rule": "`judgement_undeclared` records that nothing is known about what a kind is judged by, so it excludes every other axis. A kind claiming both would be asking the settle side to widen and the resolve side to narrow over the same row, and which won would be an accident of rule order.",
+      "file": "src/core/store/operations.zig",
+      "find": "            .tunnel, .plan_phase, .audit, .cleanup => .{\n                .judgement_undeclared = true,\n                .runs_our_command = false,",
+      "replace": "            .tunnel, .plan_phase, .audit, .cleanup => .{\n                .judgement_undeclared = true,\n                .runs_our_command = true,",
+      "expect_gate": "gate: admissibility follows declared capability, not kind identity"
+    },
+    {
+      "id": "W6-survived-kill-is-a-proven-failure",
+      "rule": "A `session rm` whose host reports the session still present settles `failed` from the reading that proves it, not `indeterminate`. Recording a proof as an unknown bars the scope of a session nothing touched and sends an operator to reconcile a settled question.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    _ = execution.settle(.{ .proven_failure = .{\n        .observation = observation,\n        .error_code = code.survived,\n    } }, .{}) catch |err| refuseLedgerUnrecordable(",
+      "replace": "    _ = execution.settle(.{ .indeterminate = .{\n        .reason = observation,\n        .last_observed = execution.status,\n        .error_code = code.survived,\n    } }, .{}) catch |err| refuseLedgerUnrecordable(",
+      "expect_gate": "blackbox: `session rm` deletes nothing when the session survives the kill"
     }
   ]
 }

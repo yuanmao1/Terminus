@@ -744,6 +744,24 @@ fn terminalEvent(
             event.remote_started = false;
             event.timed_out = false;
         },
+        .proven_failure => |p| {
+            // The reading goes in the table's "what went wrong, in words" column,
+            // beside `never_submitted`, `indeterminate` and `input_refused`, which
+            // use it for reasons that are not transport failures either. The
+            // machine-readable half is `error_code`, filled from
+            // `terminal.errorCode()` above and required by the variant.
+            event.transport_error = p.observation;
+            // No exit code, and none may be inferred from the absence: this
+            // operation was judged by the host's answer about its subject, and no
+            // command of the caller's reported anything. `timed_out = false`
+            // because no deadline was involved — a local one expiring is
+            // `indeterminate` (`op_state` rule 2), not this.
+            event.timed_out = false;
+            // `remote_started` and `connected` are left as the source state derived
+            // them. The act was submitted, so both are facts about how far it got,
+            // and this terminal does not contradict either: what it denies is that
+            // the act took effect, not that it was sent.
+        },
     }
     return event;
 }
@@ -1218,342 +1236,180 @@ pub const ResolutionEvidence = union(enum) {
     /// domains: a job wrapper's exit status would be allowed to close a
     /// transfer whose bytes nobody ever checked.
     ///
-    /// Exhaustive in both directions, with no default arm anywhere, so adding
-    /// an `operations.Kind` or a `ResolutionEvidence` variant is a compile
-    /// error here until someone states what may settle what. The arm this
-    /// replaced was `else => true`: every kind not named admitted every kind of
-    /// evidence, and every kind added later inherited that — the widest
-    /// possible permit, granted by omission, on the path that decides whether a
-    /// resolution may lift the same-scope mutation barrier.
+    /// **Each arm names the property a kind must have for this evidence to be a
+    /// statement about it**, and reads that property off
+    /// `operations.Kind.capabilities`. It was 99 cells until now — nine variants
+    /// spelled out against all eleven kinds, six of which nothing constructs — and
+    /// the arm this table originally replaced was `else => true`: every kind not
+    /// named admitted every kind of evidence, on the path that decides whether a
+    /// resolution may lift the same-scope mutation barrier. Neither shape survives
+    /// here: there is no `else`, and there is no cell either. A new evidence
+    /// variant states which property it needs, a new kind states which properties
+    /// it has, and the pairing follows from the two.
     ///
-    /// Each cell answers "can evidence of this kind make a statement about work
-    /// of this kind at all", not "could it be useful here". Where the answer is
-    /// not clear the cell refuses and says why: a wrongly refused resolution is
-    /// an operator inconvenience that names exactly what it refused, while a
-    /// wrongly admitted one releases a safety barrier on a claim about
-    /// something else.
+    /// Nothing is admitted by omission, and nothing is exempted by name. The
+    /// arguments that used to sit in the cells are kept where they belong: the ones
+    /// about a *kind* — why a job's recorded pid is its pane's, why a control act
+    /// has somebody else's process in view, why a write has no wrapper — are on the
+    /// arms of `Kind.capabilities`, and the ones about an *evidence variant* are
+    /// here.
+    ///
+    /// Each arm answers "can evidence of this kind make a statement about work of
+    /// this kind at all", not "could it be useful here". Where the answer is not
+    /// clear it refuses and says why: a wrongly refused resolution is an operator
+    /// inconvenience that names exactly what it refused, while a wrongly admitted
+    /// one releases a safety barrier on a claim about something else.
     pub fn appliesToKind(e: ResolutionEvidence, kind: operations.Kind) bool {
+        return e.appliesTo(kind.capabilities());
+    }
+
+    /// The rules themselves, over capabilities alone.
+    ///
+    /// Split out from `appliesToKind` so that a kind is **not in scope** while the
+    /// rules are being decided. That is the difference between a table that
+    /// derives and a table that happens to agree: an exception for one kind cannot
+    /// be written here without adding a parameter, so "admissibility follows
+    /// capability, not kind identity" is a property of the signature rather than a
+    /// convention. It also lets `gates_test` flip one axis at a time against these
+    /// very rules and check that each axis decides something.
+    pub fn appliesTo(e: ResolutionEvidence, can: operations.Capabilities) bool {
         return switch (e) {
-            // Refused for every kind, until something builds a producer that
-            // binds a report to the attempt it is about.
+            // Refused for every kind, and the refusal is about the variant rather
+            // than about any property a kind could acquire — which is why it is a
+            // literal `false` and not a rule.
             //
-            // The variant is kept rather than deleted — the supervisor is
-            // unbuilt work, not abandoned work — but nothing constructs one
-            // today, and admitting it meanwhile grants the widest permit in the
-            // union to the only mechanical variant with **no identity binding at
-            // all**. Every other one has something tying the reading to this
-            // operation, checked in `resolve`: `job_result` carries the request
-            // id the document itself names, `process_probe` is matched against
-            // the pid and start token the attempt recorded, `job_sentinel` is
-            // matched against the sentinel the launch wrote down, and the four
-            // readings of a destination are compared against the side, path and
-            // digest the transfer committed to before it submitted. A
+            // The variant is kept rather than deleted — the supervisor is unbuilt
+            // work, not abandoned work — but nothing constructs one today, and
+            // admitting it meanwhile grants the widest permit in the union to the
+            // only mechanical variant with **no identity binding at all**. Every
+            // other one has something tying the reading to this operation, checked
+            // in `resolve`: `job_result` carries the request id the document itself
+            // names, `process_probe` is matched against the pid and start token the
+            // attempt recorded, `job_sentinel` against the sentinel the launch
+            // wrote down, and the four readings of a destination against the side,
+            // path and digest the transfer committed to before it submitted. A
             // `supervisor_report` carries a status and a sentence. Any caller
             // holding any request id could hand one in and have it graded
             // mechanical (`isMechanical`), which is the grade that releases the
             // same-scope mutation barrier without an operator in the loop.
             //
-            // **What a producer must supply for these cells to be reopened**,
-            // written here because this is where a future author will come to
-            // undo the refusal:
+            // **What a producer must supply before this becomes a rule**, written
+            // here because this is where a future author will come to undo the
+            // refusal:
             //
             //  * a field on the variant naming what the report is *about*, in a
-            //    form the report's own writer filled in and this binary can
-            //    check against something it wrote down first. The three shapes
-            //    that already work are `job_result`'s — the request id, read out
-            //    of the document, compared against the operation being resolved
-            //    — `process_probe`'s — a process identity, compared against
-            //    the one the attempt recorded on its trail — and
-            //    `job_sentinel`'s, a string compared against the one this binary
-            //    chose at launch and stored in `job_attempts`. The wrapper in
-            //    `supervisor.zig` already writes both a request id and a pid, so
-            //    either is available; what is not acceptable is a field the
-            //    caller fills from the operation it is resolving, which compares
-            //    a value against itself and can never fire;
+            //    form the report's own writer filled in and this binary can check
+            //    against something it wrote down first. The three shapes that
+            //    already work are `job_result`'s — the request id, read out of the
+            //    document, compared against the operation being resolved —
+            //    `process_probe`'s, a process identity compared against the one the
+            //    attempt recorded, and `job_sentinel`'s, a string compared against
+            //    the one this binary chose at launch and stored in `job_attempts`.
+            //    The wrapper in `supervisor.zig` already writes both a request id
+            //    and a pid, so either is available; what is not acceptable is a
+            //    field the caller fills from the operation it is resolving, which
+            //    compares a value against itself and can never fire;
             //  * the check in `resolve`, next to the `job_result` and
             //    `process_probe` arms and before `supports`, refusing with
             //    `evidence_wrong_operation` (or `evidence_wrong_process`) rather
             //    than with a generic error;
-            //  * then, and only then, a decision per cell here about which kinds
-            //    that mechanism actually supervises — which is a narrower
-            //    question than "which kinds run a remote process", and the
-            //    reasons the old `exec, .job => true` cell gave for each group
-            //    are kept below because they will still be the reasons.
-            //
-            // The old cell's reasoning, unchanged and still the starting point:
-            // `exec` and `job` are one supervised remote command each, so what
-            // the attempt did is what that command did and its supervisor's
-            // report is a statement about the whole of it. A transfer's outcome
-            // is whether the bytes are at the destination and hash to what was
-            // promised in advance — a copier that wrote to the wrong path, or
-            // whose rename never ran, still exits 0, and this variant would
-            // carry that 0 straight to `completed` past the digest comparison
-            // every other route to a transfer's verdict has to pass. Nothing in
-            // this binary creates a `tunnel`, `plan_phase`, `audit` or `cleanup`
-            // operation, so nothing supervises one either.
+            //  * then, and only then, the property this arm should read. It is
+            //    narrower than `runs_our_command`: the question is which kinds that
+            //    mechanism actually *supervises*. The reasoning the old cells gave
+            //    still applies — `exec` and `job` are one supervised remote command
+            //    each, so a supervisor's report is a statement about the whole of
+            //    what the attempt did, while a transfer's outcome is whether the
+            //    bytes are at the destination and hash to what was promised, and a
+            //    copier that wrote to the wrong path still exits 0.
             //
             // Refusing everywhere costs nothing that is reachable: no command
             // constructs this variant, so no operator route disappears, and
             // `operator_override` remains admissible for every kind — nothing is
             // left with no way to be settled.
-            .supervisor_report => switch (kind) {
-                .exec,
-                .job,
-                .session_write,
-                .control,
-                .transfer_push,
-                .transfer_pull,
-                .fetch,
-                .tunnel,
-                .plan_phase,
-                .audit,
-                .cleanup,
-                => false,
-            },
-            // A pid and start-token reading of a process. `resolve` requires it
-            // to be a reading of *this operation's own* recorded process, so
-            // the kinds it may speak for are the ones a process identity is
-            // recorded for.
-            .process_probe => switch (kind) {
-                // An `exec` records the pid and start token the shell reported
-                // for the command it ran (`supervisor.Identity`, put on the
-                // trail by `execution.remoteStarted`).
-                .exec => true,
-                // A `job` records neither of those things. `cmd_job` launches
-                // into a tmux session and reports `Tmux.panePid`, so the identity
-                // on a job's trail is the *pane's* pid with no start token — a
-                // reading about one process, admitted to settle a different one.
-                // `supervisor.zig` says outright what that is worth: "a command
-                // that daemonized, called `disown`, or ran under `setsid`
-                // outlives the pane". `cmd_job`'s own kill path honours that — it
-                // writes `remote_cancel_confirmed` only when
-                // `verified_cancellation` is satisfied, which shell mode never
-                // satisfies — and while this cell was `true`, a probe arriving
-                // here made the same claim with nothing asked of it: pane gone,
-                // `cancelled`, scope released, child still running.
-                //
-                // It was left admissible once on the argument that the honest
-                // rule is about the recorded *identity* rather than the kind, and
-                // that narrowing the cell would encode today's job launcher into
-                // the evidence contract. The argument is sound and the conclusion
-                // was wrong: a job already has two evidence chains of its own
-                // that are addressed to it — `job_sentinel` and `job_result` —
-                // so refusing here removes no route, while admitting it keeps a
-                // permit alive for a reading that is structurally about the
-                // wrong process. If a launcher ever reports the command's own pid
-                // and start token onto the job's trail, this cell is where that
-                // becomes true again, and it should be reopened in the same
-                // change that makes it true rather than held open in advance.
-                .job => false,
-                // A `session_write` records no process at all, and there is no
-                // shape in which it could: `Tmux.sendKeys` runs one tmux
-                // command and reports nothing about the pane, let alone about
-                // whatever the shell went on to fork. So there is nothing for
-                // a probe to be a reading *of* — `resolve` would find no
-                // recorded identity and refuse with `evidence_wrong_process`
-                // anyway, and this cell says why that is the permanent answer
-                // rather than a gap somebody should fill by recording the
-                // pane's pid. The pane's pid is not the input's process; that
-                // mistake is the one the `.job` cell above was closed for.
-                .session_write => false,
-                // A control act records no process either, and the reason is
-                // one step sharper than a write's: it has one in *view* and it
-                // is somebody else's. `session rm` sends `tmux kill-session`
-                // and reads `tmux has-session`; the process in that pane
-                // belongs to whoever started the session, and the only thing
-                // this operation ever wrote down about the host is the session
-                // *name* (`operations.alias`). So there is no recorded identity
-                // for a probe to be checked against — `resolve` would refuse
-                // with `evidence_wrong_process` — and recording the pane's pid
-                // to make one available would repeat the `.job` cell's mistake
-                // twice over: a reading of one process settling a different
-                // operation, where the operation is not even about a process.
-                //
-                // What a control operation *is* judged by is whether the thing
-                // it named is gone, and the terminal that carries that reading
-                // is `remote_cancel_confirmed`
-                // (`terminalDescribesKind`) — written at the moment the host
-                // answers, so the only control acts that reach a reconcile are
-                // the ones whose answer was lost.
-                .control => false,
-                // A transfer writes down a destination and a digest, not a
-                // process. "It is no longer running" is equally true of a
-                // transfer that finished and one that died mid-rename, and
-                // `cancelled` — the only thing a dead process establishes —
-                // would release the barrier on the second while its checkpoint
-                // went on holding the path against everyone else.
-                .transfer_push, .transfer_pull, .fetch => false,
-                // As above: no such operation exists yet, so none of them
-                // records a process a probe could be a reading of.
-                .tunnel, .plan_phase, .audit, .cleanup => false,
-            },
-            // Both are exit statuses recorded by the job wrapper — the
-            // sidecar it writes and the sentinel it echoes. Neither exists
-            // for any other kind of operation, so one turning up against a
-            // transfer or a fetch means the evidence was misrouted, not that
-            // the operation is settled.
+            .supervisor_report => false,
+            // A pid and start-token reading of a process. `resolve` requires it to
+            // be a reading of *this operation's own* recorded process, so it may
+            // speak only for a kind that recorded one — which is a fact about what
+            // the attempt wrote down, not about whether a process existed.
             //
-            // A `session_write` is the case worth naming, because it is the
-            // one kind that shares a mechanism with a job and still admits
-            // neither: `cmd_job` types its launch line into a tmux session
-            // exactly as `write` types the operator's, and the job's two
-            // evidence chains come from the *wrapper* that line carries — a
-            // sentinel echoed after the command, a sidecar written at an
-            // address derived from the request id. A write carries no wrapper.
-            // Nothing it types is obliged to echo anything, and an operator
-            // who typed a wrapper of their own would be offering a document
-            // this binary never asked any host to produce.
-            .job_result, .job_sentinel => switch (kind) {
-                .job => true,
-                // The cell that says out loud what "control and target settle
-                // independently" (§3.4) means on the evidence axis. A control
-                // act *aimed at a job* — `job kill`, `job rm`, and `session rm`
-                // pointed at `job-<name>` — is settled by what it itself did:
-                // the lease was ours or not, the kill went out or was withheld,
-                // the host said the session was gone or still there. The job's
-                // wrapper documents belong to the job's own attempt, and that
-                // row is where they settle it.
-                //
-                // Admitting them here would be the two-subjects defect
-                // reintroduced on the resolve side: a sidecar saying `exit 0`
-                // would close the *supervisory* operation, reporting that the
-                // removal succeeded on the strength of the removed job having
-                // finished. The two can disagree — a kill that lost its lease
-                // over a job that had already exited is exactly that case — and
-                // `fdd1144` is the commit that had to untangle it by hand.
-                .control => false,
-                .exec,
-                .session_write,
-                .transfer_push,
-                .transfer_pull,
-                .fetch,
-                .tunnel,
-                .plan_phase,
-                .audit,
-                .cleanup,
-                => false,
-            },
-            // A file read at a path and hashed. It can only mean anything for
-            // work that said in advance which file would prove it — `resolve`
-            // compares side, path and digest against that commitment, and no
-            // other kind of operation makes one. A hash cannot say whether an
+            // Only `exec` declares it. A job runs a remote process and records its
+            // *pane's* pid instead; a write and a control act record no process at
+            // all, and a control act's is somebody else's to begin with. All three
+            // arguments are on `Kind.capabilities`, next to the field they decide,
+            // because each is a statement about that kind rather than about probes.
+            // For any of them `resolve` would find no recorded identity and refuse
+            // with `evidence_wrong_process` anyway; this is where that stops being
+            // an accident of the trail and becomes the contract.
+            .process_probe => can.records_process_identity,
+            // Both are exit statuses recorded by our job wrapper — the sidecar it
+            // writes and the sentinel it echoes — so they can only speak for work
+            // whose launch line carried that wrapper. One turning up against a
+            // transfer or a fetch means the evidence was misrouted, not that the
+            // operation is settled.
+            //
+            // `session_write` and `control` are the two that share a *mechanism*
+            // with a job and still admit neither, and both arguments are on their
+            // capability arms: `cmd_job` types its launch line into a tmux session
+            // exactly as `write` types the operator's, and a control act aimed at a
+            // job is settled by what it itself did rather than by the job's
+            // documents.
+            .job_result, .job_sentinel => can.wrapper_documents_exit,
+            // A file read at a path and hashed. It can only mean anything for work
+            // that said in advance which file would prove it — `resolve` compares
+            // side, path and digest against that commitment, and only a kind that
+            // publishes a declared artifact makes one. A hash cannot say whether an
             // arbitrary command did what it was asked.
-            .filesystem_effect => switch (kind) {
-                .transfer_push, .transfer_pull, .fetch => true,
-                .exec, .job, .session_write, .control, .tunnel, .plan_phase, .audit, .cleanup => false,
-            },
-            // The same address, read and found empty. Only work that named a
-            // destination in advance can be spoken about this way — `resolve`
-            // compares side and path against that commitment — and only a
-            // transfer names one. "Nothing is at /srv/app/out.bin" is not a
-            // statement about what an arbitrary command did, however true it is.
-            //
-            // Its two positive twins are the same cell for the same reason: all
-            // three are readings of an address, and only a transfer has one on
-            // record. They travel together because a kind that can be told its
-            // artifact is there must be tellable that it is not and that it is
+            .filesystem_effect => can.publishes_declared_artifact,
+            // The same address, read and found empty, or found to hold something
+            // this transfer cannot vouch for. Same property as the positive
+            // reading, and the same rule for a reason worth stating: all four are
+            // readings of an address, and only work that named one in advance has
+            // one on record. They travel together because a kind that can be told
+            // its artifact is there must be tellable that it is not and that it is
             // the wrong one, or some of its outcomes have no evidence that can
-            // express them at all — which is how the parked publish came to be
-            // wedged in the first place.
+            // express them at all — which is how a parked publish came to be wedged
+            // in the first place. "Nothing is at /srv/app/out.bin" is not a
+            // statement about what an arbitrary command did, however true it is.
             .destination_absent,
             .destination_present_unverified,
             .destination_present_contradicting,
-            => switch (kind) {
-                .transfer_push, .transfer_pull, .fetch => true,
-                // A control act names a session, not an address on a
-                // filesystem. "Nothing is at /srv/app/out.bin" is not a
-                // statement about whether a shell was stopped, and the pane log
-                // `session rm` deletes is not a *destination* — nothing declared
-                // in advance that a file there would be what proved the act,
-                // which is the commitment `resolve` compares these readings
-                // against and the reason only a transfer can be spoken about
-                // this way.
-                .exec, .job, .session_write, .control, .tunnel, .plan_phase, .audit, .cleanup => false,
-            },
+            => can.publishes_declared_artifact,
             // A human's decision, and the only variant that is about the
-            // *operation* rather than about some mechanism's output — so there
-            // is no kind of work it cannot speak about. Admissible everywhere
-            // on purpose: an attempt nothing mechanical can settle holds its
-            // scope until somebody settles it, and a kind admitted no evidence
-            // at all could never be settled by anyone. That is not hypothetical
-            // any more — `supervisor_report` is now refused for every kind and
-            // `process_probe` for every kind but `exec`, so for a `tunnel` or a
-            // `plan_phase` this cell is the *only* admissible one. What keeps it
-            // honest lives elsewhere — it is recorded as a decision
-            // (`isMechanical`), and `publishAdjudication` refuses to let it
-            // write an artifact fact nobody read.
+            // *operation* rather than about some mechanism's output — so there is no
+            // kind of work it cannot speak about. Admissible everywhere on purpose,
+            // and, like `supervisor_report`'s refusal, a literal rather than a rule:
+            // an attempt nothing mechanical can settle holds its scope until
+            // somebody settles it, and a kind admitting no evidence at all could
+            // never be settled by anyone. That is not hypothetical — with
+            // `supervisor_report` refused everywhere and `process_probe` admitted
+            // only where an identity was recorded, this is the *only* admissible
+            // evidence for six of the eleven kinds.
             //
-            // That refusal is also the limit of what this cell buys, and the
-            // limit is real rather than theoretical: for a transfer parked in
-            // `indeterminate_publish` an override is admitted here and then
-            // fails the whole resolution with
-            // `error.PublishAdjudicationUndetermined`, because the checkpoint
-            // has to be judged in the same transaction and an override cannot
-            // judge it. Such an operation is settleable by a reading of its
-            // destination and by nothing else, and there is now one for each
-            // answer a look can produce: `filesystem_effect` matching the digest
-            // it declared, `destination_present_contradicting` when the artifact
-            // is there and hashes to something else,
-            // `destination_present_unverified` when it declared no digest at
-            // all, or `destination_absent` at the path it committed to. All four
-            // are available to the operator who checked by hand — that is the
-            // same act with the reading attached — so the limit is a requirement
-            // to say what was seen.
+            // What keeps it honest lives elsewhere: it is recorded as a decision
+            // (`isMechanical`), and `publishAdjudication` refuses to let it write an
+            // artifact fact nobody read. That refusal is also the limit of what this
+            // buys, and the limit is real: a transfer parked in
+            // `indeterminate_publish` is admitted here and then fails the whole
+            // resolution with `error.PublishAdjudicationUndetermined`, because the
+            // checkpoint has to be judged in the same transaction and an override
+            // cannot judge it. Such an operation is settleable by a reading of its
+            // destination and by nothing else, and there is one for each answer a
+            // look can produce — all four available to the operator who checked by
+            // hand, which is the same act with the reading attached.
             //
-            // `session_write` is the newest kind for which this is the *only*
-            // admissible cell, and unlike a `tunnel` that is not because
-            // nothing creates one — `terminus write` creates one every time it
-            // runs. It is because a write's own terminal
-            // (`op_state.Terminal.input_accepted`) settles it at the moment the
-            // remote answers, so the only writes that reach a reconcile are the
-            // ones whose answer was lost, and about *those* no mechanism on
-            // this host or that one has anything to say. The bytes are either
-            // in a pane or they are not; nothing recorded which.
-            //
-            // **What a future mechanical producer would have to bind itself
-            // to**, written here for the reason `supervisor_report`'s refusal
-            // is: an operator arriving to widen a cell should find the terms
-            // rather than invent them. A write records exactly two things
-            // about itself before it sends — the session it is aimed at
-            // (`operations.alias`, and the scope key, which are the same
-            // string) and the digest of the bytes it is about to type
-            // (`operations.argv_sha256`). So evidence that could speak for a
-            // `session_write` has to be a reading of *that pane* carrying
-            // *that digest*, checked in `resolve` against those two columns
-            // before `supports` runs, and refused with a named identity
-            // outcome the way `evidence_wrong_sentinel` is. What would not do:
-            // a reading of the pane alone — every write to a busy session
-            // would match it, which is the "compares a value against itself"
-            // shape — or a marker the *operator's own input* was asked to
-            // echo, since nothing makes an operator type one and a write that
-            // did not is exactly the write nobody can settle.
-            //
-            // `control` is the second such kind, and it is reachable for the
-            // same reason: `terminus session rm` creates one every time it runs,
-            // and its own terminal settles it the moment the host answers
-            // `has-session`. The control acts that reach a reconcile are the
-            // ones whose answer was lost, and about those nothing on either host
-            // has anything to say — a session that was killed and a session that
-            // was not look identical from here once the reply is gone, and the
-            // next `tmux has-session` would be a reading of a *name* somebody
-            // else has been free to reuse ever since, not of the incarnation
-            // this act was aimed at. Per-attempt session identity (§4) is what
-            // would make such a reading mean something, and it is not in this
-            // slice.
-            .operator_override => switch (kind) {
-                .exec,
-                .job,
-                .session_write,
-                .control,
-                .transfer_push,
-                .transfer_pull,
-                .fetch,
-                .tunnel,
-                .plan_phase,
-                .audit,
-                .cleanup,
-                => true,
-            },
+            // Two of the six are reachable today rather than waiting on a producer.
+            // `terminus write` creates a `session_write` every time it runs and
+            // `terminus session rm` creates a `control`; for both, their own
+            // terminal settles them at the moment the remote answers, so the only
+            // ones that reach a reconcile are the ones whose answer was lost — and
+            // about those nothing on either host has anything to say. The bytes are
+            // in a pane or they are not; a session that was killed and one that was
+            // not look identical from here once the reply is gone, and the next
+            // `has-session` would be a reading of a *name* somebody else has been
+            // free to reuse ever since. What a future mechanical producer for
+            // either would have to bind itself to is written on their capability
+            // arms, beside the fields that say what each one recorded about itself.
+            .operator_override => true,
         };
     }
 
@@ -1646,474 +1502,234 @@ pub const ResolutionEvidence = union(enum) {
 /// `std` and `operations.zig` imports *it* — the matrix there would close an
 /// import cycle in the store's leaf module.
 ///
-/// The two are not symmetric, and the asymmetry is why this one did not exist
-/// until now. `resolve` accepts evidence about work the caller did not perform,
-/// so it must ask whether a reading is even addressed to this domain. `settle`
-/// is reached only from the code that just did the work: three `execution.begin`
-/// sites construct every operation this binary creates — `cmd_exec` (`.exec`),
-/// `cmd_job` (`.job`), `cmd_read_write` (`.session_write`) — and each settles its
-/// own, while the two routes that settle an operation their caller did not create
-/// (`request reconcile --from-log`, `Cli.settleProvableBlocker`) both require a
-/// `job_attempts` row, which only `job run` writes, on a `.job` operation. So no
-/// wrong pair is produced today. This exists to keep that true, not to correct it.
+/// **Each arm names the property a kind must have for this terminal to describe
+/// it**, read off `operations.Kind.capabilities`. It was 88 cells until now, and
+/// the twelve most expensive of them were about the four kinds nothing
+/// constructs; adding one variant meant answering eleven questions here and
+/// eleven more in the `gates_test` mirror, which is why the variant §7.5 decided
+/// on was deferred three times. A variant now states which property it needs,
+/// once.
 ///
-/// What made the question non-vacuous is `session_write`. While `exec` and `job`
-/// were the only kinds, every terminal described both and the table said nothing.
-/// A write runs no command, so `exited` — whose entire content is an exit status
-/// — acquired a kind it must not speak for, and `input_accepted` acquired nine.
+/// The two matrices are not symmetric, and the asymmetry decides most of these
+/// rules. `resolve` accepts evidence about work the caller did not perform, so it
+/// must ask whether a reading is even addressed to this domain. `settle` is
+/// reached only from the code that just did the work: four `execution.begin`
+/// sites construct every operation this binary creates — `cmd_exec` (`.exec`),
+/// `cmd_job` (`.job`), `cmd_read_write` (`.session_write`), `cmd_session`
+/// (`.control`) — and each settles its own, while the two routes that settle an
+/// operation their caller did not create (`request reconcile --from-log`,
+/// `Cli.settleProvableBlocker`) both require a `job_attempts` row, which only
+/// `job run` writes, on a `.job` operation. So no wrong pair is produced today.
+/// This exists to keep that true, not to correct it.
 ///
 /// **A refusal here is not the same shape of refusal as `appliesToKind`'s**, and
-/// saying why is what decides most of the cells below. A refused *resolution* is
-/// recoverable: the operator brings a different reading, and `operator_override`
-/// is admissible for every kind precisely so nothing is left with no way out. A
-/// refused *settlement* is not. `settle` is the sole terminal writer, there is no
-/// operator variant in `op_state.Terminal`, and none is proposed here — so a kind
-/// whose only route to an outcome is refused cannot reach that outcome at all.
-/// The attempt stays live, goes on blocking its scope, and `resolve` cannot
-/// rescue it either, because `resolve` acts only on `indeterminate` and the
-/// operation never got there. Refusing on this side deletes an outcome from a
-/// kind's vocabulary; refusing on the other side only narrows what may prove one.
+/// that is what makes the rules below narrower than they look. A refused
+/// *resolution* is recoverable: the operator brings a different reading, and
+/// `operator_override` is admissible for every kind precisely so nothing is left
+/// with no way out. A refused *settlement* is not. `settle` is the sole terminal
+/// writer, there is no operator variant in `op_state.Terminal`, and none is
+/// proposed here — so a kind whose only route to an outcome is refused cannot
+/// reach that outcome at all. The attempt stays live, goes on blocking its scope,
+/// and `resolve` cannot rescue it either, because `resolve` acts only on
+/// `indeterminate` and the operation never got there. Refusing on this side
+/// deletes an outcome from a kind's vocabulary; refusing on the other side only
+/// narrows what may prove one.
 ///
-/// So the test for a cell here is not "would this be useful" but "can this kind
-/// perform the act the terminal describes, and does refusing still leave it able
-/// to say what happened to it".
+/// So the test for a rule here is not "would this be useful" but "can a kind with
+/// this property perform the act the terminal describes, and does refusing the
+/// rest still leave them able to say what happened to them". Three consequences
+/// of applying that test are worth stating up front, because a reader will
+/// otherwise assume a mistake:
 ///
-/// The three transfer kinds are where that test was applied hardest, and the
-/// result is worth stating up front because a reader will otherwise assume a
-/// mistake: `transfer_push`, `transfer_pull` and `fetch` admit **no business
-/// terminal at all**. `exited`, `remote_deadline` and `remote_cancel_confirmed`
-/// are each refused for them, so `completed` and `timed_out` are unreachable
-/// through `settle`, and `failed` and `cancelled` only before submission. Each
-/// of those three carries a fact about a *process*, and a transfer is judged by
-/// an artifact at a destination it named in advance — a copier that exits 0
-/// having renamed nothing is the case that makes the difference load-bearing.
-/// The second half of the test is satisfied, which is why the refusal is
-/// admissible: `indeterminate` stays open from every in-flight state, and it is
-/// not a dead end here, because `transfers` reads `resolved_status` alongside
-/// `status` (`ownerBlocksScope`, `incumbentBlocksScope`) and `resolve` admits
-/// four readings of a declared destination for exactly these kinds. "We have not
-/// looked yet" then "here is what was at the path" is the whole route, and it is
-/// the honest one. Decided while no producer existed, deliberately, so that
-/// whoever writes one brings a terminal carrying the local effect it observed
-/// rather than inheriting a cell that would take an exit status instead.
+///  * `transfer_push`, `transfer_pull` and `fetch` admit **no business terminal
+///    at all**. They declare no `runs_our_command`, no `supervised_deadline` and
+///    no `supervises_another_subject`, so `completed` and `timed_out` are
+///    unreachable through `settle` and `failed`/`cancelled` reachable only before
+///    submission. Each refused terminal carries a fact about a *process*, and a
+///    transfer is judged by an artifact at a destination it named in advance — a
+///    copier that exits 0 having renamed nothing is the case that makes the
+///    difference load-bearing. The second half of the test is what makes it
+///    admissible: `indeterminate` stays open from every in-flight state and is
+///    not a dead end, because `transfers` reads `resolved_status` alongside
+///    `status` (`ownerBlocksScope`, `incumbentBlocksScope`) and `resolve` admits
+///    four readings of a declared destination for exactly these kinds.
+///  * `control`'s whole business vocabulary is `remote_cancel_confirmed` and
+///    `proven_failure` — the host's answer that the thing it named is gone, or
+///    that it is not. `completed` and `timed_out` are unreachable for it, exactly
+///    as for a transfer, and `cancelled`/`failed` are both reachable, so no
+///    control act is left holding a scope it cannot settle.
+///  * the four kinds that declare `judgement_undeclared` keep the three
+///    process-shaped terminals, and that is a blank rather than a permit. Nothing
+///    is known about what one is judged by, so refusing would be a guess in the
+///    opposite direction — and specifically *not* the free refusal it would be in
+///    `appliesToKind`: refusing every terminal for a producerless kind means the
+///    first operation of that kind ever created is unsettleable, holds its scope,
+///    and never reaches `indeterminate` for a reconcile to act on.
 ///
-/// `control` is the newest row and the only one whose *single* business terminal
-/// is `remote_cancel_confirmed`. A control act — `terminus session rm` today —
-/// stops a remote session, and the whole of what it can establish is the host's
-/// own answer to "is it gone". It runs no command of the caller's, so `exited`
-/// and `remote_deadline` are refused; it offers no bytes to a terminal, so the
-/// input pair is refused. That leaves `completed` and `timed_out` unreachable for
-/// the kind, exactly as they are for a transfer, and for the same test: refusing
-/// is admissible only because `cancelled` (through the cell it does admit) and
-/// `indeterminate` (through the universal one) are both still reachable, so no
-/// control act is left holding a scope it cannot settle.
-///
-/// Exhaustive in both directions with no `else` anywhere, for the reason
-/// `appliesToKind` has none: a new terminal or a new kind must stop the build
-/// until somebody answers the question for it, rather than inheriting whichever
-/// answer the previous author happened to write last. `gates_test` states the
-/// same table a second time from the other direction, kind by kind.
+/// Exhaustive with no `else`, for the reason `appliesToKind` has none: a new
+/// terminal must stop the build until somebody says what it needs, rather than
+/// inheriting whichever answer the previous author happened to write last.
+/// `gates_test` states the same rules a second time, from its own transcription
+/// of the capabilities.
 pub fn terminalDescribesKind(terminal: op_state.Terminal, kind: operations.Kind) bool {
+    return terminalDescribes(terminal, kind.capabilities());
+}
+
+/// The rules themselves, over capabilities alone.
+///
+/// Split from `terminalDescribesKind` for the reason
+/// `ResolutionEvidence.appliesTo` is: with no `kind` in scope, a rule cannot name
+/// one, so no cell can be excepted by identity even by accident. `gates_test`
+/// flips single axes against this function to hold every axis to deciding
+/// something.
+pub fn terminalDescribes(terminal: op_state.Terminal, can: operations.Capabilities) bool {
     return switch (terminal) {
-        // Three of the eight describe the *attempt* rather than the work, and
-        // each is admitted for every kind — not by default, but for a reason
-        // that is checked per kind below and is the same reason in each case:
-        // the fact they carry is about this host's side of the exchange, and
-        // every kind of work has one of those.
+        // Three of the nine describe the *attempt* rather than the work, and each
+        // is admitted for every kind — not by default, but because the fact it
+        // carries is about this host's side of the exchange, and every kind of work
+        // has one of those. They are literals rather than rules for that reason:
+        // there is no property a kind could lack that would make them meaningless.
         //
-        // `never_submitted` says the connection layer proved the caller's
-        // command did not leave this machine. Per kind: an `exec`'s command, a
-        // `job`'s launch line, a `session_write`'s bytes, a transfer's first
-        // byte, and whatever a `tunnel`, `plan_phase`, `audit` or `cleanup`
-        // would send are all things this binary hands over, and every one of
-        // them can fail to be handed over. There is no kind for which "it never
-        // left" is either meaningless or false by construction.
+        // `never_submitted` says the connection layer proved the caller's command
+        // did not leave this machine. An `exec`'s command, a `job`'s launch line, a
+        // `session_write`'s bytes, a control act's kill, a transfer's first byte
+        // and whatever a `tunnel`, `plan_phase`, `audit` or `cleanup` would send
+        // are all things this binary hands over, and every one of them can fail to
+        // be handed over. There is no kind for which "it never left" is either
+        // meaningless or false by construction.
         //
-        // Refusing any cell would also break the give-up path rather than narrow
-        // it. `op_state.terminalForTransportLoss` builds this variant from
-        // `created`/`connecting` without being told the kind, and
-        // `Execution.abandon` — and through it `Execution.deinit`, the last
-        // resort for a process that returned without deciding — calls it for
-        // every operation there is. A refused cell would turn "the process
-        // exited without recording an outcome" into a lost receipt for whichever
-        // kind refused it.
-        .never_submitted => switch (kind) {
-            .exec,
-            .job,
-            .session_write,
-            .control,
-            .transfer_push,
-            .transfer_pull,
-            .fetch,
-            .tunnel,
-            .plan_phase,
-            .audit,
-            .cleanup,
-            => true,
-        },
-        // "Nothing had been handed over, so there is nothing to stop." Also
-        // about the attempt: it records a decision made on this side, in the
-        // window before anything was sent, and what was going to be sent does
-        // not enter into it. Per kind, the sentence is true of all ten for the
-        // same reason `never_submitted`'s is — each is created, each dials, and
-        // each can be given up on before it dials.
+        // Refusing any of the three would also break the give-up path rather than
+        // narrow it. `op_state.terminalForTransportLoss` builds `never_submitted`
+        // and `indeterminate` from the state alone, without being told the kind,
+        // and `Execution.abandon` — through it `Execution.deinit`, the last resort
+        // for a process that returned without deciding — calls it for every
+        // operation there is. A refusal would turn "the process exited without
+        // recording an outcome" into a lost receipt.
+        .never_submitted => true,
+        // "Nothing had been handed over, so there is nothing to stop." Also about
+        // the attempt: it records a decision made on this side, in the window
+        // before anything was sent, and what was going to be sent does not enter
+        // into it. Every kind is created, every kind dials, and every kind can be
+        // given up on before it dials.
         //
-        // Not interchangeable with `never_submitted`, which is why refusing a
-        // cell here would cost something even though that variant stays open:
-        // one claims the transport *proved* the bytes did not leave, the other
-        // records that we chose to stop. A kind refused here would have to
-        // either claim a transport failure that did not happen or stay live.
-        // The in-tree users are the transfer fixtures — a checkpoint can only be
-        // adopted from an owner that has stopped blocking scope, and this is the
-        // evidence that fits an owner still at `created`.
-        .local_abandon => switch (kind) {
-            .exec,
-            .job,
-            .session_write,
-            .control,
-            .transfer_push,
-            .transfer_pull,
-            .fetch,
-            .tunnel,
-            .plan_phase,
-            .audit,
-            .cleanup,
-            => true,
-        },
-        // The terminal of last resort, and the one cell-by-cell argument that is
-        // really an argument about all ten at once: "we cannot establish the
-        // remote outcome" is a statement about *our knowledge*, and every kind
-        // can be in that position — the answer is lost for an exec, a job, a
-        // write, a transfer, or anything later kinds turn out to do. A kind
-        // refused here would be a kind obliged to guess, which is the single
-        // thing this whole module exists to prevent (`op_state` rule 3).
+        // Not interchangeable with `never_submitted`, which is why refusing it for
+        // some kind would cost something even though that variant stays open: one
+        // claims the transport *proved* the bytes did not leave, the other records
+        // that we chose to stop. A kind refused here would have to either claim a
+        // transport failure that did not happen or stay live. The in-tree users are
+        // the transfer fixtures — a checkpoint may only be adopted from an owner
+        // that has stopped blocking scope, and this is the evidence that fits an
+        // owner still at `created`.
+        .local_abandon => true,
+        // The terminal of last resort. "We cannot establish the remote outcome" is
+        // a statement about *our knowledge*, and every kind can be in that
+        // position — the answer is lost for an exec, a job, a write, a removal, a
+        // transfer, or anything later kinds turn out to do. A kind refused here
+        // would be a kind obliged to guess, which is the single thing this module
+        // exists to prevent (`op_state` rule 3), and for a transfer it is the only
+        // terminal available after submission at all.
+        .indeterminate => true,
+        // A real exit status, so the operation's verdict has to *be* an exit
+        // status. `judgement_undeclared` widens it for the reason given above: a
+        // kind nothing knows anything about must not be born unsettleable.
         //
-        // Like `never_submitted` it is produced kind-blindly by
-        // `terminalForTransportLoss`, on the same universal give-up path.
-        .indeterminate => switch (kind) {
-            .exec,
-            .job,
-            .session_write,
-            .control,
-            .transfer_push,
-            .transfer_pull,
-            .fetch,
-            .tunnel,
-            .plan_phase,
-            .audit,
-            .cleanup,
-            => true,
-        },
-        // A real exit status, reported by something that ran a command.
-        .exited => switch (kind) {
-            // One supervised remote command each, judged by exactly this. The
-            // producers are `cmd_exec`'s run path and `cmd_job`'s attach/finish
-            // paths, plus the two routes that settle a job somebody else
-            // launched.
-            .exec, .job => true,
-            // A write types bytes into a shell somebody else is running. It runs
-            // no command, so there is no exit status anywhere in the operation,
-            // and this cell is what makes `input_accepted` binding rather than
-            // merely available: `op_state` split that variant out so a receipt
-            // would not carry `exit_code = 0` in the column an auditor reads
-            // first, for an operation in which no command was judged. Nothing
-            // stopped the wrong answer being written beside the right one until
-            // here.
-            //
-            // The tempting wrong answer is concrete rather than hypothetical:
-            // `tmux send-keys` is itself a command with an exit status, and a
-            // driver could settle the write with the tmux client's. That is
-            // `input_accepted`/`input_refused` respelled as a verdict on a
-            // command, and it loses the byte count and digest a write's receipt
-            // is required by its own evidence type to carry.
-            //
-            // Refusing costs the kind no outcome: `completed` and `failed` stay
-            // reachable through the two variants built to carry what a write
-            // actually establishes.
-            .session_write => false,
-            // Refused, and it is the same mistake as the write's one line up —
-            // which is exactly why it is written out rather than inherited.
-            //
-            // A control act runs no command of the caller's. What `session rm`
-            // sends is `tmux kill-session`, `tmux has-session` and `rm -f`, and
-            // each of those has an exit status of its own: the tempting wrong
-            // answer here is not hypothetical, it is three exit codes sitting in
-            // one function, any of which a driver could hand to `settle`. A
-            // receipt carrying `exit_code = 0` for a session removal would say,
-            // in the column an auditor reads first, that a command the caller
-            // asked for succeeded. None did; a session was stopped. That is the
-            // sentence `7d0898a` had to split `input_accepted` out of `exited`
-            // to stop being written about a write, and a control act is one step
-            // further from a judged command than a write is.
-            //
-            // The cost is real and is stated rather than hidden: `completed` is
-            // unreachable for this kind, because `exited` is the only terminal
-            // that yields it for anything but a write. That is not a wedge,
-            // which is the test a refusal here has to pass — a control act's
-            // success is `remote_cancel_confirmed` below, carrying the reading
-            // that actually established it, and `cancelled` is a settled status
-            // that releases the scope barrier exactly as `completed` would. The
-            // kind loses a word it could not have earned, not an outcome.
-            .control => false,
-            // Refused, and refused on purpose *before* a producer exists.
-            //
-            // A transfer's verdict is a file at a destination it declared in
-            // advance, hashing to the digest it promised. A copier's exit status
-            // is not a reading of that destination and cannot be turned into
-            // one: a copier that wrote to the wrong path, or whose rename never
-            // ran, still exits 0 — the argument `appliesToKind` already uses to
-            // refuse `supervisor_report` for these kinds and `process_probe`
-            // with it. What was left standing until now was the same claim by a
-            // shorter route: `settle` writing `exited` straight onto a transfer,
-            // reaching `completed` past every digest comparison the resolve side
-            // is built to require.
-            //
-            // The objection this overrides, recorded because it is sound as far
-            // as it goes and a future author will re-derive it: `exited` is the
-            // only terminal yielding `completed` for anything that is not a
-            // `session_write`, so refusing here does not narrow how a transfer
-            // may be settled — it removes `completed` from the kind outright,
-            // and `timed_out` and post-submission `cancelled` go with it in the
-            // two arms below. What makes that acceptable rather than a wedge is
-            // that **nothing in this binary creates a transfer operation** —
-            // `transfers` is store-side work, no CLI path constructs one, and
-            // `.fetch` has no HTTP producer either — so there is no flow to
-            // wedge, and holding the cells open until a producer arrives means
-            // the producer inherits a loose contract instead of bringing
-            // evidence. Deciding now costs a hypothetical; deciding later costs
-            // an argument with working code on the other side.
-            //
-            // Nor is the subsystem left without a route to a final answer, which
-            // is the thing the objection was really about. `transfers` does not
-            // require `status` to be a business outcome — `ownerBlocksScope` and
-            // `incumbentBlocksScope` read `status` *and* `resolved_status`, so an
-            // owner that settles `indeterminate` and is then resolved stops
-            // blocking. And `resolve` admits, for exactly these three kinds and
-            // no others, the four readings of a declared destination:
-            // `filesystem_effect` for the digest it promised,
-            // `destination_present_contradicting` for one that disagrees,
-            // `destination_present_unverified` when it declared no digest, and
-            // `destination_absent` at the path it committed to. That is the
-            // artifact evidence this cell is refusing a substitute for, and it
-            // is already built.
-            //
-            // What is genuinely gone until somebody writes it: a transfer cannot
-            // reach `completed` or `timed_out` through `settle` at all, and can
-            // reach `failed` or `cancelled` only before submission, through
-            // `never_submitted` and `local_abandon`. Post-submission the only
-            // terminal a transfer may take is `indeterminate` — which is not a
-            // gap to be filled with one of these three, but the honest reading
-            // of a host we have not looked at yet, and the state a reconcile
-            // acts on. **A producer that wants `completed` back must bring a
-            // terminal whose content is the local effect it observed** — the
-            // destination it wrote, and the digest it read back off that
-            // destination after the rename — not an exit status from the process
-            // that was supposed to produce one. That is a new `op_state.Terminal`
-            // variant and therefore not this change's to make.
-            .transfer_push, .transfer_pull, .fetch => false,
-            // Still open, and the contrast with the arm above is the whole of
-            // the reason. A transfer is refused on a positive argument: its
-            // verdict is a named artifact, and the evidence type that reads one
-            // already exists. Nothing is known about what a `tunnel`,
-            // `plan_phase`, `audit` or `cleanup` is judged by — no producer, no
-            // mechanism, no declared effect — so refusing here would not be a
-            // narrowing, it would be a guess in the opposite direction, and
-            // specifically *not* the free refusal it would be in `appliesToKind`:
-            // refusing every terminal for a producerless kind means the first
-            // operation of that kind ever created is unsettleable, holds its
-            // scope, and never reaches `indeterminate` for a reconcile to act on.
-            // A deliberate blank, to be decided by whichever change builds one.
-            .tunnel, .plan_phase, .audit, .cleanup => true,
-        },
-        // A deadline the *remote* enforced and reported.
-        .remote_deadline => switch (kind) {
-            // Both declare it as a capability they may have —
-            // `supervisor.Requirement.remote_deadline`, satisfied only by the
-            // remote helper — which is what makes a report of one a statement
-            // about their own work rather than about the local clock.
-            .exec, .job => true,
-            // A write hands one tmux invocation over and reads its answer.
-            // Nothing on the far side of `send-keys` enforces a deadline or
-            // reports one, and `timed_out` is not an outcome the operation can
-            // have: the bytes were taken or they were not.
-            //
-            // The tempting wrong answer is the *local* deadline waiting for that
-            // answer, which `op_state` rule 2 already names — a local deadline
-            // expiring while the remote is unreachable is not a timeout — and
-            // which `terminalForTransportLoss` routes to `indeterminate`. This
-            // is the one refusal in the table that removes a status from a
-            // kind's vocabulary entirely, and it removes one the kind could
-            // never have reached honestly.
-            .session_write => false,
-            // Refused, for the reason above and one of its own. Nothing on the
-            // far side of `kill-session` enforces a deadline or reports one —
-            // there is no supervisor in a control act, because there is no
-            // process of ours being supervised. And `timed_out` is not an
-            // outcome the act can have: the session it named is gone or it is
-            // not, and a local deadline expiring while the answer is in flight
-            // is `indeterminate` (`op_state` rule 2), which stays admissible.
-            .control => false,
-            // Refused, with the `exited` arm above. A deadline enforced and
-            // reported by the far side is a statement about a *process* the far
-            // side was supervising, and nothing supervises a transfer: there is
-            // no `supervisor.Requirement.remote_deadline` on a copier because
-            // there is no copier. A local deadline expiring while a destination
-            // has not been read is `indeterminate` (`op_state` rule 2), which
-            // stays admissible, and a transfer that really did run out of time
-            // still has to be settled by looking at the path it declared — the
-            // partial is there or it is not, and `timed_out` says neither.
-            //
-            // This removes `timed_out` from the three kinds outright. Accepted
-            // for the reason above: no producer, so nothing loses a route it was
-            // using, and a producer that wants the status back has to bring a
-            // terminal that carries what it observed at the destination.
-            .transfer_push, .transfer_pull, .fetch => false,
-            .tunnel, .plan_phase, .audit, .cleanup => true,
-        },
-        // A remote process was signalled and its absence verified.
-        .remote_cancel_confirmed => switch (kind) {
-            // An `exec` records the pid and start token of the process that ran
-            // its command (`supervisor.Identity`, put on the trail by
-            // `execution.remoteStarted`), so there is a process to signal and an
-            // identity to verify absence against — the same fact that makes
-            // `process_probe` admissible for `exec` and only `exec` in
-            // `appliesToKind`.
-            .exec => true,
-            // The producer is `cmd_job`'s kill path, which constructs this only
-            // when the operation's recorded capability satisfies
-            // `verified_cancellation`; shell mode never does, and gets
-            // `indeterminate` instead.
-            .job => true,
-            // **The business terminal of a control act**, and the one cell in
-            // this table that had to be argued from the variant's own text
-            // rather than from a neighbour's.
-            //
-            // `op_state.Terminal.remote_cancel_confirmed` says "a remote process
-            // was signalled *and its absence verified*", and its `pid` is
-            // optional for a reason it spells out: "proof comes at different
-            // granularities: a helper verifies a specific process, while tmux
-            // verifies that the session (and with it the process group) is
-            // gone." That sentence was written about a granularity this kind is
-            // made of. `Tmux.killSession` sends `kill-session` and then asks
-            // `has-session`, and the boolean it returns is the host's own answer
-            // about the session — not an inference, not a local timeout.
-            //
-            // Why the `.job` reservation does not transfer, which is the whole
-            // question. A job's kill may only publish this when the supervisor
-            // can prove the *process tree* is gone, because a job's subject is
-            // the command running in the pane and a disowned or `setsid` child
-            // outlives the pane that launched it — `cmd_job.cancellationProvable`
-            // holds that line and shell mode never satisfies it. A control act's
-            // subject is the **session itself**. `terminus session rm <s>` is not
-            // a claim about anybody's work; it is "stop this shell, delete its
-            // log, forget it", and `has-session` reading absent is a direct
-            // reading of exactly that subject. The gap that forces a job to
-            // `indeterminate` — pane gone, work possibly alive — is not a gap in
-            // this claim, because this claim never reached for the work.
-            //
-            // What the receipt must therefore not say is anything about what was
-            // running inside. That is held in the payload rather than here: the
-            // producer writes `pid = null` (no process was identified) and a
-            // `verification_method` naming the two tmux commands, so a reader
-            // sees the granularity of the proof beside the verdict. A control act
-            // that could not establish the absence has `indeterminate`, and one
-            // that lost its scope lease after the kill has it too — the name it
-            // stopped is one a peer has been free to reuse since, so "it is gone"
-            // stops being this command's to assert.
-            .control => true,
-            // A write starts no remote process, so there is nothing for a
-            // cancellation to have confirmed the absence of. `Tmux.sendKeys`
-            // runs one tmux command and reports nothing about the pane, and the
-            // pane's process belongs to whoever started the session — killing it
-            // does not cancel a write, it kills somebody else's work. That is
-            // the mistake `appliesToKind`'s `process_probe` × `job` cell was
-            // closed for, one axis over.
-            //
-            // The tempting wrong answer is the operator interrupting `terminus
-            // write`: nothing local un-sends bytes already handed to tmux, and
-            // after submission the honest terminal is `indeterminate`, which is
-            // what `cmd_read_write` writes. `cancelled` is not lost — before
-            // submission it is still reachable through `local_abandon`, and
-            // before submission is the only window in which a write has anything
-            // to abandon.
-            .session_write => false,
-            // Refused, with the two arms above, and the reasoning is one step
-            // sharper here because a confirmed cancellation is a *true* fact
-            // that still settles nothing about the artifact. "The copier is no
-            // longer running, and its absence was verified" is equally true of a
-            // transfer that finished and one that died mid-rename — the exact
-            // sentence `appliesToKind` refuses `process_probe` for these kinds
-            // over, one axis across. Admitting it would release the scope
-            // barrier on the second while its checkpoint went on holding the
-            // destination path against everybody else, and the receipt would say
-            // `cancelled` about an operation whose bytes may all be there.
-            //
-            // The old comment claimed this was "the state a killed transfer is
-            // really left in", crediting a `gates_test` fixture. The fixture says
-            // the opposite where it is specific: a hard-killed transfer settles
-            // `indeterminate`, and the price of that is `terminus request
-            // reconcile <id>` with a reading of the destination attached. That is
-            // the route, and it is the route because a kill is an observation
-            // about a process, not a verdict on a file.
-            //
-            // Post-submission `cancelled` is therefore gone for these three
-            // kinds; before submission it is still reachable through
-            // `local_abandon`, which claims nothing about a destination because
-            // nothing had been sent to one.
-            .transfer_push, .transfer_pull, .fetch => false,
-            .tunnel, .plan_phase, .audit, .cleanup => true,
-        },
+        // The kinds this refuses are refused on their own arguments, which are on
+        // their capability arms because each is a statement about that kind: a
+        // write runs no command and `tmux send-keys`'s own status is not its
+        // verdict; a control act runs three tmux invocations and is judged by none
+        // of their exit codes; a copier that renamed nothing still exits 0. All
+        // three are the same sentence `7d0898a` had to split `input_accepted` out
+        // of `exited` to stop being written — a receipt carrying `exit_code = 0`,
+        // in the column an auditor reads first, for an operation in which no
+        // command of the caller's was judged.
+        .exited => can.runs_our_command or can.judgement_undeclared,
+        // A deadline the *remote* enforced and reported, which requires something
+        // on the far side that supervises the work and can hold it to one. Declared
+        // as `supervisor.Requirement.remote_deadline` and satisfied only by the
+        // remote helper, which is what makes a report of one a statement about the
+        // attempt's own work rather than about the local clock.
+        //
+        // The tempting wrong answer everywhere it is refused is the *local*
+        // deadline waiting for an answer, which `op_state` rule 2 already names —
+        // a local deadline expiring while the remote is unreachable is not a
+        // timeout — and which `terminalForTransportLoss` routes to
+        // `indeterminate`. This is the rule that removes a status from a kind's
+        // vocabulary most often, and it removes one those kinds could never have
+        // reached honestly.
+        .remote_deadline => can.supervised_deadline or can.judgement_undeclared,
+        // A remote process was signalled and its absence verified. Two properties
+        // reach it, and the second is the one that had to be argued.
+        //
+        // `runs_our_command` covers `exec` and `job`: there is a process of ours to
+        // signal, and an identity or a supervisor to verify absence against.
+        // `supervises_another_subject` covers a control act, whose subject is not a
+        // process of ours at all but a session — and
+        // `op_state.Terminal.remote_cancel_confirmed` documents its optional `pid`
+        // for exactly that granularity: "a helper verifies a specific process,
+        // while tmux verifies that the session (and with it the process group) is
+        // gone". `Tmux.killSession` sends `kill-session` and then asks
+        // `has-session`, and the boolean it returns is the host's own answer about
+        // the session — not an inference, not a local timeout.
+        //
+        // What the receipt must therefore not say is anything about what was
+        // running inside, and that is held in the payload rather than here: the
+        // producer writes `pid = null` and a `verification_method` naming the two
+        // tmux commands, so a reader sees the granularity of the proof beside the
+        // verdict.
+        //
+        // Refused for a write, which starts nothing whose absence could be
+        // confirmed — killing the pane's process would not cancel a write, it would
+        // kill somebody else's work — and for a transfer, where "no longer running,
+        // absence verified" is a *true* fact that settles nothing about the
+        // artifact: it is equally true of one that finished and one that died
+        // mid-rename, and admitting it would release the scope barrier on the
+        // second while its checkpoint went on holding the destination against
+        // everybody else.
+        .remote_cancel_confirmed => can.runs_our_command or
+            can.supervises_another_subject or
+            can.judgement_undeclared,
+        // The act was submitted and the host's answer establishes that it did not
+        // take effect. So the kind's verdict has to be readable *from the subject
+        // of the act*, which is what `supervises_another_subject` says: a control
+        // act names a session, and `tmux has-session` reading it present after a
+        // kill is a direct reading of the thing that was supposed to be gone.
+        //
+        // Why the two kinds with a proven failure of their own are refused rather
+        // than admitted alongside. For `exec` and `job` a proven post-submission
+        // failure *is* an exit status, and `exited` carries it with the number that
+        // caused it; admitting this one would let a driver record a failure for a
+        // command that reported one, without the status it reported. For a
+        // `session_write` it is `input_refused`, which is the same shape of claim
+        // one axis over — the remote answered, and what it answered is that the
+        // shell was never touched — and carries the reason in a variant whose name
+        // says what was refused. Both would lose a field by being folded in here.
+        //
+        // A transfer is refused for the reason it is refused everywhere else on
+        // this side: its verdict is an artifact at a declared destination, and this
+        // terminal would hand it a post-submission `failed` with no reading of that
+        // destination behind it — the exact bypass `destination_absent` exists to
+        // make impossible on the resolve side. `judgement_undeclared` does not
+        // widen it either, and unlike the three rules above that costs those kinds
+        // nothing: they keep `exited`, which carries a failure with its status, and
+        // all three attempt-level terminals.
+        .proven_failure => can.supervises_another_subject,
         // A live terminal's answer about bytes it was offered, positive or
-        // negative. `terminus write` performs that act and nothing else does.
-        .input_accepted, .input_refused => switch (kind) {
-            .session_write => true,
-            // Refused, and this is the trap §7.5 names by its commit number.
-            // A control act stops a session, and one told "the session is gone"
-            // needs a terminal for that — `input_refused` is superficially close
-            // ("the remote answered, and nothing of ours was touched") and its
-            // *name* is about input, which is the only thing that matters here.
-            // `input_accepted`/`input_refused` exist **because** settling a write
-            // as `.exited{0}` put a false word in a receipt where an auditor
-            // reads the exit code first (`7d0898a`); reusing an input-named
-            // terminal for an act that types nothing repeats that mistake one
-            // level up. Nothing in a session removal offers bytes to a terminal,
-            // so there is no answer about bytes to record.
-            //
-            // Free, like the two below: `remote_cancel_confirmed` carries what
-            // a control act does establish, and all three attempt-level
-            // terminals stay open.
-            .control => false,
-            // An `exec` or a `job` runs a command and is judged by its exit
-            // status. `input_accepted` would settle one `completed` carrying a
-            // byte count and no exit code — a command recorded as having
-            // succeeded that nothing ever judged — and `input_refused` would say
-            // the shell was never touched, which for a job is false in the most
-            // literal way available: `cmd_job` types its launch line into a tmux
-            // session exactly as `write` types the operator's. That shared
-            // mechanism is precisely why the cell is written out rather than
-            // assumed; `appliesToKind` names the same pair for the same reason
-            // in its `job_result` row.
-            //
-            // Refusing costs neither kind an outcome — `exited` carries both of
-            // theirs — so this is a refusal, not a blank.
-            .exec, .job => false,
-            // A transfer's completion is a file at a destination it declared,
-            // with the digest it promised. "A terminal took some bytes" is not a
-            // reading of a destination and cannot be turned into one. A refusal
-            // because the act is simply not theirs — and now the fourth refusal
-            // in this column rather than the only one: `exited`,
-            // `remote_deadline` and `remote_cancel_confirmed` are refused above
-            // on the same principle, so the row is consistent instead of
-            // refusing the one process-shaped claim a transfer would never have
-            // been offered while admitting the three it would.
-            .transfer_push, .transfer_pull, .fetch => false,
-            // Refused rather than left blank for the same reason, and the
-            // refusal is free: whatever these turn out to do, none of them is
-            // "type bytes into somebody else's shell", which is the only act
-            // this pair describes — and each keeps `exited` and all three
-            // attempt-level terminals.
-            .tunnel, .plan_phase, .audit, .cleanup => false,
-        },
+        // negative. Exactly one kind performs that act, and it is the one that
+        // declares it.
+        //
+        // Refused for `exec` and `job` even though `cmd_job` types its launch line
+        // into a tmux session exactly as `write` types the operator's; refused for
+        // a control act, which is the trap §7.5 names by its commit number —
+        // `input_refused` is superficially close to "the session is gone" and its
+        // *name* is about input, which is the only thing that matters. Refused for
+        // a transfer, whose completion is a file at a destination it declared and
+        // for which "a terminal took some bytes" is not a reading. Refused, not
+        // left blank, for the four undeclared kinds: whatever they turn out to do,
+        // none of them is "type bytes into somebody else's shell", and each keeps
+        // `exited` and all three attempt-level terminals, so the refusal is free.
+        // Every one of those arguments is on the arm of `Kind.capabilities` that
+        // sets `offers_input_bytes` for that kind.
+        .input_accepted, .input_refused => can.offers_input_bytes,
     };
 }
 

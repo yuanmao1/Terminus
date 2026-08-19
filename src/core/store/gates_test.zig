@@ -2894,124 +2894,165 @@ fn sampleEvidence(tag: EvidenceTag) Store.receipts.ResolutionEvidence {
     };
 }
 
-/// The admissibility matrix, transcribed independently of the implementation.
+/// The capability table, transcribed independently of the implementation.
 ///
-/// That is the whole point of it: a second statement of the same table, so a
-/// cell cannot be widened in `receipts.zig` alone. Both switches are exhaustive
-/// and neither has a default arm, so a new `operations.Kind` or a new evidence
-/// variant is a compile error in both places until somebody writes down what it
-/// may settle.
+/// This is what the two 187-cell matrices collapsed into, and it is the whole of
+/// what this file now has to restate: eleven rows of eight booleans instead of
+/// 187 hand-decided cells, plus one rule per terminal and per evidence variant
+/// below. The purpose has not changed — a second statement of the same claim, so
+/// nothing can be widened in `receipts.zig` alone — but the unit of the claim is
+/// now "what is this kind of work", which is the question a new kind actually
+/// raises.
 ///
-/// Two rows of the table are refusals rather than routings, and they are the
-/// ones a future change is most likely to undo by accident:
+/// Deliberately written from the *kind's* side, in this file's own words, without
+/// asking `Store.operations.Kind.capabilities`. If it agreed by calling it, the
+/// gate below would compare the store against itself.
 ///
-///  * `supervisor_report` is refused for **every** kind. It is the only
-///    mechanical variant with no identity binding at all — a status and a
-///    sentence, nothing tying either to the attempt it is handed to — while
-///    `isMechanical` grades it mechanical, the grade that releases a scope
-///    barrier with no operator in the loop. Nothing constructs one, so the
-///    refusal costs no reachable route. `receipts.appliesToKind` names what a
-///    producer must supply before any cell here may go back to `true`.
-///  * `process_probe` is admitted for `exec` and refused for `job`. A job runs
-///    in its own tmux session, so the pid on its trail is the *pane's*
-///    (`Tmux.panePid`), not the job's process: a probe of it is a reading about
-///    one process being used to settle another. A job has two evidence chains
-///    addressed to it — `job_sentinel` and `job_result` — so nothing is lost.
-fn pinnedCell(kind: Store.operations.Kind, tag: EvidenceTag) bool {
+/// Exhaustive with no `else`, and the struct has no defaults, so a new kind or a
+/// new axis stops the build here as well as there.
+fn pinnedCapabilities(kind: Store.operations.Kind) Store.operations.Capabilities {
     return switch (kind) {
         // One supervised remote command, and the only kind that records the
-        // pid and start token of the process that ran it. It has no job
-        // wrapper and publishes no declared file.
-        .exec => switch (tag) {
-            .process_probe, .operator_override => true,
-            .supervisor_report,
-            .job_sentinel,
-            .job_result,
-            .filesystem_effect,
-            .destination_absent,
-            .destination_present_unverified,
-            .destination_present_contradicting,
-            => false,
+        // identity — pid *and* start token — of the process that ran it.
+        .exec => .{
+            .runs_our_command = true,
+            .supervised_deadline = true,
+            .records_process_identity = true,
+            .offers_input_bytes = false,
+            .publishes_declared_artifact = false,
+            .supervises_another_subject = false,
+            .wrapper_documents_exit = false,
+            .judgement_undeclared = false,
         },
-        // The two records the job wrapper writes, and nothing about a process:
-        // the only pid a job ever recorded belongs to its pane.
-        .job => switch (tag) {
-            .job_sentinel, .job_result, .operator_override => true,
-            .supervisor_report,
-            .process_probe,
-            .filesystem_effect,
-            .destination_absent,
-            .destination_present_unverified,
-            .destination_present_contradicting,
-            => false,
+        // Also one supervised remote command, and its launch line carries our
+        // wrapper: a sentinel echoed after the command, a sidecar written at an
+        // address derived from the request id. It records no process identity of
+        // its own — the pid on a job's trail is its *pane's*, with no start token,
+        // and a probe of it is a reading about one process offered as a verdict on
+        // another.
+        .job => .{
+            .runs_our_command = true,
+            .supervised_deadline = true,
+            .wrapper_documents_exit = true,
+            .records_process_identity = false,
+            .offers_input_bytes = false,
+            .publishes_declared_artifact = false,
+            .supervises_another_subject = false,
+            .judgement_undeclared = false,
         },
-        // Bytes typed into somebody else's shell. It records no process, no
-        // sentinel, no sidecar and no destination — the only thing it ever
-        // knew was that a terminal took some bytes, and its own terminal
-        // receipt says so at the moment it happens. A write that reaches a
-        // reconcile is one whose answer was lost, and nothing mechanical has
-        // anything to say about those: the bytes are in a pane or they are
-        // not, and nothing recorded which.
-        .session_write => switch (tag) {
-            .operator_override => true,
-            .supervisor_report,
-            .process_probe,
-            .job_sentinel,
-            .job_result,
-            .filesystem_effect,
-            .destination_absent,
-            .destination_present_unverified,
-            .destination_present_contradicting,
-            => false,
+        // Bytes typed into a shell somebody else is running. It runs no command of
+        // the caller's — `tmux send-keys`'s own exit status is not the operation's
+        // verdict — nothing on the far side enforces a deadline, it starts no
+        // process and records none, it carries no wrapper and declares no
+        // destination.
+        .session_write => .{
+            .offers_input_bytes = true,
+            .runs_our_command = false,
+            .supervised_deadline = false,
+            .publishes_declared_artifact = false,
+            .supervises_another_subject = false,
+            .records_process_identity = false,
+            .wrapper_documents_exit = false,
+            .judgement_undeclared = false,
         },
-        // A supervisory act on somebody else's session: `session rm` stops one,
-        // deletes its pane log and forgets its local row. It records no process
-        // (the pid in that pane is the session owner's, not this command's), no
-        // sentinel and no sidecar — those belong to the job it may be pointed
-        // at, and that job's own attempt is where they settle. It declares no
-        // destination. What it knew before it sent anything is a session name,
-        // and nothing mechanical is a reading of a name.
-        .control => switch (tag) {
-            .operator_override => true,
-            .supervisor_report,
-            .process_probe,
-            .job_sentinel,
-            .job_result,
-            .filesystem_effect,
-            .destination_absent,
-            .destination_present_unverified,
-            .destination_present_contradicting,
-            => false,
+        // A supervisory act on somebody else's session, judged by whether the
+        // thing it named is gone — read from the host's own answer. It runs three
+        // tmux invocations and is judged by none of their exit codes, offers no
+        // bytes to a terminal, has somebody else's process in view rather than one
+        // of its own, and the job documents it may be pointed at belong to the
+        // job's own attempt.
+        .control => .{
+            .supervises_another_subject = true,
+            .runs_our_command = false,
+            .supervised_deadline = false,
+            .offers_input_bytes = false,
+            .publishes_declared_artifact = false,
+            .records_process_identity = false,
+            .wrapper_documents_exit = false,
+            .judgement_undeclared = false,
         },
-        // A transfer's outcome is a fact about a file at a declared
-        // destination — that it is there and right, that it is there and
-        // wrong, that it is there and uncheckable, or that it is not there.
-        // Every claim about a *process* is refused, however authoritative its
-        // source: exit 0 from a copier that never renamed is still exit 0.
-        .transfer_push, .transfer_pull, .fetch => switch (tag) {
-            .filesystem_effect,
-            .destination_absent,
-            .destination_present_unverified,
-            .destination_present_contradicting,
-            .operator_override,
-            => true,
-            .supervisor_report, .process_probe, .job_sentinel, .job_result => false,
+        // Judged by an artifact at a destination declared before a byte moved, and
+        // by nothing about a process: a copier that renamed nothing still exits 0,
+        // nothing supervises one, and "it is no longer running" is equally true of
+        // one that finished and one that died mid-rename.
+        .transfer_push, .transfer_pull, .fetch => .{
+            .publishes_declared_artifact = true,
+            .runs_our_command = false,
+            .supervised_deadline = false,
+            .offers_input_bytes = false,
+            .supervises_another_subject = false,
+            .records_process_identity = false,
+            .wrapper_documents_exit = false,
+            .judgement_undeclared = false,
         },
-        // Nothing creates these yet, so no mechanism produces evidence about
-        // one. The operator route stays open so the first one is not born
-        // stuck.
-        .tunnel, .plan_phase, .audit, .cleanup => switch (tag) {
-            .operator_override => true,
-            .supervisor_report,
-            .process_probe,
-            .job_sentinel,
-            .job_result,
-            .filesystem_effect,
-            .destination_absent,
-            .destination_present_unverified,
-            .destination_present_contradicting,
-            => false,
+        // Nothing constructs one and nothing is known about what one would be
+        // judged by. The four kinds that absorbed 204 of the old cells.
+        .tunnel, .plan_phase, .audit, .cleanup => .{
+            .judgement_undeclared = true,
+            .runs_our_command = false,
+            .supervised_deadline = false,
+            .offers_input_bytes = false,
+            .publishes_declared_artifact = false,
+            .supervises_another_subject = false,
+            .records_process_identity = false,
+            .wrapper_documents_exit = false,
         },
+    };
+}
+
+/// The resolve-side admissibility rules, transcribed independently.
+///
+/// One rule per evidence variant, stated as the property a kind must have, and
+/// read against this file's own capability table rather than the store's. It was
+/// 99 cells; the nine rules below say the same thing and say it once each.
+///
+/// Two rules are refusals rather than routings, and they are the ones a future
+/// change is most likely to undo by accident:
+///
+///  * `supervisor_report` is refused for **every** kind, by a literal `false`
+///    rather than by a property. It is the only mechanical variant with no
+///    identity binding at all — a status and a sentence, nothing tying either to
+///    the attempt it is handed to — while `isMechanical` grades it mechanical,
+///    the grade that releases a scope barrier with no operator in the loop.
+///    Nothing constructs one, so the refusal costs no reachable route.
+///  * `process_probe` follows `records_process_identity`, which is a fact about
+///    what the attempt *wrote down*, not about whether a process existed. `exec`
+///    has it; a job runs a process and records its pane's pid instead, and
+///    admitting it there let "the pane is gone" mean "the job was cancelled"
+///    while a daemonized child ran on.
+fn pinnedCell(kind: Store.operations.Kind, tag: EvidenceTag) bool {
+    return pinnedEvidenceRule(pinnedCapabilities(kind), tag);
+}
+
+/// The rules alone, with no kind in scope — the shape `receipts.appliesTo` has,
+/// and for the same reason: a rule that cannot see a kind cannot except one.
+fn pinnedEvidenceRule(can: Store.operations.Capabilities, tag: EvidenceTag) bool {
+    return switch (tag) {
+        // No producer, and no field on the variant that could bind a report to the
+        // attempt it is offered against.
+        .supervisor_report => false,
+        // A reading of a process, admissible only where an identity was recorded
+        // for it to be checked against.
+        .process_probe => can.records_process_identity,
+        // The two documents our job wrapper writes. Only work whose launch line
+        // carried that wrapper can be spoken about by them — a `session_write`
+        // shares the tmux mechanism and carries no wrapper, and a control act's
+        // target's documents settle the target.
+        .job_sentinel, .job_result => can.wrapper_documents_exit,
+        // All four readings of an address, positive and negative. Only work that
+        // named a destination in advance has one on record, and they travel
+        // together: a kind that can be told its artifact is there must be tellable
+        // that it is not, that it is the wrong one, and that nothing could check
+        // it, or some of its outcomes have no evidence that can express them.
+        .filesystem_effect,
+        .destination_absent,
+        .destination_present_unverified,
+        .destination_present_contradicting,
+        => can.publishes_declared_artifact,
+        // A human's decision, about the operation rather than about a mechanism's
+        // output, and admissible everywhere on purpose: a kind that admitted no
+        // evidence at all would hold its scope with no way out.
+        .operator_override => true,
     };
 }
 
@@ -3122,6 +3163,10 @@ fn sampleTerminal(tag: TerminalTag) op_state.Terminal {
         } },
         .input_accepted => .{ .input_accepted = .{ .bytes = 12, .sha256 = "aabbcc" } },
         .input_refused => .{ .input_refused = .{ .reason = "the session does not exist" } },
+        .proven_failure => .{ .proven_failure = .{
+            .observation = "tmux has-session reported the session still present after kill-session",
+            .error_code = "SESSION_SURVIVED_KILL",
+        } },
         .indeterminate => .{ .indeterminate = .{
             .reason = "the connection dropped",
             .last_observed = .submitted,
@@ -3129,150 +3174,69 @@ fn sampleTerminal(tag: TerminalTag) op_state.Terminal {
     };
 }
 
-/// The settle-side admissibility matrix, transcribed independently of the
-/// implementation and from the other direction — kind by kind, where
-/// `receipts.terminalDescribesKind` goes terminal by terminal.
+/// The settle-side admissibility rules, transcribed independently and from the
+/// same direction as the resolve-side ones above: one rule per terminal, stated
+/// as the property a kind must have.
 ///
-/// Same purpose as `pinnedCell` one axis over: a second statement of the table,
-/// so a cell cannot be widened in `receipts.zig` alone. Both switches are
-/// exhaustive and neither has a default arm, so a new `operations.Kind` or a new
-/// `op_state.Terminal` variant is a compile error in both places until somebody
-/// writes down what may settle what.
+/// It was 88 cells written kind by kind — four distinct rows, each spelled out in
+/// full so that a row agreeing with its neighbour by coincidence and one agreeing
+/// by omission could not look the same. The rows are now the capability table,
+/// which says the same thing better: two kinds have the same admissibility
+/// *because* they declared the same properties, and the gate below asserts that
+/// equal declarations produce equal rows, which is the coincidence-versus-omission
+/// question answered rather than sidestepped.
 ///
-/// The table has four distinct rows, and the count is the history: while `exec`
-/// and `job` were the only kinds, every terminal described every kind and this
-/// said nothing at all. `session_write` made it non-vacuous — bytes typed into
-/// somebody else's shell are judged by the terminal's answer, not by an exit
-/// status — the transfer kinds made it restrictive, by refusing every
-/// process-shaped terminal for work whose verdict is a file at a declared
-/// destination, and `control` made it narrow in a third direction: an act whose
-/// only claim is that the thing it named is gone. The remaining six kinds share
-/// the fourth row. Written out per row anyway, because a row that agrees with its
-/// neighbour by coincidence and a row that agrees with it by omission look the
-/// same once they are collapsed.
+/// Three refusals are worth restating, because they are what a reader will assume
+/// is a mistake:
+///
+///  * a transfer admits **no business terminal at all** — `completed` and
+///    `timed_out` are unreachable through `settle`, `failed` and `cancelled` only
+///    before submission. Every terminal it refuses carries a fact about a process,
+///    and its verdict is an artifact at a declared destination.
+///  * `control`'s whole business vocabulary is the two terminals that read its
+///    subject: `remote_cancel_confirmed` when the session is gone,
+///    `proven_failure` when the host says it is not.
+///  * the four undeclared kinds keep the three process-shaped terminals as a
+///    blank, not a permit. A total refusal on this side has no escape hatch —
+///    there is no operator variant in `op_state.Terminal` — so the first operation
+///    of such a kind would be unsettleable and would hold its scope with no route
+///    to `indeterminate` for a reconcile to act on.
 fn pinnedTerminalCell(kind: Store.operations.Kind, tag: TerminalTag) bool {
-    return switch (kind) {
-        // One supervised remote command, with a recorded process identity. It
-        // is judged by an exit status, may be given a remote deadline, and can
-        // be cancelled with verified absence. It types nothing into anybody's
-        // shell.
-        .exec => switch (tag) {
-            .exited,
-            .never_submitted,
-            .remote_deadline,
-            .local_abandon,
-            .remote_cancel_confirmed,
-            .indeterminate,
-            => true,
-            .input_accepted, .input_refused => false,
-        },
-        // Also one supervised remote command, and the shared mechanism is the
-        // trap: `cmd_job` types its launch line into a tmux session exactly as
-        // `write` types the operator's. What a job is judged by is still the
-        // wrapper's exit status, never the terminal's acceptance of the line
-        // that started it.
-        .job => switch (tag) {
-            .exited,
-            .never_submitted,
-            .remote_deadline,
-            .local_abandon,
-            .remote_cancel_confirmed,
-            .indeterminate,
-            => true,
-            .input_accepted, .input_refused => false,
-        },
-        // The row that makes this table non-vacuous. A write runs no command,
-        // so it has no exit status; nothing on the far side of `send-keys`
-        // enforces a deadline; and it starts no process to have confirmed the
-        // absence of. What it has instead is the pair built for it, carrying
-        // the byte count and digest that are the whole of what it established.
-        //
-        // The three attempt-level terminals stay, and they are what keeps the
-        // kind from being wedged: `never_submitted` and `local_abandon` before
-        // anything is handed over, `indeterminate` after — which is exactly the
-        // set `cmd_read_write` reaches for.
-        .session_write => switch (tag) {
-            .input_accepted,
-            .input_refused,
-            .never_submitted,
-            .local_abandon,
-            .indeterminate,
-            => true,
-            .exited, .remote_deadline, .remote_cancel_confirmed => false,
-        },
-        // The newest row, and the only one whose whole business vocabulary is a
-        // single cell. A control act stops a remote session and reads the host's
-        // own answer about whether it is gone — `tmux kill-session` then `tmux
-        // has-session`, which is the session-granularity proof
-        // `remote_cancel_confirmed` documents its optional `pid` for. It runs no
-        // command of the caller's, so there is no exit status to be judged by
-        // and no far side enforcing a deadline; it offers no bytes to a
-        // terminal, so the input pair describes a different act entirely — and
-        // reaching for the input-named one because it happens to mean "the
-        // remote answered and nothing was touched" is the mistake `7d0898a`
-        // already paid for, one level down.
-        //
-        // So `completed` and `timed_out` are unreachable here, as they are for a
-        // transfer. The kind is not wedged, which is the only thing that makes
-        // that admissible: `cancelled` through the cell it admits, and the three
-        // attempt-level terminals underneath it.
-        .control => switch (tag) {
-            .remote_cancel_confirmed,
-            .never_submitted,
-            .local_abandon,
-            .indeterminate,
-            => true,
-            .exited, .remote_deadline, .input_accepted, .input_refused => false,
-        },
-        // The row with no business terminal at all, and the one that stops this
-        // table being "everything except a write". A transfer is judged by an
-        // artifact at a destination it named before it sent a byte. Each of the
-        // three process-shaped terminals carries a fact about a *process*
-        // instead: an exit status (a copier that renamed nothing still exits 0),
-        // a deadline the far side enforced (nothing supervises a copier), or a
-        // verified absence (equally true of one that finished and one that died
-        // mid-rename). None of them may settle what happened to the file, so
-        // `completed` and `timed_out` are unreachable for these kinds and
-        // `failed`/`cancelled` reachable only before submission.
-        //
-        // What keeps that from being a wedge is the resolve side, not this one:
-        // `indeterminate` stays admissible from every in-flight state,
-        // `transfers` reads `resolved_status` beside `status`, and
-        // `appliesToKind` admits four readings of a declared destination for
-        // exactly these three kinds. `input_accepted` is refused on the same
-        // principle as the other three — "a terminal took some bytes" is not a
-        // reading of a destination either.
-        .transfer_push, .transfer_pull, .fetch => switch (tag) {
-            .never_submitted,
-            .local_abandon,
-            .indeterminate,
-            => true,
-            .exited,
-            .remote_deadline,
-            .remote_cancel_confirmed,
-            .input_accepted,
-            .input_refused,
-            => false,
-        },
-        // Nothing creates these at all, and unlike a transfer nothing is known
-        // about what one would be judged by — no declared effect, no evidence
-        // type of their own, so a refusal would be a guess rather than a
-        // narrowing. The blanks stay open, and a total refusal on this side has
-        // no escape hatch: there is no operator variant in `op_state.Terminal`,
-        // so the first operation of such a kind would be unsettleable and would
-        // hold its scope with no route to `indeterminate` for a reconcile to act
-        // on. Typing into somebody else's shell is still not what any of them
-        // does.
-        .tunnel, .plan_phase, .audit, .cleanup => switch (tag) {
-            .exited,
-            .never_submitted,
-            .remote_deadline,
-            .local_abandon,
-            .remote_cancel_confirmed,
-            .indeterminate,
-            => true,
-            .input_accepted, .input_refused => false,
-        },
+    return pinnedTerminalRule(pinnedCapabilities(kind), tag);
+}
+
+/// The rules alone, with no kind in scope. See `pinnedEvidenceRule`.
+fn pinnedTerminalRule(can: Store.operations.Capabilities, tag: TerminalTag) bool {
+    return switch (tag) {
+        // The three that describe the *attempt* rather than the work. Every kind
+        // hands something over, every kind can fail to, every kind can be given up
+        // on before it dials, and every kind can lose the answer. Literals, because
+        // there is no property whose absence would make one of them meaningless —
+        // and `terminalForTransportLoss` builds two of them from the state alone,
+        // without being told the kind.
+        .never_submitted, .local_abandon, .indeterminate => true,
+        // An exit status is the verdict only where the operation ran a command of
+        // ours. Widened for the undeclared kinds so the first one ever created is
+        // not born unsettleable.
+        .exited => can.runs_our_command or can.judgement_undeclared,
+        // A deadline needs a far side that enforced and reported one.
+        .remote_deadline => can.supervised_deadline or can.judgement_undeclared,
+        // Either there was a process of ours to signal, or the act's subject is a
+        // remote thing whose absence the host itself reports. A write starts
+        // nothing; a transfer's copier being gone says nothing about the artifact.
+        .remote_cancel_confirmed => can.runs_our_command or
+            can.supervises_another_subject or
+            can.judgement_undeclared,
+        // The mirror image of the cell above: the host answered about the act's
+        // subject and the answer is that it is still there, so the act provably did
+        // not take effect. Only a kind judged by its subject can say it — for a
+        // command it is `exited` with the status, for a write `input_refused` with
+        // the reason, and for a transfer it would be a post-submission `failed`
+        // with no reading of the destination behind it. Not widened for the
+        // undeclared kinds, and that costs them nothing: they keep `exited`.
+        .proven_failure => can.supervises_another_subject,
+        // One act, one kind: bytes offered to a terminal somebody else is running.
+        .input_accepted, .input_refused => can.offers_input_bytes,
     };
 }
 
@@ -3351,9 +3315,17 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         //    refused ("no longer running" is equally true of one that finished
         //    and one that died mid-rename) and a write still is (it starts
         //    nothing whose absence could be confirmed).
+        //  * `proven_failure` is the same reading with the opposite answer, and
+        //    its set is narrower than either: *only* a kind whose verdict is the
+        //    state of somebody else's subject. `exec` and `job` are excluded even
+        //    though they can obviously fail after submitting, because their proven
+        //    failure is `exited` carrying the status that caused it, and a write's
+        //    is `input_refused` carrying the reason. This is the one predicate here
+        //    that no undeclared kind shares, and that is deliberate: refusing it
+        //    for them costs nothing, because `exited` still carries a failure.
         //
         // Transcribed here as properties of the kind, deliberately without
-        // asking the store, so that widening a cell in `receipts.zig` has to be
+        // asking the store, so that widening a rule in `receipts.zig` has to be
         // argued for twice. Exhaustive, so a new kind stops the build here too.
         const judged_by_a_command_it_asked_for = switch (kind) {
             .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => true,
@@ -3362,6 +3334,20 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         const stops_a_remote_thing = switch (kind) {
             .exec, .job, .control, .tunnel, .plan_phase, .audit, .cleanup => true,
             .session_write, .transfer_push, .transfer_pull, .fetch => false,
+        };
+        const judged_by_somebody_elses_subject = switch (kind) {
+            .control => true,
+            .exec,
+            .job,
+            .session_write,
+            .transfer_push,
+            .transfer_pull,
+            .fetch,
+            .tunnel,
+            .plan_phase,
+            .audit,
+            .cleanup,
+            => false,
         };
         try t.expectEqual(
             judged_by_a_command_it_asked_for,
@@ -3374,6 +3360,10 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         try t.expectEqual(
             stops_a_remote_thing,
             Store.receipts.terminalDescribesKind(sampleTerminal(.remote_cancel_confirmed), kind),
+        );
+        try t.expectEqual(
+            judged_by_somebody_elses_subject,
+            Store.receipts.terminalDescribesKind(sampleTerminal(.proven_failure), kind),
         );
     }
 
@@ -3431,6 +3421,194 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         };
         try t.expectEqual(judged_by_a_command_it_asked_for, reachable.contains(.timed_out));
     }
+}
+
+test "gate: admissibility follows declared capability, not kind identity" {
+    const t = std.testing;
+    const Kind = Store.operations.Kind;
+    const Capabilities = Store.operations.Capabilities;
+    const axes = @typeInfo(Capabilities).@"struct".fields;
+
+    // The two matrices used to be 187 hand-decided cells with an independently
+    // transcribed mirror each, and six of the eleven kinds — the ones nothing in
+    // this binary constructs — accounted for 204 of the 374. They are now rules
+    // over the table below, so this is the gate that has to hold what the cells
+    // used to: that the derivation is real, that it is stated twice, and that no
+    // kind is being excepted by name behind it.
+
+    // 1. The table itself, stated twice. This is the double entry the cell tables
+    //    had, moved to the unit that actually carries a decision: eight booleans
+    //    per kind rather than seventeen cells.
+    inline for (@typeInfo(Kind).@"enum".fields) |kind_field| {
+        const kind: Kind = @field(Kind, kind_field.name);
+        const got = kind.capabilities();
+        const pinned = pinnedCapabilities(kind);
+        inline for (axes) |axis| {
+            if (@field(got, axis.name) != @field(pinned, axis.name)) {
+                std.debug.print(
+                    "capability {s}.{s}: the store says {}, this file says {}\n",
+                    .{ kind_field.name, axis.name, @field(got, axis.name), @field(pinned, axis.name) },
+                );
+                return error.CapabilityChanged;
+            }
+        }
+    }
+
+    // 2. `judgement_undeclared` excludes every other axis. It is not a capability;
+    //    it records that nothing is known about what a kind is judged by, and the
+    //    two matrices read it in opposite directions — widening the settle side so
+    //    the first such operation is not born unsettleable, ignored on the resolve
+    //    side where an override always remains. A kind claiming both that nothing
+    //    is known about it and that it publishes an artifact would be asking for
+    //    both readings at once, and the answer to which one wins would be an
+    //    accident of rule order.
+    inline for (@typeInfo(Kind).@"enum".fields) |kind_field| {
+        const kind: Kind = @field(Kind, kind_field.name);
+        const can = kind.capabilities();
+        if (can.judgement_undeclared) {
+            inline for (axes) |axis| {
+                const is_the_flag = comptime std.mem.eql(u8, axis.name, "judgement_undeclared");
+                if (!is_the_flag and @field(can, axis.name)) {
+                    std.debug.print(
+                        "kind {s} declares nothing is known about it and also declares {s}\n",
+                        .{ kind_field.name, axis.name },
+                    );
+                    return error.UndeclaredKindDeclaresSomething;
+                }
+            }
+        }
+    }
+
+    // 3. Equal declarations produce equal admissibility, in both matrices. This is
+    //    the claim the old tables answered by writing every row out in full,
+    //    "because a row that agrees with its neighbour by coincidence and a row
+    //    that agrees with it by omission look the same once they are collapsed" —
+    //    asserted here instead of avoided. The transfer trio and the four
+    //    undeclared kinds are where it has teeth: seven kinds, two declarations,
+    //    and nothing may distinguish them but what they declared.
+    for (std.enums.values(Kind)) |a| {
+        for (std.enums.values(Kind)) |b| {
+            if (!std.meta.eql(a.capabilities(), b.capabilities())) continue;
+            inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
+                const tag: TerminalTag = @field(TerminalTag, field.name);
+                try t.expectEqual(
+                    Store.receipts.terminalDescribesKind(sampleTerminal(tag), a),
+                    Store.receipts.terminalDescribesKind(sampleTerminal(tag), b),
+                );
+            }
+            inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
+                const tag: EvidenceTag = @field(EvidenceTag, field.name);
+                try t.expectEqual(
+                    sampleEvidence(tag).appliesToKind(a),
+                    sampleEvidence(tag).appliesToKind(b),
+                );
+            }
+        }
+    }
+
+    // 4. Every axis decides something. Run against the store's own rules, which
+    //    take capabilities and not a kind, so a single axis can be flipped on its
+    //    own — the eleven real kinds never differ by exactly one. An axis that
+    //    changed no cell would be a declaration an author answers carefully and
+    //    that nothing reads, which is worse than no axis at all: it reads as a
+    //    guarantee.
+    var nothing: Capabilities = undefined;
+    inline for (axes) |axis| @field(nothing, axis.name) = false;
+    inline for (axes) |axis| {
+        var only: Capabilities = nothing;
+        @field(only, axis.name) = true;
+        var decides = false;
+        inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
+            const tag: TerminalTag = @field(TerminalTag, field.name);
+            if (Store.receipts.terminalDescribes(sampleTerminal(tag), only) !=
+                Store.receipts.terminalDescribes(sampleTerminal(tag), nothing)) decides = true;
+        }
+        inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
+            const tag: EvidenceTag = @field(EvidenceTag, field.name);
+            if (sampleEvidence(tag).appliesTo(only) != sampleEvidence(tag).appliesTo(nothing))
+                decides = true;
+        }
+        if (!decides) {
+            std.debug.print("capability axis {s} changes no cell in either matrix\n", .{axis.name});
+            return error.CapabilityDecidesNothing;
+        }
+    }
+
+    // 5. The floor a set that declares nothing lands on, since that is what an
+    //    author who fills in eight `false`s gets. The three attempt-level
+    //    terminals and an operator's decision, and nothing else: it can record
+    //    that it never sent, that it gave up, and that the answer was lost, so it
+    //    is not wedged — and it can claim no exit status, no deadline, no verified
+    //    absence, no proven failure and no reading of a file, because it declared
+    //    nothing that would make one of those a statement about it.
+    inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
+        const tag: TerminalTag = @field(TerminalTag, field.name);
+        const attempt_level = switch (tag) {
+            .never_submitted, .local_abandon, .indeterminate => true,
+            .exited, .remote_deadline, .remote_cancel_confirmed, .proven_failure, .input_accepted, .input_refused => false,
+        };
+        try t.expectEqual(attempt_level, Store.receipts.terminalDescribes(sampleTerminal(tag), nothing));
+    }
+    inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
+        const tag: EvidenceTag = @field(EvidenceTag, field.name);
+        try t.expectEqual(tag == .operator_override, sampleEvidence(tag).appliesTo(nothing));
+    }
+}
+
+test "gate: every kind can record a failure it proved after submitting, except a transfer" {
+    const t = std.testing;
+
+    // The hole `proven_failure` was added for. `canSettle` admits
+    // `never_submitted` only from `created`/`connecting`, so after submission a
+    // kind whose verdict is not an exit status had nothing but `indeterminate` —
+    // "we could not establish what happened" — for outcomes it had established.
+    // That never faked success, and it cost a blocked scope and a reconcile for a
+    // settled question every time.
+    //
+    // One candidate per shape of proof, so the claim is about the vocabulary as a
+    // whole rather than about one variant: an exit status, a terminal's refusal of
+    // bytes, and a reading of somebody else's subject.
+    const failures = [_]op_state.Terminal{
+        .{ .exited = .{ .exit_code = 1 } },
+        .{ .input_refused = .{ .reason = "the session does not exist" } },
+        .{ .proven_failure = .{
+            .observation = "tmux has-session reported the session still present after kill-session",
+            .error_code = "SESSION_SURVIVED_KILL",
+        } },
+    };
+    for (failures) |terminal| {
+        try t.expectEqual(op_state.Status.failed, terminal.status());
+        try t.expect(op_state.canSettle(.submitted, terminal));
+    }
+
+    for (std.enums.values(Store.operations.Kind)) |kind| {
+        var proves = false;
+        for (failures) |terminal| {
+            if (Store.receipts.terminalDescribesKind(terminal, kind)) proves = true;
+        }
+        // A transfer is the exception, and it is a decision rather than a gap: its
+        // verdict is an artifact at a destination it declared, and none of these
+        // three is a reading of one. Post-submission it takes `indeterminate` and
+        // is judged by `resolve`, which admits four readings of that destination
+        // for exactly these kinds.
+        const publishes_a_declared_file = switch (kind) {
+            .transfer_push, .transfer_pull, .fetch => true,
+            else => false,
+        };
+        try t.expectEqual(!publishes_a_declared_file, proves);
+    }
+
+    // For a control act it is the new terminal and nothing else. `exited` is
+    // refused because no command of the caller's ran — `session rm` sends three
+    // tmux invocations and is judged by none of their exit codes — and
+    // `input_refused` because nothing in a session removal offers bytes to a
+    // terminal, which is the trap §7.5 names by its commit number.
+    try t.expect(!Store.receipts.terminalDescribesKind(.{ .exited = .{ .exit_code = 1 } }, .control));
+    try t.expect(!Store.receipts.terminalDescribesKind(
+        .{ .input_refused = .{ .reason = "the session does not exist" } },
+        .control,
+    ));
+    try t.expect(Store.receipts.terminalDescribesKind(failures[2], .control));
 }
 
 test "gate: a terminal that does not describe this kind of work is refused at settle" {
