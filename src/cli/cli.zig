@@ -5,6 +5,15 @@ pub const Output = @import("output.zig");
 pub const Dispatch = @import("dispatch.zig");
 pub const Args = @import("args.zig");
 pub const Setup = @import("cmd_setup.zig");
+/// The one reader for `skill/SKILL.md`, shared by the drift gates in
+/// `cmd_job.zig` and `cmd_session.zig`.
+///
+/// Re-exported here rather than left file-private because the black-box gates need
+/// the same bytes: `test/blackbox.zig`'s package root is `test/`, so it cannot
+/// `@embedFile` a document outside it, and the build wires `terminus_skill` into
+/// the library module alone. Through this it reaches `Terminus.Cli.skill_doc.text`
+/// and reads the shipped text instead of the checkout's working directory.
+pub const skill_doc = @import("skill_doc.zig");
 
 const Core = @import("../core/core.zig");
 const Store = Core.Store;
@@ -128,6 +137,54 @@ pub fn failWithCode(code: []const u8, comptime fmt: []const u8, args: anytype) n
         }
     }
     std.process.fatal(fmt ++ "\n  code: {s}", args ++ .{code});
+}
+
+/// `fail`, for a command that took a scope lease before it could fail.
+///
+/// Same stream, same exit status and the same `settleActiveExecution` /
+/// `releaseReservation` discipline as `fail`. The difference is two keys: what
+/// became of the lease, as a value rather than as a line on stderr.
+///
+/// **Why this is not `fail` itself.** `fail` is the tree-wide route and almost none
+/// of its callers ever take a lease, so widening its envelope would put two keys on
+/// every refusal in the CLI — a bad `--limit`, an unknown server, a missing key —
+/// where the answer is `not_taken` and says nothing. Three verbs hold a claim
+/// across a remote step (`job kill`, `job rm`, `session rm`), and on their paths
+/// the answer is the difference between a scope that is free and one that refuses
+/// the operator's next command for its whole TTL. So the two keys go where the
+/// question exists.
+///
+/// **Why this is not the verb's own fixed key set either.** The paths that reach
+/// here fail before the verb has established anything: `Cli.connect` could not
+/// reach the host or could not authenticate, so there is no step to report, and no
+/// word in either verb's published `errorCode` vocabulary that means "we never got
+/// a connection". Minting one is a protocol addition rather than something this
+/// closes. What these paths *can* state, and now do, is what happened to the lease
+/// they were holding.
+pub fn failReportingClaim(comptime fmt: []const u8, args: anytype) noreturn {
+    closeDaemonSocket();
+    settleActiveExecution("command failed before recording an outcome");
+    releaseReservation();
+    // Above the document, like every other reporter of this answer: a value
+    // written before the release has happened is a prediction, and the whole
+    // point of the key is that it is the answer.
+    const lease = releaseClaimReporting();
+    if (active_ctx) |ctx| {
+        if (ctx.out.format == .json) {
+            const message = std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt;
+            ctx.out.json(.{
+                .ok = false,
+                .@"error" = message,
+                .leaseRelease = lease.code,
+                .leaseReleaseError = lease.detail,
+            }) catch {};
+            ctx.out.flush() catch {};
+            std.process.exit(exit_code.failure);
+        }
+    }
+    // Human mode needs no extra line: `releaseClaimReporting` has already written
+    // the sentence for every answer that is not an ordinary hand-back.
+    std.process.fatal(fmt, args);
 }
 
 /// The execution owning the current command, if any.
@@ -406,9 +463,9 @@ pub fn releaseClaimReporting() ClaimRelease {
 
 /// Gives the scope back, if this command still holds it.
 ///
-/// Called from every process-ending path below, none of which has a document of
-/// its own to put the answer in. A claim that is no longer ours — a peer took it
-/// over with `--force` — matches no row and is left exactly where it is.
+/// Called from the process-ending paths below that have no document of their own
+/// to put the answer in. A claim that is no longer ours — a peer took it over with
+/// `--force` — matches no row and is left exactly where it is.
 ///
 /// The form for a caller that has already written its report, or has none: the
 /// answer is dropped, and a failure reaches the operator through the stderr line
@@ -417,6 +474,16 @@ pub fn releaseClaimReporting() ClaimRelease {
 /// did would be reintroducing the defect: a leaked lease refuses the next command
 /// on that scope for its whole TTL, and the caller must be able to read that off
 /// the document rather than off a terminal. See `ClaimRelease`.
+///
+/// **Two of the paths that used to end here now have reporting siblings**, because
+/// "no document of its own" was not true of them: `failReportingClaim` (the connect
+/// and auth failures of a command that claimed the scope before it dialled) and
+/// `receiptFatalReportingClaim` (a ledger write made under a claim). Both write
+/// JSON an agent parses, and both were dropping the answer into it. What is left
+/// here is `fail`, `failWithCode`, `failIndeterminate` and
+/// `failIndeterminateAfterOutput`: the first two are the tree-wide routes shared
+/// with every non-claiming verb, and the last two are reached after the caller has
+/// already published its own `leaseRelease`.
 pub fn releaseClaim() void {
     _ = releaseClaimReporting();
 }
@@ -500,12 +567,49 @@ pub fn failIndeterminateAfterOutput(request_id: []const u8) noreturn {
     std.process.exit(exit_code.indeterminate);
 }
 
+/// The tree-wide receipt-failure envelope. No defaults, so a branch that omits a
+/// key does not compile.
+const ReceiptFatalJson = struct {
+    ok: bool,
+    @"error": []const u8,
+    errorCode: []const u8,
+    requestId: []const u8,
+    cause: []const u8,
+    remoteStatus: ?[]const u8,
+    hint: []const u8,
+};
+
+/// The same envelope, for a caller that was holding a scope lease.
+///
+/// Written out rather than derived so the emitted key order is visible here; held
+/// to the one above by the gate at the bottom of this file, which is what stops the
+/// two from drifting apart the way two copies of anything else here would.
+const ReceiptFatalWithClaimJson = struct {
+    ok: bool,
+    @"error": []const u8,
+    errorCode: []const u8,
+    requestId: []const u8,
+    cause: []const u8,
+    remoteStatus: ?[]const u8,
+    leaseRelease: []const u8,
+    leaseReleaseError: ?[]const u8,
+    hint: []const u8,
+};
+
+const receipt_fatal_error = "could not persist the operation receipt";
+const receipt_fatal_hint = "the remote action may have taken effect; the local ledger is incomplete";
+
 /// A write to the operation ledger failed.
 ///
 /// This must never be swallowed the way `history.add(...) catch {}` was: if
 /// we cannot record what we did, we do not get to claim we did it cleanly.
 /// The remote effect is reported as far as we know it, alongside an explicit
 /// signal that the audit trail is incomplete.
+///
+/// The route for every caller that holds no scope lease: `exec`, `read`/`write`,
+/// `run`, `request reconcile`, and the observing `job` verbs. A caller that *does*
+/// hold one wants `receiptFatalReportingClaim` — see there for why the two
+/// envelopes are not one.
 pub fn receiptFatal(
     request_id: []const u8,
     err: anyerror,
@@ -515,14 +619,14 @@ pub fn receiptFatal(
     releaseClaim();
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
-            ctx.out.json(.{
+            ctx.out.json(ReceiptFatalJson{
                 .ok = false,
-                .@"error" = "could not persist the operation receipt",
+                .@"error" = receipt_fatal_error,
                 .errorCode = "RECEIPT_PERSIST_FAILED",
                 .requestId = request_id,
                 .cause = @errorName(err),
                 .remoteStatus = known_remote_status,
-                .hint = "the remote action may have taken effect; the local ledger is incomplete",
+                .hint = receipt_fatal_hint,
             }) catch {};
             ctx.out.flush() catch {};
             std.process.exit(exit_code.receipt_persist_failed);
@@ -534,6 +638,83 @@ pub fn receiptFatal(
         ctx.out.flush() catch {};
     }
     std.process.exit(exit_code.receipt_persist_failed);
+}
+
+/// `receiptFatal`, for a caller that was holding a scope lease.
+///
+/// The ledger write that failed here was made *under* a claim, so the claim is
+/// given back on the way out — and until now through the `void` `releaseClaim()`,
+/// which drops the answer. That is the worst place to drop it: this is the branch
+/// where the remote step already happened, the ledger does not have it, and the
+/// caller is about to be told to reconcile. A `left_held` on top of that means the
+/// reconcile-then-retry the hint asks for is refused for the lease's whole TTL,
+/// and the only warning was a line on stderr under a JSON document that never
+/// mentioned a lease.
+///
+/// A sibling rather than a widening of `receiptFatal`, for the reason
+/// `failReportingClaim` gives: `receiptFatal` is shared with `cmd_exec`,
+/// `cmd_read_write`, `cmd_request` and the observing `job` verbs, none of which
+/// takes a lease, and their envelopes are not this question's business.
+pub fn receiptFatalReportingClaim(
+    request_id: []const u8,
+    err: anyerror,
+    known_remote_status: ?[]const u8,
+) noreturn {
+    closeDaemonSocket();
+    // Above the document that publishes it.
+    const lease = releaseClaimReporting();
+    if (active_ctx) |ctx| {
+        if (ctx.out.format == .json) {
+            ctx.out.json(ReceiptFatalWithClaimJson{
+                .ok = false,
+                .@"error" = receipt_fatal_error,
+                .errorCode = "RECEIPT_PERSIST_FAILED",
+                .requestId = request_id,
+                .cause = @errorName(err),
+                .remoteStatus = known_remote_status,
+                .leaseRelease = lease.code,
+                .leaseReleaseError = lease.detail,
+                .hint = receipt_fatal_hint,
+            }) catch {};
+            ctx.out.flush() catch {};
+            std.process.exit(exit_code.receipt_persist_failed);
+        }
+        ctx.out.print(
+            "RECEIPT_PERSIST_FAILED: {s}\n  request: {s}\n  remote status: {s}\n  the remote action may have taken effect; the local ledger is incomplete\n",
+            .{ @errorName(err), request_id, known_remote_status orelse "unknown" },
+        ) catch {};
+        if (lease.detail) |text| ctx.out.print("  {s}\n", .{text}) catch {};
+        ctx.out.flush() catch {};
+    }
+    std.process.exit(exit_code.receipt_persist_failed);
+}
+
+// The claim-reporting envelope is the shared one plus exactly the two lease keys,
+// in the same order, with the same types — and that is checked rather than
+// asserted in a comment, because two hand-written copies of one envelope is the
+// shape this whole pass exists to stop repeating. A key added to `receiptFatal`
+// and not to its sibling would otherwise leave two verbs reporting a ledger
+// failure differently, which is how `localRow` came to be missing from `job rm`'s.
+test "gate: the claim-reporting receipt envelope is the shared one plus the lease answer" {
+    const t = std.testing;
+    const plain = @typeInfo(ReceiptFatalJson).@"struct".fields;
+    const with_claim = @typeInfo(ReceiptFatalWithClaimJson).@"struct".fields;
+
+    // `hint` is last on both, and the two lease keys sit immediately before it.
+    const added = [_][]const u8{ "leaseRelease", "leaseReleaseError" };
+    try t.expectEqual(plain.len + added.len, with_claim.len);
+    try t.expectEqualStrings("hint", plain[plain.len - 1].name);
+    try t.expectEqualStrings("hint", with_claim[with_claim.len - 1].name);
+
+    // Every key the shared envelope has before `hint`, in the same order and with
+    // the same type. A key added to one and not the other lands here.
+    inline for (plain[0 .. plain.len - 1], 0..) |f, i| {
+        try t.expectEqualStrings(f.name, with_claim[i].name);
+        try t.expect(f.type == with_claim[i].type);
+    }
+    inline for (added, 0..) |name, k| {
+        try t.expectEqualStrings(name, with_claim[plain.len - 1 + k].name);
+    }
 }
 
 /// How much of a job log's *end* a state probe reads. The sentinel is one
@@ -885,10 +1066,25 @@ pub fn resolveServer(ctx: *Ctx, store: *Store, name: []const u8) struct {
 pub const OnConnectFailure = enum {
     /// The command cannot do its job without the host: say why and exit.
     fatal,
+    /// `fatal`, for a command that took a scope lease before it dialled: the
+    /// refusal publishes what became of that lease instead of dropping it on
+    /// stderr. See `failReportingClaim`.
+    fatal_reporting_claim,
     /// The connection was worth trying but is not required: say why on stderr,
     /// return null, and let the caller carry on with what it already knows.
     report_and_continue,
 };
+
+/// `fail` or `failReportingClaim`, according to what the caller was holding.
+///
+/// A bool rather than the enum, so this is total: `report_and_continue` never
+/// reaches here — those branches return null above — and a switch with an
+/// `unreachable` arm for it would be a claim about control flow instead of a
+/// function that cannot be called wrongly.
+fn connectFatal(reporting_claim: bool, comptime fmt: []const u8, args: anytype) noreturn {
+    if (reporting_claim) failReportingClaim(fmt, args);
+    fail(fmt, args);
+}
 
 /// Connect + authenticate, with user-oriented fatal messages.
 pub fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh {
@@ -896,6 +1092,7 @@ pub fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh {
 }
 
 fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFailure) ?Ssh {
+    const reporting_claim = on_failure == .fatal_reporting_claim;
     var client = Ssh.connect(server.host, server.port) catch |err| switch (on_failure) {
         // Reported rather than swallowed, and reported as its own kind of
         // failure: "we never reached the host" and "the host turned us away"
@@ -907,7 +1104,7 @@ fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFa
             });
             return null;
         },
-        .fatal => fail("cannot connect to {s}:{d}: {s} ({s})", .{
+        .fatal, .fatal_reporting_claim => connectFatal(reporting_claim, "cannot connect to {s}:{d}: {s} ({s})", .{
             server.host, server.port, @errorName(err), Ssh.lastConnectError(),
         }),
     };
@@ -925,11 +1122,11 @@ fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFa
         switch (err) {
             error.UnsupportedKeyFormat => {
                 const format = Ssh.KeyFormat.detect(auth.key.private);
-                fail("the key for '{s}' is in an unsupported format.\n{s}", .{
+                connectFatal(reporting_claim, "the key for '{s}' is in an unsupported format.\n{s}", .{
                     server.name, Ssh.KeyFormat.adviceFor(format),
                 });
             },
-            else => fail("authentication failed for {s}@{s}: {s}", .{
+            else => connectFatal(reporting_claim, "authentication failed for {s}@{s}: {s}", .{
                 server.username, server.host, client.errorMessage(),
             }),
         }
@@ -995,6 +1192,23 @@ pub fn tryConnect(
     auth: Ssh.Auth,
 ) ?Connection {
     return openConnection(ctx, parsed, server, auth, .report_and_continue);
+}
+
+/// `connect` for a caller that took a scope lease before it dialled.
+///
+/// The three destructive verbs — `job kill`, `job rm`, `session rm` — all claim
+/// the scope *before* the connection is opened, on purpose: a peer's live claim
+/// then refuses them with nothing sent, not even a dial. The cost is that every
+/// connect and auth failure from there on happens with a lease held, and those
+/// were the paths that dropped the release answer. This is the same connect with
+/// that answer published. See `failReportingClaim`.
+pub fn connectReportingClaim(
+    ctx: *Ctx,
+    parsed: *const Args.Parsed,
+    server: Store.servers.Server,
+    auth: Ssh.Auth,
+) Connection {
+    return openConnection(ctx, parsed, server, auth, .fatal_reporting_claim).?;
 }
 
 fn openConnection(

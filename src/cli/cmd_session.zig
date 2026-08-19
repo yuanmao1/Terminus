@@ -382,7 +382,7 @@ fn removeSession(
 
     // --- The exits that are deliberately *not* the fixed document ------------
     //
-    // Four of them, all before this command can have established anything about
+    // Three of them, all before this command can have established anything about
     // this session, and each one named rather than left to be found:
     //
     //  * the two above — a missing or malformed argument. There is no session and
@@ -391,14 +391,21 @@ fn removeSession(
     //    operation row exists, so there is no `requestId` and no `status` to put
     //    in the document; `{ok, error}` and exit 1 are honest for "nothing
     //    happened, and we could not even start".
-    //  * `leases.acquire` in `claimScope`. An operation row exists by then, and
-    //    `Cli.fail`'s exit hook settles it — so the ledger is complete and exit 1
-    //    is true of the host. What it does not carry is this verb's key set, and
-    //    giving that branch a code of its own is a protocol addition rather than
-    //    one of the failures this slice is about.
     //  * the two `fatal` calls in `provenCancellation` and `refuseSurvivedKill`,
     //    which are out of memory while formatting a receipt. That is the
     //    tree-wide OOM exit and it is not a state a document helps with.
+    //
+    // `leases.acquire` in `claimScope` used to be a fourth. It is not any more: an
+    // operation row exists by then, so the document has a `requestId` and a
+    // `status` to carry, and it now reports `RECEIPT_PERSIST_FAILED` and exit 76
+    // like every other store write this command needs and cannot make.
+    //
+    // `Cli.connect` is not on this list either, and was never on it: it fails with
+    // the scope already held, so it reports through `Cli.connectReportingClaim` —
+    // `{ok, error, leaseRelease, leaseReleaseError}`. Not this verb's key set,
+    // because "we never got a connection" has no word in the published `errorCode`
+    // vocabulary and minting one is a protocol addition; but not silent about the
+    // lease either, which is the half that mattered.
     //
     // Every other exit — including every ledger-write failure and the kill that
     // got no answer — emits `RemovalJson`.
@@ -466,7 +473,11 @@ fn removeSession(
         err,
     );
 
-    var conn = Cli.connect(ctx, parsed, server, auth);
+    // The scope is held from here on, `Cli.connect` included — so this is the
+    // connect that publishes what became of the lease if it cannot open. It used
+    // to be the plain one, whose `{ok, error}` said nothing about a lease this
+    // command had taken and might not have been able to hand back.
+    var conn = Cli.connectReportingClaim(ctx, parsed, server, auth);
     defer conn.deinit();
     const executor = conn.executor();
 
@@ -1782,12 +1793,14 @@ test contentionScope {
 /// about to be destroyed along with its memories, and nothing in this slice
 /// establishes whose shell it is. Waiting out the TTL is the escape hatch.
 ///
-/// Takes the execution rather than just its id because its two refusals are
-/// branches of `session rm` like any other: they used to `fatal`, which emits the
-/// generic `{ok, error}` envelope, so a caller that hit the one-in-a-thousand
-/// window between `begin`'s check and this acquisition got two keys instead of the
-/// verb's fixed set. Both settle the attempt and both report through
-/// `refuseWithNothingSent`.
+/// Takes the execution rather than just its id because all three of its failures
+/// are branches of `session rm` like any other: they used to `fatal` or
+/// `storeFatal`, which emit the generic `{ok, error}` envelope, so a caller that
+/// hit the one-in-a-thousand window between `begin`'s check and this acquisition —
+/// or hit a store that refused the write — got two keys instead of the verb's fixed
+/// set. The two refusals settle the attempt and report through
+/// `refuseWithNothingSent`; the store error cannot settle anything (the store is
+/// what just failed) and reports through `refuseLedgerUnrecordable`.
 fn claimScope(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -1820,7 +1833,25 @@ fn claimScope(
         // start time — a TTL dated from it starts running before the store was
         // even opened.
         .now = wallClockSeconds(ctx.io),
-    }) catch |err| Cli.storeFatal(store, err);
+    }) catch |err| refuseLedgerUnrecordable(
+        ctx,
+        execution.id(),
+        server_name,
+        session,
+        execution.status.text(),
+        .held,
+        Facts.untouched,
+        code.receipt_persist_failed,
+        // Not "nothing was written": the acquisition is one transaction and its
+        // rollback is best-effort, so a lease row under the id below may or may
+        // not be standing. Saying which would be inventing the one fact this
+        // branch does not have. `leaseRelease` is `not_taken` beside this and
+        // that is the narrower, true statement: nothing was *registered*, so
+        // this command handed nothing back.
+        "the scope lease this removal has to hold could not be taken: the store refused the write, and whether a lease row was left behind under the request id below is not established. Nothing was sent to the host",
+        "nothing was sent, so the host is untouched; the attempt is left unsettled and bars this session's scope until it is reconciled, and any row the refused acquisition left behind lapses at its TTL (120s)",
+        err,
+    );
 
     switch (outcome) {
         .acquired => {
@@ -1974,310 +2005,28 @@ fn validateName(name: []const u8) void {
 //
 // It already drifted: the document said 11 keys for a struct with 12, and nothing
 // caught it, because the `session rm` paragraph was the one key set with no gate
-// reading it. `cmd_job.zig` has held `KillJson` and `RemovalJson` against their
-// paragraphs since they were published; this is the same rule for this verb.
+// reading it.
 //
-// Nullability is read from `@typeInfo` rather than from a list maintained beside
-// it, because a list maintained beside it is one more thing to forget.
-//
-// The parse is a literal read of English and will break if that paragraph is
-// reflowed. That is the trade, taken deliberately: a reformat that defeats the
-// check fails the gate rather than quietly checking nothing. Every failure below
-// prints the literal it was looking for, so the repair is to the document — or, if
-// the wording genuinely moved on, to the needle here.
-//
-// The machinery is a second, smaller copy of `cmd_job.zig`'s. That is a real cost
-// and it is stated rather than hidden: those helpers are file-private, and hoisting
-// them into a module both files can reach is a module-boundary change, which is not
-// this slice's to make.
+// The reader lives in `skill_doc.zig` now and is shared with `cmd_job.zig`. It was
+// a second, smaller copy of that file's machinery, kept here because those helpers
+// were file-private — and two copies of a drift detector is itself a drift risk:
+// the detector can drift, and a fix applied to one copy and not the other leaves a
+// gate quietly checking less than it says. What stays here is what only this file
+// knows: which struct and which namespaces the document is describing, and which
+// literals to look for.
 
-/// The same text `terminus setup` ships, embedded rather than read: the gate runs
-/// wherever the tests run, with no working directory to be wrong about.
-const skill_md = @embedFile("terminus_skill");
-
-const SkillError = error{
-    SkillAnchorMissing,
-    SkillCountUnreadable,
-    SkillListUnterminated,
-    SkillParensUnbalanced,
-    SkillKeySetDrifted,
-};
-
-/// Whatever follows `needle`, or a loud failure naming it.
-fn skillAfter(hay: []const u8, needle: []const u8, what: []const u8) SkillError![]const u8 {
-    const at = std.mem.indexOf(u8, hay, needle) orelse {
-        std.debug.print(
-            \\
-            \\skill/SKILL.md: cannot find {s}.
-            \\  looked for the literal: "{s}"
-            \\This gate parses that text to learn what the document claims about
-            \\`session rm --json`'s key set. If the paragraph was reworded or reflowed,
-            \\fix the needle in src/cli/cmd_session.zig; deleting the gate puts the
-            \\document back to drifting from the struct unnoticed — which is how it came
-            \\to publish 11 keys for a 12-field struct.
-            \\
-        , .{ what, needle });
-        return error.SkillAnchorMissing;
-    };
-    return hay[at + needle.len ..];
-}
-
-/// The paragraph starting at `s`: up to its first blank line, or all of it. A line
-/// of only spaces, tabs or `\r` is blank, so the parse does not depend on how the
-/// checkout wrote its line endings.
-fn skillParagraph(s: []const u8) []const u8 {
-    var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, s, i, '\n')) |nl| {
-        var j = nl + 1;
-        while (j < s.len and (s[j] == ' ' or s[j] == '\t' or s[j] == '\r')) j += 1;
-        if (j == s.len or s[j] == '\n') return s[0..nl];
-        i = nl + 1;
-    }
-    return s;
-}
-
-/// Every `code span` after `label` that is not inside a parenthetical aside, up to
-/// the first `.` outside both parentheses and code spans.
-///
-/// Parentheses are the reason this is not a plain search for the next period: the
-/// document puts each enumeration's values in one (`gone` | `present` | ...), and
-/// those are values, not keys.
-fn skillKeys(
-    gpa: std.mem.Allocator,
-    para: []const u8,
-    label: []const u8,
-    what: []const u8,
-) (SkillError || std.mem.Allocator.Error)![]const []const u8 {
-    const rest = try skillAfter(para, label, what);
-    var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(gpa);
-    var depth: usize = 0;
-    var i: usize = 0;
-    var ended = false;
-    while (i < rest.len) : (i += 1) {
-        switch (rest[i]) {
-            '(' => depth += 1,
-            ')' => {
-                if (depth == 0) {
-                    std.debug.print(
-                        \\
-                        \\skill/SKILL.md: unbalanced parentheses in {s}, so the gate cannot tell
-                        \\the keys from the values.
-                        \\  text read: "{s}"
-                        \\
-                    , .{ what, rest });
-                    return error.SkillParensUnbalanced;
-                }
-                depth -= 1;
-            },
-            '`' => {
-                const close = std.mem.indexOfScalarPos(u8, rest, i + 1, '`') orelse {
-                    std.debug.print(
-                        \\
-                        \\skill/SKILL.md: an unclosed `code span` in {s}.
-                        \\  text read: "{s}"
-                        \\
-                    , .{ what, rest });
-                    return error.SkillListUnterminated;
-                };
-                if (depth == 0) try out.append(gpa, rest[i + 1 .. close]);
-                i = close;
-            },
-            '.' => if (depth == 0) {
-                ended = true;
-                break;
-            },
-            else => {},
-        }
-    }
-    if (!ended or out.items.len == 0) {
-        std.debug.print(
-            \\
-            \\skill/SKILL.md: {s} is empty or runs past the end of its sentence, so the
-            \\gate would be checking nothing.
-            \\  text read: "{s}"
-            \\
-        , .{ what, rest });
-        return error.SkillListUnterminated;
-    }
-    return out.toOwnedSlice(gpa);
-}
-
-fn skillHas(list: []const []const u8, entry: []const u8) bool {
-    for (list) |item| if (std.mem.eql(u8, item, entry)) return true;
-    return false;
-}
-
-/// Every `code span` inside the parenthetical that follows `label`.
-///
-/// The other half of `skillKeys`, which deliberately *skips* those parentheticals
-/// because they hold values rather than keys. Nothing was reading them, so a
-/// value could be added to the document, or to the code, with no gate noticing —
-/// which is exactly the shape the key-count drift took before a gate read that.
-///
-/// Stops at the first `)`, so it reads one key's list and not the rest of the
-/// sentence.
-fn skillValues(
-    gpa: std.mem.Allocator,
-    para: []const u8,
-    label: []const u8,
-    what: []const u8,
-) (SkillError || std.mem.Allocator.Error)![]const []const u8 {
-    const rest = try skillAfter(para, label, what);
-    var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(gpa);
-    var i: usize = 0;
-    var closed = false;
-    while (i < rest.len) : (i += 1) {
-        switch (rest[i]) {
-            ')' => {
-                closed = true;
-                break;
-            },
-            '`' => {
-                const close = std.mem.indexOfScalarPos(u8, rest, i + 1, '`') orelse {
-                    std.debug.print(
-                        \\
-                        \\skill/SKILL.md: an unclosed `code span` in {s}.
-                        \\  text read: "{s}"
-                        \\
-                    , .{ what, rest });
-                    return error.SkillListUnterminated;
-                };
-                try out.append(gpa, rest[i + 1 .. close]);
-                i = close;
-            },
-            else => {},
-        }
-    }
-    if (!closed or out.items.len == 0) {
-        std.debug.print(
-            \\
-            \\skill/SKILL.md: {s} is empty or its parenthetical never closes, so the gate
-            \\would be checking nothing.
-            \\  text read: "{s}"
-            \\
-        , .{ what, rest });
-        return error.SkillListUnterminated;
-    }
-    return out.toOwnedSlice(gpa);
-}
-
-/// One documented value list against the namespace the branches actually spell it
-/// from.
-fn expectSkillVocabulary(
-    gpa: std.mem.Allocator,
-    documented: []const []const u8,
-    what: []const u8,
-    comptime namespace: type,
-) SkillError!void {
-    var actual: std.ArrayList([]const u8) = .empty;
-    defer actual.deinit(gpa);
-    inline for (@typeInfo(namespace).@"struct".decls) |decl| {
-        actual.append(gpa, @field(namespace, decl.name)) catch return error.SkillKeySetDrifted;
-    }
-    try expectSkillKeys(what, documented, actual.items);
-}
-
-/// One documented list against the one the code actually has, in both directions.
-/// Both matter: an entry the document invented is as wrong as one it forgot, and a
-/// field whose `?` came or went shows up as one of each.
-fn expectSkillKeys(
-    what: []const u8,
-    documented: []const []const u8,
-    actual: []const []const u8,
-) SkillError!void {
-    var drifted = false;
-    for (documented) |entry| {
-        if (!skillHas(actual, entry)) {
-            std.debug.print(
-                \\
-                \\skill/SKILL.md lists `{s}` among {s}, and RemovalJson has nothing of that
-                \\name there — it was removed, renamed, or moved to the other list.
-                \\
-            , .{ entry, what });
-            drifted = true;
-        }
-    }
-    for (actual) |entry| {
-        if (!skillHas(documented, entry)) {
-            std.debug.print(
-                \\
-                \\RemovalJson has `{s}` among {s}, and skill/SKILL.md does not list it there.
-                \\
-            , .{ entry, what });
-            drifted = true;
-        }
-    }
-    if (!drifted and documented.len != actual.len) {
-        std.debug.print(
-            \\
-            \\skill/SKILL.md repeats an entry among {s}: {d} listed for {d} in the struct.
-            \\
-        , .{ what, documented.len, actual.len });
-        drifted = true;
-    }
-    if (drifted) return error.SkillKeySetDrifted;
-}
+const SkillDoc = @import("skill_doc.zig");
 
 test "gate: SKILL.md's `session rm --json` key set is the one RemovalJson emits" {
     const gpa = std.testing.allocator;
-    const fields = @typeInfo(RemovalJson).@"struct".fields;
-
-    var never_null: std.ArrayList([]const u8) = .empty;
-    defer never_null.deinit(gpa);
-    var nullable: std.ArrayList([]const u8) = .empty;
-    defer nullable.deinit(gpa);
-    inline for (fields) |f| {
-        // From the type. A hand-kept list of which keys are optional would be
-        // exactly the drift this gate exists to catch.
-        const bucket = if (@typeInfo(f.type) == .optional) &nullable else &never_null;
-        try bucket.append(gpa, f.name);
-    }
-
-    const heading = "\n`session rm --json` — ";
-    const para = skillParagraph(try skillAfter(skill_md, heading, "the key-set paragraph it opens"));
-
-    const keys_at = std.mem.indexOf(u8, para, " keys,") orelse {
-        std.debug.print(
-            \\
-            \\skill/SKILL.md: "`session rm --json` — " is not followed by "<n> keys,", so
-            \\the gate cannot read the count the document claims.
-            \\
-        , .{});
-        return error.SkillCountUnreadable;
-    };
-    const claimed = std.fmt.parseInt(usize, para[0..keys_at], 10) catch {
-        std.debug.print(
-            \\
-            \\skill/SKILL.md: "`session rm --json` — " is followed by "{s} keys,", which is
-            \\not a number.
-            \\
-        , .{para[0..keys_at]});
-        return error.SkillCountUnreadable;
-    };
-    if (claimed != fields.len) {
-        std.debug.print(
-            \\
-            \\skill/SKILL.md says "`session rm --json` — {d} keys,"; RemovalJson has {d}
-            \\fields. This is the exact drift the gate was added for.
-            \\
-        , .{ claimed, fields.len });
-        return error.SkillKeySetDrifted;
-    }
-
-    const documented_never_null = try skillKeys(gpa, para, "Never null: ", "`session rm`'s never-null keys");
-    defer gpa.free(documented_never_null);
-    const documented_nullable = try skillKeys(gpa, para, "Nullable: ", "`session rm`'s nullable keys");
-    defer gpa.free(documented_nullable);
-
-    // Both, before either is raised: a field that gained or lost its `?` is one
-    // complaint from each list, and reporting half of that would send the reader
-    // looking for a rename that never happened.
-    const never_null_verdict = expectSkillKeys("`session rm`'s never-null keys", documented_never_null, never_null.items);
-    const nullable_verdict = expectSkillKeys("`session rm`'s nullable keys", documented_nullable, nullable.items);
-    try never_null_verdict;
-    try nullable_verdict;
+    try SkillDoc.expectKeySet(
+        gpa,
+        RemovalJson,
+        "\n`session rm --json` — ",
+        " keys,",
+        "`session rm`'s never-null keys",
+        "`session rm`'s nullable keys",
+    );
 }
 
 // `errorCode`'s vocabulary is published too, and a token the document invented
@@ -2286,20 +2035,14 @@ test "gate: SKILL.md's `session rm --json` key set is the one RemovalJson emits"
 // rewrites the check along with the code.
 test "gate: SKILL.md publishes exactly `session rm`'s errorCode vocabulary" {
     const gpa = std.testing.allocator;
-    const para = skillParagraph(try skillAfter(
-        skill_md,
+    const what = "`session rm`'s errorCode values";
+    const para = try SkillDoc.paragraphAfter(
         "\n`session rm --json`'s `errorCode` is ",
         "the errorCode vocabulary paragraph",
-    ));
-    const documented = try skillKeys(gpa, para, "one of ", "`session rm`'s errorCode values");
+    );
+    const documented = try SkillDoc.list(gpa, para, "one of ", null, what);
     defer gpa.free(documented);
-
-    var actual: std.ArrayList([]const u8) = .empty;
-    defer actual.deinit(gpa);
-    inline for (@typeInfo(code).@"struct".decls) |decl| {
-        try actual.append(gpa, @field(code, decl.name));
-    }
-    try expectSkillKeys("`session rm`'s errorCode values", documented, actual.items);
+    try SkillDoc.expectVocabulary(gpa, what, documented, code);
 }
 
 // The step vocabularies are published too, and until now nothing read them. The
@@ -2313,24 +2056,33 @@ test "gate: SKILL.md publishes exactly `session rm`'s errorCode vocabulary" {
 // renamed or added member rewrites the check along with the code. The namespaces
 // exist for this: flat, the union of the three had `not_attempted` in it twice and
 // there was nothing a documented list could be compared with.
+//
+// `authority` and `leaseRelease` are published in this same paragraph and are
+// *not* here: those two vocabularies belong to no single verb, so both are held
+// against the code for all three paragraphs at once, in `cmd_job.zig`.
 test "gate: SKILL.md publishes exactly `session rm`'s step-state vocabularies" {
     const gpa = std.testing.allocator;
-    const heading = "\n`session rm --json` — ";
-    const para = skillParagraph(try skillAfter(skill_md, heading, "the key-set paragraph it opens"));
+    const para = try SkillDoc.paragraphAfter(
+        "\n`session rm --json` — ",
+        "the key-set paragraph it opens",
+    );
 
-    const session_values = try skillValues(gpa, para, "`sessionState` (", "`sessionState`'s values");
+    const session_what = "`sessionState`'s values";
+    const session_values = try SkillDoc.list(gpa, para, "`sessionState` (", ")", session_what);
     defer gpa.free(session_values);
-    const log_values = try skillValues(gpa, para, "`logState` (", "`logState`'s values");
+    const log_what = "`logState`'s values";
+    const log_values = try SkillDoc.list(gpa, para, "`logState` (", ")", log_what);
     defer gpa.free(log_values);
-    const row_values = try skillValues(gpa, para, "`localRow` (", "`localRow`'s values");
+    const row_what = "`localRow`'s values";
+    const row_values = try SkillDoc.list(gpa, para, "`localRow` (", ")", row_what);
     defer gpa.free(row_values);
 
     // All three before any is raised, for the reason the key-set gate gives: a
     // value that moved from one key to another is one complaint from each list,
     // and reporting half of that sends the reader after a rename that never was.
-    const session_verdict = expectSkillVocabulary(gpa, session_values, "`sessionState`'s values", state.session);
-    const log_verdict = expectSkillVocabulary(gpa, log_values, "`logState`'s values", state.log);
-    const row_verdict = expectSkillVocabulary(gpa, row_values, "`localRow`'s values", state.row);
+    const session_verdict = SkillDoc.expectVocabulary(gpa, session_what, session_values, state.session);
+    const log_verdict = SkillDoc.expectVocabulary(gpa, log_what, log_values, state.log);
+    const row_verdict = SkillDoc.expectVocabulary(gpa, row_what, row_values, state.row);
     try session_verdict;
     try log_verdict;
     try row_verdict;
@@ -2342,12 +2094,12 @@ test "gate: SKILL.md publishes exactly `session rm`'s step-state vocabularies" {
 // that no gate parses is the thing this file has already been caught doing.
 test "gate: SKILL.md publishes the word `session rm` uses when the ledger has no row" {
     const gpa = std.testing.allocator;
-    const para = skillParagraph(try skillAfter(
-        skill_md,
+    const what = "`session rm`'s no-row status word";
+    const para = try SkillDoc.paragraphAfter(
         "\n`session rm --json`'s `status` is ",
         "the status paragraph",
-    ));
-    const documented = try skillKeys(gpa, para, "so it is ", "`session rm`'s no-row status word");
+    );
+    const documented = try SkillDoc.list(gpa, para, "so it is ", null, what);
     defer gpa.free(documented);
-    try expectSkillVocabulary(gpa, documented, "`session rm`'s no-row status word", state.ledger);
+    try SkillDoc.expectVocabulary(gpa, what, documented, state.ledger);
 }

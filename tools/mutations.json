@@ -237,8 +237,8 @@
       "id": "M5-skill-key-renamed",
       "rule": "SKILL.md's documented key names are the struct's own field names.",
       "file": "skill/SKILL.md",
-      "find": "`attemptRetained`, `resultRecord`, `authority`,\n",
-      "replace": "`attemptsRetained`, `resultRecord`, `authority`,\n",
+      "find": "`attemptRetained`, `resultRecord`,\n",
+      "replace": "`attemptsRetained`, `resultRecord`,\n",
       "expect_gate": "gate: SKILL.md's --json key sets are the ones these structs emit"
     },
     {
@@ -773,9 +773,49 @@
       "id": "W2-skill-lease-vocabulary",
       "rule": "skill/SKILL.md's published `leaseRelease` values are `Cli.ClaimRelease.codes`, not prose nobody checks.",
       "file": "skill/SKILL.md",
-      "find": "`authority`,\n`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).\nNullable: `exitCode`",
-      "replace": "`authority`,\n`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_behind`).\nNullable: `exitCode`",
+      "find": "`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).\nNullable: `exitCode`",
+      "replace": "`leaseRelease` (`not_taken` | `released` | `not_ours` | `left_behind`).\nNullable: `exitCode`",
       "expect_gate": "gate: SKILL.md publishes exactly the leaseRelease vocabulary, everywhere it publishes it"
+    },
+    {
+      "id": "S2b-skill-authority-vocabulary",
+      "rule": "skill/SKILL.md's published `authority` values are `Control.Authority.code()`'s own words, in every paragraph that publishes them, not prose nobody checks.",
+      "file": "skill/SKILL.md",
+      "find": "`cancellationProven`, `resultRecord`,\n`authority` (`held` | `lapsed` | `unreadable`),\n",
+      "replace": "`cancellationProven`, `resultRecord`,\n`authority` (`held` | `lapsed` | `unreadable` | `swept`),\n",
+      "expect_gate": "gate: SKILL.md publishes exactly the authority vocabulary, everywhere it publishes it"
+    },
+    {
+      "id": "S2b-kill-connect-publishes-the-lease",
+      "rule": "The two mutating `job` verbs claim the scope before they dial, so their connect and auth failures publish what became of that lease instead of leaving it on stderr.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    var conn = if (mutation != null)\n        Cli.connectReportingClaim(ctx, &parsed, resolved.server, resolved.auth)\n    else\n        Cli.connect(ctx, &parsed, resolved.server, resolved.auth);\n",
+      "replace": "    var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);\n",
+      "expect_gate": "blackbox: a `job kill` that could not open a connection says what became of the scope it took"
+    },
+    {
+      "id": "S2b-rm-unrecordable-publishes-the-lease",
+      "rule": "`job rm`'s unwritable-transaction report publishes what its release actually answered, not a constant: the branch whose own hint says to reconcile and re-run is the one a leaked lease refuses.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    Cli.clearExecution();\n    const lease = Cli.releaseClaimReporting();\n",
+      "replace": "    Cli.clearExecution();\n    const lease = Cli.ClaimRelease.released;\n",
+      "expect_gate": "blackbox: a `job rm` whose transaction and whose release both fail names the leak beside the row"
+    },
+    {
+      "id": "S2b-session-rm-lease-acquire-keys",
+      "rule": "A store that refuses `session rm`'s scope lease emits the verb's fixed key set and exits 76, not the generic `{ok, error}` and exit 1.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    }) catch |err| refuseLedgerUnrecordable(\n        ctx,\n        execution.id(),\n        server_name,\n        session,\n        execution.status.text(),\n        .held,\n        Facts.untouched,\n        code.receipt_persist_failed,\n        // Not \"nothing was written\": the acquisition is one transaction and its\n        // rollback is best-effort, so a lease row under the id below may or may\n        // not be standing. Saying which would be inventing the one fact this\n        // branch does not have. `leaseRelease` is `not_taken` beside this and\n        // that is the narrower, true statement: nothing was *registered*, so\n        // this command handed nothing back.\n        \"the scope lease this removal has to hold could not be taken: the store refused the write, and whether a lease row was left behind under the request id below is not established. Nothing was sent to the host\",\n        \"nothing was sent, so the host is untouched; the attempt is left unsettled and bars this session's scope until it is reconciled, and any row the refused acquisition left behind lapses at its TTL (120s)\",\n        err,\n    );\n",
+      "replace": "    }) catch |err| Cli.storeFatal(store, err);\n",
+      "expect_gate": "blackbox: a `session rm` whose scope lease cannot be written reports the full document and exits 76"
+    },
+    {
+      "id": "S2b-session-rm-connect-publishes-the-lease",
+      "rule": "`session rm` claims the scope before it dials, so its connect and auth failures publish what became of that lease.",
+      "file": "src/cli/cmd_session.zig",
+      "find": "    var conn = Cli.connectReportingClaim(ctx, parsed, server, auth);\n",
+      "replace": "    var conn = Cli.connect(ctx, parsed, server, auth);\n",
+      "expect_gate": "blackbox: a `session rm` whose scope lease cannot be written reports the full document and exits 76"
     },
     {
       "id": "W3-authority-owner-keys-the-claim-read",

@@ -480,7 +480,8 @@ signal; `null` means "there is no such reading", never "we did not look".
 (`killed` | `already_finished` | `finished_during_kill` | `not_killed`), `job`,
 `status`, `outcomeProven`, `observedAt`, `sessionGone`, `sessionCleanedUp` (the
 same boolean under the older name, published everywhere so it means one thing),
-`cancellationProven`, `resultRecord`, `authority`,
+`cancellationProven`, `resultRecord`,
+`authority` (`held` | `lapsed` | `unreadable`),
 `leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
 Nullable: `exitCode` (null when no record answered, and deliberately null on the
 `conflict` and unusable-record branches — those codes must not be read as an
@@ -490,7 +491,8 @@ attempt), `resultRecordError`, `cacheError`, `authorityError`,
 
 `job rm` — 19 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
 `errorCode`, `job`, `status`, `outcomeProven`, `rowRemoved`, `evidenceRetained`,
-`attemptRetained`, `resultRecord`, `authority`,
+`attemptRetained`, `resultRecord`,
+`authority` (`held` | `lapsed` | `unreadable`),
 `leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
 Nullable: `conflict`, `requestId`, `resultRecordError`, `cacheError`,
 `authorityError`, `leaseReleaseError`, `hint`.
@@ -510,7 +512,8 @@ vocabulary `session rm` publishes wherever the two verbs describe the same fact.
 `RECEIPT_PERSIST_FAILED` is the one word that never arrives inside this key set:
 that branch could not write the transaction carrying the terminal and the delete,
 so it reports the fatal envelope
-(`{ok, error, errorCode, requestId, cause, remoteStatus, localRow, hint}`) and
+(`{ok, error, errorCode, requestId, cause, remoteStatus, localRow, leaseRelease,
+leaseReleaseError, hint}`) and
 exits **76** — read `localRow` there, which is `kept` when the undo was proved and
 `unknown` when it was not.
 
@@ -524,6 +527,28 @@ does **not** change the exit code or `ok`: on a completed kill or removal the ac
 did complete and is durably recorded, so exiting non-zero would say otherwise and
 send you into a retry the leaked lease would refuse. Branch on `leaseRelease`;
 `leaseReleaseError` is prose.
+
+**`leaseRelease` is also on the two envelopes that are not a verb's key set.** All
+three claim-holding verbs — `job kill`, `job rm`, `session rm` — take the scope
+lease *before* they dial, on purpose: a peer's live claim then refuses them with
+nothing sent, not even a dial. The cost is that a connect or authentication failure
+happens with the lease already held, and so does every ledger write the command
+makes afterwards. Both used to hand the lease back through a path that dropped the
+answer onto stderr, under JSON that never mentioned a lease. They now carry it:
+
+- **The connection could not be opened or authenticated**:
+  `{ok, error, leaseRelease, leaseReleaseError}`, exit **1**. Not the verb's key
+  set — nothing was established, and neither verb's `errorCode` vocabulary has a
+  word for "we never got a connection" — and not silent about the lease either.
+- **A ledger write made under the claim failed**:
+  `{ok, error, errorCode, requestId, cause, remoteStatus, leaseRelease,
+  leaseReleaseError, hint}` with `errorCode:"RECEIPT_PERSIST_FAILED"`, exit **76**.
+  `job rm`'s composite adds `localRow` to that, as above. `session rm` does not use
+  this envelope at all: every ledger failure of that verb emits its own 16 keys.
+
+`left_held` means the same thing on all of them, and it is the reason to read it
+here: the recovery each of these branches recommends is a retry, and a lease this
+command could not hand back refuses exactly that until it lapses (120s).
 
 `status` on these two verbs is the ledger's word for the attempt, and it has two
 values `job status` never prints: `"unknown"` (the row names no attempt, or names
@@ -629,10 +654,21 @@ something.
   cannot. `errorCode:"RECEIPT_PERSIST_FAILED"`, exit **76**, and the three step
   keys report exactly how far the command had got — including the branch where the
   refusal's *own* record is what could not be written, where `requestId` is the id
-  the command minted and nothing exists under it (`status:"unknown"` says so).
+  the command minted and nothing exists under it (`status:"unknown"` says so), and
+  including the branch where the store refused the **scope lease** this removal has
+  to hold: nothing was sent, all three step keys are untouched, and `leaseRelease`
+  is `not_taken` because nothing was registered to hand back. Whether that refused
+  acquisition left a row behind is *not* claimed either way — if it did, it lapses
+  at its TTL.
   `localRow` is `"unknown"` only when a composite could not commit *and* its
   rollback could not be confirmed; every other branch can prove the row is where it
   was and says `"kept"`.
+- **The connection could not be opened or authenticated**: this verb claims the
+  scope before it dials, so that failure happens with the lease held. It reports
+  `{ok, error, leaseRelease, leaseReleaseError}` and exits **1** — not the 16 keys,
+  because nothing was established and no `errorCode` here means "we never got a
+  connection". The attempt is settled `failed` on the way out, so the scope is free
+  and re-running once the host is reachable is safe.
 - **Refused by a peer's claim**: `errorCode:"SCOPE_HELD_BY_PEER"`, nothing sent,
   exit 1 — **and the refusal is recorded**, as a `control` operation of its own
   settled `cancelled`. It is queryable by `requestId` and it does **not** bar the

@@ -5236,22 +5236,17 @@ fn operationCount(store: *Store) !i64 {
     return stmt.columnInt(0);
 }
 
-/// The agent-facing skill text, read from the checkout the gates run in.
+/// The agent-facing skill text, as the binary ships it.
 ///
-/// Read rather than `@embedFile`d because this module's package root is `test/` and
-/// the document lives outside it; the build wires `skill/SKILL.md` into the library
-/// module only, which no public declaration re-exports. Repo-relative paths are
-/// already load-bearing throughout this file — every fixture lives under
-/// `.zig-cache/tmp` — so this adds no assumption that was not here already.
-fn readSkillDocument(f: *Fixture, arena: std.mem.Allocator) ![]const u8 {
-    return std.Io.Dir.cwd().readFileAlloc(f.io, "skill/SKILL.md", arena, .limited(1 << 20)) catch |err| {
-        std.debug.print(
-            "could not read skill/SKILL.md from the checkout ({t}); these gates run with the repository root as their working directory\n",
-            .{err},
-        );
-        return err;
-    };
-}
+/// This module's package root is `test/` and the document lives outside it, so a
+/// direct `@embedFile` here cannot see it, and the build wires `terminus_skill`
+/// into the library module alone. It used to be a runtime `readFileAlloc` of
+/// `skill/SKILL.md` from the working directory for exactly that reason. It no
+/// longer has to be: the one reader of that document is now a module, and
+/// `Cli.skill_doc` re-exports it — so these gates and the four compile-time gates
+/// in `cmd_job.zig` / `cmd_session.zig` read the same bytes, and neither depends on
+/// where the process was started.
+const skill_document = Terminus.Cli.skill_doc.text;
 
 /// Asserts that the exit code this run produced is the one the shipped document
 /// publishes for `error_code`.
@@ -5272,10 +5267,9 @@ fn expectDocumentedExit(f: *Fixture, error_code: []const u8, r: Run) !void {
     var arena_state = std.heap.ArenaAllocator.init(f.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const skill_md = try readSkillDocument(f, arena);
 
     const needle = try std.fmt.allocPrint(arena, "`{s}` exits **", .{error_code});
-    const at = std.mem.indexOf(u8, skill_md, needle) orelse {
+    const at = std.mem.indexOf(u8, skill_document, needle) orelse {
         std.debug.print(
             \\
             \\skill/SKILL.md does not publish an exit code for `{s}`.
@@ -5288,7 +5282,7 @@ fn expectDocumentedExit(f: *Fixture, error_code: []const u8, r: Run) !void {
         , .{ error_code, needle });
         return error.SkillPublishesNoExitCode;
     };
-    const rest = skill_md[at + needle.len ..];
+    const rest = skill_document[at + needle.len ..];
     const end = std.mem.indexOf(u8, rest, "**") orelse return error.SkillExitCodeUnterminated;
     const documented = std.fmt.parseInt(u8, rest[0..end], 10) catch {
         std.debug.print(
@@ -5700,5 +5694,306 @@ test "blackbox: a `session rm` that cannot write to the ledger reports the full 
         var store = try f.open();
         defer store.close();
         try t.expectEqual(@as(?i64, null), try Store.sessions.idByName(&store, 1, "shell"));
+    }
+}
+
+// --- The claim-holding paths that had no document ----------------------------
+//
+// W2 gave `job kill`, `job rm` and `session rm` the reporting release on their
+// *typed* branches: every `KillJson` and `RemovalJson` now carries `leaseRelease`.
+// What it did not reach were the paths that exit through a shared envelope — the
+// connect and auth failures, and the ledger writes that route through
+// `Cli.receiptFatal` — and those are precisely the paths most likely to strand a
+// lease. All three took the scope *before* dialling, so every one of these
+// failures happens with the claim held, and every one of them handed it back
+// through the `void` `Cli.releaseClaim()`, which drops the answer.
+//
+// The three gates below drive each of those shapes through the real binary.
+//
+// **How `left_held` is arranged here, and why it is not the `strand` rule.** The
+// fake host's `strand` needs a round trip to ride, and these failures happen
+// before there is one — a connect that never opened has no reply to attach to, and
+// `job rm` has no round trip between its last renewal and its commit. What is left
+// is the other way a release fails: the store refuses it. A trigger on `leases`
+// that fires **only** when `release_reason` is being set to `released` is exactly
+// that, and it is surgical — `expired` and `takeover` write other words, and a
+// renewal writes none, so every `stillOurs` on the way in still answers truthfully
+// and the reports below can say `authority: held`. Real sqlite behaviour arranged,
+// not a seam faked: the same shape arrives from a disk that has gone read-only
+// under a command mid-flight.
+//
+// Every one has a discriminating control in its own fixture: the same failure with
+// a writable `leases` table answers `released`. Without it, a binary that had
+// started reporting a leak unconditionally would pass.
+
+/// The trigger that makes a voluntary release fail, and nothing else.
+const refuse_release_trigger =
+    \\CREATE TRIGGER refuse_lease_release BEFORE UPDATE ON leases
+    \\WHEN NEW.release_reason = 'released'
+    \\BEGIN SELECT RAISE(ABORT, 'the release cannot be recorded'); END
+;
+
+fn arrangeRefusedRelease(f: *Fixture) !void {
+    var store = try f.open();
+    defer store.close();
+    try store.db.exec(refuse_release_trigger);
+}
+
+fn allowRelease(f: *Fixture) !void {
+    var store = try f.open();
+    defer store.close();
+    try store.db.exec("DROP TRIGGER refuse_lease_release");
+}
+
+// The connect/auth path. `job kill` claims the scope before it dials, so a host it
+// cannot reach leaves it holding a lease with nothing to show for it — and the
+// envelope it exits through was `{ok, error}`, which said nothing about that.
+//
+// `--no-daemon` on every leg: the failure under test is this fixture's own closed
+// port, not a daemon the machine running the gate may or may not have.
+test "blackbox: a `job kill` that could not open a connection says what became of the scope it took" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "kill_connect_lease");
+    defer f.deinit();
+    try f.seedServer();
+    try seedRunningJob(&f, "01KKKKKKKK0123456789ABCDEF", "deploy", "__TERMINUS_JOB_21__");
+    try seedRunningJob(&f, "01SSSSSSSS0123456789ABCDEF", "ship", "__TERMINUS_JOB_22__");
+    try arrangeRefusedRelease(&f);
+
+    var stranded = try run(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--no-daemon", "--db", f.db,
+    });
+    defer stranded.deinit(f.allocator);
+
+    // Exit 1 and the real reason, unchanged: this is still a command that could not
+    // reach its host.
+    try stranded.expectCode(1);
+    try stranded.expectSays("\"ok\": false");
+    try stranded.expectSays("cannot connect to 127.0.0.1:1");
+    // The assertion. The scope was taken before the dial and could not be given
+    // back, so the next command on this job is refused for the lease's whole TTL —
+    // and until now the only warning was a line on stderr.
+    try stranded.expectSays("\"leaseRelease\": \"left_held\"");
+    try stranded.expectSaysNot("\"leaseReleaseError\": null");
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Read from the store rather than believed from the report: a document that
+    // printed the word over a row that had in fact been handed back would be a new
+    // way of lying about the same thing.
+    try expectScopeStillHeld(&f, arena);
+
+    // And the consequence the word warns about, performed. A caller that read the
+    // connect error, fixed the host and retried walks into this.
+    var again = try run(&f, &.{
+        "job", "kill", "box", "deploy", "--json", "--no-daemon", "--db", f.db,
+    });
+    defer again.deinit(f.allocator);
+    try again.expectCode(1);
+    try again.expectSays("holds a lease on an overlapping scope");
+
+    try allowRelease(&f);
+
+    // The discriminating control: the same failure on a job whose release can be
+    // written answers `released`. Without it, everything above is satisfied by a
+    // binary reporting a leak on every connect failure.
+    var clean = try run(&f, &.{
+        "job", "kill", "box", "ship", "--json", "--no-daemon", "--db", f.db,
+    });
+    defer clean.deinit(f.allocator);
+    try clean.expectCode(1);
+    try clean.expectSays("cannot connect to 127.0.0.1:1");
+    try clean.expectSays("\"leaseRelease\": \"released\"");
+    try clean.expectSays("\"leaseReleaseError\": null");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // One row still held — `deploy`'s — and `ship`'s handed back. Counted,
+        // because "the control released" and "the control never took one" are
+        // different facts and only one of them makes it a control.
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 1), held.len);
+        try t.expectEqualStrings("deploy", held[0].scope_key);
+    }
+}
+
+// The `receiptFatal` path. `job rm`'s one transaction — the terminal and the local
+// delete together — could not be written, and the branch that reports it is the one
+// whose own hint tells the caller to reconcile and re-run. A lease left holding this
+// job's scope refuses exactly that, and this envelope did not mention it.
+//
+// `RAISE(ABORT)` rather than `RAISE(ROLLBACK)`: the statement is refused and the
+// transaction survives it, so the undo is provable and `localRow` reads `kept`.
+// That half is already gated; what is new here is the key beside it.
+test "blackbox: a `job rm` whose transaction and whose release both fail names the leak beside the row" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "rm_unrecordable_lease");
+    defer f.deinit();
+    try f.seedServer();
+
+    const sentinel = "__TERMINUS_JOB_23__";
+    try seedRunningJob(&f, "01MMMMMMMM0123456789ABCDEF", "deploy", sentinel);
+    try seedRunningJob(&f, "01NNNNNNNN0123456789ABCDEF", "ship", sentinel);
+
+    const running = "\n" ++ probe_split ++ "\n12\nbuilding...\n";
+    const finished = "\n" ++ probe_split ++ "\n20\nwork done\n" ++ sentinel ++ ":0\n";
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = "job-deploy.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-deploy.log", .stdout = finished },
+        .{ .needle = "job-ship.log", .stdout = running, .uses = 1 },
+        .{ .needle = "job-ship.log", .stdout = finished },
+        .{ .needle = "kill-session", .exit_code = 0 },
+        .{ .needle = "has-session", .exit_code = 0 },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    {
+        var store = try f.open();
+        defer store.close();
+        try store.db.exec(
+            \\CREATE TRIGGER refuse_job_delete BEFORE DELETE ON jobs
+            \\BEGIN SELECT RAISE(ABORT, 'the local delete cannot happen'); END
+        );
+    }
+    try arrangeRefusedRelease(&f);
+
+    var stranded = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "deploy", "--json", "--db", f.db,
+    }, &environ);
+    defer stranded.deinit(f.allocator);
+
+    // The kill really went out, and nothing was deleted after it.
+    try host.expectSent("kill-session");
+    try host.expectNeverSent("rm -f");
+    try host.expectFullyScripted();
+
+    try stranded.expectCode(76);
+    try stranded.expectSays("\"errorCode\": \"RECEIPT_PERSIST_FAILED\"");
+    try stranded.expectSays("\"localRow\": \"kept\"");
+    // The assertion.
+    try stranded.expectSays("\"leaseRelease\": \"left_held\"");
+    try stranded.expectSaysNot("\"leaseReleaseError\": null");
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectScopeStillHeld(&f, arena);
+    {
+        var store = try f.open();
+        defer store.close();
+        // The row really is where the report says it is.
+        try t.expect((try Store.jobs.getByName(&store, arena, 1, "deploy")) != null);
+    }
+
+    try allowRelease(&f);
+
+    // The control: the same unwritable transaction on a job whose release can be
+    // written reports the same row and a clean hand-back.
+    var clean = try runWithEnvironment(&f, &.{
+        "job", "rm", "box", "ship", "--json", "--db", f.db,
+    }, &environ);
+    defer clean.deinit(f.allocator);
+    try host.expectFullyScripted();
+    try clean.expectCode(76);
+    try clean.expectSays("\"errorCode\": \"RECEIPT_PERSIST_FAILED\"");
+    try clean.expectSays("\"localRow\": \"kept\"");
+    try clean.expectSays("\"leaseRelease\": \"released\"");
+    try clean.expectSays("\"leaseReleaseError\": null");
+}
+
+// `session rm`'s two remaining exits outside its fixed document, and they are each
+// other's control on the shape.
+//
+// **The scope lease itself could not be written.** An operation row exists by then,
+// so the document has a `requestId` and a `status` to carry — and this branch
+// reached `Cli.storeFatal` → `Cli.fail`, which emitted two keys and exit 1 against
+// a document claiming 16 on every branch.
+//
+// **The connection could not be opened.** Still not the 16 keys, and deliberately:
+// nothing was established, and no word in this verb's `errorCode` vocabulary means
+// "we never got a connection". What it does carry now is the lease it was holding.
+test "blackbox: a `session rm` whose scope lease cannot be written reports the full document and exits 76" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "session_rm_lease_unwritable");
+    defer f.deinit();
+    try f.seedServer();
+
+    {
+        var store = try f.open();
+        defer store.close();
+        try store.db.exec(
+            \\CREATE TRIGGER refuse_lease_insert BEFORE INSERT ON leases
+            \\BEGIN SELECT RAISE(ABORT, 'the scope lease cannot be written'); END
+        );
+    }
+
+    var unwritable = try run(&f, &.{
+        "session", "rm", "box", "shell", "--json", "--no-daemon", "--db", f.db,
+    });
+    defer unwritable.deinit(f.allocator);
+
+    // 76, not 1: a write this command needed could not be made, and 1 reads as
+    // "nothing happened, a retry is safe" — true of the host, false of the ledger.
+    try unwritable.expectCode(76);
+    try expectFixedRemovalDocument(unwritable);
+    try unwritable.expectSays("\"errorCode\": \"RECEIPT_PERSIST_FAILED\"");
+    // Nothing was sent, and all three step keys say so.
+    try unwritable.expectSays("\"sessionState\": \"not_attempted\"");
+    try unwritable.expectSays("\"logState\": \"not_attempted\"");
+    try unwritable.expectSays("\"localRow\": \"kept\"");
+    // `not_taken`, not `released`: the acquisition was refused, so this command
+    // registered no claim and handed nothing back.
+    try unwritable.expectSays("\"leaseRelease\": \"not_taken\"");
+    try unwritable.expectSays("\"leaseReleaseError\": null");
+    // The renewals never answered anything else, and the document does not pretend
+    // the scope moved.
+    try unwritable.expectSays("\"authority\": \"held\"");
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // The insert really was refused: no lease row of any kind exists.
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 0), held.len);
+        // …and the attempt is left unsettled on purpose, which is what the exit
+        // code and the hint both say.
+        try t.expectEqual(@as(i64, 1), try operationCount(&store));
+
+        try store.db.exec("DROP TRIGGER refuse_lease_insert");
+    }
+
+    // The other exit, and the control on the one above: a different session name,
+    // because the unsettled attempt from leg one bars its own scope. The lease is
+    // taken, the dial fails, and the release is reported rather than dropped.
+    var unreachable_host = try run(&f, &.{
+        "session", "rm", "box", "web", "--json", "--no-daemon", "--db", f.db,
+    });
+    defer unreachable_host.deinit(f.allocator);
+
+    try unreachable_host.expectCode(1);
+    try unreachable_host.expectSays("\"ok\": false");
+    try unreachable_host.expectSays("cannot connect to 127.0.0.1:1");
+    try unreachable_host.expectSays("\"leaseRelease\": \"released\"");
+    try unreachable_host.expectSays("\"leaseReleaseError\": null");
+    // Not the verb's key set, and that is the documented boundary rather than an
+    // oversight — asserted so the two envelopes cannot quietly become one.
+    try unreachable_host.expectSaysNot("\"sessionState\"");
+
+    {
+        var store = try f.open();
+        defer store.close();
+        // Taken and handed back, so the scope is free: this command changed
+        // nothing and a retry once the host is reachable walks into no refusal.
+        const held = try Store.leases.active(&store, arena, 1, try Store.leases.clockSeconds(&store));
+        try t.expectEqual(@as(usize, 0), held.len);
     }
 }
