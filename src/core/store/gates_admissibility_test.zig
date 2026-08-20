@@ -766,7 +766,7 @@ test "gate: every kind can record a failure it proved after submitting, except a
     // refused because no command of the caller's ran — `session rm` sends three
     // tmux invocations and is judged by none of their exit codes — and
     // `input_refused` because nothing in a session removal offers bytes to a
-    // terminal, which is the trap §7.5 names by its commit number.
+    // terminal, which is the trap `session_proven_gone` exists to avoid (`2b670a9`).
     try t.expect(!Store.receipts.terminalDescribesKind(.{ .exited = .{ .exit_code = 1 } }, .control));
     try t.expect(!Store.receipts.terminalDescribesKind(
         .{ .input_refused = .{ .reason = "the session does not exist" } },

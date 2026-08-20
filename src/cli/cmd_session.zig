@@ -217,9 +217,9 @@ const RemovalJson = struct {
     logState: []const u8,
     /// `removed` | `absent` | `kept` | `unknown`.
     ///
-    /// Four words rather than a bool, because `sessions.remove` answering false
-    /// is not a refusal — see the call site — and because a rollback nobody could
-    /// confirm leaves the row's fate genuinely undecided rather than kept.
+    /// Four words rather than a bool, because `sessions.removeLocked` answering
+    /// false is not a refusal — see the call site — and because a rollback nobody
+    /// could confirm leaves the row's fate genuinely undecided rather than kept.
     localRow: []const u8,
     /// `held` | `lapsed` | `unreadable`: what this command's own renewals
     /// answered. Branch on this, never on the prose.
@@ -428,10 +428,10 @@ fn removeSession(
         Cli.storeFatal(store, err);
 
     // The ledger entry this verb never had. `control` is the kind for a
-    // supervisory act on somebody else's session (§3.1); the target it acted on
+    // supervisory act on somebody else's session; the target it acted on
     // travels in `alias`, which is already where a session name goes
     // (`cmd_exec.zig`'s `.alias = target.session`). The dedicated `target_*`
-    // columns of §7.2 are v13 and are not this slice.
+    // columns would be a v13 migration and are not this slice.
     //
     // `mutating` is left at its default `true` and it is worth saying why out
     // loud: this is the most destructive verb in the tree. It stops a shell,
@@ -455,7 +455,7 @@ fn removeSession(
 
     // Refused here means refused before the connection is opened: no socket, no
     // tmux command, nothing on the host to undo. This is the arm that closes
-    // §1.2 — a running job holds an unsettled writer on the scope its session
+    // the gap a running job used to leave: it holds an unsettled writer on the scope its session
     // belongs to, and it is now something `session rm` can see.
     var execution = switch (start) {
         .ready => |e| e,
@@ -544,7 +544,7 @@ fn removeSession(
     // command sending `kill-session` *by name* at a session the new holder may
     // already own. That window is narrowed, not closed: the host still acts some
     // interval after the renewal answered, and only a session identity the host
-    // itself can check would close it (§2.4).
+    // itself can check would close it.
     if (!stillOurs(claim, ctx.io, &authority)) refuseBeforeKill(ctx, &execution, server_name, name, authority);
     const gone = Tmux.killSession(executor, ctx.arena, name) catch |err| switch (err) {
         // The one `killSession` error whose proof the *host* carries. Its script
@@ -603,7 +603,7 @@ fn removeSession(
         // that this machine had no metadata row for the session, which `merge`
         // below documents as an ordinary state — a session started outside
         // Terminus is alive remotely with nothing local naming it. It is now
-        // *reported* rather than merely justified (§2.2), because "there was no
+        // *reported* rather than merely justified, because "there was no
         // row" and "the row is gone" are different facts about this machine and
         // only one of them means a cascade happened.
         .removed => |done| done.had_row,
@@ -1065,7 +1065,7 @@ fn refuseKillUnanswered(
 /// to classify a give-up (`op_state.terminalForTransportLoss`): from
 /// `connecting` that is `never_submitted`, whose whole claim is that the command
 /// the caller asked for did not run. That is precisely a withheld kill, it
-/// settles `failed`, and it is what §3.4 says a control operation that lost its
+/// settles `failed`, and it is what a control operation that lost its
 /// lease before sending anything records.
 fn refuseBeforeKill(
     ctx: *Cli.Ctx,
@@ -1331,7 +1331,7 @@ fn settleAfterKillOrReport(
 /// that had to be decided.** What the variant claims is a verified absence of the
 /// session, and that is exactly what was established: the host answered before
 /// this line was reached, and a later deletion failing does not make an earlier
-/// reading unknown. `indeterminate` would be the mistake §7.5 rejected one level
+/// reading unknown. `indeterminate` would be the mistake rejected one level
 /// up — recording a proof as an unknown, which additionally bars the scope and so
 /// forces a `request reconcile` before the re-run that would actually finish the
 /// job. Both remote steps are idempotent and the local row is still there, so a
@@ -1740,7 +1740,7 @@ fn blockerHint(ctx: *Cli.Ctx, blocker: Core.execution.Blocker) ?[]const u8 {
 
 /// The scope a command acting on session `name` contends on.
 ///
-/// This is the line that closes §1.2, and the only place in this slice where a
+/// This is the line that closes that blindness, and the only place in this slice where a
 /// name is taken apart.
 ///
 /// A session called `job-<x>` is job `<x>`'s shell: `cmd_job` builds that name
@@ -1753,22 +1753,22 @@ fn blockerHint(ctx: *Cli.Ctx, blocker: Core.execution.Blocker) ?[]const u8 {
 /// contended, and `session rm` killed running jobs.
 ///
 /// So the *kill target* stays the physical session name and the *contention key*
-/// is the logical thing that session belongs to — the split §4.3 states, applied
+/// is the logical thing that session belongs to — that split, applied
 /// one verb early. The surgery lives here, at the call site that knows what it
 /// is acting on, and never inside `Scope.overlaps`, which has to stay an
-/// obviously correct key comparison (§7.10 rejected exactly that for this
+/// obviously correct key comparison (putting the surgery there was rejected for this
 /// reason).
 ///
 /// Two limits, stated here rather than discovered later:
 ///
 ///  * a *user* session literally named `deploy` also maps to `.job:"deploy"` and
-///    so now blocks against job `deploy`. That is §1.3's existing false
+///    so now blocks against job `deploy`. That is the existing false
 ///    collision — `write` and `exec <server>:<session>` already spell a session
 ///    scope as `.job:<session name>` — widened by one verb rather than invented
 ///    here, and it is the safe direction: refusing once too often costs a wait,
 ///    refusing once too rarely destroys somebody's shell.
 ///  * `write web:job-deploy` claims `.job:"job-deploy"` and still does not
-///    overlap this, so those two remain blind to each other. That is §1.3's
+///    overlap this, so those two remain blind to each other. That is the
 ///    false *miss*, and it closes with the v13 `.session` scope — fixing it
 ///    *is* the scope-vocabulary change, and that is not this slice.
 fn contentionScope(name: []const u8) Core.execution.Scope {

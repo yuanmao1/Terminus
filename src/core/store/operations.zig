@@ -64,7 +64,7 @@ pub const Kind = enum {
     /// lost, kill sent or withheld, the host's answer — and never from the
     /// target's. That separation is the whole point: one row used to carry two
     /// subjects, which is why `fdd1144` had to decide by hand whether a lost
-    /// lease may overwrite a proven exit code (§3.4).
+    /// lease may overwrite a proven exit code.
     control,
     transfer_push,
     transfer_pull,
@@ -201,8 +201,8 @@ pub const Kind = enum {
             // column an auditor reads first, that a command the caller asked for
             // succeeded. None did; a session was stopped.
             //
-            // `offers_input_bytes = false` is the trap §7.5 names by its commit
-            // number: an act told "the session is gone" needs a terminal for that,
+            // `offers_input_bytes = false` is the trap `session_proven_gone`
+            // exists to avoid (`2b670a9`): an act told "the session is gone" needs a terminal for that,
             // and `input_refused` is superficially close ("the remote answered,
             // and nothing of ours was touched") while its *name* is about input.
             // Nothing in a session removal offers bytes to a terminal, so there is
@@ -218,7 +218,7 @@ pub const Kind = enum {
             // operation is not even about a process.
             //
             // `wrapper_documents_exit = false` says out loud what "control and
-            // target settle independently" (§3.4) means on the evidence axis. A
+            // target settle independently" means on the evidence axis. A
             // control act aimed at a job — `job kill`, `job rm`, `session rm`
             // pointed at `job-<name>` — is settled by what it itself did. The
             // job's wrapper documents belong to the job's own attempt, and that

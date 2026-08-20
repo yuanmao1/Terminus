@@ -1506,8 +1506,8 @@ pub const ResolutionEvidence = union(enum) {
 /// it**, read off `operations.Kind.capabilities`. It was 88 cells until now, and
 /// the twelve most expensive of them were about the four kinds nothing
 /// constructs; adding one variant meant answering eleven questions here and
-/// eleven more in the `gates_test` mirror, which is why the variant §7.5 decided
-/// on was deferred three times. A variant now states which property it needs,
+/// eleven more in the `gates_test` mirror, which is why adding `proven_failure` was
+/// deferred three times (it landed in `d730a12`). A variant now states which property it needs,
 /// once.
 ///
 /// The two matrices are not symmetric, and the asymmetry decides most of these
@@ -1719,7 +1719,7 @@ pub fn terminalDescribes(terminal: op_state.Terminal, can: operations.Capabiliti
         //
         // Refused for `exec` and `job` even though `cmd_job` types its launch line
         // into a tmux session exactly as `write` types the operator's; refused for
-        // a control act, which is the trap §7.5 names by its commit number —
+        // a control act, which is the trap `session_proven_gone` exists to avoid (`2b670a9`) —
         // `input_refused` is superficially close to "the session is gone" and its
         // *name* is about input, which is the only thing that matters. Refused for
         // a transfer, whose completion is a file at a destination it declared and

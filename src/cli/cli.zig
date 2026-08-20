@@ -1651,7 +1651,7 @@ test "gate: a released claim records the time the scope was actually held" {
 }
 
 // A release that could not happen used to be a line on stderr and a `void`
-// return, so the caller went on to report success. That is the shape §3.1 calls
+// return, so the caller went on to report success. That is the shape called
 // a pretend-success: the command's own act may well have completed, but it left a
 // lease holding a scope, and the next command on that scope is refused for the
 // whole TTL while the JSON said `ok: true` with nothing in it about a lease.
