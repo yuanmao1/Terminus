@@ -248,8 +248,8 @@ pub const Rollback = union(enum) {
 /// Everything `settleAndRemoveSession` can answer with.
 ///
 /// It carries `jobs.WriteError` through `DestructiveError`, which a session
-/// removal cannot produce: one destructive contract means one error set, and
-/// `sessions.removeLocked` and `jobs.removeLocked` do not fail the same way. The
+/// removal cannot produce: one claim-backed destruction contract means one error
+/// set, and `sessions.removeLocked` and `jobs.removeLocked` do not fail the same way. The
 /// same trade `AdoptError` records, for the same reason — the alternative is two
 /// copies of the transaction.
 pub const SessionRemovalError = DestructiveError || ContractError || error{
@@ -297,9 +297,13 @@ pub var between_settle_and_cache: if (builtin.is_test) ?*const fn () void else v
 /// from another connection at exactly that instant; under one `BEGIN IMMEDIATE`
 /// it cannot take the write lock, and under three separate writes it can.
 ///
-/// One seam for every destructive path, because there is now one transaction: a
-/// per-verb hook would have been a second thing to remember to add when a fourth
-/// verb arrives.
+/// One seam for every *claim-backed* destructive path, because there is now one
+/// transaction: a per-verb hook would have been a second thing to remember to add
+/// when a fourth verb arrives. It is not the only such seam in the tree, and the
+/// other one is not a duplicate — `servers.between_check_and_delete` is the same
+/// idea for the quiescence-backed contract, whose transaction this function is not
+/// in and whose barriers are not the authority check this probes. See the header
+/// above `commitDestruction`.
 ///
 /// `void` outside a test build, so the shipped binary contains neither the
 /// variable nor the branch.
@@ -542,8 +546,8 @@ pub const AuthorityVerdict = union(enum) {
     claim_lost: leases.ClaimState,
 };
 
-/// The in-transaction authority check every destructive commit runs, expressed
-/// once.
+/// The in-transaction authority check every claim-backed destructive commit runs,
+/// expressed once.
 ///
 /// **Two conjuncts, answering two questions neither can answer alone.**
 ///
@@ -619,9 +623,16 @@ pub fn authorityLocked(
     return .cleared;
 }
 
-// --- One destructive transaction, expressed once -----------------------------
+// --- The claim-backed destruction contract, expressed once -------------------
 //
-// Every destructive commit in the tree runs under the same four guarantees:
+// **There are two destruction contracts in this tree, and they answer different
+// questions.** Naming both is the point of this header: they were nearly folded
+// into one, and folding them would have required inventing a lease so that the
+// claim re-read below had something to read.
+//
+// This is the **claim-backed** contract. It is for a destructive act performed
+// *under a lease*, and every commit that reaches it runs under the same four
+// guarantees:
 //
 //   1. inside the transaction, the authority owner's own claim state is re-read
 //      and the act is refused unless it is `held`;
@@ -632,12 +643,30 @@ pub fn authorityLocked(
 //   4. a rollback that could not be confirmed reports the local state as unknown
 //      rather than guessing.
 //
+// (1) is what makes it the right shape for these acts: `session rm` and `job rm`
+// run for seconds against a remote host while holding a lease, and a lease can be
+// lost mid-flight — swept on expiry, taken by a peer's `--force`. So the question
+// it must answer at the moment of the delete is *is my claim still mine*, and only
+// a re-read of that claim can answer it.
+//
 // Written once because it was written per-verb four times and drifted every time.
 // `session rm` is the reference and reaches this through
 // `Execution.settleAndRemoveSession`; `job rm` reaches it through
 // `settleAndForgetJob`, including the two branches that used to call
 // `jobs.remove` — a `BEGIN IMMEDIATE` of its own with no terminal beside it and
 // no authority check at all.
+//
+// **The other contract is `servers.removeLocked`, and it must not be folded into
+// this one.** `server rm` takes no lease and holds no claim, so (1) would have
+// nothing to re-read and (2) no claim of ours to exempt from the peer check. What
+// that act requires instead is **quiescence**: no unsettled operation, no active
+// lease and no handover-bound transfer anywhere on the server, all three counted
+// inside the same `BEGIN IMMEDIATE` as the DELETE. That is a stricter and
+// categorically different question — *does nobody hold anything here at all*
+// rather than *is my claim still mine* — and the strictness is exactly what lets
+// it be asked by an actor holding nothing. Neither contract subsumes the other:
+// this one licenses a destruction while peers are live elsewhere, and that one
+// refuses while any peer is live at all. See the header above `servers.remove`.
 //
 // The price of one contract is one error set: `sessions.removeLocked` can fail
 // with `Db.Error` and `jobs.removeLocked` with `jobs.WriteError`, so

@@ -1,4 +1,6 @@
-//! CRUD for the `servers` table.
+//! CRUD for the `servers` table, and the **quiescence-backed** destruction
+//! contract — one of the two destruction contracts in this tree. See the header
+//! above `remove`, and its counterpart above `execution.commitDestruction`.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -156,6 +158,15 @@ pub const CascadeCounts = struct {
 /// is free to let `--force` wave it through, because every number here is a
 /// record of a host nobody wants any more.
 ///
+/// **Five of the seven tables the delete cascades, not all of them.** The other
+/// two are `leases`, which a barrier refuses over while a claim is live but whose
+/// *released* history rows go with the server unmentioned, and `redaction_rules`,
+/// which nothing here counts and no barrier refuses over. Adding a field is not a
+/// formality — it is the difference between a row an operator was told about and
+/// one that simply went — so the set is held against the schema's own foreign
+/// keys by `gates_schema_test.zig`'s `server_cascade`, which fails if a new
+/// cascading table appears here or in the schema without the other side moving.
+///
 /// It is **not** the safety check and must not be read as one. The barriers
 /// that can refuse a removal are evaluated by `remove` inside the same write
 /// transaction as the DELETE, and are reported by it; see there. This function
@@ -256,7 +267,46 @@ pub const RemoveError = Db.Error || error{
 pub var between_check_and_delete: if (builtin.is_test) ?*const fn () void else void =
     if (builtin.is_test) null else {};
 
+// --- The quiescence-backed destruction contract ------------------------------
+//
+// **There are two destruction contracts in this tree and this is the second one.**
+// Written here rather than only in a commit message, because the first thing a
+// reader wants to do on seeing two is fold them into one, and doing that would
+// break this act.
+//
+// `execution.commitDestruction` is the **claim-backed** contract: the actor holds
+// a lease, and the contract re-reads *that actor's own claim* inside the
+// transaction and checks for a peer on the one scope it is about, then writes the
+// terminal and destroys in one commit. It is the right shape for `session rm` and
+// `job rm`, which run for seconds against a remote host under a lease that can be
+// swept or taken from them mid-flight.
+//
+// This is the **quiescence-backed** contract, and `server rm` is its one act. The
+// actor holds *nothing*: it takes no lease, mints no request id, and has no claim.
+// So what it requires is not "is my claim still mine" but "does nobody hold
+// anything here at all" — no unsettled operation, no active lease, no
+// handover-bound transfer, anywhere on this server, counted inside the same
+// `BEGIN IMMEDIATE` as the DELETE. See the three barriers in `removeLocked`.
+//
+// **Why each contract is the right shape for its act, and why neither subsumes
+// the other.** Claim-backed destruction is *scoped*: it destroys one session or
+// one job row while peers go on working elsewhere on the same host, and the only
+// thing it can afford to demand is that its own claim survived. Quiescence-backed
+// destruction is *host-wide* — the delete cascades every server-scoped table there
+// is — so there is no "elsewhere" left to be tolerant of, and it can demand the
+// stricter thing precisely because nothing about it needs a lease. Folded together
+// they would each lose their point: routing `server rm` through the claim-backed
+// contract would mean inventing a lease for a server-level act so that the claim
+// re-read had something to read, and routing `session rm` through this one would
+// have it refuse whenever any peer anywhere on the host held anything.
+//
+// The two share only the property that makes either meaningful: the question and
+// the DELETE are in one transaction.
+
 /// Deletes a server, or refuses and says which barrier stopped it.
+///
+/// The transaction-opening half of the contract above; `removeLocked` is the
+/// decision.
 ///
 /// The check and the delete are one `BEGIN IMMEDIATE` transaction, and that is
 /// the substance of this function rather than tidiness. SQLite allows one
@@ -291,6 +341,19 @@ pub fn remove(store: *Store, name: []const u8, now: i64) RemoveError!Removal {
 /// Caller must hold it. A barrier evaluated outside the transaction that then
 /// acts on what it found is not a barrier — whatever it checked can become
 /// false before the DELETE lands.
+///
+/// **The widest destruction in this tree.** The DELETE below takes the server row
+/// and everything the schema cascades off it, which is seven tables and not the
+/// five this file's `CascadeCounts` counts. The set is not written down in any Zig
+/// list — it is a property of `migrate.zig`'s foreign keys — so it is *declared*
+/// and held against the schema a fresh store actually has, by
+/// `gates_schema_test.zig`'s `server_cascade`. That gate is the thing that notices
+/// when a new table joins this delete's blast radius; see its header for the
+/// count and for which of the seven no barrier covers.
+///
+/// The route to it is held to one writer and its one local wrapper by
+/// `gates_authority_test.zig`'s parameterised cascade scan, the same scan that
+/// holds the session cascade.
 pub fn removeLocked(store: *Store, name: []const u8, now: i64) RemoveError!Removal {
     try store.db.requireTransaction();
 

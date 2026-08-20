@@ -11,12 +11,14 @@
 //!   into. The drift probe reads the shape sqlite actually stored, not just the
 //!   column names, because a CHECK or an index can go missing without a column
 //!   doing so.
-//! * **Agreement.** Three gates exist only to stop a Zig list and a SQL list
+//! * **Agreement.** Four gates exist only to stop a Zig list and a SQL list
 //!   drifting apart: the statuses Zig calls scope-blocking against what the
 //!   barrier query returns, the states Zig calls destination-holding against
-//!   what the index covers, and the statuses Zig knows against what the schema
-//!   admits. Each of those pairs is written out twice on purpose, and each stops
-//!   being a gate the moment somebody derives one side from the other.
+//!   what the index covers, the statuses Zig knows against what the schema
+//!   admits, and the tables Zig declares the `servers` DELETE destroys against
+//!   what the foreign keys actually cascade. Each of those pairs is written out
+//!   twice on purpose, and each stops being a gate the moment somebody derives
+//!   one side from the other.
 //! * **Transaction discipline.** Every `…Locked` writer refuses to run outside a
 //!   transaction, which is what makes `fixtures.locked` an honest stand-in for
 //!   the caller that would normally hold one, rather than a way around the
@@ -1156,4 +1158,308 @@ test "gate: a *Locked writer refuses to run outside a transaction" {
         @as(i64, 0),
         try locked(&store, Store.transfers.handoverBoundCountLocked, .{ &store, 1 }),
     );
+}
+
+// --- The server cascade set is declared, and the schema is held to it --------
+//
+// The `servers` DELETE is the widest destruction in this tree. It takes the
+// server row and everything the foreign keys cascade off it, and until this gate
+// existed that set was written down **nowhere**: not in a Zig list, not in a
+// comment, not in a count. It existed only as `REFERENCES servers(id) ON DELETE
+// CASCADE` scattered across eight migrations, so anybody adding a table with that
+// clause silently joined the widest destruction in the tree and no gate, no
+// review checklist and no message noticed.
+//
+// That is not a hypothetical. The set was hand-derived by grepping the schema
+// text while this gate was being specified, and the hand-derivation was **wrong
+// in three of ten entries**: it counted `keys` (the reference runs the other way
+// — `servers.key_id REFERENCES keys(id)`, so a server delete leaves the key
+// material alone), `host_pins` (no `server_id` column at all; it is keyed on
+// host/port/key_type) and `job_probe_state` (it cascades off
+// `operations(request_id)`, and `operations.server_id` is `ON DELETE SET NULL`,
+// so a server delete never reaches it). A hand-list is exactly what this gate
+// exists instead of.
+//
+// **Seven, and why it is seven.** Seven tables carry a `server_id` that cascades:
+// five from v1–v4 when a server was just a host with notes on it (`sessions`,
+// `memories`, `jobs`, `facts`, `history`), and two from v7 when servers gained
+// coordination and policy (`leases`, `redaction_rules`). The transitive closure
+// adds nothing: `memories` also cascades off `sessions`, but it is already in the
+// set directly, and nothing references the other six.
+//
+// **The derivation is not a second list.** The actual set comes out of the schema
+// a fresh store really has — `migrate.zig`'s text, applied — read back through
+// `pragma_foreign_key_list` and closed transitively. A hand-list of tables to
+// check could not see a table that did not exist when the list was written, which
+// is precisely the regression this catches; and reading the applied schema rather
+// than the source text means an `ALTER TABLE … REFERENCES` or a v-next re-cut is
+// seen the same way a `CREATE TABLE` is.
+//
+// **What each of the seven is worth to an operator, stated per table.** The three
+// barriers in `servers.removeLocked` count operations, leases and transfers; of
+// those three tables only `leases` is in this cascade at all. `operations` is `ON
+// DELETE SET NULL` and `transfer_checkpoints` has no server column, so two of the
+// three barriers guard rows that survive the delete. Meanwhile five of the seven
+// cascading tables are behind nothing but `servers.cascadeCounts` — an advisory
+// volume warning that `--force` answers — and `redaction_rules` is behind nothing
+// at all. `Guard` records that per table, so the claim is checkable rather than
+// prose, and the `volume_warning` half is held against `CascadeCounts`'s own
+// fields rather than asserted.
+
+/// One table that the `servers` DELETE destroys, and what stands between an
+/// operator and that destruction.
+const CascadedTable = struct {
+    name: []const u8,
+    guard: Guard,
+
+    /// Three, and the difference between them is the difference between a
+    /// removal that cannot happen and one that happens without being mentioned.
+    const Guard = enum {
+        /// One of `servers.removeLocked`'s three in-transaction barriers refuses
+        /// the whole removal while a row here is live. `leases` is the only
+        /// member, and only for *unreleased* rows: `leases.activeCountLocked`
+        /// counts claims, so a released lease's history row is destroyed as
+        /// silently as an `unwatched` table's.
+        barrier,
+        /// `servers.cascadeCounts` counts it, and `server rm` puts the number in
+        /// the message `--force` answers. Advisory only — it refuses nothing —
+        /// which is correct for it: these are records of a host nobody wants any
+        /// more.
+        volume_warning,
+        /// Nothing. No barrier refuses over it, no count mentions it, and no
+        /// message names it. The rows go with the server and nobody is told.
+        unwatched,
+    };
+};
+
+/// The declared cascade set. Seven; see the header for why seven.
+///
+/// Adding a table here is the decision this gate exists to force: a new
+/// `REFERENCES servers(id) ON DELETE CASCADE` fails the gate until somebody
+/// writes the table down *and* says which of the three guards it gets.
+const server_cascade = [_]CascadedTable{
+    .{ .name = "facts", .guard = .volume_warning },
+    .{ .name = "history", .guard = .volume_warning },
+    .{ .name = "jobs", .guard = .volume_warning },
+    .{ .name = "leases", .guard = .barrier },
+    .{ .name = "memories", .guard = .volume_warning },
+    // Declared secret locations, so redaction does not depend on pattern
+    // guessing alone (v7). Server-scoped rules go with the server, and neither
+    // a barrier nor the volume warning nor any message mentions them.
+    .{ .name = "redaction_rules", .guard = .unwatched },
+    .{ .name = "sessions", .guard = .volume_warning },
+};
+
+/// Stated separately from `server_cascade.len` so the number has to be edited
+/// deliberately. A table added to the list without this moving is a table
+/// somebody added without reading why the count is what it is.
+const server_cascade_count = 7;
+
+fn containsName(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |name| if (std.mem.eql(u8, name, needle)) return true;
+    return false;
+}
+
+/// Whether deleting a `parent` row cascades away `child` rows, as sqlite has it.
+fn cascadesTo(store: *Store, child: []const u8, parent: []const u8) Db.Error!bool {
+    var stmt = try store.db.prepare(
+        \\SELECT 1 FROM pragma_foreign_key_list(?1)
+        \\WHERE "table" = ?2 AND "on_delete" = 'CASCADE'
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, child);
+    try stmt.bindText(2, parent);
+    return try stmt.step();
+}
+
+fn cascadesToAny(
+    store: *Store,
+    child: []const u8,
+    root: []const u8,
+    reached: []const []const u8,
+) Db.Error!bool {
+    if (try cascadesTo(store, child, root)) return true;
+    for (reached) |mid| if (try cascadesTo(store, child, mid)) return true;
+    return false;
+}
+
+/// Every table a `DELETE FROM <root>` destroys, transitively, as this database's
+/// own foreign keys define it.
+///
+/// A fixpoint rather than a worklist: one pass per table at worst, and it needs
+/// no mutable slice being iterated while it grows.
+fn cascadeClosure(
+    store: *Store,
+    arena: std.mem.Allocator,
+    root: []const u8,
+) !std.ArrayList([]const u8) {
+    var tables: std.ArrayList([]const u8) = .empty;
+    {
+        var stmt = try store.db.prepare(
+            \\SELECT name FROM sqlite_master
+            \\WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\'
+            \\ORDER BY name
+        );
+        defer stmt.deinit();
+        while (try stmt.step()) try tables.append(arena, try arena.dupe(u8, stmt.columnText(0)));
+    }
+
+    var reached: std.ArrayList([]const u8) = .empty;
+    var grew = true;
+    while (grew) {
+        grew = false;
+        for (tables.items) |child| {
+            if (std.mem.eql(u8, child, root)) continue;
+            if (containsName(reached.items, child)) continue;
+            if (!try cascadesToAny(store, child, root, reached.items)) continue;
+            try reached.append(arena, child);
+            grew = true;
+        }
+    }
+    return reached;
+}
+
+test "gate: the server cascade set is declared and the schema is held to it" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_server_cascade_set");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    try t.expectEqual(@as(usize, server_cascade_count), server_cascade.len);
+
+    const actual = try cascadeClosure(&store, arena, "servers");
+
+    // A closure that found nothing would agree with nothing. `sessions` has
+    // cascaded off `servers` since v1, so an empty answer means the derivation
+    // is broken and every comparison below it is vacuous.
+    if (!containsName(actual.items, "sessions")) {
+        std.debug.print(
+            \\
+            \\the cascade derivation found {d} tables and `sessions` is not among
+            \\them. `sessions.server_id` has been ON DELETE CASCADE since v1, so
+            \\this is the derivation failing, not the schema changing — every
+            \\comparison below would pass for the wrong reason.
+            \\
+        , .{actual.items.len});
+        return error.ServerCascadeDerivationFoundNothing;
+    }
+
+    // The schema gained a cascading table nobody has decided about.
+    for (actual.items) |table| {
+        var declared = false;
+        for (server_cascade) |entry| {
+            if (std.mem.eql(u8, entry.name, table)) declared = true;
+        }
+        if (declared) continue;
+        std.debug.print(
+            \\
+            \\`{s}` now cascades off `servers`, so `server rm` destroys its rows —
+            \\and nothing in the tree says so. That delete is the widest
+            \\destruction here; joining it is a decision, not a schema detail.
+            \\
+            \\Add `{s}` to `server_cascade` in this file, with the guard it gets:
+            \\
+            \\  .barrier         a barrier in `servers.removeLocked` refuses the
+            \\                   removal while a row here is live;
+            \\  .volume_warning  `servers.cascadeCounts` counts it and `server rm`
+            \\                   puts the number in the message `--force` answers;
+            \\  .unwatched       nothing refuses, nothing counts it, no message
+            \\                   names it. Rows go and nobody is told.
+            \\
+            \\If `{s}` should not go with the server at all, its foreign key wants
+            \\ON DELETE SET NULL — which is what `operations` and `job_attempts`
+            \\already use — rather than a declaration here.
+            \\
+        , .{ table, table, table });
+        return error.ServerCascadeGainedAnUndeclaredTable;
+    }
+
+    // And the declaration describes a table the schema still cascades.
+    for (server_cascade) |entry| {
+        if (containsName(actual.items, entry.name)) continue;
+        std.debug.print(
+            \\
+            \\`server_cascade` declares `{s}`, and the `servers` DELETE no
+            \\longer reaches it. Either its foreign key changed — in which case the
+            \\entry and `server_cascade_count` go with it — or the table is gone.
+            \\A declaration that outlives what it describes is how the next reader
+            \\comes to trust a set that is no longer true.
+            \\
+        , .{entry.name});
+        return error.ServerCascadeDeclaresATableTheSchemaDoesNot;
+    }
+    try t.expectEqual(server_cascade.len, actual.items.len);
+
+    // The `volume_warning` half against the struct that does the counting, so
+    // "five of the seven are behind an advisory number" is read off
+    // `CascadeCounts` rather than asserted here. Both directions: a field added
+    // there for a table that does not cascade is counting something a removal
+    // does not destroy, and a cascading table dropped from it goes from advisory
+    // to silent with nothing to notice.
+    const counted = @typeInfo(Store.servers.CascadeCounts).@"struct".fields;
+    inline for (counted) |field| {
+        for (server_cascade) |entry| {
+            if (!std.mem.eql(u8, entry.name, field.name)) continue;
+            if (entry.guard == .volume_warning) break;
+            std.debug.print(
+                \\
+                \\`CascadeCounts` counts `{s}`, which this file declares as `{s}`
+                \\rather than `volume_warning`. The struct is what `server rm` puts
+                \\in front of `--force`, so it is the definition of that guard.
+                \\
+            , .{ field.name, @tagName(entry.guard) });
+            return error.ServerCascadeGuardDisagreesWithTheVolumeWarning;
+        } else {
+            std.debug.print(
+                \\
+                \\`CascadeCounts` counts `{s}`, and the `servers` DELETE does
+                \\not destroy it. The number `server rm` shows an operator is then
+                \\about rows the removal leaves alone.
+                \\
+            , .{field.name});
+            return error.VolumeWarningCountsATableTheCascadeDoesNotDestroy;
+        }
+    }
+    for (server_cascade) |entry| {
+        if (entry.guard != .volume_warning) continue;
+        var in_struct = false;
+        inline for (counted) |field| {
+            if (std.mem.eql(u8, entry.name, field.name)) in_struct = true;
+        }
+        if (in_struct) continue;
+        std.debug.print(
+            \\
+            \\`{s}` is declared `volume_warning` and `CascadeCounts` has no field
+            \\for it, so nothing counts it. Add the field, or move the entry to
+            \\`.unwatched` and say out loud that this table goes silently.
+            \\
+        , .{entry.name});
+        return error.VolumeWarningIsDeclaredForATableNothingCounts;
+    }
+
+    // And the shape of the answer, so the header's three numbers are checked
+    // rather than written. One behind a barrier — `leases`, and `leases` alone,
+    // because `operations` is SET NULL and `transfer_checkpoints` has no server
+    // column, so two of the three barriers guard rows that outlive the delete.
+    // Five behind the advisory count. One behind nothing.
+    var barriered: usize = 0;
+    var counted_n: usize = 0;
+    var unwatched: usize = 0;
+    for (server_cascade) |entry| switch (entry.guard) {
+        .barrier => barriered += 1,
+        .volume_warning => counted_n += 1,
+        .unwatched => unwatched += 1,
+    };
+    try t.expectEqual(@as(usize, 1), barriered);
+    try t.expectEqual(@as(usize, 5), counted_n);
+    try t.expectEqual(@as(usize, 1), unwatched);
+    for (server_cascade) |entry| {
+        if (entry.guard != .barrier) continue;
+        try t.expectEqualStrings("leases", entry.name);
+    }
 }

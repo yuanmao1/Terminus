@@ -1008,6 +1008,46 @@
       "find": "            .session_proven_gone => .reread_claim,",
       "replace": "            .session_proven_gone => .grounds_alone,",
       "expect_gate": "the short route admits exactly the grounds that need no claim"
+    },
+    {
+      "id": "S2e-server-cascade-schema-gains-a-table",
+      "rule": "A table that joins `DELETE FROM servers`'s cascade must be declared. The cascade set lives only in `migrate.zig`'s foreign keys, so a new `REFERENCES servers(id) ON DELETE CASCADE` silently joins the widest destruction in the tree; the gate derives the real set from the schema a fresh store has and refuses one it was not told about, naming the table. Mutated here by giving the store the gate reads a cascading table the declaration does not have, which is the same comparison a new migration would fail - migrate.zig is frozen and not editable by a mutation that has to keep the build green.",
+      "file": "src/core/store/gates_schema_test.zig",
+      "find": "    const actual = try cascadeClosure(&store, arena, \"servers\");",
+      "replace": "    try store.db.exec(\n        \\\\CREATE TABLE widgets (\n        \\\\  id        INTEGER PRIMARY KEY,\n        \\\\  server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE\n        \\\\)\n    );\n    const actual = try cascadeClosure(&store, arena, \"servers\");",
+      "expect_gate": "gate: the server cascade set is declared and the schema is held to it"
+    },
+    {
+      "id": "S2e-server-cascade-declaration-drifts",
+      "rule": "The declared cascade set is held in both directions: a declaration that no longer names a table the schema cascades leaves that table's rows going with the server under no guard and with nothing recording that anybody decided so. `redaction_rules` is the entry that carries the point - it is the one member behind no barrier and in no count.",
+      "file": "src/core/store/gates_schema_test.zig",
+      "find": "    .{ .name = \"redaction_rules\", .guard = .unwatched },",
+      "replace": "    .{ .name = \"redaction_rules_renamed\", .guard = .unwatched },",
+      "expect_gate": "gate: the server cascade set is declared and the schema is held to it"
+    },
+    {
+      "id": "S2e-server-cascade-second-local-route",
+      "rule": "`servers.remove` is the one local caller of the server-cascade writer, and it is the wrapper that opens the `BEGIN IMMEDIATE` the three barriers are counted inside. A second wrapper beside it is a second route to the widest destruction in the tree, calling the writer unqualified - no `servers.` prefix to find, no second DELETE, no new file - so every cross-file count still reads right. The count of the writer's own name inside its own file is what closes that.",
+      "file": "src/core/store/servers.zig",
+      "find": "pub fn removeLocked(store: *Store, name: []const u8, now: i64) RemoveError!Removal {\n    try store.db.requireTransaction();",
+      "replace": "pub fn removeQuick(store: *Store, name: []const u8, now: i64) RemoveError!Removal {\n    try store.db.exec(\"BEGIN\");\n    errdefer store.db.exec(\"ROLLBACK\") catch {};\n    const outcome = try removeLocked(store, name, now);\n    try store.db.exec(\"COMMIT\");\n    return outcome;\n}\n\npub fn removeLocked(store: *Store, name: []const u8, now: i64) RemoveError!Removal {\n    try store.db.requireTransaction();",
+      "expect_gate": "gate: the server cascade has one writer and its wrapper is the one route"
+    },
+    {
+      "id": "S2e-server-cascade-writer-reached-directly",
+      "rule": "Nothing outside `servers.zig` may call the server-cascade writer. It requires its caller's write transaction and counts its three barriers inside it, so a cross-file caller runs those barriers inside a transaction it opened itself, over a delete that cascades seven tables. The route is `servers.remove`, which opens that transaction; reaching past it is a decision about the contract and not a call site.",
+      "file": "src/core/store/gates_schema_test.zig",
+      "find": "    const counted = @typeInfo(Store.servers.CascadeCounts).@\"struct\".fields;",
+      "replace": "    try store.db.exec(\"BEGIN IMMEDIATE\");\n    _ = try Store.servers.removeLocked(&store, \"no-server-by-this-name\", 1);\n    try store.db.exec(\"COMMIT\");\n\n    const counted = @typeInfo(Store.servers.CascadeCounts).@\"struct\".fields;",
+      "expect_gate": "gate: the server cascade has one writer and its wrapper is the one route"
+    },
+    {
+      "id": "S2e-server-cascade-wrapper-caller-count",
+      "rule": "`servers.remove` is public and is the route to the server cascade, so unlike `sessions.remove` it is not deletable - its caller count is pinned instead. A new caller from a file that is not on the list fails, because a public route to a seven-table cascade acquiring a second production call site is a decision somebody has to make on purpose.",
+      "file": "src/core/store/gates_schema_test.zig",
+      "find": "    var barriered: usize = 0;",
+      "replace": "    _ = try Store.servers.remove(&store, \"no-server-by-this-name\", 1);\n\n    var barriered: usize = 0;",
+      "expect_gate": "gate: the server cascade has one writer and its wrapper is the one route"
     }
   ]
 }

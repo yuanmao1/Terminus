@@ -68,7 +68,8 @@ pub fn list(store: *Store, arena: std.mem.Allocator, server_id: i64) (Db.Error |
 /// one — the same DELETE wrapped in a `BEGIN IMMEDIATE` of its own — and it was
 /// a public way to drop a session row and take its memories with it with nothing
 /// in the ledger recording that anybody did so, and no authority check. It had no
-/// callers left once `session rm` moved onto the destruction contract, so it was
+/// callers left once `session rm` moved onto the claim-backed destruction
+/// contract, so it was
 /// deleted rather than documented: a door nobody walks through is still a door,
 /// and the next caller would have taken it by default. A caller that thinks it
 /// needs the convenience form needs `execution.commitDestruction` instead, and
