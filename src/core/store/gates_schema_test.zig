@@ -1199,55 +1199,59 @@ test "gate: a *Locked writer refuses to run outside a transaction" {
 // barriers in `servers.removeLocked` count operations, leases and transfers; of
 // those three tables only `leases` is in this cascade at all. `operations` is `ON
 // DELETE SET NULL` and `transfer_checkpoints` has no server column, so two of the
-// three barriers guard rows that survive the delete. Meanwhile five of the seven
-// cascading tables are behind nothing but `servers.cascadeCounts` — an advisory
-// volume warning that `--force` answers — and `redaction_rules` is behind nothing
-// at all. `Guard` records that per table, so the claim is checkable rather than
-// prose, and the `volume_warning` half is held against `CascadeCounts`'s own
-// fields rather than asserted.
+// three barriers guard rows that survive the delete.
+//
+// **A barrier and a count are two facts, not two values of one.** This declaration
+// used to carry a three-way `Guard` — barrier, volume warning, or nothing — which
+// forced `leases` to pick one, and it picked the barrier. That reads as covered and
+// is not: `leases.activeCountLocked` counts *live claims*, so a server whose leases
+// have all been given back clears the barrier with its entire lease history still
+// on disk, and the delete took every row of it without a number anywhere. So the
+// two are recorded as two independent booleans, and `leases` has both.
+//
+// The other thing that change closed: `redaction_rules` was declared `.unwatched`
+// — no barrier, no count, no message — and `.unwatched` was a legal thing to write
+// down. It is not any more. Every one of the seven is now behind at least a count,
+// the `.counted` column is held against `CascadeCounts`'s own fields in both
+// directions, and an entry behind neither fails this gate rather than documenting
+// itself.
 
 /// One table that the `servers` DELETE destroys, and what stands between an
 /// operator and that destruction.
 const CascadedTable = struct {
     name: []const u8,
-    guard: Guard,
 
-    /// Three, and the difference between them is the difference between a
-    /// removal that cannot happen and one that happens without being mentioned.
-    const Guard = enum {
-        /// One of `servers.removeLocked`'s three in-transaction barriers refuses
-        /// the whole removal while a row here is live. `leases` is the only
-        /// member, and only for *unreleased* rows: `leases.activeCountLocked`
-        /// counts claims, so a released lease's history row is destroyed as
-        /// silently as an `unwatched` table's.
-        barrier,
-        /// `servers.cascadeCounts` counts it, and `server rm` puts the number in
-        /// the message `--force` answers. Advisory only — it refuses nothing —
-        /// which is correct for it: these are records of a host nobody wants any
-        /// more.
-        volume_warning,
-        /// Nothing. No barrier refuses over it, no count mentions it, and no
-        /// message names it. The rows go with the server and nobody is told.
-        unwatched,
-    };
+    /// One of `servers.removeLocked`'s three in-transaction barriers refuses the
+    /// whole removal while a row here is live. `leases` is the only member, and
+    /// only for *unreleased* rows — which is exactly why this is not a substitute
+    /// for `counted`.
+    barrier: bool,
+
+    /// `servers.cascadeCounts` counts it, and `server rm` puts the number in the
+    /// message `--force` answers. Advisory — it refuses nothing — and held
+    /// against the struct that does the counting rather than asserted here.
+    counted: bool,
 };
 
 /// The declared cascade set. Seven; see the header for why seven.
 ///
 /// Adding a table here is the decision this gate exists to force: a new
 /// `REFERENCES servers(id) ON DELETE CASCADE` fails the gate until somebody
-/// writes the table down *and* says which of the three guards it gets.
+/// writes the table down *and* says what guards it. Writing `false` in both
+/// columns is not a way out — a table behind nothing fails too.
 const server_cascade = [_]CascadedTable{
-    .{ .name = "facts", .guard = .volume_warning },
-    .{ .name = "history", .guard = .volume_warning },
-    .{ .name = "jobs", .guard = .volume_warning },
-    .{ .name = "leases", .guard = .barrier },
-    .{ .name = "memories", .guard = .volume_warning },
+    .{ .name = "facts", .barrier = false, .counted = true },
+    .{ .name = "history", .barrier = false, .counted = true },
+    .{ .name = "jobs", .barrier = false, .counted = true },
+    // Both, and the two are about different rows: the barrier refuses while a
+    // claim is held, the count says how much lease history goes when none is.
+    .{ .name = "leases", .barrier = true, .counted = true },
+    .{ .name = "memories", .barrier = false, .counted = true },
     // Declared secret locations, so redaction does not depend on pattern
-    // guessing alone (v7). Server-scoped rules go with the server, and neither
-    // a barrier nor the volume warning nor any message mentions them.
-    .{ .name = "redaction_rules", .guard = .unwatched },
-    .{ .name = "sessions", .guard = .volume_warning },
+    // guessing alone (v7). Server-scoped rules go with the server, and until the
+    // count named them nothing did.
+    .{ .name = "redaction_rules", .barrier = false, .counted = true },
+    .{ .name = "sessions", .barrier = false, .counted = true },
 };
 
 /// Stated separately from `server_cascade.len` so the number has to be edited
@@ -1362,14 +1366,16 @@ test "gate: the server cascade set is declared and the schema is held to it" {
             \\and nothing in the tree says so. That delete is the widest
             \\destruction here; joining it is a decision, not a schema detail.
             \\
-            \\Add `{s}` to `server_cascade` in this file, with the guard it gets:
+            \\Add `{s}` to `server_cascade` in this file, saying what guards it:
             \\
-            \\  .barrier         a barrier in `servers.removeLocked` refuses the
+            \\  .barrier = true  a barrier in `servers.removeLocked` refuses the
             \\                   removal while a row here is live;
-            \\  .volume_warning  `servers.cascadeCounts` counts it and `server rm`
-            \\                   puts the number in the message `--force` answers;
-            \\  .unwatched       nothing refuses, nothing counts it, no message
-            \\                   names it. Rows go and nobody is told.
+            \\  .counted = true  `servers.cascadeCounts` counts it and `server rm`
+            \\                   puts the number in the message `--force` answers.
+            \\
+            \\At least one must be true. Both false is a table whose rows go with
+            \\the server and nobody is told, and that is no longer something this
+            \\declaration can express — add the `CascadeCounts` field.
             \\
             \\If `{s}` should not go with the server at all, its foreign key wants
             \\ON DELETE SET NULL — which is what `operations` and `job_attempts`
@@ -1395,24 +1401,45 @@ test "gate: the server cascade set is declared and the schema is held to it" {
     }
     try t.expectEqual(server_cascade.len, actual.items.len);
 
-    // The `volume_warning` half against the struct that does the counting, so
-    // "five of the seven are behind an advisory number" is read off
-    // `CascadeCounts` rather than asserted here. Both directions: a field added
-    // there for a table that does not cascade is counting something a removal
-    // does not destroy, and a cascading table dropped from it goes from advisory
-    // to silent with nothing to notice.
+    // Nothing in the cascade is behind nothing, and this is asked first because
+    // it is the coarsest thing that can be wrong. There used to be an entry like
+    // this: `redaction_rules` was `.unwatched` — no barrier, no count, no message
+    // — its rows went with the server, and the declaration recorded that as a
+    // decision somebody had made rather than a defect. Declared secret locations
+    // are the worst of the seven to lose in silence, so both columns false is a
+    // failure now and not a third guard.
+    for (server_cascade) |entry| {
+        if (entry.barrier or entry.counted) continue;
+        std.debug.print(
+            \\
+            \\`{s}` cascades off `servers` with no barrier and no count: its rows
+            \\go with the server and nothing refuses, nothing counts them and no
+            \\message names them. Add the `CascadeCounts` field and set
+            \\`.counted = true`; there is no third answer here.
+            \\
+        , .{entry.name});
+        return error.ServerCascadeTableIsBehindNothing;
+    }
+
+    // The `.counted` column against the struct that does the counting, so "all
+    // seven are behind a number" is read off `CascadeCounts` rather than asserted
+    // here. Both directions: a field added there for a table that does not
+    // cascade is counting something a removal does not destroy, and a cascading
+    // table dropped from it goes from advisory to silent with nothing to notice.
     const counted = @typeInfo(Store.servers.CascadeCounts).@"struct".fields;
     inline for (counted) |field| {
         for (server_cascade) |entry| {
             if (!std.mem.eql(u8, entry.name, field.name)) continue;
-            if (entry.guard == .volume_warning) break;
+            if (entry.counted) break;
             std.debug.print(
                 \\
-                \\`CascadeCounts` counts `{s}`, which this file declares as `{s}`
-                \\rather than `volume_warning`. The struct is what `server rm` puts
-                \\in front of `--force`, so it is the definition of that guard.
+                \\`CascadeCounts` counts `{s}`, and this file declares it
+                \\`.counted = false`. The struct is what `server rm` puts in front
+                \\of `--force`, so it is the definition of that column — a barrier
+                \\on the same table does not stand in for it, because a barrier is
+                \\about rows somebody is holding and the count is about the rest.
                 \\
-            , .{ field.name, @tagName(entry.guard) });
+            , .{field.name});
             return error.ServerCascadeGuardDisagreesWithTheVolumeWarning;
         } else {
             std.debug.print(
@@ -1426,7 +1453,7 @@ test "gate: the server cascade set is declared and the schema is held to it" {
         }
     }
     for (server_cascade) |entry| {
-        if (entry.guard != .volume_warning) continue;
+        if (!entry.counted) continue;
         var in_struct = false;
         inline for (counted) |field| {
             if (std.mem.eql(u8, entry.name, field.name)) in_struct = true;
@@ -1434,32 +1461,37 @@ test "gate: the server cascade set is declared and the schema is held to it" {
         if (in_struct) continue;
         std.debug.print(
             \\
-            \\`{s}` is declared `volume_warning` and `CascadeCounts` has no field
-            \\for it, so nothing counts it. Add the field, or move the entry to
-            \\`.unwatched` and say out loud that this table goes silently.
+            \\`{s}` is declared `.counted = true` and `CascadeCounts` has no field
+            \\for it, so nothing counts it. Add the field — dropping the claim
+            \\instead leaves the table behind nothing, which the check below
+            \\refuses.
             \\
         , .{entry.name});
         return error.VolumeWarningIsDeclaredForATableNothingCounts;
     }
 
-    // And the shape of the answer, so the header's three numbers are checked
-    // rather than written. One behind a barrier — `leases`, and `leases` alone,
-    // because `operations` is SET NULL and `transfer_checkpoints` has no server
-    // column, so two of the three barriers guard rows that outlive the delete.
-    // Five behind the advisory count. One behind nothing.
+    // And nothing in the cascade is behind nothing — asked above, before the
+    // agreement checks, so that a table dropped out of `CascadeCounts` fails on
+    // the coarse question rather than the fine one.
+
+    // And the shape of the answer, so the header's numbers are checked rather
+    // than written. One behind a barrier — `leases`, and `leases` alone, because
+    // `operations` is SET NULL and `transfer_checkpoints` has no server column, so
+    // two of the three barriers guard rows that outlive the delete. All seven
+    // behind the advisory count, `leases` included: the barrier covers held
+    // claims, the count covers the released history the barrier stops caring
+    // about.
     var barriered: usize = 0;
     var counted_n: usize = 0;
-    var unwatched: usize = 0;
-    for (server_cascade) |entry| switch (entry.guard) {
-        .barrier => barriered += 1,
-        .volume_warning => counted_n += 1,
-        .unwatched => unwatched += 1,
-    };
-    try t.expectEqual(@as(usize, 1), barriered);
-    try t.expectEqual(@as(usize, 5), counted_n);
-    try t.expectEqual(@as(usize, 1), unwatched);
     for (server_cascade) |entry| {
-        if (entry.guard != .barrier) continue;
+        if (entry.barrier) barriered += 1;
+        if (entry.counted) counted_n += 1;
+    }
+    try t.expectEqual(@as(usize, 1), barriered);
+    try t.expectEqual(@as(usize, server_cascade_count), counted_n);
+    try t.expectEqual(@as(usize, server_cascade_count), counted.len);
+    for (server_cascade) |entry| {
+        if (!entry.barrier) continue;
         try t.expectEqualStrings("leases", entry.name);
     }
 }

@@ -149,6 +149,8 @@ pub const CascadeCounts = struct {
     jobs: i64,
     facts: i64,
     history: i64,
+    leases: i64,
+    redaction_rules: i64,
 };
 
 /// How much *recorded knowledge* about this host the delete would erase.
@@ -158,14 +160,30 @@ pub const CascadeCounts = struct {
 /// is free to let `--force` wave it through, because every number here is a
 /// record of a host nobody wants any more.
 ///
-/// **Five of the seven tables the delete cascades, not all of them.** The other
-/// two are `leases`, which a barrier refuses over while a claim is live but whose
-/// *released* history rows go with the server unmentioned, and `redaction_rules`,
-/// which nothing here counts and no barrier refuses over. Adding a field is not a
-/// formality — it is the difference between a row an operator was told about and
-/// one that simply went — so the set is held against the schema's own foreign
-/// keys by `gates_schema_test.zig`'s `server_cascade`, which fails if a new
-/// cascading table appears here or in the schema without the other side moving.
+/// **All seven of the tables the delete cascades, and it took a decision to make
+/// that true.** Two of the seven were missing and were not oversights of the same
+/// kind:
+///
+///  * `redaction_rules` is a **security declaration** — the secret locations an
+///    operator wrote down so that redaction does not depend on pattern guessing.
+///    Nothing refused over them and no number mentioned them, so `server rm`
+///    destroyed them in silence; of the seven that is the least acceptable one to
+///    lose without being told, because what it costs is not a record of the past
+///    but a rule that was protecting something.
+///  * `leases` sits behind a barrier already, and a barrier is not a count. The
+///    barrier asks "is anybody holding a claim here right now" and refuses while
+///    the answer is yes; this asks "how much goes when the answer is no", and the
+///    released rows — the record of who held what and how it was given back —
+///    are exactly the ones the barrier stops caring about. Two questions, two
+///    answers, and the row needs both.
+///
+/// Adding a field is not a formality — it is the difference between a row an
+/// operator was told about and one that simply went — so the set is held against
+/// the schema's own foreign keys by `gates_schema_test.zig`'s `server_cascade`,
+/// which fails if a new cascading table appears here or in the schema without the
+/// other side moving. With all seven counted, that gate's `.counted` column has no
+/// false entry left in it, and a table joining the cascade behind nothing at all
+/// is now a failure rather than a declaration somebody can write down.
 ///
 /// It is **not** the safety check and must not be read as one. The barriers
 /// that can refuse a removal are evaluated by `remove` inside the same write
@@ -183,6 +201,15 @@ pub fn cascadeCounts(store: *Store, server_id: i64) Db.Error!CascadeCounts {
         .jobs = try countRows(store, "jobs", server_id),
         .facts = try countRows(store, "facts", server_id),
         .history = try countRows(store, "history", server_id),
+        // Every lease row on this server, held and released alike, which is the
+        // count the barrier does not take: `leases.activeCountLocked` counts
+        // live claims, so a server whose leases have all been given back passes
+        // the barrier with its whole lease history still on disk.
+        .leases = try countRows(store, "leases", server_id),
+        // Server-scoped rules only. `redaction_rules.server_id` is nullable and
+        // the global rules have it NULL, so `= ?1` is what distinguishes the
+        // rules that go with this host from the ones that stay.
+        .redaction_rules = try countRows(store, "redaction_rules", server_id),
     };
 }
 
@@ -233,9 +260,39 @@ pub const Barrier = union(enum) {
     resumable_transfers: i64,
 };
 
+/// What became of the private key this server pointed at.
+///
+/// **`server rm` destroys no key material, and that is exactly why this exists.**
+/// `servers.key_id REFERENCES keys(id)` runs *toward* `keys` and is `NO ACTION`,
+/// so the `keys` row and its `private_pem` outlive every removal. What the removal
+/// takes away is the reference that was refusing `key rm`: with the last server
+/// gone, the key is unreferenced, and `keys.remove` is a `DELETE FROM keys` over
+/// material nobody can regenerate.
+///
+/// The decision here is *not* to put a barrier in front of `key rm` — deleting a
+/// server's key after deleting the server is a reasonable thing to want. The
+/// defect was the silence, so a successful removal says which key it left behind.
+///
+/// Three answers rather than a boolean, because the two silences are different
+/// facts and a caller wording the sentence has to be able to tell them apart: a
+/// server that never had a key, and a key another server still points at — for
+/// which nothing changed at all and saying otherwise would be false.
+pub const KeyAfterRemoval = enum {
+    /// The server had no `key_id`. There is no key to say anything about.
+    none,
+    /// Another server still points at the same `keys` row. The removal changed
+    /// nothing for that key and must not claim it did.
+    still_referenced,
+    /// Nothing references it any more. The row and its private material are
+    /// still in the store, and `key rm` will now go through over them.
+    left_unreferenced,
+};
+
 /// What `remove` did, or what stopped it.
 pub const Removal = union(enum) {
-    removed,
+    /// The row is gone, and this is what the removal did to the server's key —
+    /// see `KeyAfterRemoval`, and `keyAfterRemovalLocked` for when it is read.
+    removed: KeyAfterRemoval,
     /// No server by that name. A distinct answer from `removed`, because a
     /// caller that folds the two together reports a successful deletion for a
     /// typo.
@@ -343,13 +400,19 @@ pub fn remove(store: *Store, name: []const u8, now: i64) RemoveError!Removal {
 /// false before the DELETE lands.
 ///
 /// **The widest destruction in this tree.** The DELETE below takes the server row
-/// and everything the schema cascades off it, which is seven tables and not the
-/// five this file's `CascadeCounts` counts. The set is not written down in any Zig
-/// list — it is a property of `migrate.zig`'s foreign keys — so it is *declared*
-/// and held against the schema a fresh store actually has, by
+/// and everything the schema cascades off it, which is seven tables — the seven
+/// this file's `CascadeCounts` now counts, one field each. The set is not written
+/// down in any Zig list — it is a property of `migrate.zig`'s foreign keys — so it
+/// is *declared* and held against the schema a fresh store actually has, by
 /// `gates_schema_test.zig`'s `server_cascade`. That gate is the thing that notices
 /// when a new table joins this delete's blast radius; see its header for the
-/// count and for which of the seven no barrier covers.
+/// count and for how the counted set is derived rather than asserted.
+///
+/// **What it does not take is key material.** `servers.key_id` points *at*
+/// `keys` and is `NO ACTION`, so the key row and its `private_pem` survive; what
+/// the removal ends is the reference that was refusing `key rm`. A successful
+/// removal therefore reports which key it left unreferenced — see
+/// `KeyAfterRemoval` and `keyAfterRemovalLocked`.
 ///
 /// The route to it is held to one writer and its one local wrapper by
 /// `gates_authority_test.zig`'s parameterised cascade scan, the same scan that
@@ -385,6 +448,11 @@ pub fn removeLocked(store: *Store, name: []const u8, now: i64) RemoveError!Remov
         if (between_check_and_delete) |probe| probe();
     }
 
+    // Read here, one statement above the DELETE and inside its transaction, and
+    // both halves of the question are answered by that one statement. See
+    // `keyAfterRemovalLocked`.
+    const key_after = try keyAfterRemovalLocked(store, server_id);
+
     var stmt = try store.db.prepare("DELETE FROM servers WHERE id = ?1");
     defer stmt.deinit();
     try stmt.bindInt(1, server_id);
@@ -393,5 +461,41 @@ pub fn removeLocked(store: *Store, name: []const u8, now: i64) RemoveError!Remov
     // matching nothing is not "it was already gone" — it is proof the lock is
     // not doing what the rest of this function assumes.
     if (store.db.changes() == 0) return error.ServerVanishedDuringRemoval;
-    return .removed;
+    return .{ .removed = key_after };
+}
+
+/// Whether the row about to be deleted is the last thing referencing its key.
+///
+/// Caller must hold the write transaction, and it must be the one the DELETE
+/// runs in. The two facts this answers are true at *different* moments — the
+/// server's `key_id` can only be read while the row still exists, and "nothing
+/// references that key" is only true once the row is gone — so reading them apart
+/// would mean stitching a claim together out of two snapshots. Under one
+/// `BEGIN IMMEDIATE` there is only one snapshot: sqlite admits a single writer,
+/// so between this statement and the DELETE no peer can point a server at this
+/// key or take one away, and "no other server references it *now*" and "nothing
+/// references it *after*" are the same sentence.
+///
+/// One statement rather than two: the peer count is taken against the very
+/// `key_id` this row has, in the same read that establishes there is one, so
+/// there is no window between learning the key and counting its holders — not
+/// even a window this transaction's own lock would have closed, which keeps the
+/// property from depending on the caller having remembered to hold it.
+fn keyAfterRemovalLocked(store: *Store, server_id: i64) RemoveError!KeyAfterRemoval {
+    try store.db.requireTransaction();
+    var stmt = try store.db.prepare(
+        \\SELECT s.key_id IS NOT NULL,
+        \\       (SELECT COUNT(*) FROM servers peer
+        \\        WHERE peer.key_id = s.key_id AND peer.id <> s.id)
+        \\FROM servers s WHERE s.id = ?1
+    );
+    defer stmt.deinit();
+    try stmt.bindInt(1, server_id);
+    // The caller read this row under this same lock a few statements ago, so no
+    // row here is the same proof the DELETE's own row count is: the lock is not
+    // holding, and every answer this function could give would be about a
+    // database somebody else is changing.
+    if (!try stmt.step()) return error.ServerVanishedDuringRemoval;
+    if (stmt.columnInt(0) == 0) return .none;
+    return if (stmt.columnInt(1) > 0) .still_referenced else .left_unreferenced;
 }

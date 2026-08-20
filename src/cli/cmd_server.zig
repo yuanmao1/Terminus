@@ -16,8 +16,11 @@ const usage =
     \\  server set    <name> [--host H] [--port P] [--user U] [--key K] [--note ...]
     \\  server rm     <name> [--force]
     \\                --force confirms the cascade (memories/facts/sessions/
-    \\                jobs/history). It does not, and cannot, cover an
-    \\                unsettled attempt, a held lease or a resumable transfer.
+    \\                jobs/history/leases/redaction rules). It does not, and
+    \\                cannot, cover an unsettled attempt, a held lease or a
+    \\                resumable transfer. The server's private key is not
+    \\                deleted; a successful removal names it if nothing else
+    \\                references it any more.
     \\
 ;
 
@@ -155,13 +158,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         const name = parsed.positional(0) orelse fatal("{s}", .{usage});
         const server = (Store.servers.getByName(&store, ctx.arena, name) catch |err|
             Cli.storeFatal(&store, err)) orelse fatal("unknown server '{s}'", .{name});
-        const outcome = removeServer(&store, server.id, name, parsed.boolean("force"), ctx.now) catch |err|
+        const outcome = removeServer(&store, server.id, name, server.key, parsed.boolean("force"), ctx.now) catch |err|
             Cli.storeFatal(&store, err);
         switch (outcome) {
-            .removed => switch (ctx.out.format) {
-                .json => try ctx.out.json(.{ .ok = true, .action = "removed", .server = name }),
-                .human => try ctx.out.print("removed server '{s}'\n", .{name}),
-            },
+            .removed => |orphaned| try reportRemoved(ctx.out, name, orphaned),
             .vanished => Cli.failWithCode(
                 "SERVER_VANISHED",
                 "server '{s}' was there when its barriers were checked and gone when the delete ran; the removal was abandoned and nothing was deleted",
@@ -169,8 +169,15 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             ),
             .needs_force => |counts| Cli.failWithCode(
                 "SERVER_CASCADE_NOT_CONFIRMED",
-                "removing '{s}' also deletes {d} memories, {d} facts, {d} sessions, {d} jobs, {d} history entries; re-run with --force",
-                .{ name, counts.memories, counts.facts, counts.sessions, counts.jobs, counts.history },
+                "removing '{s}' also deletes {d} memories, {d} facts, {d} sessions, {d} jobs, {d} history entries, " ++
+                    "{d} lease records and {d} redaction rules. The lease records are the history of who held what on " ++
+                    "this host and how it was given back, which the lease barrier stops covering the moment nothing is " ++
+                    "held; the redaction rules are declared secret locations, so losing them puts what they hid back on " ++
+                    "pattern guessing. Re-run with --force",
+                .{
+                    name,        counts.memories, counts.facts,  counts.sessions,
+                    counts.jobs, counts.history,  counts.leases, counts.redaction_rules,
+                },
             ),
             // One sentence per barrier, naming the count and the way past it.
             // `--force` is absent from all three on purpose and is not an
@@ -208,9 +215,47 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 }
 
+/// A successful removal, in both formats and in one place.
+///
+/// Extracted from `run` so a gate can drive it: "the key is published in the JSON
+/// *and* in the human line" is a property of two arms that would otherwise only be
+/// checkable by reading them, and the arm most likely to be forgotten is the one a
+/// human never looks at.
+///
+/// `orphanedKey` is present on every success and null when nothing was orphaned,
+/// rather than absent. An agent branches on one key either way; an absent key would
+/// make it distinguish "nothing was left behind" from "this build does not report
+/// it", which is a question about the binary and not about the removal.
+fn reportRemoved(out: *Cli.Output, name: []const u8, orphaned: ?[]const u8) !void {
+    switch (out.format) {
+        .json => try out.json(.{
+            .ok = true,
+            .action = "removed",
+            .server = name,
+            .orphanedKey = orphaned,
+        }),
+        // The key is named, not merely reported to exist: an operator told "a
+        // key is now unreferenced" cannot act on it without going to look up
+        // which one.
+        .human => if (orphaned) |key| try out.print(
+            "removed server '{s}'; its private key '{s}' was not deleted and is now referenced by nothing — " ++
+                "'terminus key rm {s}' would destroy material that cannot be regenerated\n",
+            .{ name, key, key },
+        ) else try out.print("removed server '{s}'\n", .{name}),
+    }
+}
+
 /// What `server rm` decided, before any of it is worded.
 const RmOutcome = union(enum) {
-    removed,
+    /// The server is gone, and the payload is the private key the removal left
+    /// behind with nothing referencing it — `null` when there was no key, and
+    /// when another server still points at the same one, for which the removal
+    /// changed nothing and saying so would be false.
+    ///
+    /// A key name and not a flag, because the sentence has to name the key: an
+    /// operator told "a key is now unreferenced" has been given a fact they
+    /// cannot act on without going to look it up.
+    removed: ?[]const u8,
     /// The cascade *volume* warning: how much recorded knowledge about the host
     /// goes with it. `--force` covers this and only this.
     needs_force: Store.servers.CascadeCounts,
@@ -240,10 +285,18 @@ const RmOutcome = union(enum) {
 /// remote outcome nobody knows, a claim somebody is holding, a transfer with a
 /// legal move left. The way past each of those is to establish the fact it is
 /// waiting on, and no flag supplies a fact.
+///
+/// `key_name` is the third kind, and it is neither a loss nor a barrier: the
+/// removal leaves the private key exactly where it was and only stops referencing
+/// it. It arrives as a parameter rather than being read here because it has to be
+/// read from the `servers`→`keys` join while the server row still exists — see
+/// the header above `Store.servers.KeyAfterRemoval` for what the store decides
+/// and what this passes through.
 fn removeServer(
     store: *Store,
     server_id: i64,
     name: []const u8,
+    key_name: ?[]const u8,
     force: bool,
     now: i64,
 ) Store.servers.RemoveError!RmOutcome {
@@ -252,11 +305,23 @@ fn removeServer(
     // that matters. The numbers that *do* matter are counted inside the
     // transaction that deletes.
     const counts = try Store.servers.cascadeCounts(store, server_id);
-    const total = counts.sessions + counts.memories + counts.jobs + counts.facts + counts.history;
+    // All seven, so a table cannot be in the cascade and out of the sentence.
+    // `leases` is counted as well as barriered because the two answer different
+    // questions — the barrier refuses over live claims, this counts the released
+    // history that goes when there are none — and `redaction_rules` is counted
+    // because destroying a declared secret location in silence is the worst of
+    // the seven.
+    const total = counts.sessions + counts.memories + counts.jobs + counts.facts +
+        counts.history + counts.leases + counts.redaction_rules;
     if (total > 0 and !force) return .{ .needs_force = counts };
 
     return switch (try Store.servers.remove(store, name, now)) {
-        .removed => .removed,
+        // The name is the one read from the `servers`→`keys` join before the
+        // removal opened its transaction; whether it is now unreferenced was
+        // decided inside it. See `RmOutcome.removed`.
+        .removed => |key_after| .{
+            .removed = if (key_after == .left_unreferenced) key_name else null,
+        },
         .unknown_server => .vanished,
         .refused => |barrier| .{ .refused = barrier },
     };
@@ -338,7 +403,7 @@ test "gate: --force covers the cascade and no barrier" {
     });
     try t.expectEqual(
         @as(std.meta.Tag(RmOutcome), .needs_force),
-        std.meta.activeTag(try removeServer(&store, server_id, "box", false, 200)),
+        std.meta.activeTag(try removeServer(&store, server_id, "box", null, false, 200)),
     );
 
     // A lease is somebody's live claim. `--force` is the strongest thing the
@@ -357,7 +422,7 @@ test "gate: --force covers the cascade and no barrier" {
         .renewed, .conflict => return error.LeaseDidNotTake,
     }
 
-    switch (try removeServer(&store, server_id, "box", true, 210)) {
+    switch (try removeServer(&store, server_id, "box", null, true, 210)) {
         .refused => |barrier| try t.expectEqual(
             Store.servers.Barrier{ .active_leases = 1 },
             barrier,
@@ -383,7 +448,202 @@ test "gate: --force covers the cascade and no barrier" {
     );
     try t.expectEqual(
         @as(std.meta.Tag(RmOutcome), .removed),
-        std.meta.activeTag(try removeServer(&store, server_id, "box", true, 230)),
+        std.meta.activeTag(try removeServer(&store, server_id, "box", null, true, 230)),
     );
     try t.expect((try Store.servers.getByName(&store, arena, "box")) == null);
+}
+
+/// Removes a server through the whole of `server rm` bar wording, and answers
+/// what it said about the key.
+///
+/// `force = false` on purpose: these servers are meant to have nothing on them,
+/// so a cascade warning here is the fixture having grown rows nobody intended
+/// rather than something to wave through.
+fn removeAndReportKey(
+    store: *Store,
+    arena: std.mem.Allocator,
+    name: []const u8,
+    now: i64,
+) !?[]const u8 {
+    const server = (try Store.servers.getByName(store, arena, name)) orelse
+        return error.ServerWasNotThereToRemove;
+    return switch (try removeServer(store, server.id, name, server.key, false, now)) {
+        .removed => |orphaned| orphaned,
+        .needs_force => error.CascadeWarningBlockedTheRemoval,
+        .refused => error.RemovalUnexpectedlyRefused,
+        .vanished => error.ServerVanished,
+    };
+}
+
+/// The private material behind a key name, or an error if the row is not there.
+///
+/// An error and not a `null` a caller can ignore: every use below is asserting
+/// that `server rm` left the key alone, and a lookup that quietly finds nothing
+/// would turn "the key survived" into "we did not look".
+fn survivingPrivateKey(store: *Store, arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const material = (try Store.keys.material(store, arena, name)) orelse
+        return error.KeyRowWasDestroyedByTheServerRemoval;
+    return material.private orelse error.KeyRowSurvivedWithoutItsPrivateMaterial;
+}
+
+/// `removeAndReportKey` for a removal that is supposed to name a key.
+///
+/// A named error rather than `.?`: unwrapping a null here panics, and a gate
+/// whose failure is a panic tells the next reader that something crashed rather
+/// than which of the three readings stopped being true.
+fn orphanedKeyOf(
+    store: *Store,
+    arena: std.mem.Allocator,
+    name: []const u8,
+    now: i64,
+) ![]const u8 {
+    return (try removeAndReportKey(store, arena, name, now)) orelse
+        error.RemovalDidNotNameTheKeyItLeftUnreferenced;
+}
+
+fn wordedRemoval(
+    arena: std.mem.Allocator,
+    format: Cli.Output.Format,
+    name: []const u8,
+    orphaned: ?[]const u8,
+) ![]const u8 {
+    var buffer: std.Io.Writer.Allocating = .init(arena);
+    var out: Cli.Output = .{ .writer = &buffer.writer, .format = format };
+    try reportRemoved(&out, name, orphaned);
+    return buffer.toOwnedSlice();
+}
+
+test "gate: a successful removal names the private key it leaves unreferenced" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_server_orphan_key");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // Two keys with real private material, and three shapes of server pointing
+    // at them: one sole referrer, two sharing one key, and one with no key at
+    // all. All three readings of the sentence are in this one store.
+    _ = try Store.keys.add(&store, .{
+        .name = "solo-key",
+        .kind = "ed25519",
+        .private = "-----BEGIN PRIVATE KEY-----solo",
+        .now = 100,
+    });
+    _ = try Store.keys.add(&store, .{
+        .name = "shared-key",
+        .kind = "ed25519",
+        .private = "-----BEGIN PRIVATE KEY-----shared",
+        .now = 100,
+    });
+    for ([_]struct { name: []const u8, key: ?[]const u8 }{
+        .{ .name = "solo", .key = "solo-key" },
+        .{ .name = "twin-a", .key = "shared-key" },
+        .{ .name = "twin-b", .key = "shared-key" },
+        .{ .name = "bare", .key = null },
+    }) |spec| {
+        _ = try Store.servers.add(&store, .{
+            .name = spec.name,
+            .host = "10.0.0.1",
+            .port = 22,
+            .username = "ubuntu",
+            .key = spec.key,
+            .now = 100,
+        });
+    }
+    // The fixture is the evidence, so it is counted before anything is removed:
+    // four servers and two keys, or every silence below is a server that was
+    // never there.
+    try t.expectEqual(@as(usize, 4), (try Store.servers.list(&store, arena)).len);
+    try t.expectEqual(@as(usize, 2), (try Store.keys.list(&store, arena)).len);
+
+    // (1) Correctly silent, and silent for a *reason*: `shared-key` is still
+    //     referenced by `twin-b`, so nothing about that key changed and a
+    //     sentence claiming it had been left unreferenced would be false.
+    try t.expectEqual(@as(?[]const u8, null), try removeAndReportKey(&store, arena, "twin-a", 200));
+
+    // (2) Reported. Same key, one removal later, and now the last reference to
+    //     it is gone. This pair is the whole point: if the answer were "the
+    //     server had a key" rather than "the key is now unreferenced", (1) and
+    //     (2) would read the same and only one of them would be true.
+    try t.expectEqualStrings(
+        "shared-key",
+        try orphanedKeyOf(&store, arena, "twin-b", 210),
+    );
+
+    // (3) Not malformed. No key at all, so there is no name to put in a
+    //     sentence and the plain line is the whole output — no empty quotes, no
+    //     dangling clause.
+    try t.expectEqual(@as(?[]const u8, null), try removeAndReportKey(&store, arena, "bare", 220));
+    try t.expectEqualStrings(
+        "removed server 'bare'\n",
+        try wordedRemoval(arena, .human, "bare", null),
+    );
+
+    // (4) The sole referrer, reported the same way, so (2) is not an artefact
+    //     of a key that once had two servers.
+    try t.expectEqualStrings(
+        "solo-key",
+        try orphanedKeyOf(&store, arena, "solo", 230),
+    );
+
+    // Nothing is left to remove, and both key rows outlived every one of those
+    // removals with their private material intact. `servers.key_id` points *at*
+    // `keys` and is `NO ACTION`: the removal ends the reference, never the
+    // material, which is exactly why the sentence has to be said — `key rm`
+    // will now go through over bytes nobody can regenerate.
+    try t.expectEqual(@as(usize, 0), (try Store.servers.list(&store, arena)).len);
+    try t.expectEqual(@as(usize, 2), (try Store.keys.list(&store, arena)).len);
+    try t.expectEqualStrings(
+        "-----BEGIN PRIVATE KEY-----solo",
+        try survivingPrivateKey(&store, arena, "solo-key"),
+    );
+    try t.expectEqualStrings(
+        "-----BEGIN PRIVATE KEY-----shared",
+        try survivingPrivateKey(&store, arena, "shared-key"),
+    );
+
+    // And the answer reaches both published formats. The JSON arm is the one a
+    // human never reads, so it is the one that would go missing; the key is
+    // present either way and null is the "nothing was orphaned" answer, so an
+    // agent branches on one key rather than on its absence.
+    try t.expectEqualStrings(
+        \\{
+        \\  "ok": true,
+        \\  "action": "removed",
+        \\  "server": "solo",
+        \\  "orphanedKey": "solo-key"
+        \\}
+        \\
+    , try wordedRemoval(arena, .json, "solo", "solo-key"));
+    try t.expectEqualStrings(
+        \\{
+        \\  "ok": true,
+        \\  "action": "removed",
+        \\  "server": "bare",
+        \\  "orphanedKey": null
+        \\}
+        \\
+    , try wordedRemoval(arena, .json, "bare", null));
+
+    // The human line names the key and says what is now possible over it. Held
+    // as substrings rather than the whole sentence: the wording is allowed to
+    // improve, the two facts in it are not allowed to leave.
+    const line = try wordedRemoval(arena, .human, "solo", "solo-key");
+    for ([_][]const u8{ "solo-key", "referenced by nothing", "key rm solo-key" }) |needle| {
+        if (std.mem.indexOf(u8, line, needle) == null) {
+            std.debug.print(
+                \\
+                \\the human line for a removal that orphaned a key does not contain
+                \\`{s}`. It read:
+                \\
+                \\  {s}
+                \\
+            , .{ needle, line });
+            return error.OrphanedKeyIsNotInTheHumanLine;
+        }
+    }
 }

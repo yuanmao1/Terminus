@@ -1019,10 +1019,10 @@
     },
     {
       "id": "S2e-server-cascade-declaration-drifts",
-      "rule": "The declared cascade set is held in both directions: a declaration that no longer names a table the schema cascades leaves that table's rows going with the server under no guard and with nothing recording that anybody decided so. `redaction_rules` is the entry that carries the point - it is the one member behind no barrier and in no count.",
+      "rule": "The declared cascade set is held in both directions: a declaration that no longer names a table the schema cascades leaves that table's rows going with the server under nothing that records anybody having decided so. `redaction_rules` is the entry that carries the point - declared secret locations, and until the volume count named them nothing did.",
       "file": "src/core/store/gates_schema_test.zig",
-      "find": "    .{ .name = \"redaction_rules\", .guard = .unwatched },",
-      "replace": "    .{ .name = \"redaction_rules_renamed\", .guard = .unwatched },",
+      "find": "    .{ .name = \"redaction_rules\", .barrier = false, .counted = true },",
+      "replace": "    .{ .name = \"redaction_rules_renamed\", .barrier = false, .counted = true },",
       "expect_gate": "gate: the server cascade set is declared and the schema is held to it"
     },
     {
@@ -1048,6 +1048,46 @@
       "find": "    var barriered: usize = 0;",
       "replace": "    _ = try Store.servers.remove(&store, \"no-server-by-this-name\", 1);\n\n    var barriered: usize = 0;",
       "expect_gate": "gate: the server cascade has one writer and its wrapper is the one route"
+    },
+    {
+      "id": "S2f-server-cascade-table-behind-nothing",
+      "rule": "Every table the `servers` DELETE cascades is behind a barrier or behind the volume count. `redaction_rules` used to be behind neither, and the declaration could say so out loud - which made the silent destruction of declared secret locations a documented state rather than a defect. Both columns false is a gate failure now, so the shape that could record it is gone.",
+      "file": "src/core/store/gates_schema_test.zig",
+      "find": "    .{ .name = \"redaction_rules\", .barrier = false, .counted = true },",
+      "replace": "    .{ .name = \"redaction_rules\", .barrier = false, .counted = false },",
+      "expect_gate": "gate: the server cascade set is declared and the schema is held to it"
+    },
+    {
+      "id": "S2f-lease-history-drops-out-of-the-count",
+      "rule": "A barrier is not a count. `leases` is behind `servers.removeLocked`'s live-claim barrier and behind `CascadeCounts` as well, because the barrier refuses over held claims while the count is about the released history that goes when nothing is held. Dropping the count and keeping the barrier reads as covered and is not.",
+      "file": "src/core/store/gates_schema_test.zig",
+      "find": "    .{ .name = \"leases\", .barrier = true, .counted = true },",
+      "replace": "    .{ .name = \"leases\", .barrier = true, .counted = false },",
+      "expect_gate": "gate: the server cascade set is declared and the schema is held to it"
+    },
+    {
+      "id": "S2f-orphaned-key-never-reported",
+      "rule": "`server rm` destroys no key material - `servers.key_id` points at `keys` and is NO ACTION - so a successful removal must say that the private key remains and is now referenced by nothing, because after it `key rm` is a DELETE over material nobody can regenerate. Answering `still_referenced` unconditionally keeps the removal silent while every other outcome stays correct.",
+      "file": "src/core/store/servers.zig",
+      "find": "    return if (stmt.columnInt(1) > 0) .still_referenced else .left_unreferenced;",
+      "replace": "    return if (stmt.columnInt(1) >= 0) .still_referenced else .left_unreferenced;",
+      "expect_gate": "gate: a successful removal names the private key it leaves unreferenced"
+    },
+    {
+      "id": "S2f-orphaned-key-reported-for-a-shared-key",
+      "rule": "The report is made only when the key actually becomes unreferenced. Another server still pointing at the same key row means nothing changed for that key, and naming it anyway tells an operator that material is unreferenced when it is not - the one sentence here that could get a key deleted while a server still needs it. The peer count is what draws that line.",
+      "file": "src/core/store/servers.zig",
+      "find": "        WHERE peer.key_id = s.key_id AND peer.id <> s.id)",
+      "replace": "        WHERE peer.key_id = s.key_id AND peer.id <> s.id AND 1 = 0)",
+      "expect_gate": "gate: a successful removal names the private key it leaves unreferenced"
+    },
+    {
+      "id": "S2f-orphaned-key-absent-from-the-json",
+      "rule": "The orphaned key is published in the human line and in the JSON. The JSON arm is the one no human reads, so it is the one that goes missing; an agent told to branch on `orphanedKey` then finds nothing there and reports a clean removal over a key nothing references.",
+      "file": "src/cli/cmd_server.zig",
+      "find": "            .orphanedKey = orphaned,",
+      "replace": "            .orphanedKeyOmitted = true,",
+      "expect_gate": "gate: a successful removal names the private key it leaves unreferenced"
     },
     {
       "id": "S3a-terminal-written-after-the-kill",
