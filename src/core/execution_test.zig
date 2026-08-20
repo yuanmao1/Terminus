@@ -34,7 +34,7 @@ fn mustSubmit(e: *execution.Execution) !void {
 }
 
 fn mustRun(e: *execution.Execution, executor: Executor, command: []const u8) !execution.RunOutcome {
-    return switch (try execution.runCommand(e, executor, command)) {
+    return switch (try execution.runCommand(e, executor, command, null)) {
         .ran => |outcome| outcome,
         .refused => error.UnexpectedlyRefused,
     };

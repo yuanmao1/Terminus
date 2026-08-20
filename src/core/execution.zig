@@ -2233,10 +2233,29 @@ pub const RunResult = union(enum) {
     refused: Blocker,
 };
 
+/// The bytes a command reads, and where the count of what was accepted lands.
+///
+/// Optional at the call site rather than implied by a second function, because
+/// the two shapes differ in exactly three lines — which call goes out, how a
+/// transport loss is worded, and whether the receipt carries a `stdin` field —
+/// and fifty identical ones. `cmd_exec` held a copy of those fifty for one
+/// slice, and the single rule they could drift on (a channel that closed
+/// without the exit marker is `indeterminate`, never a failure) needed a gate
+/// driving both to say they still agreed. One function needs no such gate.
+///
+/// `accepted` is written by the pump on **every** path including the failing
+/// ones, so it is the only thing a caller learns about a rejected input, and it
+/// is what the receipt records rather than the source's length.
+pub const Input = struct {
+    source: *std.Io.Reader,
+    accepted: *Ssh.Accepted,
+};
+
 pub fn runCommand(
     execution: *Execution,
     executor: Executor,
     command: []const u8,
+    input: ?Input,
 ) Error!RunResult {
     const wrapped = try supervisor.wrapShell(execution.arena, command, execution.nonce);
 
@@ -2245,9 +2264,17 @@ pub fn runCommand(
         .refused => |blocker| return .{ .refused = blocker },
     }
 
-    const result = executor.exec(execution.arena, wrapped) catch |err| {
-        // We do not know whether the remote ran it. Say so.
-        _ = try execution.transportLoss(describe(executor, err));
+    const result = (if (input) |in|
+        executor.execWithStdin(execution.arena, wrapped, in.source, in.accepted)
+    else
+        executor.exec(execution.arena, wrapped)) catch |err| {
+        // We do not know whether the remote ran it. Say so — and when there was
+        // an input, say how much of it went, because a command that read a
+        // prefix may have acted on it.
+        _ = try execution.transportLoss(if (input) |in|
+            try inputLossReason(execution, executor, err, in.accepted)
+        else
+            describe(executor, err));
         return .{ .ran = .{
             .status = execution.status,
             .exit_code = null,
@@ -2267,6 +2294,18 @@ pub fn runCommand(
     if (observed.identity) |identity| try execution.remoteStarted(identity);
 
     const stream_extra: receipts.TerminalExtra = .{
+        // The count the channel accepted and the digest of those same bytes,
+        // never the source's length. A receipt claiming the whole file after a
+        // short write is indistinguishable from a clean run, which is precisely
+        // the pseudo-success the input channel was built to avoid.
+        //
+        // `.{}` and not a filled-in zero when there was no input: `StreamEvidence`
+        // defaults both fields to null, so "this command read nothing" and "this
+        // command was fed zero bytes" stay different rows.
+        .stdin = if (input) |in| .{
+            .bytes = @intCast(in.accepted.bytes),
+            .sha256 = in.accepted.sha256[0..],
+        } else .{},
         .stdout = .{ .bytes = @intCast(observed.stdout.len) },
         .stderr = .{ .bytes = @intCast(observed.stderr.len) },
         .remote_pid = if (observed.identity) |i| i.pid else null,
@@ -2300,6 +2339,42 @@ pub fn runCommand(
         .stderr = observed.stderr,
         .identity = observed.identity,
     } };
+}
+
+/// How a transport loss reads when the command was being fed input.
+///
+/// Each arm names how much of the input had already gone, because that is what
+/// decides whether the remote may have acted: a command that read a prefix and
+/// then lost its channel is not the same event as one that never received a
+/// byte. Falls through to `describe` for the errors that are not about input.
+fn inputLossReason(
+    execution: *Execution,
+    executor: Executor,
+    err: anyerror,
+    accepted: *const Ssh.Accepted,
+) Error![]const u8 {
+    return switch (err) {
+        error.InputRejected => std.fmt.allocPrint(
+            execution.arena,
+            "the remote stopped accepting input after {d} byte(s) (sha256 {s}); the command may " ++
+                "have already read and acted on that much",
+            .{ accepted.bytes, accepted.sha256[0..] },
+        ),
+        error.InputSourceUnreadable => std.fmt.allocPrint(
+            execution.arena,
+            "the local --stdin-file source could not be read past {d} byte(s), which had already " ++
+                "been accepted by the remote",
+            .{accepted.bytes},
+        ),
+        error.InputEofNotSent => std.fmt.allocPrint(
+            execution.arena,
+            "all {d} byte(s) went and the end-of-input marker did not, so the remote command is " ++
+                "still waiting on a read that will never complete",
+            .{accepted.bytes},
+        ),
+        error.InputUnsupported => "this transport has no channel for the command's standard input",
+        else => describe(executor, err),
+    };
 }
 
 /// The best available text for a transport failure.

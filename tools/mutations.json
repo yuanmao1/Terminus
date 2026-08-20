@@ -1523,9 +1523,9 @@
     },
     {
       "id": "M4-receipt-records-the-input",
-      "rule": "The terminal receipt of a run that was fed local bytes records how many the channel accepted and their SHA-256.",
-      "file": "src/cli/cmd_exec.zig",
-      "find": "        .stdin = .{\n            .bytes = @intCast(accepted.bytes),\n            .sha256 = accepted.sha256[0..],\n        },",
+      "rule": "The terminal receipt of a run that was fed local bytes records how many the channel accepted and their SHA-256. Dropping the field to its default makes a fed run indistinguishable from one that read nothing, which is the difference the two always-null columns exist to record.",
+      "file": "src/core/execution.zig",
+      "find": "        .stdin = if (input) |in| .{\n            .bytes = @intCast(in.accepted.bytes),\n            .sha256 = in.accepted.sha256[0..],\n        } else .{},",
       "replace": "        .stdin = .{},",
       "expect_gate": "gate: the terminal receipt records the bytes the channel accepted and their digest"
     },

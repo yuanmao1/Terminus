@@ -299,17 +299,21 @@ fn runOneShot(
     else
         command;
 
-    const result = (if (input) |source| blk: {
-        // A transport with no input channel is refused here, before the guard
-        // binds, so the refusal is one where nothing was sent. `Cli.connect`
-        // already takes a direct connection when `--stdin-file` is named, so
-        // reaching this means the transport changed under us.
-        if (!executor.carriesInput()) fatal(
-            "this transport has no channel for --stdin-file input; nothing was sent. Re-run with --no-daemon",
-            .{},
-        );
-        break :blk runWithInput(execution, executor, effective, source, accepted);
-    } else Core.execution.runCommand(execution, executor, effective)) catch |err|
+    // A transport with no input channel is refused before the guard binds, so
+    // the refusal is one where nothing was sent. `Cli.connect` already takes a
+    // direct connection when `--stdin-file` is named, so reaching this means
+    // the transport changed under us.
+    if (input != null and !executor.carriesInput()) fatal(
+        "this transport has no channel for --stdin-file input; nothing was sent. Re-run with --no-daemon",
+        .{},
+    );
+
+    const result = Core.execution.runCommand(
+        execution,
+        executor,
+        effective,
+        if (input) |source| .{ .source = source, .accepted = accepted } else null,
+    ) catch |err|
         // The command may well have run; what failed is our record of it.
         Cli.receiptFatal(execution.id(), err, execution.status.text());
 
@@ -327,136 +331,6 @@ fn runOneShot(
         else
             outcome.stderr,
         .identity = outcome.identity,
-    };
-}
-
-/// `Core.execution.runCommand`, for a command that is fed local bytes.
-///
-/// **Why this mirrors that function instead of calling it.** The two numbers
-/// this whole channel exists to produce — how many bytes the remote process's
-/// standard input accepted, and their digest — belong on the terminal receipt,
-/// where `receipts.TerminalExtra.stdin` has been waiting for them since the
-/// schema was written. `runCommand` builds that receipt itself, out of stdout
-/// and stderr alone, and takes nothing from its caller to put beside them. So
-/// there are two ways to fill the columns: change `core/execution.zig` so
-/// `runCommand` accepts an input source, or record the terminal here. The first
-/// is the right home and is out of this change's scope; this is the second.
-///
-/// **The one rule the two could drift on** is the last branch: a channel that
-/// closed without the exit marker is `indeterminate`, never a failure and never
-/// a zero. `cmd_exec_test` holds both against it.
-///
-/// `accepted` is filled by the pump on every path, including the failing ones,
-/// and it is the only thing the caller learns about a rejected input.
-pub fn runWithInput(
-    execution: *Core.execution.Execution,
-    executor: Core.Executor,
-    command: []const u8,
-    source: *std.Io.Reader,
-    accepted: *Core.Ssh.Accepted,
-) Core.execution.Error!Core.execution.RunResult {
-    const wrapped = try Core.supervisor.wrapShell(execution.arena, command, execution.nonce);
-
-    switch (try execution.submitted()) {
-        .submitted => {},
-        .refused => |blocker| return .{ .refused = blocker },
-    }
-
-    const result = executor.execWithStdin(execution.arena, wrapped, source, accepted) catch |err| {
-        _ = try execution.transportLoss(try inputLossReason(execution, executor, err, accepted));
-        return .{ .ran = .{
-            .status = execution.status,
-            .exit_code = null,
-            .stdout = "",
-            .stderr = "",
-            .identity = null,
-        } };
-    };
-
-    const observed = try Core.supervisor.parseShell(
-        execution.arena,
-        execution.nonce,
-        result.stdout,
-        result.stderr,
-    );
-
-    if (observed.identity) |identity| try execution.remoteStarted(identity);
-
-    const stream_extra: Core.Store.receipts.TerminalExtra = .{
-        // The count the channel accepted and the digest of those same bytes,
-        // never the source's length. A receipt claiming the whole file after a
-        // short write is precisely the pseudo-success this channel was built to
-        // avoid, and it would be indistinguishable from a clean run.
-        .stdin = .{
-            .bytes = @intCast(accepted.bytes),
-            .sha256 = accepted.sha256[0..],
-        },
-        .stdout = .{ .bytes = @intCast(observed.stdout.len) },
-        .stderr = .{ .bytes = @intCast(observed.stderr.len) },
-        .remote_pid = if (observed.identity) |i| i.pid else null,
-        .remote_pgid = if (observed.identity) |i| i.pgid else null,
-        .remote_start_token = if (observed.identity) |i| i.start_token else null,
-    };
-
-    if (observed.exit_code) |code| {
-        _ = try execution.settle(.{ .exited = .{ .exit_code = code } }, stream_extra);
-        return .{ .ran = .{
-            .status = execution.status,
-            .exit_code = code,
-            .stdout = observed.stdout,
-            .stderr = observed.stderr,
-            .identity = observed.identity,
-        } };
-    }
-
-    // The channel closed cleanly and the exit marker never arrived, so the
-    // command's fate is unknown. `result.exit_code` here is the channel's and
-    // not the command's — the rule `runCommand` holds, held identically.
-    _ = try execution.settle(.{ .indeterminate = .{
-        .reason = "remote closed the channel before reporting an exit status",
-        .last_observed = execution.status,
-    } }, stream_extra);
-    return .{ .ran = .{
-        .status = execution.status,
-        .exit_code = null,
-        .stdout = observed.stdout,
-        .stderr = observed.stderr,
-        .identity = observed.identity,
-    } };
-}
-
-/// What to record when the input channel failed.
-///
-/// Every one of these leaves the remote's fate unknown, for the reason
-/// `runCommand` gives about any transport failure after submission: the shell
-/// was started before the first byte went, so a command that read a prefix and
-/// acted on it has already acted. What differs is what to say — and the input
-/// failures say how far the channel got, because that is the number a caller
-/// deciding whether to re-send needs and the one a "failed" would hide.
-fn inputLossReason(
-    execution: *Core.execution.Execution,
-    executor: Core.Executor,
-    err: anyerror,
-    accepted: *const Core.Ssh.Accepted,
-) Core.execution.Error![]const u8 {
-    return switch (err) {
-        error.InputRejected => std.fmt.allocPrint(
-            execution.arena,
-            "the remote stopped accepting input after {d} byte(s) (sha256 {s}); the command may have already acted on what it received",
-            .{ accepted.bytes, accepted.sha256[0..] },
-        ),
-        error.InputSourceUnreadable => std.fmt.allocPrint(
-            execution.arena,
-            "the local --stdin-file source could not be read past {d} byte(s), which had already gone to the remote",
-            .{accepted.bytes},
-        ),
-        error.InputEofNotSent => std.fmt.allocPrint(
-            execution.arena,
-            "all {d} byte(s) went and the end-of-input marker did not, so the remote command is reading a channel that will not close",
-            .{accepted.bytes},
-        ),
-        error.InputUnsupported => "this transport has no channel for the command's standard input",
-        else => Core.execution.describe(executor, err),
     };
 }
 

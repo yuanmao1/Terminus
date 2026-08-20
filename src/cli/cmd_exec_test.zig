@@ -503,12 +503,11 @@ test "gate: the terminal receipt records the bytes the channel accepted and thei
     } }});
 
     var taken: Ssh.Accepted = .{};
-    const result = try cmd_exec.runWithInput(
+    const result = try Core.execution.runCommand(
         &execution,
         script.executor(),
         "cat > /tmp/out.bin",
-        &reader,
-        &taken,
+        .{ .source = &reader, .accepted = &taken },
     );
     try t.expect(result == .ran);
     try t.expectEqual(@as(?i32, 0), result.ran.exit_code);
@@ -546,12 +545,11 @@ test "gate: a rejected input settles indeterminate and the receipt does not clai
     script.intake = .{ .stalls_after = cut };
 
     var taken: Ssh.Accepted = .{};
-    const result = try cmd_exec.runWithInput(
+    const result = try Core.execution.runCommand(
         &execution,
         script.executor(),
         "cat > /tmp/out.bin",
-        &reader,
-        &taken,
+        .{ .source = &reader, .accepted = &taken },
     );
 
     // The shell was started before the first byte went, so a command that read
@@ -588,12 +586,13 @@ test "gate: an input run and a plain run agree that a missing exit marker is ind
     var b = try Harness.init(t.allocator, "exec_marker_plain");
     defer b.deinit();
 
-    // `runWithInput` mirrors `Core.execution.runCommand` because the terminal
-    // receipt has to carry the input evidence and `runCommand` builds that
-    // receipt itself. Mirrored code drifts, and this is the branch it would
-    // drift on: a channel that closed cleanly without the exit marker knows
-    // nothing about the command, and the channel's own exit status is not the
-    // command's. Both are driven, in one test, against the same reply.
+    // One `runCommand`, two shapes of call: with an input and without. This is
+    // the branch where the difference would matter most and must not — a channel
+    // that closed cleanly without the exit marker knows nothing about the
+    // command, and the channel's own exit status is not the command's. An
+    // earlier pass had a second copy of this function in `cmd_exec`, and this
+    // gate existed to catch the two drifting apart; the copy is gone and the
+    // gate now holds the surviving one against both of its call shapes.
     const marker_free = "output with no marker in it\n";
 
     var statuses: [2][]const u8 = undefined;
@@ -611,7 +610,12 @@ test "gate: an input run and a plain run agree that a missing exit marker is ind
         } }});
         var reader: std.Io.Reader = .fixed("some input");
         var taken: Ssh.Accepted = .{};
-        const result = try cmd_exec.runWithInput(&execution, script.executor(), "sh", &reader, &taken);
+        const result = try Core.execution.runCommand(
+            &execution,
+            script.executor(),
+            "sh",
+            .{ .source = &reader, .accepted = &taken },
+        );
         statuses[0] = result.ran.status.text();
         codes[0] = result.ran.exit_code;
         // The input still went, and the receipt still says how much — a run
@@ -628,7 +632,7 @@ test "gate: an input run and a plain run agree that a missing exit marker is ind
             .stdout = try b.arena.dupe(u8, marker_free),
             .stderr = "",
         } }});
-        const result = try Core.execution.runCommand(&execution, script.executor(), "sh");
+        const result = try Core.execution.runCommand(&execution, script.executor(), "sh", null);
         statuses[1] = result.ran.status.text();
         codes[1] = result.ran.exit_code;
         checked += 1;
