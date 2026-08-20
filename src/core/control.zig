@@ -408,6 +408,239 @@ pub fn renewalsAreAdjacent(
     return found;
 }
 
+// --- The other dangerous call: the one that writes the terminal -------------
+//
+// `renewalsAreAdjacent` covers the calls that change the *host*. It does not
+// cover the call that changes the *ledger*, and that was the gap: the renewal
+// standing between a lost scope and a terminal is spelled
+// `_ = stillOurs(claim, ctx.io, &authority);` — a discard, three tokens of
+// visible effect, the easiest line in a 680-line function to read as a no-op and
+// delete. Deleting one left the suite green. The command then chooses its
+// terminal from a stale `authority` and publishes `authority: held` on a branch
+// where the scope was already gone.
+//
+// The rule is not adjacency. A terminal is not one call, it is a derivation —
+// load the attempt, read the last observed status, decide what the evidence
+// proves — and code between the renewal and the write is normal. What may not
+// sit in that gap is a *round trip*. A renewal answers about the moment it was
+// taken; local statements do not move that moment, and a call to the host does.
+// So: a renewal must have happened, and nothing since it may have gone to the
+// host.
+//
+// Two kinds of terminal write, and only one needs the rule
+// --------------------------------------------------------
+// `settleObserved(` writes the terminal from `authority` alone. Nothing re-asks
+// the store, so the text is the only thing that can say the answer was fresh.
+//
+// `settleAndForgetJob(` and `settleAndRemoveSession(` go through
+// `execution.commitDestruction`, which re-reads the acting party's own claim
+// *inside* the transaction that writes the terminal. That is strictly stronger
+// than any textual rule — there is no gap left to police, because the question
+// and the write are one commit. `removeSession` is why this distinction has to
+// be stated rather than assumed: it renews, then makes a `Tmux.removeLog(`
+// round trip, then settles. Under a single rule that is a violation; it is in
+// fact the safest of the eight sites, and a rule that cannot tell the two apart
+// would have to be weakened for all of them.
+//
+// So both are counted and each caller asserts both. The counts are the load
+// bearing part, not the pass: a verb that swapped `settleAndRemoveSession(` for
+// a bare `settleObserved(` would still satisfy the adjacency rule, and the pair
+// moving from `(0, 1)` to `(1, 0)` is what says the in-transaction re-read was
+// dropped. Downgrading from the contract to a bare settle is the change this
+// gate exists to make unwritable.
+
+/// A call that goes to the host, spelled as it is written.
+///
+/// A superset of `destructive_remote_calls` — every call in that list is one of
+/// these — because this rule is about elapsed time rather than about damage. A
+/// probe changes nothing and is just as good a window for a peer's `--force` to
+/// land in.
+pub const remote_round_trips = [_][]const u8{
+    "Tmux.killSession(",
+    "Tmux.removeLog(",
+    "Tmux.removeResult(",
+    "Tmux.probeTail(",
+    "Tmux.isAlive(",
+    "Tmux.readLog(",
+    "finalProbe(",
+};
+
+/// Terminal writes that take the ledger's word from `authority` and nothing else.
+pub const bare_terminal_writes = [_][]const u8{"settleObserved("};
+
+/// Terminal writes that re-read the claim inside their own transaction.
+///
+/// Listed so they can be *counted*, not so they can be checked: what protects
+/// them is `commitDestruction`, and no arrangement of text could add to it.
+pub const contract_backed_terminal_writes = [_][]const u8{
+    "settleAndForgetJob(",
+    "settleAndRemoveSession(",
+};
+
+/// How each body settled: how many terminals it wrote on its own authority, and
+/// how many it wrote through the claim-backed contract.
+pub const LedgerWrites = struct { bare: usize, contract_backed: usize };
+
+/// Every top-level function in `source` whose body renews a claim, as the
+/// `\nfn name(` headers `bodyOf` takes.
+///
+/// Derived rather than declared, because the hand-written lists diverged. Both
+/// rules in this file need "which functions hold a claim", and `cmd_job.zig`
+/// answered it twice: `claim_reporting_bodies` named seven — including
+/// `reportFinishedDuringKill` — and `claim_holding_bodies` named two, leaving
+/// that function's renewal and its `settleObserved` unscanned by the renewal
+/// rules while the release rule covered it. Neither list was wrong about its own
+/// question; the drift is that the answer was written down twice.
+///
+/// A function that renews is holding a claim — that is what renewing is — so the
+/// membership is a property of the text and is read off it. Callers still assert
+/// the count, because a scan that finds nothing must fail rather than pass over
+/// an empty region.
+///
+/// Comment lines are stripped before the search: a paragraph that explains
+/// `stillOurs` is not a renewal, and this file's own prose is full of them.
+pub fn claimHoldingBodies(
+    source: []const u8,
+    out: [][]const u8,
+) error{ FunctionUnterminated, TooManyClaimHoldingBodies }![]const []const u8 {
+    var count: usize = 0;
+    for ([_][]const u8{ "\nfn ", "\npub fn " }) |opener| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, source, from, opener)) |at| {
+            from = at + 1;
+            const paren = std.mem.indexOfPos(u8, source, at, "(") orelse continue;
+            const header = source[at .. paren + 1];
+            // `\nfn ` is a prefix of nothing else, but `\npub fn ` bodies are
+            // also found by neither — a header whose body has no `\n}\n` is a
+            // scan that has stopped covering the function, and that is the one
+            // thing this must not do quietly.
+            const body = bodyOf(source, header) catch |err| switch (err) {
+                error.FunctionMissing => continue,
+                error.FunctionUnterminated => return error.FunctionUnterminated,
+            };
+            var lines = std.mem.splitScalar(u8, body, '\n');
+            const renews = while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (std.mem.startsWith(u8, line, "//")) continue;
+                if (std.mem.indexOf(u8, line, "stillOurs(") != null) break true;
+            } else false;
+            if (!renews) continue;
+            if (count == out.len) return error.TooManyClaimHoldingBodies;
+            out[count] = header;
+            count += 1;
+        }
+    }
+    return out[0..count];
+}
+
+/// Checks that every `bare_terminal_writes` call in `bodies` follows a
+/// `stillOurs(...)` renewal with no `remote_round_trips` call in between — and
+/// returns how many writes of each kind it saw.
+///
+/// Both counts are returned rather than asserted here for the reason
+/// `renewalsAreAdjacent` returns its one: a scan over a renamed function walks
+/// an empty region and reports success. A caller with no bare writes at all —
+/// `cmd_session.zig` is one — has nothing else to prove it looked, which is
+/// exactly when the contract-backed count is doing the work.
+pub fn renewalsPrecedeTerminalWrites(
+    file: []const u8,
+    source: []const u8,
+    bodies: []const []const u8,
+) error{
+    FunctionMissing,
+    FunctionUnterminated,
+    TerminalWrittenWithoutARenewal,
+    TerminalWrittenAfterARoundTrip,
+}!LedgerWrites {
+    var seen: LedgerWrites = .{ .bare = 0, .contract_backed = 0 };
+    for (bodies) |header| {
+        const body = try bodyOf(source, header);
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        var renewed_at: ?usize = null;
+        // The first round trip since that renewal, kept with its line so the
+        // failure can name the call that opened the gap rather than just
+        // asserting one exists.
+        var trip: ?struct { number: usize, call: []const u8 } = null;
+        var number: usize = 0;
+        while (lines.next()) |raw| {
+            number += 1;
+            const line = std.mem.trim(u8, raw, " \t\r");
+            // Prose that spells a call is not a call. Skipped before any of the
+            // three questions below, so the paragraphs that explain each site
+            // cannot trip the rule they explain.
+            if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
+
+            if (std.mem.indexOf(u8, line, "stillOurs(") != null) {
+                renewed_at = number;
+                trip = null;
+            }
+
+            for (contract_backed_terminal_writes) |write| {
+                if (std.mem.indexOf(u8, line, write) != null) {
+                    seen.contract_backed += 1;
+                    break;
+                }
+            }
+
+            for (bare_terminal_writes) |write| {
+                if (std.mem.indexOf(u8, line, write) == null) continue;
+                seen.bare += 1;
+                const renewal = renewed_at orelse {
+                    std.debug.print(
+                        \\
+                        \\{s}: a terminal is written on an authority this body never renewed.
+                        \\
+                        \\  in:            {s}
+                        \\  line {d} of it: {s}
+                        \\
+                        \\`{s}` writes the terminal from `authority` and re-asks nothing. A body
+                        \\that holds a claim must renew before it settles, because the renewal is
+                        \\what decides which terminal this command is entitled to write — and a
+                        \\command that lost the scope is not entitled to record a cancellation of
+                        \\work it no longer speaks for.
+                        \\
+                    , .{ file, header[1..], number, line, write });
+                    return error.TerminalWrittenWithoutARenewal;
+                };
+                if (trip) |made| {
+                    std.debug.print(
+                        \\
+                        \\{s}: a terminal is written on a renewal that a round trip has outlived.
+                        \\
+                        \\  in:              {s}
+                        \\  renewed on line: {d}
+                        \\  round trip on:   {d}  ({s})
+                        \\  settled on line: {d}  {s}
+                        \\
+                        \\`{s}` takes the ledger's word from `authority`, so the renewal above it is
+                        \\the whole of what says the scope was still ours. A call to the host in
+                        \\between is time a peer's `--force` can land in, and the terminal that
+                        \\follows would be written on an answer that has since stopped being true.
+                        \\
+                        \\Renew again after the round trip, or settle through
+                        \\`execution.commitDestruction` — it re-reads the claim inside the
+                        \\transaction that writes the terminal, which closes the gap rather than
+                        \\shortening it.
+                        \\
+                    , .{ file, header[1..], renewal, made.number, made.call, number, line, write });
+                    return error.TerminalWrittenAfterARoundTrip;
+                }
+                break;
+            }
+
+            if (trip == null) {
+                for (remote_round_trips) |call| {
+                    if (std.mem.indexOf(u8, line, call) != null) {
+                        trip = .{ .number = number, .call = call };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return seen;
+}
+
 // Compile-checks every declaration in *this* module.
 //
 // Nothing here is exercised by a test of its own: the behaviour is proved end to

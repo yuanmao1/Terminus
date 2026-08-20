@@ -1048,6 +1048,38 @@
       "find": "    var barriered: usize = 0;",
       "replace": "    _ = try Store.servers.remove(&store, \"no-server-by-this-name\", 1);\n\n    var barriered: usize = 0;",
       "expect_gate": "gate: the server cascade has one writer and its wrapper is the one route"
+    },
+    {
+      "id": "S3a-terminal-written-after-the-kill",
+      "rule": "`killJob` renews immediately before `Tmux.killSession(`, re-probes, and only then chooses its terminal. Deleting the second renewal leaves the terminal chosen from an `authority` that predates both round trips, so a peer's `--force` landing in between is recorded as this command's own cancellation. The renewal is spelled `_ = stillOurs(...)`, three tokens of visible effect, and deleting it left the suite green before this gate existed.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    _ = stillOurs(claim, ctx.io, &authority);\n    const last_observed = if (execution) |e| e.status else .remote_started;",
+      "replace": "    const last_observed = if (execution) |e| e.status else .remote_started;",
+      "expect_gate": "gate: no terminal is written on a renewal a round trip has outlived"
+    },
+    {
+      "id": "S3a-terminal-written-after-the-result-removal",
+      "rule": "The same deletion in `removeJob`. Its nearest surviving renewal is inside the `--discard-evidence` arm, and a `Tmux.removeResult(` sits between that and the settle, so the terminal would be written on an answer two round trips old.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    _ = stillOurs(claim, ctx.io, &authority);\n    const terminal: Core.Store.op_state.Terminal = if (final.unreadable)",
+      "replace": "    const terminal: Core.Store.op_state.Terminal = if (final.unreadable)",
+      "expect_gate": "gate: no terminal is written on a renewal a round trip has outlived"
+    },
+    {
+      "id": "S3a-claim-holder-stops-renewing",
+      "rule": "`reportFinishedDuringKill` renews once and settles once. Deleting that renewal does not trip the terminal-write rule - it removes the body from the derived claim-holder set entirely, so the rule stops looking at it. That is the failure mode of deriving membership, and it is why the count is still written down: three drops to two and the gate names it. Before this pass the body was in `claim_reporting_bodies` and not in the renewal list, so this deletion was invisible.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    _ = stillOurs(claim, ctx.io, &authority);\n    // The exit code stands whatever the lease says.",
+      "replace": "    // The exit code stands whatever the lease says.",
+      "expect_gate": "gate: every destructive remote call is renewed on the line above it"
+    },
+    {
+      "id": "S3a-contract-backed-write-misclassified",
+      "rule": "`session rm` settles through `commitDestruction`, which re-reads the claim inside the transaction that writes the terminal - which is why a `Tmux.removeLog(` may sit between its renewal and its settle. Forgetting that `settleAndRemoveSession(` is contract-backed makes the pair (0, 0), and the assertion that it is (0, 1) is what says the scan walked a real body: with no bare writes there, nothing else would fail if the walk covered an empty region.",
+      "file": "src/core/control.zig",
+      "find": "    \"settleAndForgetJob(\",\n    \"settleAndRemoveSession(\",",
+      "replace": "    \"settleAndForgetJob(\",",
+      "expect_gate": "gate: `session rm` settles through the contract, not on its own authority"
     }
   ]
 }

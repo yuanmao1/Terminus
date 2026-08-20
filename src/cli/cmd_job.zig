@@ -5185,28 +5185,116 @@ fn lostTerminal(
 // knows — which of its functions hold a claim, and how many destructive sites
 // there are in them.
 
-/// How many `Control.destructive_remote_calls` the two claim-holding verbs
-/// make. Asserted so a scan that found nothing — a renamed function, a body
-/// delimiter that moved — fails instead of passing over an empty region.
+/// How many `Control.destructive_remote_calls` the claim-holding verbs make.
+/// Asserted so a scan that found nothing — a renamed function, a body delimiter
+/// that moved — fails instead of passing over an empty region.
 const destructive_remote_call_count = 7;
 
-/// The two functions that hold a `Claim` while they touch the host. The one
-/// other `killSession` in this file — `runCmd` clearing a leftover session
-/// before it reuses the name — runs under a reservation and never takes a
-/// lease, so it has no renewal to be adjacent to and is not this rule's
-/// business.
-const claim_holding_bodies = [_][]const u8{ "\nfn killJob(", "\nfn removeJob(" };
+/// How many functions here hold a `Claim`: `killJob`, `removeJob` and the ending
+/// `killJob` delegates to, `reportFinishedDuringKill`.
+///
+/// The membership is derived by `Control.claimHoldingBodies` — a body that
+/// renews is holding a claim — and only the number is written down. It used to
+/// be a hand-written list of two, next to a second hand-written list of seven
+/// that named `reportFinishedDuringKill` for the release rule. So that function
+/// renewed and settled with neither renewal rule looking at it, and the two
+/// lists were each right about their own question. Writing the answer down twice
+/// was the defect; the number is asserted so growing a fourth claim-holder is a
+/// decision somebody makes rather than one they inherit.
+///
+/// The other `killSession` in this file — `runCmd` clearing a leftover session
+/// before it reuses the name — runs under a reservation and never renews, so it
+/// is not found and is not this rule's business.
+const claim_holding_body_count = 3;
+
+/// The claim-holders, derived, with the two invariants only this file can state:
+/// how many there are, and that each one also publishes.
+///
+/// The second is new because the first changed. While both lists were
+/// hand-written they went stale together; now that this side grows by itself,
+/// adding a claim-holding verb widens the renewal rules automatically and leaves
+/// `claim_reporting_bodies` behind — the same divergence as before, running the
+/// other way. A body that acts under a claim and does not report what became of
+/// it is the defect the release rule exists to prevent, so acting bodies are
+/// required to be in its list rather than trusted to be.
+fn claimHoldingBodies(out: [][]const u8) ![]const []const u8 {
+    const t = std.testing;
+    const found = try Control.claimHoldingBodies(@embedFile("cmd_job.zig"), out);
+    try t.expectEqual(@as(usize, claim_holding_body_count), found.len);
+    for (found) |header| {
+        for (claim_reporting_bodies) |reporter| {
+            if (std.mem.eql(u8, header, reporter)) break;
+        } else {
+            std.debug.print(
+                \\
+                \\{s}… holds a claim and is not in `claim_reporting_bodies`.
+                \\
+                \\It renews, so the renewal rules found it and are already holding it. The
+                \\release rule is a hand-written list and is not: this function can give the
+                \\scope back through the void `Cli.releaseClaim()`, or publish its document
+                \\before releasing, and nothing here would say so. Add it there.
+                \\
+            , .{header[1..]});
+            return error.ClaimHolderDoesNotReport;
+        }
+    }
+    return found;
+}
 
 test "gate: every destructive remote call is renewed on the line above it" {
     const t = std.testing;
+    var buf: [8][]const u8 = undefined;
     const found = try Control.renewalsAreAdjacent(
         "src/cli/cmd_job.zig",
         @embedFile("cmd_job.zig"),
-        &claim_holding_bodies,
+        try claimHoldingBodies(&buf),
     );
     // A scan that matched nothing would have reported nothing. Say how many
     // sites the rule is actually holding.
     try t.expectEqual(@as(usize, destructive_remote_call_count), found);
+}
+
+// --- ...and the same question at the call that writes the terminal ----------
+//
+// The rule and why it is not adjacency are in `Control` beside the scan. What
+// stays here are the two numbers only this file knows.
+//
+// The six bare settles are the ones the rule is about: four in `killJob`, one in
+// `reportFinishedDuringKill`, one in `removeJob`'s non-forgetting arm. Each
+// follows a renewal with no round trip since — including the two that are 69 and
+// 175 lines downstream of theirs, which is why "preceded, nothing to the host in
+// between" is the rule rather than "on the line above".
+//
+// `applyProbe` also calls `settleObserved` four times and is deliberately not
+// among the claim-holders. It runs on the read paths, never renews, and has no
+// authority to lose; requiring a renewal there would mean inventing a claim for
+// `job status` so a gate could check it. It is excluded because it does not
+// renew, which is the same fact as it not holding a claim — not because a list
+// leaves it out.
+//
+// The one contract-backed write is `removeJob`'s `settleAndForgetJob`. It is
+// counted, not checked — `commitDestruction` re-reads the claim inside the
+// transaction that writes the terminal — and the count is what makes the
+// downgrade visible: swapping it for a bare `settleObserved` moves this pair
+// from `(6, 1)` to `(7, 0)`, and the in-transaction re-read would be gone with
+// nothing else in the tree to say so.
+
+/// How many terminals the claim-holding verbs write on their own authority.
+const bare_terminal_write_count = 6;
+
+/// ...and how many they write through the claim-backed contract.
+const contract_backed_terminal_write_count = 1;
+
+test "gate: no terminal is written on a renewal a round trip has outlived" {
+    const t = std.testing;
+    var buf: [8][]const u8 = undefined;
+    const seen = try Control.renewalsPrecedeTerminalWrites(
+        "src/cli/cmd_job.zig",
+        @embedFile("cmd_job.zig"),
+        try claimHoldingBodies(&buf),
+    );
+    try t.expectEqual(@as(usize, bare_terminal_write_count), seen.bare);
+    try t.expectEqual(@as(usize, contract_backed_terminal_write_count), seen.contract_backed);
 }
 
 // --- The release comes before the document that publishes it ----------------

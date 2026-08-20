@@ -1937,27 +1937,88 @@ fn claimScope(
 // which is now `Control.destructive_remote_calls` — it names one call
 // (`Tmux.removeResult(`) that `removeSession` does not make today, which
 // changes no count here and holds the rule for the day it does. What stays here
-// is what only this file knows: which of its functions holds a claim, and how
-// many destructive sites it has.
+// is what only this file knows: how many claim-holding bodies it has, and how
+// many destructive sites are in them. *Which* functions those are is derived —
+// see `claim_holding_body_count`.
 
 /// How many `Control.destructive_remote_calls` this file's claim-holding verb
 /// makes. Asserted so a scan that found nothing — a renamed function, a body
 /// delimiter that moved — fails instead of passing over an empty region.
 const destructive_remote_call_count = 2;
 
-/// The one function here that holds a `Claim` while it touches the host.
-const claim_holding_bodies = [_][]const u8{"\nfn removeSession("};
+/// How many functions here hold a `Claim`: one, `removeSession`.
+///
+/// Derived by `Control.claimHoldingBodies` — a body that renews is holding a
+/// claim — with only the number written down. `cmd_job.zig` had two
+/// hand-written answers to this question that disagreed; one derivation and one
+/// asserted count cannot.
+const claim_holding_body_count = 1;
+
+fn claimHoldingBodies(out: [][]const u8) ![]const []const u8 {
+    const found = try Control.claimHoldingBodies(@embedFile("cmd_session.zig"), out);
+    try std.testing.expectEqual(@as(usize, claim_holding_body_count), found.len);
+    return found;
+}
 
 test "gate: `session rm`'s destructive remote calls are renewed on the line above them" {
     const t = std.testing;
+    var buf: [8][]const u8 = undefined;
     const found = try Control.renewalsAreAdjacent(
         "src/cli/cmd_session.zig",
         @embedFile("cmd_session.zig"),
-        &claim_holding_bodies,
+        try claimHoldingBodies(&buf),
     );
     // A scan that matched nothing would have reported nothing. Say how many
     // sites the rule is actually holding.
     try t.expectEqual(@as(usize, destructive_remote_call_count), found);
+}
+
+// --- ...and this verb settles through the contract, which is a fact worth
+// --- pinning ---------------------------------------------------------------
+//
+// `removeSession` is the site that proves the terminal-write rule had to
+// distinguish two kinds of write rather than police one. It renews, then makes a
+// `Tmux.removeLog(` round trip, then settles seventeen lines later. Measured
+// against "a renewal must not be outlived by a round trip" that is a violation,
+// and it is in fact the *safest* settle in the tree: `settleAndRemoveSession`
+// goes through `execution.commitDestruction`, which re-reads this command's own
+// claim inside the transaction that writes the terminal. There is no gap to
+// police because the question and the write are one commit.
+//
+// So the pair here is `(0, 1)` and both halves are load-bearing. The zero is not
+// an absence — `bare` counts the settles that would need the textual rule, and
+// this verb has none. The one is what says the scan walked a real body: with no
+// bare writes to find, nothing else would fail if `removeSession` were renamed
+// and the walk covered an empty region.
+//
+// And the pair is the alarm on a downgrade. Replacing `settleAndRemoveSession`
+// with a bare `settleObserved` — which every other gate in this file would
+// pass — moves the pair to `(1, 0)` and fails twice over: once because the count
+// moved, and once because there is a `Tmux.removeLog(` between the renewal and
+// the write.
+//
+// The five other `execution.settle(` calls in this file are refusal paths
+// (`refuseKillNeverRan`, `refuseSurvivedKill`, `refuseLedgerUnrecordable` and
+// their siblings). They settle *because* authority was lost or the host went
+// unanswerable; a renewal there would be asking a question already answered.
+// They never renew, so the derivation does not find them, and that is the same
+// fact as their not holding a claim rather than a list leaving them out.
+
+/// How many terminals this file's claim-holding verb writes on its own
+/// authority, and how many through the claim-backed contract.
+const bare_terminal_write_count = 0;
+const contract_backed_terminal_write_count = 1;
+
+test "gate: `session rm` settles through the contract, not on its own authority" {
+    const t = std.testing;
+    var buf: [8][]const u8 = undefined;
+    const seen = try Control.renewalsPrecedeTerminalWrites(
+        "src/cli/cmd_session.zig",
+        @embedFile("cmd_session.zig"),
+        try claimHoldingBodies(&buf),
+    );
+    try t.expectEqual(@as(usize, bare_terminal_write_count), seen.bare);
+    try t.expectEqual(@as(usize, contract_backed_terminal_write_count), seen.contract_backed);
 }
 
 const MergedSession = struct {
