@@ -819,6 +819,10 @@ is what to branch on:
   `failed_source_changed` and it points at a different file.
 - `failed_hash_mismatch` — exit **1**. The two ends hashed to different digests.
   Nothing was renamed.
+- `failed_clobber_conflict` — exit **1**. `--no-clobber` was asked for and
+  something already occupies the destination. Nothing was linked, so that path
+  holds exactly what it held. This is the only publish refusal that is a fact
+  about your data rather than about the mechanism.
 - `failed_publish` — exit **1**. The rename itself reported failure. Nothing was
   renamed.
 - `indeterminate_publish` — exit **75**. The rename was issued and its answer
@@ -860,8 +864,8 @@ an interruption.
 
 `--restart` releases the holder's claim and starts the replacement in the same
 transaction — so the path is never free with nothing on the way to it — and it
-refuses everything else. It releases **4** of the eight verdicts above:
-the four proven failures. What to do about the rest:
+refuses everything else. It releases **5** of the nine verdicts above:
+the five proven failures. What to do about the rest:
 
 - the holding request is not settled (`indeterminate`): a copier on the far side
   may still be writing beside that path, so nothing may take it — neither verb.
@@ -882,6 +886,51 @@ place is that there is something at that path worth knowing about; the
 replacement truncates and rewrites the partial on its way through anyway. A
 `--resume` truncates nothing below its confirmed offset — that is the point of
 it — and cuts away only the unconfirmed tail, after proving the prefix.
+
+### `--no-clobber`: refusing to replace, without looking first
+
+`--no-clobber` on `push` or `pull` refuses to overwrite an existing destination.
+It is not a check followed by a rename — that has a window in which two
+transfers both find the path free and the second silently destroys the first's
+artifact. The refusal happens **in the kernel**:
+
+- a **push** publishes with `ln` and then unlinks the partial. POSIX `link(2)` is
+  specified to fail when the name exists, and it decides a race between two
+  publishes rather than reporting on one. (`mv -n` is not used: it is a GNU/BSD
+  extension, absent from busybox, and implemented as exactly the check this
+  avoids.)
+- a **pull** publishes with an atomic non-replacing rename —
+  `renameat2(RENAME_NOREPLACE)` on Linux, `NtSetInformationFile` with
+  `REPLACE_IF_EXISTS = false` on Windows, link-then-unlink elsewhere.
+
+Two refusals, and they are **different facts**. Do not treat them as one:
+
+- `failed_clobber_conflict` — something is at that path. Your data. Read it,
+  then either send elsewhere or re-run with `--restart` and without
+  `--no-clobber` to replace it deliberately.
+- `failed_publish` — the publish could not be *performed*: the host could not
+  hard-link, the filesystem has no atomic non-replacing rename, the directory is
+  read-only. The destination is empty as far as anything could tell. Reporting
+  this as a conflict would be a false statement about your data, so it is not
+  reported as one.
+
+Without the flag the publish is an ordinary replacing rename, exactly as before —
+the default is unchanged.
+
+**The promise lives on the checkpoint, not on the command line.** `no_clobber` is
+written once, when the transfer is created, and nothing updates it. So:
+
+- a `--resume` honours the promise the interrupted attempt made, even if you omit
+  the flag. The instruction was about the destination, not about one attempt.
+- a `--resume` that *adds* `--no-clobber` to a transfer that did not have it is
+  **refused**. There is no way to make the record agree, and a driver refusing a
+  publish the record says was permitted is worse than a refusal you can read.
+  Use `--restart --no-clobber`, which mints a fresh checkpoint.
+- a `--restart` mints that fresh checkpoint from the command line you just typed,
+  so its `--no-clobber` is the one you passed — not the superseded row's.
+
+`noClobber` in `--json` is the promise that was actually in force, which on a
+resume is the row's and not your argument's.
 
 ## Memory discipline
 

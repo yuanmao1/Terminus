@@ -70,6 +70,20 @@ pub const Error = Ssh.ExecError || Allocator.Error || error{
     ObserverFailed,
     /// The rename that publishes a staged partial did not report success.
     PublishFailed,
+    /// A `--no-clobber` publish found something already at the destination.
+    /// Nothing was linked or renamed, so the destination holds exactly what it
+    /// held. A fact about the operator's data, and the only publish refusal
+    /// that is.
+    DestinationExists,
+    /// A `--no-clobber` publish did not happen and the destination is *not*
+    /// what stopped it: the host could not hard-link, or the filesystem cannot
+    /// do an atomic non-replacing rename.
+    ///
+    /// Its own name so it cannot be reported as `DestinationExists`. A
+    /// filesystem without hard links is not a conflict, and telling an operator
+    /// that their destination is occupied when it is empty is a false statement
+    /// about their data — see `publishRemote` for how the two are told apart.
+    NoClobberUnsupported,
     /// A resume was asked to start past the end of its own source. Named rather
     /// than clamped: a clamp would publish a shorter file and call it the one
     /// that was asked for.
@@ -446,19 +460,133 @@ pub fn truncateRemote(
 /// what makes it the publish step — every byte before it went to the partial, so
 /// until this runs the destination is untouched by construction rather than by
 /// care.
+///
+/// **`no_clobber` is a different primitive, not an option on that one.** POSIX
+/// `mv` has no non-replacing form: `mv -n` is a GNU/BSD extension, absent from
+/// busybox and from macOS's own `mv` before it was added, and it is implemented
+/// as a check followed by a rename — which is the shape a no-clobber promise
+/// exists to avoid. `ln` is the POSIX primitive that refuses an existing
+/// destination *in the kernel*: `link(2)` is specified to fail with `EEXIST`,
+/// and it decides a race between two publishes rather than reporting on one.
+/// The staged partial is then unlinked, leaving one name for one inode, which is
+/// exactly what a rename would have left.
+///
+/// **Telling "occupied" from "this host cannot link".** `ln` exits 1 for both,
+/// so the script asks a second question — and asks it *in the same exec*, which
+/// is the whole difference between this and the check-then-rename it replaces.
+/// There the read licenses a write and a race makes the write wrong. Here the
+/// write already happened, or already did not, atomically; the read only labels
+/// which. A destination created or removed in the microseconds between the two
+/// can mislabel the answer, and cannot make the publish wrong.
+///
+/// Exit 47 is "something occupies the destination" and 48 is "the link did not
+/// happen and nothing occupies it". 48 is deliberately not narrowed to "no hard
+/// link support": `ln`'s reason is only in its stderr, which is locale
+/// dependent, and `abortTransfer` already refuses to diagnose a host from its
+/// error text. What 48 proves is the part that matters — that the destination is
+/// not what refused — so it is reported as a failure of the mechanism and never
+/// as a conflict.
+///
+/// `-e` follows symlinks, so `-L` is asked as well: a dangling symlink at the
+/// destination is a name `ln` refuses and `[ -e ]` alone would call absent.
+///
+/// A failed `rm -f` does not turn a successful publish into a reported failure.
+/// The link landed, so the artifact is at the destination under its own name;
+/// claiming failure would send an operator looking for bytes that are there. The
+/// leftover sits under the documented `.terminus-part` suffix, where every other
+/// interrupted transfer leaves one.
 pub fn publishRemote(
     executor: Executor,
     arena: Allocator,
     partial_path: []const u8,
     dest_path: []const u8,
+    no_clobber: bool,
 ) Error!void {
-    const cmd = try std.fmt.allocPrint(
-        arena,
-        "mv -f '{s}' '{s}'",
-        .{ partial_path, dest_path },
-    );
+    if (!no_clobber) {
+        const cmd = try std.fmt.allocPrint(
+            arena,
+            "mv -f '{s}' '{s}'",
+            .{ partial_path, dest_path },
+        );
+        const r = try executor.exec(arena, cmd);
+        if (r.exit_code != 0) return error.PublishFailed;
+        return;
+    }
+
+    const cmd = try std.fmt.allocPrint(arena,
+        \\if ln '{[part]s}' '{[dest]s}' 2>/dev/null; then rm -f '{[part]s}'; exit 0; fi
+        \\if [ -e '{[dest]s}' ] || [ -L '{[dest]s}' ]; then exit 47; fi
+        \\exit 48
+    , .{ .part = partial_path, .dest = dest_path });
     const r = try executor.exec(arena, cmd);
-    if (r.exit_code != 0) return error.PublishFailed;
+    switch (r.exit_code) {
+        0 => {},
+        47 => return error.DestinationExists,
+        48 => return error.NoClobberUnsupported,
+        else => return error.PublishFailed,
+    }
+}
+
+/// The refusals a local publish comes back with.
+///
+/// Wider than this module's `Error` on purpose. The two named members are the
+/// two the *state machine* distinguishes; every other rename failure keeps its
+/// own name, because `failed_publish`'s reason line is the only place an
+/// operator learns whether the directory was read-only or the file was locked,
+/// and collapsing them all into one word would take that away — on the default
+/// path as well as this one.
+pub const PublishLocalError = error{
+    DestinationExists,
+    NoClobberUnsupported,
+} || std.Io.Dir.RenameError;
+
+/// Renames a staged partial over its destination on this machine.
+///
+/// The local counterpart of `publishRemote`, and the same two primitives in the
+/// same two roles: `rename` replaces, `renamePreserve` refuses an existing
+/// destination in the kernel. It is not a hand-rolled staging-and-link — std's
+/// own POSIX backend for `renamePreserve` *is* link-then-unlink, the Windows one
+/// is `NtSetInformationFile` with `REPLACE_IF_EXISTS = false`, and Linux gets
+/// `renameat2(RENAME_NOREPLACE)`. Reimplementing that here would be more code
+/// across fewer platforms.
+///
+/// Three mappings, and the second is the one worth stating:
+///
+///  * `PathAlreadyExists` — the destination is occupied. `DestinationExists`.
+///  * `OperationUnsupported` and `CrossDevice` — the filesystem cannot do an
+///    atomic non-replacing rename, or the two paths are not on one device.
+///    Neither is a fact about the destination, so neither may be reported as a
+///    conflict. `NoClobberUnsupported`. `CrossDevice` is unreachable through
+///    this driver — the partial is the destination path plus a suffix, so the
+///    two are always in one directory — and it is mapped rather than left to the
+///    residual because a caller that ever staged elsewhere would otherwise be
+///    told "the rename failed" about a filesystem boundary.
+///  * everything else keeps its name and lands in `failed_publish`.
+///
+/// **`AccessDenied` is in the residual, deliberately.** Zig documents that
+/// Windows may return it instead of `PathAlreadyExists` when renaming a
+/// *directory* over an existing directory. A publish's source is always a
+/// regular file — the partial is created with `createFile` — so the caveat's own
+/// precondition is not reachable here, and driving all three shapes on this
+/// machine (file over file, file over directory, directory over directory)
+/// produced `PathAlreadyExists` every time. What `AccessDenied` really carries
+/// on a file publish is a permission or sharing-mode failure, which is a
+/// mechanism failure; and were the caveat ever to reach us it would under-report
+/// a conflict as `failed_publish`, whose words — the rename reported failure,
+/// nothing was renamed, the destination is untouched — are still true.
+pub fn publishLocal(
+    io: std.Io,
+    partial_path: []const u8,
+    dest_path: []const u8,
+    no_clobber: bool,
+) PublishLocalError!void {
+    const cwd = std.Io.Dir.cwd();
+    if (!no_clobber) return cwd.rename(partial_path, cwd, dest_path, io);
+    cwd.renamePreserve(partial_path, cwd, dest_path, io) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.DestinationExists,
+        error.OperationUnsupported, error.CrossDevice => return error.NoClobberUnsupported,
+        else => |e| return e,
+    };
 }
 
 // --- Push --------------------------------------------------------------------

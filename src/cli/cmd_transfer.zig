@@ -96,13 +96,22 @@ const Store = Core.Store;
 const digest = Core.digest;
 const transfers = Store.transfers;
 
-const usage =
-    \\usage: terminus push <server> <local-path> <remote-path> [--mode 644] [--via scp|exec] [--resume|--restart] [--force] [--json]
-    \\       terminus pull <server> <remote-path> <local-path> [--via scp|exec] [--resume|--restart] [--force] [--json]
+/// What `--help` and every argument refusal print.
+///
+/// `pub` so a gate can hold it against `skill/SKILL.md`: a flag documented for an
+/// agent and missing from the usage an operator sees is the two audiences being
+/// told different things about the same binary.
+pub const usage =
+    \\usage: terminus push <server> <local-path> <remote-path> [--mode 644] [--via scp|exec] [--resume|--restart] [--no-clobber] [--force] [--json]
+    \\       terminus pull <server> <remote-path> <local-path> [--via scp|exec] [--resume|--restart] [--no-clobber] [--force] [--json]
     \\
     \\Bytes are staged beside the destination and renamed into place only after
     \\both ends agree on a SHA-256. A transfer the host cannot hash ends
     \\`completed_unverified`, never `published`.
+    \\
+    \\`--no-clobber` refuses to replace an existing destination, and refuses it in
+    \\the kernel rather than by looking first: the publish becomes `ln` then an
+    \\unlink on the host, and an atomic non-replacing rename locally.
     \\
     \\A failed transfer keeps its destination: the next transfer aimed there is
     \\refused until somebody says what to do about the leftovers. There are two
@@ -157,6 +166,15 @@ pub const Outcome = enum {
     failed_remote_partial_mismatch,
     /// The two ends disagreed. Nothing was renamed.
     failed_hash_mismatch,
+    /// `--no-clobber` was asked for and the destination is already occupied.
+    /// Nothing was linked, so the destination holds exactly what it held.
+    ///
+    /// The only publish refusal that is a fact about the operator's data rather
+    /// than about the mechanism, which is why it is not `failed_publish`: a host
+    /// that cannot hard-link and an empty destination are a mechanism failure,
+    /// and reporting either as this would be a false statement about what is at
+    /// the path.
+    failed_clobber_conflict,
     /// The rename reported failure. Nothing was renamed.
     failed_publish,
     /// The rename was issued and its answer was lost. It may or may not have
@@ -183,6 +201,7 @@ pub const Outcome = enum {
             .failed_source_changed,
             .failed_remote_partial_mismatch,
             .failed_hash_mismatch,
+            .failed_clobber_conflict,
             .failed_publish,
             => Cli.exit_code.failure,
             .completed_unverified, .indeterminate_publish, .paused => Cli.exit_code.indeterminate,
@@ -211,6 +230,7 @@ pub const Outcome = enum {
             .failed_source_changed => "the source is not the one this transfer was about; nothing was renamed and the destination is untouched",
             .failed_remote_partial_mismatch => "the staged partial beside the destination is not the prefix this transfer confirmed, so nothing could be spliced onto it; nothing was sent and the destination is untouched",
             .failed_hash_mismatch => "the two ends hashed to different digests; nothing was renamed and the destination is untouched",
+            .failed_clobber_conflict => "--no-clobber was asked for and something already occupies the destination; nothing was linked and the destination holds exactly what it held",
             .failed_publish => "the rename reported failure; nothing was renamed and the destination is untouched",
             .indeterminate_publish => "the rename was issued and its answer was lost; it may or may not have landed",
             .paused => "the transfer stopped before the destination came into it; the destination is untouched and the staged partial is trustworthy",
@@ -222,6 +242,7 @@ pub const Outcome = enum {
             .published => null,
             .completed_unverified => "install sha256sum or shasum on the host for a verified transfer; this operation stays unresolved until an operator judges it",
             .failed_source_changed, .failed_hash_mismatch, .failed_publish => "the destination still holds what it held; the staged partial is left beside it",
+            .failed_clobber_conflict => "the destination is occupied and this transfer promised not to replace it, so nothing was written there; read what is at that path, then either send elsewhere or re-run with --restart and without --no-clobber to replace it deliberately",
             .failed_remote_partial_mismatch => "the confirmed prefix could not be proven, so this attempt is over and it published nothing; re-run with --restart to discard the leftovers and start from zero",
             .indeterminate_publish => "read the destination and reconcile this request against what you find ('terminus request reconcile')",
             .paused => "re-run with --resume to continue from the confirmed offset; nothing is discarded",
@@ -244,6 +265,13 @@ const Run = struct {
     /// touches `dest_path`.
     partial_path: []const u8,
     source_path: []const u8,
+    /// Whether this transfer promised not to replace an existing destination.
+    ///
+    /// On a fresh transfer and on a `--restart` it is this command line's flag,
+    /// which is also what `create` wrote to the row. On a `--resume` it is read
+    /// **off the row** — see `resumeFrom` — because the column is write-once and
+    /// the promise was made before the first byte.
+    no_clobber: bool = false,
     /// The digest declared before the first byte, or null when no trustworthy
     /// one was available. This one field decides `published` against
     /// `completed_unverified` all the way down.
@@ -307,6 +335,7 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
 
     const want_resume = parsed.boolean("resume");
     const want_restart = parsed.boolean("restart");
+    const want_no_clobber = parsed.boolean("no-clobber");
     // Refused rather than ranked. They are for disjoint sets of states — see
     // `wayThrough` — so a command carrying both is a command whose author does
     // not know which situation they are in, and picking one for them would
@@ -376,10 +405,16 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
             // exists to hold it. The size arrives with the probe instead.
             .pull => null,
         },
-        // Honest, and it is a `false` this slice means: publishing is an
-        // overwriting rename, so recording a no-clobber claim would be a
-        // promise the driver does not keep. POSIX `link()` is the later slice.
-        .no_clobber = false,
+        // Honest at last, and it is this command line's flag that makes it so:
+        // publishing is an *atomic non-replacing* act when the operator asks for
+        // one — `ln` then an unlink on the host, `renamePreserve` locally — so a
+        // no-clobber claim on the row is now a promise the driver keeps. See
+        // `transfer.publishRemote` and `transfer.publishLocal`.
+        //
+        // Write-once: nothing updates this column after `create`. That is what
+        // makes a `--resume` read it rather than restate it, and what makes a
+        // `--resume` asking to *add* the promise a refusal — see `wayIn`.
+        .no_clobber = want_no_clobber,
     };
 
     // Read before an operation exists and before the connection is opened, so a
@@ -388,7 +423,7 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
     // — and it does not need to be: everything it can conclude is a refusal, and
     // the two readings that proceed are re-checked under the write lock by
     // `supersedeLocked`'s own conjuncts and by the hand-over statement's.
-    const way = wayIn(ctx, &store, dest_side, dest_path, want_resume, want_restart);
+    const way = wayIn(ctx, &store, dest_side, dest_path, want_resume, want_restart, want_no_clobber);
 
     // A transfer's blast radius is the path it publishes to, which is what
     // makes two transfers aimed at one directory see each other and a transfer
@@ -492,6 +527,9 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
         .dest_path = dest_path,
         .partial_path = partial_path,
         .source_path = src,
+        // The flag, for the two ways in that mint a checkpoint from `plan`. The
+        // adopt path overwrites this from the row it took over.
+        .no_clobber = want_no_clobber,
     };
 
     const started = std.Io.Timestamp.now(ctx.io, .awake);
@@ -581,6 +619,10 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
             .backendReason = streamed.backend_reason,
             .transferState = outcome.text(),
             .status = execution.status.text(),
+            // Which promise was in force, which on a resume is the row's and not
+            // this command line's. An agent reading `failed_clobber_conflict`
+            // needs to know the refusal was asked for.
+            .noClobber = r.no_clobber,
             // The two digests the verdict rests on, and null when there was
             // none. A caller reading `verified = false` beside a null
             // `observedSha256` can see *why* it is unverified rather than
@@ -792,6 +834,18 @@ fn resumeFrom(r: *Run) void {
     // may be stored at all is a fact about what was committed before the first
     // byte, and `recordSourceIdentity` cannot be called again to change it.
     r.identified = if (row.source.file()) |f| f.sha256 != null else false;
+    // Read, never restated — the same rule and the same reason as the digest
+    // above it. `no_clobber` is written once, by `create`, and no statement
+    // updates it, so the promise a resumed publish keeps is the one the
+    // interrupted attempt made before it sent anything.
+    //
+    // A command line that *omits* `--no-clobber` over a row that carries it does
+    // not retract it: the instruction was about the destination, not about one
+    // attempt, and this is also the safe direction — the worst it does is refuse
+    // a publish the operator had already asked to have refused. The opposite
+    // disagreement is a refusal, and `wayIn` made it before this row was ever
+    // adopted.
+    r.no_clobber = row.no_clobber;
 
     const confirmed: u64 = @intCast(@max(row.confirmed_offset, 0));
     const observed = observeForResume(r, confirmed);
@@ -1417,6 +1471,16 @@ fn parkFromVerifying(r: *Run, reason: []const u8) noreturn {
 }
 
 /// The one act that touches the destination.
+///
+/// Two primitives per side, chosen by `r.no_clobber`, and the three answers a
+/// no-clobber publish can give are mapped by what each one is *about*.
+/// `DestinationExists` is a fact about the operator's data, so it is
+/// `failed_clobber_conflict`. `NoClobberUnsupported` — a host that cannot
+/// hard-link, a filesystem with no atomic non-replacing rename, a staging path
+/// on another device — is a fact about the mechanism, so it is `failed_publish`.
+/// Collapsing the second into the first would tell an operator their destination
+/// is occupied when it is empty, which is a lie about their data and the exact
+/// class of pseudo-success this driver exists to remove.
 fn publish(r: *Run, verified: bool) Outcome {
     switch (r.verb) {
         .push => Core.transfer.publishRemote(
@@ -1424,7 +1488,29 @@ fn publish(r: *Run, verified: bool) Outcome {
             r.ctx.arena,
             r.partial_path,
             r.dest_path,
+            r.no_clobber,
         ) catch |err| switch (err) {
+            // `ln` refused because the name was taken. The link never happened,
+            // so the destination holds exactly what it held — and this is the
+            // kernel's answer to the race, not a reading we took beforehand.
+            error.DestinationExists => {
+                r.setState(
+                    .failed_clobber_conflict,
+                    "--no-clobber was asked for and the host reports something already at the destination",
+                );
+                return .failed_clobber_conflict;
+            },
+            // The link did not happen and the destination is not what refused
+            // it. Reported as the mechanism failure it is, with what was
+            // observed rather than a diagnosis of the host: `ln`'s reason lives
+            // only in its stderr, which is locale dependent.
+            error.NoClobberUnsupported => {
+                r.setState(
+                    .failed_publish,
+                    "the host could not hard-link the staged partial into place and reports nothing at the destination, so a no-clobber publish could not be performed there — the filesystem may not support hard links",
+                );
+                return .failed_publish;
+            },
             // The host answered, and its answer was that the rename failed.
             // The destination holds what it held.
             error.PublishFailed => {
@@ -1443,12 +1529,33 @@ fn publish(r: *Run, verified: bool) Outcome {
         },
         // A local rename either happens or reports why it did not; there is no
         // lost answer, so `indeterminate_publish` is unreachable on this side.
-        .pull => {
-            const cwd = std.Io.Dir.cwd();
-            cwd.rename(r.partial_path, cwd, r.dest_path, r.ctx.io) catch |err| {
+        .pull => Core.transfer.publishLocal(
+            r.ctx.io,
+            r.partial_path,
+            r.dest_path,
+            r.no_clobber,
+        ) catch |err| switch (err) {
+            error.DestinationExists => {
+                r.setState(
+                    .failed_clobber_conflict,
+                    "--no-clobber was asked for and something already occupies the destination",
+                );
+                return .failed_clobber_conflict;
+            },
+            error.NoClobberUnsupported => {
+                r.setState(
+                    .failed_publish,
+                    "this filesystem cannot publish without replacing: it reported no support for an atomic non-replacing rename, or the staged partial and the destination are not on one device",
+                );
+                return .failed_publish;
+            },
+            // Every other rename failure keeps its own name, which is the whole
+            // reason `publishLocal` does not collapse them: this line is where
+            // an operator learns it was a read-only directory or a locked file.
+            else => {
                 r.setState(.failed_publish, @errorName(err));
                 return .failed_publish;
-            };
+            },
         },
     }
 
@@ -1631,6 +1738,7 @@ fn wayIn(
     dest_path: []const u8,
     want_resume: bool,
     want_restart: bool,
+    want_no_clobber: bool,
 ) WayIn {
     const holder = transfers.findHolder(store, ctx.arena, dest_side, dest_path) catch |err|
         Cli.storeFatal(store, err);
@@ -1658,11 +1766,51 @@ fn wayIn(
             "refused: request {s} holds '{s}' and has not been settled, so a copier on the far side may still be writing to the partial this resume would splice onto; nothing was sent.\n  {s}",
             .{ held.request_id, dest_path, wayThrough(ctx.arena, held) },
         );
+        if (want_no_clobber) refuseAddedNoClobber(ctx, store, held, dest_path);
         return .{ .adopt = held };
     }
 
+    // `--restart` mints a *new* checkpoint from a fresh plan, so its
+    // `no_clobber` is this command line's flag and there is nothing to
+    // disagree with. That is not the promise being dropped: the operator typed
+    // the command again, and a replacement checkpoint records the instruction
+    // they gave it rather than the one its predecessor was given.
     if (want_restart and held.releasable()) return .{ .supersede = held };
     refuseHeld(ctx.arena, held, dest_path);
+}
+
+/// Refuses a `--resume` that asks to add a no-clobber promise the checkpoint
+/// does not carry.
+///
+/// Refused rather than honoured, and refused *here* — before an operation
+/// exists, before the dial and before the hand-over — for the reason the rest of
+/// `wayIn` is read early: everything it concludes is a refusal, so it costs
+/// nothing and sends nothing. Refusing after the adoption would leave a live row
+/// owned by an operation that will never settle, which bars the next `--resume`
+/// behind a reconcile.
+///
+/// Why it is a refusal at all: `no_clobber` is write-once. Honouring the flag
+/// would make the driver refuse a publish while the column it is judged by says
+/// replacing was permitted — a record contradicting the act. Honouring the
+/// column and ignoring the flag would silently do the opposite of what was
+/// typed. The verb that *can* carry a new promise is `--restart`, which mints a
+/// fresh checkpoint, and the operator is told so.
+fn refuseAddedNoClobber(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    held: transfers.Holder,
+    dest_path: []const u8,
+) void {
+    const row = (transfers.get(store, ctx.arena, held.id) catch |err|
+        Cli.storeFatal(store, err)) orelse fatal(
+        "refused: the checkpoint holding '{s}' went away between being read and being examined for its no-clobber promise; nothing was taken over and nothing was sent. Run it again",
+        .{dest_path},
+    );
+    if (row.no_clobber) return;
+    fatal(
+        "refused: --no-clobber cannot be added to a transfer that is already under way. Request {s} declared before its first byte that replacing '{s}' was permitted, and that declaration is write-once — honouring the flag now would refuse a publish the record says was allowed. Nothing was taken over and nothing was sent. Re-run with --resume alone to continue under the promise it already made, or with --restart --no-clobber to start over under this one",
+        .{ held.request_id, dest_path },
+    );
 }
 
 /// The refusal, in one wording, for every way a destination can be occupied.

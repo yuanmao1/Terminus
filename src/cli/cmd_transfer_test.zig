@@ -309,6 +309,9 @@ test "gate: no failure mode touches the destination, because only the rename doe
             arena,
             "/srv/app/out.bin.terminus-part",
             "/srv/app/out.bin",
+            // The default, replacing publish. `--no-clobber`'s own failure modes
+            // have their own gate; this one is about the shape being atomic.
+            false,
         ));
         // The command it would have run is the atomic one, and that is worth
         // pinning: a publish implemented as `cat partial > dest` would pass
@@ -1019,6 +1022,10 @@ test "gate: completed_unverified is not success, and every outcome says what it 
     try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_publish.exitCode());
     try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_source_changed.exitCode());
     try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_remote_partial_mismatch.exitCode());
+    // A destination this transfer promised not to replace, and did not replace.
+    // A decided failure like the others: nothing was written, so a caller may
+    // act on it without first reading the destination.
+    try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_clobber_conflict.exitCode());
     // A rename whose answer was lost is never `1`.
     try t.expectEqual(Cli.exit_code.indeterminate, cmd_transfer.Outcome.indeterminate_publish.exitCode());
     try t.expectEqual(Cli.exit_code.indeterminate, cmd_transfer.Outcome.paused.exitCode());
@@ -1035,7 +1042,7 @@ test "gate: completed_unverified is not success, and every outcome says what it 
         texts[seen] = o.proves();
         seen += 1;
     }
-    try t.expectEqual(@as(usize, 8), seen);
+    try t.expectEqual(@as(usize, 9), seen);
 
     // And every outcome is reachable back from its own state, which is what
     // `refuseResume` relies on to name a verdict from the row it just wrote.
@@ -1050,7 +1057,7 @@ test "gate: completed_unverified is not success, and every outcome says what it 
         );
         named += 1;
     }
-    try t.expectEqual(@as(usize, 8), named);
+    try t.expectEqual(@as(usize, 9), named);
     // A state no outcome is named after answers null rather than the nearest
     // member, which is what makes the lookup a check and not a guess.
     try t.expectEqual(@as(?cmd_transfer.Outcome, null), cmd_transfer.Outcome.naming(.failed_no_space));
@@ -1444,17 +1451,17 @@ test "gate: --restart and --resume divide the driver's outcomes, and neither rea
             if (state.isSupersedable() and state.isAdoptable()) both += 1;
         }
     }
-    try t.expectEqual(@as(usize, 8), outcomes);
-    // Six of the eight leave the destination held: the four decided failures,
+    try t.expectEqual(@as(usize, 9), outcomes);
+    // Seven of the nine leave the destination held: the five decided failures,
     // the unjudged publish, and `paused`.
-    try t.expectEqual(@as(usize, 6), holders);
-    // `--restart` reaches four of those six and `--resume` reaches one, and the
+    try t.expectEqual(@as(usize, 7), holders);
+    // `--restart` reaches five of those seven and `--resume` reaches one, and the
     // two sets do not overlap. These are the numbers the pair of flags turns on.
     // If `releasable` ever counts `paused`, `supersedeLocked` has been widened
     // to release a path whose confirmed prefix is still good; if `both` is ever
     // non-zero, some state has become reachable by two verbs that do opposite
     // things to it and every refusal message has to start guessing.
-    try t.expectEqual(@as(usize, 4), releasable);
+    try t.expectEqual(@as(usize, 5), releasable);
     try t.expectEqual(@as(usize, 1), resumable);
     try t.expectEqual(@as(usize, 0), both);
 
@@ -1584,6 +1591,462 @@ test "gate: --restart and --resume divide the driver's outcomes, and neither rea
     try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, busy_fail_way, "--resume"));
 }
 
+// --- gates: --no-clobber, and what each refusal is about ---------------------
+//
+// **What is proven by execution and what is reviewed — read this before the
+// assertions.**
+//
+// The *local* side runs on this machine and has no excuse: every gate below that
+// touches it drives `transfer.publishLocal` against real files under
+// `.zig-cache/tmp`, and the collision gate and the race gate are decided by this
+// kernel, not by a script. The race gate really races — two threads, one
+// destination, released together — because `renamePreserve` exists precisely to
+// let the kernel decide that and a sequential pair would prove nothing about it.
+//
+// The *remote* side has no live server: the test host's key exists only inside
+// the real database, so `Scripted` drives it. What that proves is the command
+// the driver sends and the mapping from the host's answers to this driver's
+// verdicts — which is where the lie the flag exists to avoid would live. What it
+// does **not** prove is that `ln(2)` on some particular host decides a race the
+// way `link(2)` is specified to; the two outcomes are driven sequentially there,
+// as two separate scripted answers. `ln` was chosen over `[ -e ] && mv` for
+// exactly that unprovable-from-here property, and the local race gate is the
+// nearest thing to evidence for it that exists without a server.
+
+test "gate: a real local collision refuses and the existing destination is byte-for-byte unchanged" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    const previous = "the delivery that is already there, and must survive a no-clobber publish";
+    const staged = "the bytes this transfer staged and must not publish";
+
+    var covered: usize = 0;
+
+    // (1) The collision. A real existing destination, a real staged partial, and
+    // the primitive the driver publishes with. `PathAlreadyExists` out of
+    // `renamePreserve` is mapped to `DestinationExists` — a fact about the
+    // operator's data — and nothing else about the filesystem changed.
+    {
+        covered += 1;
+        const dest = try scratch.write("noclob_hit", previous);
+        const partial = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix });
+        _ = try scratch.write("noclob_hit_ignored", "");
+        {
+            const f = try std.Io.Dir.cwd().createFile(scratch.io, partial, .{});
+            defer f.close(scratch.io);
+            var buf: [256]u8 = undefined;
+            var w = f.writerStreaming(scratch.io, &buf);
+            try w.interface.writeAll(staged);
+            try w.interface.flush();
+        }
+
+        try t.expectError(
+            error.DestinationExists,
+            Core.transfer.publishLocal(scratch.io, partial, dest, true),
+        );
+
+        // Byte for byte. This is the whole property: a refused publish is not a
+        // partial publish, and the operator's file is not shorter, longer or
+        // different by one byte.
+        try t.expectEqualStrings(previous, try scratch.read(arena, dest));
+        // And the staged bytes are still beside it, so the refusal did not also
+        // destroy the material a `--restart` would keep.
+        try t.expectEqualStrings(staged, try scratch.read(arena, partial));
+        std.Io.Dir.cwd().deleteFile(scratch.io, partial) catch {};
+    }
+
+    // (2) The default is unchanged. Without the flag the same pair publishes,
+    // replacing the destination — because that is what every transfer before
+    // this slice did and nothing here may quietly change it.
+    {
+        covered += 1;
+        const dest = try scratch.write("noclob_default", previous);
+        const partial = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix });
+        {
+            const f = try std.Io.Dir.cwd().createFile(scratch.io, partial, .{});
+            defer f.close(scratch.io);
+            var buf: [256]u8 = undefined;
+            var w = f.writerStreaming(scratch.io, &buf);
+            try w.interface.writeAll(staged);
+            try w.interface.flush();
+        }
+
+        try Core.transfer.publishLocal(scratch.io, partial, dest, false);
+        try t.expectEqualStrings(staged, try scratch.read(arena, dest));
+        // The partial is gone, because a rename moved it rather than copying it.
+        try t.expect(!scratch.exists(partial));
+    }
+
+    // (3) With the flag and a free destination the publish happens. Without this
+    // the gate above would pass on a `publishLocal` that always refused.
+    {
+        covered += 1;
+        const dest = try scratch.path("noclob_free");
+        const partial = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix });
+        {
+            const f = try std.Io.Dir.cwd().createFile(scratch.io, partial, .{});
+            defer f.close(scratch.io);
+            var buf: [256]u8 = undefined;
+            var w = f.writerStreaming(scratch.io, &buf);
+            try w.interface.writeAll(staged);
+            try w.interface.flush();
+        }
+
+        try Core.transfer.publishLocal(scratch.io, partial, dest, true);
+        try t.expectEqualStrings(staged, try scratch.read(arena, dest));
+        try t.expect(!scratch.exists(partial));
+    }
+
+    try t.expectEqual(@as(usize, 3), covered);
+}
+
+/// One side of the race: a publish that waits for the flag, then goes.
+///
+/// Its own `std.Io.Threaded` per arm rather than a shared one, so the two
+/// publishes do not serialise behind one event loop's bookkeeping and the thing
+/// being raced is the rename.
+const RaceArm = struct {
+    allocator: std.mem.Allocator,
+    partial: []const u8,
+    dest: []const u8,
+    gate: *std.atomic.Value(bool),
+    /// Null means this arm published.
+    failure: ?anyerror = null,
+
+    fn go(a: *RaceArm) void {
+        var threaded: std.Io.Threaded = .init(a.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        // Spun rather than slept: the two arms have to be released into the
+        // rename together, and a sleep would hand the first one a head start
+        // long enough that the kernel never sees a contest.
+        while (!a.gate.load(.acquire)) std.atomic.spinLoopHint();
+        Core.transfer.publishLocal(io, a.partial, a.dest, true) catch |err| {
+            a.failure = err;
+        };
+    }
+};
+
+test "gate: two local publishes race for one destination and exactly one wins" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    // A real race, decided by this kernel. `renamePreserve` is the primitive
+    // precisely because the alternative — read the destination, then rename —
+    // has a window in which both readers find it free and both publish, and the
+    // second silently destroys the first's artifact. Nothing observable from
+    // outside distinguishes that from a correct publish, which is why this is
+    // driven rather than argued.
+    //
+    // Enough rounds that a scheduler which happens to serialise one of them is
+    // not the whole sample.
+    const rounds = 40;
+    var wins: usize = 0;
+    var conflicts: usize = 0;
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        const dest = try scratch.path("noclob_race");
+        const left = try std.fmt.allocPrint(arena, "{s}.left", .{dest});
+        const right = try std.fmt.allocPrint(arena, "{s}.right", .{dest});
+        const left_body = try std.fmt.allocPrint(arena, "left arm, round {d}", .{round});
+        const right_body = try std.fmt.allocPrint(arena, "right arm, round {d}", .{round});
+        for ([_][]const u8{ left, right }, [_][]const u8{ left_body, right_body }) |p, body| {
+            const f = try std.Io.Dir.cwd().createFile(scratch.io, p, .{});
+            defer f.close(scratch.io);
+            var buf: [128]u8 = undefined;
+            var w = f.writerStreaming(scratch.io, &buf);
+            try w.interface.writeAll(body);
+            try w.interface.flush();
+        }
+
+        var flag: std.atomic.Value(bool) = .init(false);
+        var arms = [2]RaceArm{
+            .{ .allocator = t.allocator, .partial = left, .dest = dest, .gate = &flag },
+            .{ .allocator = t.allocator, .partial = right, .dest = dest, .gate = &flag },
+        };
+        var threads: [2]std.Thread = undefined;
+        for (&threads, &arms) |*th, *arm| th.* = try std.Thread.spawn(.{}, RaceArm.go, .{arm});
+        flag.store(true, .release);
+        for (threads) |th| th.join();
+
+        // Exactly one of them published, and the other was told the destination
+        // was taken — not "the rename failed", which would send an operator
+        // looking for a broken filesystem.
+        var round_wins: usize = 0;
+        for (arms) |arm| {
+            if (arm.failure) |err| {
+                try t.expectEqual(anyerror.DestinationExists, err);
+            } else round_wins += 1;
+        }
+        try t.expectEqual(@as(usize, 1), round_wins);
+        wins += round_wins;
+        conflicts += 2 - round_wins;
+
+        // And the destination holds the winner's bytes whole — not a splice of
+        // both, and not the loser's. The loser's partial is still on disk, which
+        // is what makes the assertion about the destination rather than about
+        // one of the two files having vanished.
+        const landed = try scratch.read(arena, dest);
+        const left_won = arms[0].failure == null;
+        try t.expectEqualStrings(if (left_won) left_body else right_body, landed);
+        try t.expect(scratch.exists(if (left_won) right else left));
+        try t.expect(!scratch.exists(if (left_won) left else right));
+
+        for ([_][]const u8{ left, right, dest }) |p| std.Io.Dir.cwd().deleteFile(scratch.io, p) catch {};
+    }
+    // Counted so a loop that stopped iterating fails rather than passing over an
+    // empty region, and so a run in which *every* round happened to serialise
+    // still had to produce one conflict per round.
+    try t.expectEqual(@as(usize, rounds), wins);
+    try t.expectEqual(@as(usize, rounds), conflicts);
+}
+
+test "gate: a no-clobber push links rather than renames, and tells a taken name from a host that cannot link" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const part = "/srv/app/out.bin.terminus-part";
+    const dest = "/srv/app/out.bin";
+
+    var covered: usize = 0;
+
+    // (1) The command. `ln` then an unlink, and **no `mv`** — a publish that
+    // reached `mv -n` would be a check followed by a rename on the hosts that
+    // have it and a syntax error on the ones that do not, and a publish that
+    // reached `mv -f` would replace the destination the operator asked us not to
+    // replace. One round trip, because the classification below is asked inside
+    // the same shell as the `ln` that decided it.
+    {
+        covered += 1;
+        var steps = [_]Core.Scripted.Step{reply("")};
+        var script = Core.Scripted.init(arena, &steps);
+        try Core.transfer.publishRemote(script.executor(), arena, part, dest, true);
+        try t.expectEqual(@as(usize, 1), script.seen.items.len);
+        const cmd = script.seen.items[0];
+        try t.expect(std.mem.startsWith(u8, cmd, "if ln '"));
+        try t.expect(std.mem.indexOf(u8, cmd, "then rm -f '") != null);
+        try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, cmd, "mv "));
+        // Both classifying exits are in the script the host runs, so a host that
+        // answers either one is answering a question this command asked.
+        try t.expect(std.mem.indexOf(u8, cmd, "exit 47") != null);
+        try t.expect(std.mem.indexOf(u8, cmd, "exit 48") != null);
+        // `-e` follows symlinks, so a dangling one at the destination is a name
+        // `ln` refuses and `-e` alone would call absent.
+        try t.expect(std.mem.indexOf(u8, cmd, "-L '") != null);
+    }
+
+    // (2) The default is unchanged: still one `mv -f` and nothing else.
+    {
+        covered += 1;
+        var steps = [_]Core.Scripted.Step{reply("")};
+        var script = Core.Scripted.init(arena, &steps);
+        try Core.transfer.publishRemote(script.executor(), arena, part, dest, false);
+        try t.expectEqual(@as(usize, 1), script.seen.items.len);
+        try t.expect(std.mem.startsWith(u8, script.seen.items[0], "mv -f "));
+        try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, script.seen.items[0], "ln '"));
+    }
+
+    // (3) The destination is taken. This is the only answer that is about the
+    // operator's data.
+    {
+        covered += 1;
+        var steps = [_]Core.Scripted.Step{replyCode(47, "")};
+        var script = Core.Scripted.init(arena, &steps);
+        try t.expectError(
+            error.DestinationExists,
+            Core.transfer.publishRemote(script.executor(), arena, part, dest, true),
+        );
+    }
+
+    // (4) The host cannot link and the destination is empty. **Not a conflict.**
+    // A filesystem without hard links, a read-only directory or a missing parent
+    // are failures of the mechanism, and telling an operator their destination is
+    // occupied when it is empty is a false statement about their data.
+    {
+        covered += 1;
+        var steps = [_]Core.Scripted.Step{replyCode(48, "")};
+        var script = Core.Scripted.init(arena, &steps);
+        const err = Core.transfer.publishRemote(script.executor(), arena, part, dest, true);
+        try t.expectError(error.NoClobberUnsupported, err);
+        // Said as a distinct thing rather than as the same thing: the two
+        // refusals must not be one error, because they land in different
+        // checkpoint states and send an operator to different places.
+        try t.expect(error.NoClobberUnsupported != error.DestinationExists);
+    }
+
+    // (5) Any other exit is the ordinary publish failure, not either of the two
+    // above. A host that answered something this script does not define must not
+    // be read as having reported a conflict.
+    {
+        covered += 1;
+        var steps = [_]Core.Scripted.Step{replyCode(1, "")};
+        var script = Core.Scripted.init(arena, &steps);
+        try t.expectError(
+            error.PublishFailed,
+            Core.transfer.publishRemote(script.executor(), arena, part, dest, true),
+        );
+    }
+
+    try t.expectEqual(@as(usize, 5), covered);
+}
+
+test "gate: the two no-clobber refusals reach different checkpoint states" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "noclobber_states");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    // The mapping the driver's `publish` makes, held against the vocabularies it
+    // maps between. `failed_clobber_conflict` is a decided failure that holds its
+    // destination and that `--restart` can release; `failed_publish` is the same
+    // shape, and the point is that the *conflict* one is reachable at all —
+    // before this slice a no-clobber refusal had nowhere to go but
+    // `failed_publish`, which says the rename reported failure and not that the
+    // path was taken.
+    try t.expectEqual(
+        @as(?cmd_transfer.Outcome, .failed_clobber_conflict),
+        cmd_transfer.Outcome.naming(.failed_clobber_conflict),
+    );
+    try t.expect(transfers.State.failed_clobber_conflict.holdsDestination());
+    try t.expect(transfers.State.failed_clobber_conflict.isSupersedable());
+    try t.expect(!transfers.State.failed_clobber_conflict.isAdoptable());
+    // The rename never happened, so a later reading of the destination must not
+    // be allowed to resolve this row `completed` off a matching digest — which
+    // is the hole `renameMayHaveLanded` closes, and its comment is written about
+    // this exact state.
+    try t.expect(!transfers.State.failed_clobber_conflict.renameMayHaveLanded());
+
+    // And the edge itself, **walked** rather than read off the predecessor
+    // table, because that table is private and because walking it is the thing
+    // the driver actually does. The conflict is discovered *by the publish*:
+    // there is no check before it, so `publishing` is the state the verdict is
+    // recorded from.
+    const request_id = try seedTransfer(&store, arena, "clobedge");
+    const dest = "/var/tmp/noclobber_edge.bin";
+    const cp = try transfers.create(&store, .{
+        .request_id = request_id,
+        .direction = .pull,
+        .dest_side = .local,
+        .dest_path = dest,
+        .partial_path = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix }),
+        .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+        .chunk_size = Core.Ssh.chunk_bytes,
+        .no_clobber = true,
+        .now = 100,
+    });
+    const body_sha = try hexOf(arena, "the artifact");
+    var clock: i64 = 100;
+    for ([_]transfers.State{ .probing, .transferring, .verifying }) |step| {
+        clock += 1;
+        try transfers.setState(&store, cp, request_id, step, null, clock);
+    }
+    try transfers.recordVerifiedHash(&store, cp, request_id, body_sha, clock);
+    try transfers.setState(&store, cp, request_id, .publishing, null, clock + 1);
+    try transfers.setState(
+        &store,
+        cp,
+        request_id,
+        .failed_clobber_conflict,
+        "the destination is already occupied",
+        clock + 2,
+    );
+    const row = (try transfers.get(&store, arena, cp)).?;
+    try t.expectEqual(transfers.State.failed_clobber_conflict, row.state);
+    // The promise it refused on is still on the row beside the verdict, which is
+    // what lets a reader tell a refused publish from one that was never asked to
+    // refuse.
+    try t.expect(row.no_clobber);
+
+    // And the two verdicts a no-clobber publish can produce say different things
+    // about the destination, in the field an agent reads before `ok`.
+    const conflict = cmd_transfer.Outcome.failed_clobber_conflict.proves();
+    const failure = cmd_transfer.Outcome.failed_publish.proves();
+    try t.expect(!std.mem.eql(u8, conflict, failure));
+    try t.expect(std.mem.indexOf(u8, conflict, "already occupies") != null);
+    try t.expect(std.mem.indexOf(u8, cmd_transfer.Outcome.failed_clobber_conflict.hint().?, "--restart") != null);
+}
+
+test "gate: the no-clobber promise is written once and no later write can change it" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "noclobber_writeonce");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    // Both values, walked through every write the driver makes between `create`
+    // and the publish that reads the column. This is what licenses two decisions
+    // in `cmd_transfer`:
+    //
+    //  * a `--resume` *reads* `no_clobber` off the row instead of restating it,
+    //    exactly as it reads `expected_sha256`, because the promise was made
+    //    before the first byte and nothing since could have changed it;
+    //  * a `--resume` carrying `--no-clobber` over a row that does not is
+    //    **refused** rather than honoured — there is no writer that could make
+    //    the column agree, so honouring the flag would leave the driver refusing
+    //    a publish the record says was permitted.
+    var checked: usize = 0;
+    for ([_]bool{ true, false }) |promised| {
+        checked += 1;
+        const label = if (promised) "noclobyes" else "noclobno";
+        const request_id = try seedTransfer(&store, arena, label);
+        const dest = try std.fmt.allocPrint(arena, "/var/tmp/writeonce_{s}.bin", .{label});
+        const cp = try transfers.create(&store, .{
+            .request_id = request_id,
+            .direction = .pull,
+            .dest_side = .local,
+            .dest_path = dest,
+            .partial_path = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix }),
+            .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+            .chunk_size = Core.Ssh.chunk_bytes,
+            .no_clobber = promised,
+            .now = 100,
+        });
+        // It is on the row the moment it is created, which is the half the flag
+        // depends on to survive a process boundary at all.
+        try t.expectEqual(promised, (try transfers.get(&store, arena, cp)).?.no_clobber);
+
+        const body = "the artifact this checkpoint is about";
+        const body_sha = try hexOf(arena, body);
+        try transfers.setState(&store, cp, request_id, .probing, null, 101);
+        try transfers.recordSourceIdentity(&store, cp, request_id, body.len, 1712345678 * std.time.ns_per_s, body_sha, 102);
+        try transfers.recordExpectedHash(&store, cp, request_id, body_sha, 103);
+        try Store.operations.advance(&store, request_id, .submitted, 104);
+        try transfers.setState(&store, cp, request_id, .transferring, null, 105);
+        try transfers.confirmOffset(&store, cp, request_id, body.len, body.len, body_sha, 106);
+        try transfers.setState(&store, cp, request_id, .verifying, null, 107);
+        try transfers.recordVerifiedHash(&store, cp, request_id, body_sha, 108);
+        try transfers.setState(&store, cp, request_id, .publishing, null, 109);
+
+        // `publishing` is the state `publish` reads the promise from, and the
+        // column still says what `create` wrote — after an identity, a
+        // declaration, a submission, a confirmed offset, a verification and five
+        // state changes.
+        const row = (try transfers.get(&store, arena, cp)).?;
+        try t.expectEqual(transfers.State.publishing, row.state);
+        try t.expectEqual(promised, row.no_clobber);
+    }
+    // Counted, so a loop that stopped after the first value fails rather than
+    // proving the rule for one of the two cases that matter.
+    try t.expectEqual(@as(usize, 2), checked);
+}
+
 // --- gates: the agent-facing document, held against this file ---------------
 
 /// The heading the two gates below read from, so a reflow that moved the section
@@ -1629,7 +2092,7 @@ test "gate: SKILL.md publishes an exit code for every transfer outcome, and it i
     }
     // Counted, so a section that lost its list fails here rather than passing
     // over an empty region.
-    try t.expectEqual(@as(usize, 8), documented);
+    try t.expectEqual(@as(usize, 9), documented);
 }
 
 test "gate: SKILL.md publishes how many transfer verdicts --restart can release" {
@@ -1660,10 +2123,10 @@ test "gate: SKILL.md publishes how many transfer verdicts --restart can release"
         return error.SkillRestartCountUnreadable;
     try t.expectEqual(releasable, documented);
 
-    // And the sentence that says which four, so the number cannot be right
+    // And the sentence that says which five, so the number cannot be right
     // beside a description that is not.
     const section = try skill_doc.after(skill_doc.text, transfer_section, "the transfer outcome list");
-    try t.expect(std.mem.indexOf(u8, section, "the four proven failures") != null);
+    try t.expect(std.mem.indexOf(u8, section, "the five proven failures") != null);
     // `paused` is still where every abort parks — published rather than left for
     // an agent to discover by being refused — and it is now the state the other
     // verb is for.
@@ -1710,6 +2173,60 @@ test "gate: SKILL.md tells an agent the two things about --resume that are load-
     try t.expect(!transfers.State.publishing.isSupersedable());
 }
 
+test "gate: SKILL.md tells an agent what --no-clobber refuses and what it does not" {
+    const t = std.testing;
+    const section = try skill_doc.after(skill_doc.text, transfer_section, "the transfer outcome list");
+
+    // The distinction the whole flag turns on, published rather than left for an
+    // agent to infer from an exit code. An agent that reads
+    // `failed_clobber_conflict` as "the filesystem is broken" will retry into the
+    // same refusal; one that reads `failed_publish` as "the destination is
+    // occupied" will go looking for a file that is not there and may conclude
+    // somebody deleted it.
+    var claims: usize = 0;
+    for ([_][]const u8{
+        // That the refusal is not a check followed by a rename — which is what
+        // makes a concurrent pair safe, and the reason `ln` is used.
+        "in the kernel",
+        // The two primitives, named, so an agent debugging a host can tell which
+        // one answered.
+        "publishes with `ln`",
+        "atomic non-replacing rename",
+        // The two refusals, as different facts.
+        "different facts",
+        // That the default did not move.
+        "the default is unchanged",
+        // The resume rule, which is where the promise actually lives.
+        "written once",
+    }) |needle| {
+        if (std.mem.indexOf(u8, section, needle) == null) {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: the transfer section no longer states "{s}".
+                \\`--no-clobber` publishes two refusals that land in two different checkpoint
+                \\states, and an agent told only "it failed" will retry a conflict into the
+                \\same conflict or go hunting for a file that was never there.
+                \\
+            , .{needle});
+            return error.SkillNoClobberClaimMissing;
+        }
+        claims += 1;
+    }
+    try t.expectEqual(@as(usize, 6), claims);
+
+    // And the flag is in the usage the command prints, so `--help` and the
+    // document do not disagree about whether it exists.
+    try t.expect(std.mem.indexOf(u8, section, "`--no-clobber`") != null);
+    try t.expect(std.mem.indexOf(u8, cmd_transfer.usage, "--no-clobber") != null);
+    // The state the conflict lands in is named in the document *and* is the one
+    // the driver's outcome names, held against the ledger rather than typed.
+    try t.expect(std.mem.indexOf(u8, section, "`failed_clobber_conflict`") != null);
+    try t.expectEqual(
+        @as(?cmd_transfer.Outcome, .failed_clobber_conflict),
+        cmd_transfer.Outcome.naming(try transfers.State.parse("failed_clobber_conflict")),
+    );
+}
+
 test "gate: every boolean flag this command takes is registered, so none swallows the next argument" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -1724,7 +2241,7 @@ test "gate: every boolean flag this command takes is registered, so none swallow
     // Found by running the binary, twice, which is why the list is driven rather
     // than spot-checked.
     var checked: usize = 0;
-    for ([_][]const u8{ "restart", "resume", "json", "force" }) |flag| {
+    for ([_][]const u8{ "restart", "resume", "json", "force", "no-clobber" }) |flag| {
         checked += 1;
         const trailing = try args.parse(arena, &.{
             "smoke",
@@ -1750,7 +2267,19 @@ test "gate: every boolean flag this command takes is registered, so none swallow
     }
     // Counted, so a loop that stopped iterating fails rather than passing over
     // an empty region.
-    try t.expectEqual(@as(usize, 4), checked);
+    try t.expectEqual(@as(usize, 5), checked);
+
+    // The sharpest form of the bug this gate exists for, with the flag that was
+    // added last. `--no-clobber` written before the destination would, if it
+    // were unregistered, eat the destination as its value — so the command would
+    // publish to nothing and the positional count would be short. Both halves
+    // are asserted, because the count alone passes if the parser drops the
+    // argument instead of consuming it.
+    const before = try args.parse(arena, &.{ "smoke", "./local", "--no-clobber", "/srv/app/out.bin" });
+    try t.expect(before.boolean("no-clobber"));
+    try t.expectEqual(@as(usize, 3), before.positionals.len);
+    try t.expectEqualStrings("/srv/app/out.bin", before.positional(2).?);
+    try t.expectEqual(@as(?[]const u8, null), before.flag("no-clobber"));
 
     // The two this command's own flags are, together: `--resume --restart` must
     // parse as two booleans so `run` can refuse the pair rather than have one of

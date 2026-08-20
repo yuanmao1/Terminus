@@ -1293,8 +1293,8 @@
       "id": "M3.2-restart-not-a-bool-flag",
       "rule": "`--restart` never consumes the argument after it. A flag missing from `bool_flags` is not a compile error: written last it fails with \"a flag is missing its value\", and written before `--json` it eats it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\" };",
-      "replace": "\"all\", \"resume\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
+      "replace": "\"all\", \"resume\", \"no-clobber\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1309,16 +1309,16 @@
       "id": "M3.2-skill-restart-reach-count",
       "rule": "skill/SKILL.md's count of the verdicts `--restart` can release is held against `State.isSupersedable`, so the document cannot tell an agent to restart a transfer the statement will refuse.",
       "file": "skill/SKILL.md",
-      "find": "It releases **4** of the eight verdicts above:",
-      "replace": "It releases **6** of the eight verdicts above:",
+      "find": "It releases **5** of the nine verdicts above:",
+      "replace": "It releases **6** of the nine verdicts above:",
       "expect_gate": "gate: SKILL.md publishes how many transfer verdicts --restart can release"
     },
     {
       "id": "M3.3-resume-not-a-bool-flag",
       "rule": "`--resume` never consumes the argument after it. The sibling of `M3.2-restart-not-a-bool-flag`, and the second time this exact omission would have shipped: a flag missing from `bool_flags` is not a compile error and no helper-level gate sees it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\" };",
-      "replace": "\"all\", \"restart\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
+      "replace": "\"all\", \"restart\", \"no-clobber\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1416,6 +1416,78 @@
       "find": "**resuming is exec-only.**",
       "replace": "**resuming works over either backend.**",
       "expect_gate": "gate: SKILL.md tells an agent the two things about --resume that are load-bearing"
+    },
+    {
+      "id": "M3-noclobber-local-conflict-is-not-a-mechanism-failure",
+      "rule": "An occupied destination is a fact about the operator's data and must never be reported as a filesystem that cannot do the job.",
+      "file": "src/core/transfer.zig",
+      "find": "        error.PathAlreadyExists => return error.DestinationExists,\n",
+      "replace": "        error.PathAlreadyExists => return error.NoClobberUnsupported,\n",
+      "expect_gate": "gate: a real local collision refuses and the existing destination is byte-for-byte unchanged"
+    },
+    {
+      "id": "M3-noclobber-local-honours-the-flag",
+      "rule": "A local publish asked not to replace must use the non-replacing primitive; the flag decides which rename runs.",
+      "file": "src/core/transfer.zig",
+      "find": "    if (!no_clobber) return cwd.rename(partial_path, cwd, dest_path, io);\n",
+      "replace": "    if (no_clobber) return cwd.rename(partial_path, cwd, dest_path, io);\n",
+      "expect_gate": "gate: two local publishes race for one destination and exactly one wins"
+    },
+    {
+      "id": "M3-noclobber-remote-links-rather-than-renames",
+      "rule": "A no-clobber push publishes with `ln`, never with a form of `mv`: `mv` replaces, and `mv -n` is a check followed by a rename.",
+      "file": "src/core/transfer.zig",
+      "find": "        \\\\if ln '{[part]s}' '{[dest]s}' 2>/dev/null; then rm -f '{[part]s}'; exit 0; fi\n",
+      "replace": "        \\\\if mv -f '{[part]s}' '{[dest]s}' 2>/dev/null; then exit 0; fi\n",
+      "expect_gate": "gate: a no-clobber push links rather than renames, and tells a taken name from a host that cannot link"
+    },
+    {
+      "id": "M3-noclobber-remote-symlink-is-an-occupied-name",
+      "rule": "`[ -e ]` follows symlinks, so a dangling one at the destination is a name `ln` refuses and `-e` alone calls absent; `-L` is what stops that being reported as a host that cannot link.",
+      "file": "src/core/transfer.zig",
+      "find": "        \\\\if [ -e '{[dest]s}' ] || [ -L '{[dest]s}' ]; then exit 47; fi\n",
+      "replace": "        \\\\if [ -e '{[dest]s}' ]; then exit 47; fi\n",
+      "expect_gate": "gate: a no-clobber push links rather than renames, and tells a taken name from a host that cannot link"
+    },
+    {
+      "id": "M3-noclobber-remote-classification-not-swapped",
+      "rule": "The host's two answers mean opposite things: 47 is the destination, 48 is the mechanism, and swapping them lies about the operator's data in both directions.",
+      "file": "src/core/transfer.zig",
+      "find": "        47 => return error.DestinationExists,\n        48 => return error.NoClobberUnsupported,\n",
+      "replace": "        47 => return error.NoClobberUnsupported,\n        48 => return error.DestinationExists,\n",
+      "expect_gate": "gate: a no-clobber push links rather than renames, and tells a taken name from a host that cannot link"
+    },
+    {
+      "id": "M3-noclobber-promise-reaches-the-row",
+      "rule": "The no-clobber promise is recorded on the checkpoint, because that is what makes it survive a process boundary and bind a later resume.",
+      "file": "src/core/store/transfers.zig",
+      "find": "    try stmt.bindInt(17, if (opts.no_clobber) 1 else 0);\n",
+      "replace": "    try stmt.bindInt(17, 0);\n",
+      "expect_gate": "gate: the no-clobber promise is written once and no later write can change it"
+    },
+    {
+      "id": "M3-noclobber-flag-is-registered",
+      "rule": "A boolean flag missing from `args.bool_flags` is not a compile error and silently eats the argument after it.",
+      "file": "src/cli/args.zig",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
+      "replace": "\"all\", \"restart\", \"resume\" };",
+      "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
+    },
+    {
+      "id": "M3-noclobber-conflict-says-what-it-proves",
+      "rule": "A clobber conflict and a failed rename are different findings, so they may not publish the same `proves` sentence.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "            .failed_clobber_conflict => \"--no-clobber was asked for and something already occupies the destination; nothing was linked and the destination holds exactly what it held\",\n",
+      "replace": "            .failed_clobber_conflict => \"the rename reported failure; nothing was renamed\",\n",
+      "expect_gate": "gate: the two no-clobber refusals reach different checkpoint states"
+    },
+    {
+      "id": "M3-noclobber-document-tells-the-two-facts-apart",
+      "rule": "The agent-facing document has to say that the two no-clobber refusals are different facts, because an agent told only 'it failed' retries a conflict into the same conflict.",
+      "file": "skill/SKILL.md",
+      "find": "Two refusals, and they are **different facts**. Do not treat them as one:\n",
+      "replace": "Two refusals. Do not treat them as one:\n",
+      "expect_gate": "gate: SKILL.md tells an agent what --no-clobber refuses and what it does not"
     }
   ]
 }
