@@ -7,6 +7,9 @@ pub const daemon_protocol = @import("daemon/protocol.zig");
 pub const Executor = @import("exec.zig").Executor;
 pub const script = @import("script.zig");
 pub const transfer = @import("transfer.zig");
+/// Incremental SHA-256: the digest a transfer is judged by, taken over a file
+/// nobody can hold in memory.
+pub const digest = @import("digest.zig");
 pub const supervisor = @import("supervisor.zig");
 /// The execution boundary: every remote side effect goes through it.
 pub const execution = @import("execution.zig");

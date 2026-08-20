@@ -1120,6 +1120,126 @@
       "find": "    \"settleAndForgetJob(\",\n    \"settleAndRemoveSession(\",",
       "replace": "    \"settleAndForgetJob(\",",
       "expect_gate": "gate: `session rm` settles through the contract, not on its own authority"
+    },
+    {
+      "id": "transfer-short-pull-returns-count",
+      "rule": "A short transfer is an error naming what was expected and what arrived, never a smaller byte count.",
+      "file": "src/core/transfer.zig",
+      "find": "        if (chunk.len < want) {\n            writer.interface.flush() catch return error.LocalFileFailed;\n            return error.ShortReceive;\n        }",
+      "replace": "        if (chunk.len < want) {\n            writer.interface.flush() catch return error.LocalFileFailed;\n            return received;\n        }",
+      "expect_gate": "gate: a short pull is an error naming what was expected and what arrived"
+    },
+    {
+      "id": "transfer-slice-refusal-swallowed",
+      "rule": "A remote slice write that reports failure stops the push; it is never appended past.",
+      "file": "src/core/transfer.zig",
+      "find": "    if (r.exit_code != 0) return error.RemoteWriteFailed;",
+      "replace": "    if (r.exit_code != 0) return;",
+      "expect_gate": "gate: a short exec push is an error, and the count is not the answer"
+    },
+    {
+      "id": "transfer-publish-not-atomic",
+      "rule": "Publishing is one rename, so a failure leaves the destination as it was.",
+      "file": "src/core/transfer.zig",
+      "find": "        \"mv -f '{s}' '{s}'\",",
+      "replace": "        \"cat '{s}' > '{s}'\",",
+      "expect_gate": "gate: no failure mode touches the destination, because only the rename does"
+    },
+    {
+      "id": "transfer-pull-writes-destination",
+      "rule": "A pull stages into the partial it is given and never opens the destination.",
+      "file": "src/core/transfer.zig",
+      "find": "    const file = std.Io.Dir.cwd().createFile(io, partial_path, .{}) catch\n        return error.LocalFileFailed;",
+      "replace": "    const target = if (std.mem.endsWith(u8, partial_path, \".terminus-part\"))\n        partial_path[0 .. partial_path.len - \".terminus-part\".len]\n    else\n        partial_path;\n    const file = std.Io.Dir.cwd().createFile(io, target, .{}) catch\n        return error.LocalFileFailed;",
+      "expect_gate": "gate: a pull stages beside the destination and never opens it"
+    },
+    {
+      "id": "transfer-digest-not-validated",
+      "rule": "A remote digest line is validated as 64 hex digits, so a stated absence is never read as a digest.",
+      "file": "src/core/transfer.zig",
+      "find": "    if (first.len != digest.hex_len) return null;\n    for (first) |ch| switch (ch) {\n        '0'...'9', 'a'...'f', 'A'...'F' => {},\n        else => return null,\n    };",
+      "replace": "    if (first.len == 0) return null;",
+      "expect_gate": "gate: a host that cannot hash yields no declared digest, and published is then unreachable"
+    },
+    {
+      "id": "transfer-hash-tool-not-named",
+      "rule": "remoteHashTool names sha256sum or shasum, and answers null for neither.",
+      "file": "src/core/transfer.zig",
+      "find": "    if (std.mem.eql(u8, name, \"sha256sum\") or std.mem.eql(u8, name, \"shasum\"))\n        return try arena.dupe(u8, name);\n    return null;",
+      "replace": "    return try arena.dupe(u8, name);",
+      "expect_gate": "gate: a host that cannot hash yields no declared digest, and published is then unreachable"
+    },
+    {
+      "id": "transfer-observer-only-at-end",
+      "rule": "Every chunk is offered to the observer before the next is asked for, so a confirmed offset trails the bytes.",
+      "file": "src/core/transfer.zig",
+      "find": "        if (observer) |o| try o.offer(chunk, received, total);",
+      "replace": "        if (observer) |o| if (received == total) try o.offer(chunk, received, total);",
+      "expect_gate": "gate: a verified pull walks planned to published and leaves a confirmed prefix"
+    },
+    {
+      "id": "transfer-scratch-never-reset",
+      "rule": "A transfer's peak allocation does not grow with the file.",
+      "file": "src/core/transfer.zig",
+      "find": "    _ = scratch.reset(.retain_capacity);\n    const alloc = scratch.allocator();",
+      "replace": "    const alloc = scratch.allocator();",
+      "expect_gate": "gate: a transfer's peak allocation does not grow with the file"
+    },
+    {
+      "id": "digest-hashes-only-first-chunk",
+      "rule": "A file's digest covers every chunk of it, across buffer boundaries.",
+      "file": "src/core/digest.zig",
+      "find": "        running.update(chunk);",
+      "replace": "        if (read == 0) running.update(chunk);",
+      "expect_gate": "gate: hashing a source does not grow with the source either"
+    },
+    {
+      "id": "digest-peek-ignores-the-stream",
+      "rule": "peekHex reports the digest of the prefix fed so far and leaves the stream running.",
+      "file": "src/core/digest.zig",
+      "find": "    pub fn peekHex(self: *const Running, out: *[hex_len]u8) []const u8 {\n        var copy = self.state;",
+      "replace": "    pub fn peekHex(self: *const Running, out: *[hex_len]u8) []const u8 {\n        _ = self;\n        var copy: std.crypto.hash.sha2.Sha256 = .init(.{});",
+      "expect_gate": "gate: a verified pull walks planned to published and leaves a confirmed prefix"
+    },
+    {
+      "id": "transfer-published-effect-sides-swapped",
+      "rule": "The reading a published transfer offers names the machine it published on.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "                .push => .remote,\n                .pull => .local,",
+      "replace": "                .push => .local,\n                .pull => .remote,",
+      "expect_gate": "gate: a transfer settles indeterminate and is resolved by a reading of its destination"
+    },
+    {
+      "id": "transfer-unverified-exits-zero",
+      "rule": "completed_unverified is visible to a caller as something other than success.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "            .completed_unverified, .indeterminate_publish, .paused => Cli.exit_code.indeterminate,",
+      "replace": "            .completed_unverified => Cli.exit_code.ok,\n            .indeterminate_publish, .paused => Cli.exit_code.indeterminate,",
+      "expect_gate": "gate: completed_unverified is not success, and every outcome says what it proves"
+    },
+    {
+      "id": "transfer-declared-but-unread-publishes",
+      "rule": "A declared digest with no reading back is its own verdict, and publishes nothing.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "    const observed = far_end orelse\n        return if (declared == null) .unverifiable else .declared_but_unread;",
+      "replace": "    const observed = far_end orelse return .unverifiable;\n    _ = declared;",
+      "expect_gate": "gate: what verifying concludes from the two readings it holds"
+    },
+    {
+      "id": "transfer-digest-comparison-case-sensitive",
+      "rule": "The two ends' digests are compared without regard to hex case.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "    return if (std.ascii.eqlIgnoreCase(ours, observed)) .agreed else .disagreed;",
+      "replace": "    return if (std.mem.eql(u8, ours, observed)) .agreed else .disagreed;",
+      "expect_gate": "gate: what verifying concludes from the two readings it holds"
+    },
+    {
+      "id": "transfer-allocates-a-little-per-chunk",
+      "rule": "A transfer's peak allocation is the same number at every size, not merely a number under some budget. This is the weakly-proportional case: one small allocation per chunk on the long-lived arena instead of the per-chunk scratch - the regression class `Scripted`'s own `seen` list is an instance of. It costs ~900 bytes across a 16x size change, so it stays far inside the budget and the `< budget` assertion this replaced passed both runs.",
+      "file": "src/core/transfer.zig",
+      "find": "        const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);",
+      "replace": "        _ = try arena.dupe(u8, remote_path);\n        const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);",
+      "expect_gate": "gate: a transfer's peak allocation does not grow with the file"
     }
   ]
 }
