@@ -1293,8 +1293,8 @@
       "id": "M3.2-restart-not-a-bool-flag",
       "rule": "`--restart` never consumes the argument after it. A flag missing from `bool_flags` is not a compile error: written last it fails with \"a flag is missing its value\", and written before `--json` it eats it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
-      "replace": "\"all\", \"resume\", \"no-clobber\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
+      "replace": "\"all\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1317,8 +1317,8 @@
       "id": "M3.3-resume-not-a-bool-flag",
       "rule": "`--resume` never consumes the argument after it. The sibling of `M3.2-restart-not-a-bool-flag`, and the second time this exact omission would have shipped: a flag missing from `bool_flags` is not a compile error and no helper-level gate sees it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
-      "replace": "\"all\", \"restart\", \"no-clobber\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
+      "replace": "\"all\", \"restart\", \"no-clobber\", \"normalize-lf\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1469,8 +1469,8 @@
       "id": "M3-noclobber-flag-is-registered",
       "rule": "A boolean flag missing from `args.bool_flags` is not a compile error and silently eats the argument after it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
-      "replace": "\"all\", \"restart\", \"resume\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
+      "replace": "\"all\", \"restart\", \"resume\", \"normalize-lf\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1488,6 +1488,54 @@
       "find": "Two refusals, and they are **different facts**. Do not treat them as one:\n",
       "replace": "Two refusals. Do not treat them as one:\n",
       "expect_gate": "gate: SKILL.md tells an agent what --no-clobber refuses and what it does not"
+    },
+    {
+      "id": "M4-normalize-lf-flag-is-registered",
+      "rule": "A boolean flag missing from `args.bool_flags` is not a compile error and silently eats the argument after it.",
+      "file": "src/cli/args.zig",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
+      "replace": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
+      "expect_gate": "gate: every boolean flag exec takes is registered, so none swallows the next argument"
+    },
+    {
+      "id": "M4-input-zero-accept-is-a-failure",
+      "rule": "A channel that accepts zero bytes has failed; it is not a reason to offer the same bytes again, and it is not a completed send.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "            if (n == 0) return error.InputRejected;",
+      "replace": "            if (n == 0) return;",
+      "expect_gate": "gate: a channel that accepts nothing fails instead of being offered the same bytes forever"
+    },
+    {
+      "id": "M4-input-digest-covers-accepted-only",
+      "rule": "The digest on the receipt is of the bytes the channel accepted, not of the bytes that were offered to it.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "            running.update(chunk[offset..][0..n]);",
+      "replace": "            running.update(chunk[offset..]);",
+      "expect_gate": "gate: a short write is normal traffic and the rest is offered again"
+    },
+    {
+      "id": "M4-input-end-of-input-is-sent",
+      "rule": "The remote is told the input has ended; without the marker its process reads a channel that never closes.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "    try sink.end();",
+      "replace": "    if (taken.bytes == std.math.maxInt(u64)) try sink.end();",
+      "expect_gate": "gate: every byte value survives the input channel unchanged"
+    },
+    {
+      "id": "M4-receipt-records-the-input",
+      "rule": "The terminal receipt of a run that was fed local bytes records how many the channel accepted and their SHA-256.",
+      "file": "src/cli/cmd_exec.zig",
+      "find": "        .stdin = .{\n            .bytes = @intCast(accepted.bytes),\n            .sha256 = accepted.sha256[0..],\n        },",
+      "replace": "        .stdin = .{},",
+      "expect_gate": "gate: the terminal receipt records the bytes the channel accepted and their digest"
+    },
+    {
+      "id": "M4-command-text-is-not-normalized-by-default",
+      "rule": "Command text read from `--stdin`/`--cmd-file` is sent as it was read; only `--normalize-lf` rewrites its line endings.",
+      "file": "src/cli/cli.zig",
+      "find": "    const normalize = parsed.boolean(\"normalize-lf\");",
+      "replace": "    const normalize = !parsed.boolean(\"normalize-lf\");",
+      "expect_gate": "gate: the command keeps its carriage returns unless normalization is asked for"
     }
   ]
 }

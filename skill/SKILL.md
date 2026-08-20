@@ -37,10 +37,13 @@ terminus memory add <server> --key gotchas --content "text with ; and *"
 For agents: **use `--cmd`/`--content` for one-liners and `--stdin` for
 anything with quotes, semicolons, globs, or multiple lines.**
 
-Windows CRLF is handled automatically: `--stdin` and `--cmd-file` input
-is normalized from CRLF/CR to LF before it reaches the remote shell, so a
-`\r` can never turn `true` into `true\r`. Pass `--raw` to keep bytes
-exactly (rare — only for binary-in-script cases).
+Windows CRLF is **not** rewritten for you. Command text from `--stdin` and
+`--cmd-file` is sent as they were read, byte for byte. If it holds a carriage
+return, terminus says so once on stderr and publishes the count in `--json`
+(`commandCarriageReturns`, and `commandNormalizedLf` for whether anything was
+changed) — because a `\r` a POSIX shell keeps turns `true` into `true\r` and
+nothing downstream explains why the comparison failed. Pass `--normalize-lf` to
+convert CRLF/CR to LF; that is the only thing that rewrites those bytes.
 
 ## Multiline scripts run byte-exact
 
@@ -999,3 +1002,52 @@ terminus import backup.json --only web1,prod   # limit to specific servers
 For conflicts you want to resolve individually: read both values from the
 dry-run plan, then write the merged truth with `memory add --key ...`
 (it upserts). Re-import is idempotent — identical items are skipped.
+
+## Feeding a command its own standard input
+
+`--stdin-file <path>` streams a local file into the remote command's standard
+input. It is a **different channel from `--stdin`**, and the difference is the
+one thing to get right:
+
+- `--stdin` and `--cmd-file` supply the *command* — the bytes the remote shell
+  parses and runs.
+- `--stdin-file` supplies what that command *reads*.
+  It is not the bytes of the command; it is the bytes the command consumes on
+  fd 0.
+
+```bash
+# Restore a dump without ever writing it to the remote disk first
+terminus exec db --stdin-file ./dump.sql.gz --cmd "gunzip | psql app"
+
+# A binary payload, unchanged: no base64, no shell quoting of the contents
+terminus exec host --stdin-file ./firmware.bin --cmd "cat > /tmp/fw.bin"
+```
+
+What it guarantees:
+
+- **byte for byte.** The channel is 8-bit clean, so NUL, `\r\n`, and every other
+  byte value go through untouched. Nothing normalizes this input and nothing
+  inspects it for carriage returns — here they are data, not line endings.
+- **streamed, at any size.** The bytes are never held in memory: the peak is one
+  fixed window whatever the file's size, so there is no ceiling to hit and no
+  point at which it quietly starts base64-ing or truncating.
+- **the receipt says what went in.** `--json` carries `stdinBytes` and
+  `stdinSha256`, and the terminal receipt stores both. They are the count the
+  channel **accepted** and the SHA-256 of exactly those bytes — never the
+  source's length and never a digest of the file taken separately.
+
+When it does not work:
+
+- if the channel stops accepting before the file is exhausted, that is **not** a
+  smaller success. The run settles `indeterminate` (exit **75**) and the reason
+  names how many bytes were accepted and their digest. The remote command may
+  already have acted on that prefix, so re-sending is a decision for you and
+  not a retry to make blindly. In particular the end-of-input marker is *not*
+  sent on that path: the remote sees a broken channel rather than a truncated
+  input that looks complete.
+- `--stdin-file` needs a one-shot exec channel, so a `<server>:<session>`
+  target is refused — typing into a live shell has no separate input channel.
+  Send the file with `terminus push` instead.
+- it needs a direct SSH connection: the local daemon's pooled protocol carries
+  a command and an answer and no third channel. terminus takes a direct
+  connection for you and reports it in `transport`/`daemonError`.

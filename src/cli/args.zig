@@ -12,7 +12,7 @@ const Allocator = std.mem.Allocator;
 /// found by running the binary. `cmd_transfer_test` gates `--restart` and
 /// `--resume` against this list for that reason; a new boolean flag belongs
 /// here and in a gate, in the same commit.
-const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force", "stdin", "login", "append", "strict", "include-keys", "active", "discard-evidence", "from-log", "read-only", "show-script", "all", "restart", "resume", "no-clobber" };
+const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force", "stdin", "login", "append", "strict", "include-keys", "active", "discard-evidence", "from-log", "read-only", "show-script", "all", "restart", "resume", "no-clobber", "normalize-lf" };
 
 pub const Parsed = struct {
     positionals: []const []const u8,

@@ -9,6 +9,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const c = @import("ssh2");
+// The input channel hashes what it sends as it sends it. `digest` imports only
+// `std`, so this closes no cycle, and taking a second pass over the source
+// instead would be both slower and a chance for the count and the digest to
+// describe different bytes.
+const digest = @import("../digest.zig");
 
 const Client = @This();
 
@@ -247,15 +252,179 @@ pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!Ex
     };
 }
 
-/// Runs a command feeding `input` to its stdin, then drains stdout/stderr.
-/// The channel is 8-bit clean, so arbitrary binary can stream through —
-/// this is how exec-based file transfer moves bytes in one round trip.
+// --- the input channel -------------------------------------------------------
+//
+// Local bytes into a remote process's standard input. Streaming from the first
+// line rather than retrofitted onto a `[]const u8`: the source is a reader, the
+// pump holds no buffer of its own, and nothing here ever knows the total — so
+// there is no size at which this stops working and no ceiling to hit quietly.
+//
+// Two facts about `libssh2_channel_write_ex` shape the whole of it, and both are
+// already written down twice in this file (`scpSend`, `scpSendBytes`):
+//
+//   * a return **smaller than the request is normal**. The channel takes what
+//     its window allows and the rest is offered again. Treating it as an error
+//     would fail ordinary traffic; treating it as the whole request would file a
+//     count for bytes that never left.
+//   * a return of **zero is a failure**, not a reason to offer the same bytes
+//     forever. That spin is a bug this file has already had.
+
+/// The hex digest of a stream with nothing in it.
 ///
-/// Unlike `exec`, the 30s session timeout stays armed: transfer data
-/// should flow continuously, so a 30s stall means the channel is wedged
-/// (an intermittent libssh2 blocking-read issue under bulk traffic) and
-/// the caller retries rather than hanging forever.
-pub fn execWithStdin(client: *Client, arena: Allocator, command: []const u8, input: []const u8) ExecError!ExecResult {
+/// A literal, so the zero value of `Accepted` is already a true statement about
+/// zero bytes and a reading taken after a failure that accepted nothing needs no
+/// special case. Held against `digest.hex("")` by a gate, so it cannot rot.
+pub const empty_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// What the input channel took, and the digest of exactly those bytes.
+///
+/// An out-parameter rather than part of a return value, for the reason `Moved`
+/// is one: the caller needs it precisely on the path where there is no return
+/// value. `InputRejected`'s entire content is this number, and a receipt that
+/// answered with the source's length instead would be claiming bytes arrived
+/// that the channel never took.
+///
+/// The two fields move together, after every accepted piece, so they are one
+/// observation of one set of bytes at every exit from the pump — including the
+/// failing ones. A count advanced now and a digest finalised later is how the
+/// two come to disagree.
+pub const Accepted = struct {
+    /// Bytes the channel accepted. Never what was offered.
+    bytes: u64 = 0,
+    /// Hex SHA-256 of exactly `bytes` bytes of input.
+    sha256: [digest.hex_len]u8 = empty_sha256.*,
+};
+
+pub const InputError = error{
+    /// The local source could not be read to its end. Whatever the channel had
+    /// already taken is in `Accepted`, and the remote was never told the input
+    /// ended.
+    InputSourceUnreadable,
+    /// The channel stopped taking bytes before the source was exhausted — it
+    /// refused, or it accepted nothing at all. `Accepted` is what it did take.
+    InputRejected,
+    /// The bytes all went and the end-of-input marker did not. The remote
+    /// process is reading a channel that will never close, so this is a failure
+    /// and not a completed send.
+    InputEofNotSent,
+    /// This transport has no third channel to stream into. Not a fallback
+    /// point: a command that reads stdin and is handed an immediate EOF
+    /// "succeeds" having done nothing, which is the worst available answer.
+    InputUnsupported,
+};
+
+/// Where accepted input bytes go.
+///
+/// An interface rather than the channel directly, because the channel is the one
+/// part of this that no test can reach: there is no server to open one against.
+/// Everything above the sink — the short-write loop, the refusal of a zero
+/// accept, the digest of what was taken, the end-of-input marker — is driven
+/// through a stand-in sink instead of reviewed.
+pub const InputSink = struct {
+    context: *anyopaque,
+    /// Offers bytes; answers how many were **accepted**, which may be fewer.
+    /// Zero is not this function's decision to make — see `pumpInput`.
+    on_offer: *const fn (context: *anyopaque, bytes: []const u8) InputError!usize,
+    /// Tells the far side the input has ended. Called once, after the last
+    /// accepted byte, and never on a failing path.
+    on_end: *const fn (context: *anyopaque) InputError!void,
+
+    pub fn offer(self: InputSink, bytes: []const u8) InputError!usize {
+        return self.on_offer(self.context, bytes);
+    }
+
+    pub fn end(self: InputSink) InputError!void {
+        return self.on_end(self.context);
+    }
+};
+
+/// Streams `source` into `sink`, recording exactly what was accepted.
+///
+/// No buffer of its own: it peeks at the reader's window and tosses what the
+/// sink took, so the peak is the window the caller chose and does not move with
+/// the length of the input. No allocator either, which is the strongest form of
+/// that claim available — there is nowhere for a proportional allocation to
+/// live.
+///
+/// **The end-of-input marker is the pump's, and only on success.** A remote
+/// process reads until EOF, so failing to send it leaves that process waiting
+/// for bytes that will never come. Sending it after a rejected write would be
+/// worse: it would hand the remote a truncated input that looks complete, and
+/// the command would act on a prefix believing it had the whole thing.
+pub fn pumpInput(source: *std.Io.Reader, sink: InputSink, taken: *Accepted) InputError!void {
+    // Written before anything can fail, so a caller reading it after an error is
+    // reading this call's numbers and not the last call's.
+    taken.* = .{};
+    var running: digest.Running = .init();
+
+    while (true) {
+        const chunk = source.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return error.InputSourceUnreadable,
+        };
+        var offset: usize = 0;
+        while (offset < chunk.len) {
+            const n = try sink.offer(chunk[offset..]);
+            // Held here rather than in each sink, so no sink can spin by
+            // forgetting it.
+            if (n == 0) return error.InputRejected;
+            std.debug.assert(n <= chunk.len - offset);
+            running.update(chunk[offset..][0..n]);
+            offset += n;
+            taken.bytes += n;
+            _ = running.peekHex(&taken.sha256);
+        }
+        source.toss(chunk.len);
+    }
+
+    try sink.end();
+}
+
+/// The libssh2 side of `InputSink`.
+const ChannelInput = struct {
+    channel: *c.LIBSSH2_CHANNEL,
+
+    fn offer(context: *anyopaque, bytes: []const u8) InputError!usize {
+        const self: *ChannelInput = @ptrCast(@alignCast(context));
+        const n = c.libssh2_channel_write_ex(self.channel, 0, bytes.ptr, bytes.len);
+        // Negative is the channel's failure. Zero is not judged here: the pump
+        // owns that rule for every sink at once.
+        if (n < 0) return error.InputRejected;
+        return @intCast(n);
+    }
+
+    fn end(context: *anyopaque) InputError!void {
+        const self: *ChannelInput = @ptrCast(@alignCast(context));
+        // This return used to be discarded. A dropped EOF is not a cosmetic
+        // loss: the remote process blocks on a read that never completes, and
+        // the drain below blocks waiting for output it will never produce, so
+        // the whole command hangs until somebody's timeout fires.
+        if (c.libssh2_channel_send_eof(self.channel) != 0) return error.InputEofNotSent;
+    }
+
+    fn sink(self: *ChannelInput) InputSink {
+        return .{ .context = self, .on_offer = offer, .on_end = end };
+    }
+};
+
+/// Runs a command with `source` streamed to its standard input, then drains
+/// stdout/stderr. The channel is 8-bit clean, so arbitrary binary goes through
+/// unchanged — no base64, no shell quoting of the payload.
+///
+/// `taken` is filled whether this succeeds or fails, and it is what the receipt
+/// records: the count the channel accepted and the digest of those same bytes.
+///
+/// Unlike `exec`, the 30s session timeout stays armed while the input flows:
+/// input should move continuously, so a 30s stall means the channel is wedged
+/// (an intermittent libssh2 blocking-read issue under bulk traffic) and the
+/// caller retries rather than hanging forever.
+pub fn execWithStdin(
+    client: *Client,
+    arena: Allocator,
+    command: []const u8,
+    source: *std.Io.Reader,
+    taken: *Accepted,
+) (ExecError || InputError)!ExecResult {
     const channel = c.libssh2_channel_open_ex(
         client.session,
         "session",
@@ -275,13 +444,8 @@ pub fn execWithStdin(client: *Client, arena: Allocator, command: []const u8, inp
         @intCast(command.len),
     ) != 0) return error.ExecFailed;
 
-    var offset: usize = 0;
-    while (offset < input.len) {
-        const n = c.libssh2_channel_write_ex(channel, 0, input.ptr + offset, input.len - offset);
-        if (n < 0) return error.ExecFailed;
-        offset += @intCast(n);
-    }
-    _ = c.libssh2_channel_send_eof(channel);
+    var input: ChannelInput = .{ .channel = channel };
+    try pumpInput(source, input.sink(), taken);
 
     c.libssh2_session_set_timeout(client.session, 0);
     defer c.libssh2_session_set_timeout(client.session, 30_000);

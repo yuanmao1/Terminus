@@ -1305,6 +1305,21 @@ pub fn connectReportingClaim(
     return openConnection(ctx, parsed, server, auth, .fatal_reporting_claim).?;
 }
 
+/// Why the pooled daemon connection cannot carry this command, or null when it
+/// can.
+///
+/// Not a fallback and not a failure: the daemon protocol carries a command and
+/// an answer, and a command that streams local bytes into a remote process's
+/// standard input needs a third channel it does not have. The operator asked for
+/// the input, not for the transport, so the transport is the thing that gives
+/// way — and which one carried it is reported either way, in `transport` and in
+/// the note below.
+fn daemonCannotCarry(parsed: *const Args.Parsed) ?[]const u8 {
+    if (parsed.flag("stdin-file") != null)
+        return "the daemon protocol has no channel for --stdin-file input; used direct SSH";
+    return null;
+}
+
 fn openConnection(
     ctx: *Ctx,
     parsed: *const Args.Parsed,
@@ -1316,7 +1331,8 @@ fn openConnection(
         !std.mem.eql(u8, v, "0")
     else
         false;
-    if (!parsed.boolean("no-daemon") and !env_disabled) {
+    const cannot_carry = daemonCannotCarry(parsed);
+    if (!parsed.boolean("no-daemon") and !env_disabled and cannot_carry == null) {
         const request = daemonRequest(server, auth);
         switch (DaemonClient.acquire(ctx.io, ctx.arena, ctx.environ, request)) {
             .ok => |client| {
@@ -1342,6 +1358,7 @@ fn openConnection(
     return .{
         .inner = .{ .direct = sshOpen(server, auth, on_failure) orelse return null },
         .transport = "direct",
+        .daemon_error = cannot_carry,
     };
 }
 
@@ -1448,6 +1465,35 @@ pub fn parseArgs(ctx: *Ctx, raw: []const []const u8) Args.Parsed {
     };
 }
 
+/// What the byte-exact command channels found in the text they read.
+///
+/// Published because 0.2.0 stopped rewriting it. `--stdin` and `--<file_flag>`
+/// are the two channels that carry an editor's or a heredoc's line endings
+/// verbatim, a remote POSIX shell reads a trailing `\r` as part of the token
+/// (`true\r` is not `true`), and 0.1.10 answered that by normalizing CRLF to LF
+/// by default. The half of that worth keeping was making the operator *aware* of
+/// the `\r`; the dangerous half was silently rewriting bytes nobody asked it to
+/// touch. So the carriage returns are counted and reported, and only
+/// `--normalize-lf` rewrites them.
+pub const LineEndings = struct {
+    /// Carriage returns in the text as it was read, before any rewrite.
+    carriage_returns: usize = 0,
+    /// Whether `--normalize-lf` rewrote them.
+    normalized: bool = false,
+};
+
+/// The reading from this command's `trailingContent` call.
+///
+/// Module-level rather than part of the return value because `trailingContent`
+/// is called by three commands and its signature is what they compile against;
+/// only one of them publishes a `--json` document with room for this. Same
+/// shape, and same single-threaded-CLI justification, as `active_execution`.
+var command_line_endings: LineEndings = .{};
+
+pub fn commandLineEndings() LineEndings {
+    return command_line_endings;
+}
+
 /// Trailing command/content with quote-proof input channels, in priority:
 /// `--stdin` (read all of standard input — immune to any shell parsing),
 /// `--<file_flag> <path>` (read a local file), then Args.trailing
@@ -1455,33 +1501,63 @@ pub fn parseArgs(ctx: *Ctx, raw: []const []const u8) Args.Parsed {
 ///
 /// Only fully-blank input collapses to null; interior newlines and
 /// trailing structure are preserved (heredocs need their final newline).
+///
+/// **These are the bytes of the command, not the bytes the command reads.** A
+/// process's standard input is a different channel with a different flag; see
+/// `cmd_exec`'s `--stdin-file`, which is never normalized and never inspected
+/// for carriage returns, because there they are data.
 pub fn trailingContent(
     ctx: *Ctx,
     parsed: *const Args.Parsed,
     comptime file_flag: []const u8,
     expected_positionals: usize,
 ) !?[]const u8 {
-    // stdin and file channels are byte-exact, so on Windows they carry the
-    // CRLF line endings of the local editor/heredoc. A remote POSIX shell
-    // treats a trailing `\r` as part of the token (`true\r` is not `true`),
-    // which is the single most common Windows footgun. Normalize CRLF -> LF
-    // by default; --raw preserves the bytes for the rare binary-in-script case.
-    const keep_raw = parsed.boolean("raw");
+    const normalize = parsed.boolean("normalize-lf");
     if (parsed.boolean("stdin")) {
         var buffer: [4096]u8 = undefined;
         var reader = std.Io.File.stdin().readerStreaming(ctx.io, &buffer);
         const content = reader.interface.allocRemaining(ctx.arena, .limited(16 << 20)) catch
             fail("cannot read stdin", .{});
         if (std.mem.trim(u8, content, " \t\r\n").len == 0) return null;
-        return if (keep_raw) content else try stripCarriageReturns(ctx.arena, content);
+        return try reportLineEndings(ctx.arena, content, normalize, "standard input");
     }
     if (parsed.flag(file_flag)) |path| {
         const content = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(16 << 20)) catch
             fail("cannot read {s}", .{path});
         if (std.mem.trim(u8, content, " \t\r\n").len == 0) return null;
-        return if (keep_raw) content else try stripCarriageReturns(ctx.arena, content);
+        return try reportLineEndings(ctx.arena, content, normalize, path);
     }
     return parsed.trailing(ctx.arena, expected_positionals);
+}
+
+/// Records what `content`'s line endings are, says so once on stderr when there
+/// is something to say, and rewrites them only if asked.
+pub fn reportLineEndings(
+    arena: std.mem.Allocator,
+    content: []const u8,
+    normalize: bool,
+    source: []const u8,
+) ![]const u8 {
+    const count = std.mem.count(u8, content, "\r");
+    command_line_endings = .{ .carriage_returns = count, .normalized = normalize and count != 0 };
+    if (count == 0) return content;
+    if (!normalize) {
+        // Said, not done. An operator who meant the `\r` keeps it; one who did
+        // not now knows why `true\r` did not match `true`, which is the thing
+        // the old silent rewrite was actually buying.
+        std.debug.print(
+            "terminus: the command read from {s} contains {d} carriage return(s) and was sent " ++
+                "unchanged; a POSIX shell reads a trailing \\r as part of the token, so `true\\r` " ++
+                "is not `true`. Pass --normalize-lf to convert CRLF/CR to LF.\n",
+            .{ source, count },
+        );
+        return content;
+    }
+    std.debug.print(
+        "terminus: --normalize-lf rewrote {d} carriage return(s) in the command read from {s} to LF\n",
+        .{ count, source },
+    );
+    return stripCarriageReturns(arena, content);
 }
 
 /// Rewrites CRLF and lone CR into LF. Returns the input unchanged (no copy)
