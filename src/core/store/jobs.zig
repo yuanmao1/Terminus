@@ -387,9 +387,14 @@ pub const RemoveExpectation = struct {
 
 /// On what basis the row is being destroyed.
 ///
-/// The two callers of `remove` have established completely different things
-/// and are entitled to completely different rows, so the grounds are part of
-/// the statement rather than a comment at the call site.
+/// The two destroying callers have established completely different things and
+/// are entitled to completely different rows, so the grounds are part of the
+/// statement rather than a comment at the call site.
+///
+/// They are also entitled to different *routes*, and that is `warrant` below:
+/// one of these can be passed to `remove`, which opens a transaction and checks
+/// nothing else; the other only reaches `removeLocked` from inside
+/// `execution.commitDestruction`.
 ///
 /// `run --name X` used to enforce its half in Zig, several statements before
 /// the DELETE, which is the shape this store keeps closing: a guard evaluated
@@ -419,12 +424,48 @@ pub const RemovalGrounds = enum {
         };
     }
 
+    /// What a caller destroying a row on these grounds has to be holding.
+    ///
+    /// Exhaustive on purpose, and that is the whole reason it is a function and
+    /// not a comment: a grounds variant added later does not compile until it
+    /// has said which of these two it is, and `remove` below reads the answer
+    /// at comptime.
+    pub fn warrant(g: RemovalGrounds) Warrant {
+        return switch (g) {
+            .session_proven_gone => .reread_claim,
+            .superseded_by_relaunch => .grounds_alone,
+        };
+    }
+
     pub fn describe(g: RemovalGrounds) []const u8 {
         return switch (g) {
             .session_proven_gone => "removal that has proved the remote session is gone",
             .superseded_by_relaunch => "relaunch under the same name",
         };
     }
+};
+
+/// The two things that can stand behind a destruction, and they are not
+/// interchangeable.
+///
+/// `remove` — the route that opens its own transaction — may only be handed
+/// grounds whose warrant is `grounds_alone`, and it is `@compileError` rather
+/// than a runtime refusal: a caller that reached for the other kind through the
+/// short route would be asking for a destruction with no authority behind it,
+/// which is not a thing to report at run time. It is a call that must not be
+/// writable.
+pub const Warrant = enum {
+    /// The grounds are the whole of it. `superseded_by_relaunch` is this:
+    /// `run --name X` holds a reservation, not a lease, so there is no claim
+    /// for anything to re-read — and the state list is what stands in its
+    /// place, admitting no `running` row.
+    grounds_alone,
+    /// An authority claim, re-read inside the very transaction that destroys,
+    /// with the terminal receipt landing beside it. `session_proven_gone` is
+    /// this: it admits *every* status including `running`, on the strength of a
+    /// fact established on the host, and nothing may take that on trust from
+    /// outside `execution.commitDestruction`.
+    reread_claim,
 };
 
 fn removableList(comptime g: RemovalGrounds) []const u8 {
@@ -846,25 +887,37 @@ const set_cursor_sql = std.fmt.comptimePrint(
     \\   AND status IN ({[states]s})
 , .{ .owner = ownerConjunct("?3"), .states = tracks_read_cursor_sql });
 
-/// Forgets a job row, against the row the caller read and on stated grounds.
+/// Displaces a job row, against the row the caller read and on stated grounds.
 ///
-/// Opens its own transaction, which is why **`job rm` must not use it**.
-/// `removeLocked` is the variant for a caller that is settling the operation and
-/// re-reading its authority in the same breath, and `job rm` is that caller: the
-/// delete, the terminal and the in-transaction claim check must land together or
-/// not at all. It reaches `removeLocked` through
-/// `execution.settleAndForgetJob`.
-///
-/// That leaves one legitimate caller: `run --name X` displacing the row that holds
-/// the name (`RemovalGrounds.superseded_by_relaunch`). It holds a reservation
+/// Opens its own transaction, and that is the whole of what it can offer: no
+/// claim is re-read inside it and no terminal lands beside the DELETE. So it
+/// takes only grounds that need neither — `Warrant.grounds_alone` — and the
+/// check is a `@compileError`, not a refusal. Today that admits exactly one
+/// variant, `superseded_by_relaunch`, and exactly one caller: `run --name X`
+/// taking over the row that holds the name. That caller holds a reservation
 /// rather than a lease, so there is no claim for a contract to re-read and no
-/// operation of somebody else's to settle — and the grounds it passes admit no
-/// `running` row, which is what the guard is there instead of an authority.
+/// operation of somebody else's to settle; the grounds are what stand in for
+/// the authority, and they admit no `running` row.
+///
+/// **`job rm` must not use it**, and now cannot: `session_proven_gone` admits
+/// every status on the strength of a trip to the host, and a route with no
+/// in-transaction claim check may not act on that. It goes to `removeLocked`
+/// through `execution.settleAndForgetJob`, where the delete, the terminal and
+/// the claim check land together or not at all.
 pub fn remove(
     store: *Store,
     expected: RemoveExpectation,
     comptime grounds: RemovalGrounds,
 ) WriteError!Write {
+    comptime switch (grounds.warrant()) {
+        .grounds_alone => {},
+        .reread_claim => @compileError(
+            "jobs.remove opens a transaction of its own and re-reads no claim, so it" ++
+                " cannot destroy on ." ++ @tagName(grounds) ++ " grounds. Those need the" ++
+                " destruction contract: execution.Execution.settleAndForgetJob, which" ++
+                " reaches jobs.removeLocked inside the transaction that also settles.",
+        ),
+    };
     try store.db.exec("BEGIN IMMEDIATE");
     errdefer store.db.exec("ROLLBACK") catch {};
     const result = try removeLocked(store, expected, grounds);
@@ -965,4 +1018,44 @@ test "the rendered lists say what the predicates say" {
         "'pending','exited','killed'",
         comptime removableList(.superseded_by_relaunch),
     );
+}
+
+test "the short route admits exactly the grounds that need no claim" {
+    const t = std.testing;
+
+    // `remove` — the route that opens its own transaction — refuses anything
+    // whose warrant is `reread_claim`, and refuses it at compile time, so there
+    // is no runtime behaviour here to check. What is checkable is the partition
+    // it reads, and the number that partition currently produces.
+    //
+    // **One of two.** `superseded_by_relaunch` is the only grounds a caller may
+    // put through `remove`; `session_proven_gone` admits a `running` row on the
+    // strength of a fact established on the host, and nothing may take that on
+    // trust outside `execution.commitDestruction`. A change that moved the
+    // second one across would make `jobs.remove(row, .session_proven_gone)`
+    // writable again, and it fails here first.
+    var short_route: usize = 0;
+    inline for (@typeInfo(RemovalGrounds).@"enum".fields) |field| {
+        const g: RemovalGrounds = @enumFromInt(field.value);
+        // Exhaustive by construction — `warrant` is a total switch — so this
+        // counts rather than tolerates.
+        switch (g.warrant()) {
+            .grounds_alone => short_route += 1,
+            .reread_claim => {},
+        }
+    }
+    try t.expectEqual(@as(usize, 1), short_route);
+    try t.expectEqual(Warrant.grounds_alone, RemovalGrounds.superseded_by_relaunch.warrant());
+    try t.expectEqual(Warrant.reread_claim, RemovalGrounds.session_proven_gone.warrant());
+
+    // And the two questions are not the same question. The grounds that need a
+    // claim are exactly the grounds that admit a live row, which is why the
+    // short route may not carry them — but `admits` is a per-status predicate
+    // and `warrant` is a per-route one, and asserting the correspondence here
+    // is what keeps a later variant from being given the short route while
+    // quietly admitting `running`.
+    inline for (@typeInfo(RemovalGrounds).@"enum".fields) |field| {
+        const g: RemovalGrounds = @enumFromInt(field.value);
+        try t.expectEqual(g.admits(.running), g.warrant() == .reread_claim);
+    }
 }

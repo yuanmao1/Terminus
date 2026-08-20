@@ -984,6 +984,30 @@
       "find": "    /// Nothing was sent, or nothing that mattered was: the scope moved first.\n    pub const not_killed = \"not_killed\";",
       "replace": "    /// Nothing was sent, or nothing that mattered was: the scope moved first.\n    pub const not_killed = \"not_killed\";\n    pub const invented = \"invented\";",
       "expect_gate": "gate: SKILL.md publishes exactly `job kill`'s action vocabulary"
+    },
+    {
+      "id": "S2d-session-cascade-short-route-returns",
+      "rule": "The session DELETE cascades that session's memories, so it may only run inside the transaction that also writes the terminal and re-reads the claim. A convenience wrapper beside `removeLocked` - the same DELETE inside a `BEGIN IMMEDIATE` of its own - is a public route to that cascade with no authority and nothing on the ledger. It had zero callers, which is why it was deleted rather than documented, and the gate counts the writer's name inside its own file so the wrapper cannot come back under any name.",
+      "file": "src/core/store/sessions.zig",
+      "find": "pub fn removeLocked(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {\n    try store.db.requireTransaction();",
+      "replace": "pub fn remove(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {\n    try store.db.exec(\"BEGIN IMMEDIATE\");\n    errdefer store.db.exec(\"ROLLBACK\") catch {};\n    const had_row = try removeLocked(store, server_id, name);\n    try store.db.exec(\"COMMIT\");\n    return had_row;\n}\n\npub fn removeLocked(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {\n    try store.db.requireTransaction();",
+      "expect_gate": "gate: the session cascade has one writer and the contract is its one caller"
+    },
+    {
+      "id": "S2d-session-cascade-second-caller",
+      "rule": "`execution.commitDestruction` is the only caller of the session-cascade writer. A second caller anywhere in the tree destroys a session row and its memories without the terminal receipt and the in-transaction claim check that make the removal recorded and licensed.",
+      "file": "src/core/execution.zig",
+      "find": "fn removeUnderGrounds(store: *Store, forget: JobForget) jobs.WriteError!jobs.Write {",
+      "replace": "fn forgetSessionRowUncontracted(store: *Store, server_id: i64, name: []const u8) anyerror!bool {\n    return sessions.removeLocked(store, server_id, name);\n}\n\nfn removeUnderGrounds(store: *Store, forget: JobForget) jobs.WriteError!jobs.Write {",
+      "expect_gate": "gate: the session cascade has one writer and the contract is its one caller"
+    },
+    {
+      "id": "S2d-removal-grounds-warrant-partition",
+      "rule": "`jobs.remove` opens its own transaction and re-reads no claim, so it may only be handed grounds whose warrant is `grounds_alone`. `session_proven_gone` admits a `running` row on the strength of a fact established on the host; moving it to the short route makes `jobs.remove(row, .session_proven_gone)` writable again - a cache row destroyed with no authority behind it.",
+      "file": "src/core/store/jobs.zig",
+      "find": "            .session_proven_gone => .reread_claim,",
+      "replace": "            .session_proven_gone => .grounds_alone,",
+      "expect_gate": "the short route admits exactly the grounds that need no claim"
     }
   ]
 }

@@ -317,7 +317,23 @@ test "gate: a relaunch may not delete a running row, and 'job rm' may" {
 
     // `job rm` has been to the host and proved the session is gone, which is a
     // fact this column cannot hold, so it may forget the same row.
-    try mustApply(try Store.jobs.remove(&store, running.removeExpectation(), .session_proven_gone));
+    //
+    // It has to reach the delete the only way those grounds can now be reached:
+    // `removeLocked`, inside a transaction its caller opened. `jobs.remove` will
+    // not take them — `RemovalGrounds.warrant` says they need a claim re-read in
+    // the destroying transaction, and passing them to the short route is a
+    // compile error, not a refusal. In production the transaction is
+    // `execution.commitDestruction`, which puts the terminal receipt in it too;
+    // see `gates_authority_test.zig` for that composition. What is proved here
+    // is the state list underneath it — that `running` really is removable on
+    // these grounds and on no others.
+    try store.db.exec("BEGIN IMMEDIATE");
+    try mustApply(try Store.jobs.removeLocked(
+        &store,
+        running.removeExpectation(),
+        .session_proven_gone,
+    ));
+    try store.db.exec("COMMIT");
     try t.expectEqual(@as(?Store.jobs.Job, null), try Store.jobs.getByName(&store, arena, 1, "deploy"));
 }
 

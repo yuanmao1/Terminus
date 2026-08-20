@@ -64,13 +64,23 @@ pub fn list(store: *Store, arena: std.mem.Allocator, server_id: i64) (Db.Error |
 /// Returns false if no such session row existed. Cascade-deletes the
 /// session's memories.
 ///
-/// Caller must hold the write transaction, and that requirement is the whole
-/// reason this exists separately from `remove`. This delete is the local half of
+/// **The only route to that cascade.** There used to be a `remove` beside this
+/// one — the same DELETE wrapped in a `BEGIN IMMEDIATE` of its own — and it was
+/// a public way to drop a session row and take its memories with it with nothing
+/// in the ledger recording that anybody did so, and no authority check. It had no
+/// callers left once `session rm` moved onto the destruction contract, so it was
+/// deleted rather than documented: a door nobody walks through is still a door,
+/// and the next caller would have taken it by default. A caller that thinks it
+/// needs the convenience form needs `execution.commitDestruction` instead, and
+/// should say why it does not.
+///
+/// Caller must hold the write transaction. This delete is the local half of
 /// `session rm`, and it has to land in the *same* transaction as the terminal
 /// receipt that says the removal happened: settled first and deleted afterwards,
 /// a failure in between leaves the ledger asserting a removal whose row, and
 /// whose cascaded memories, are still on disk. See
-/// `execution.Execution.settleAndRemoveSession`.
+/// `execution.Execution.settleAndRemoveSession`, and the gate that holds this to
+/// one caller in `gates_authority_test.zig`.
 pub fn removeLocked(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {
     try store.db.requireTransaction();
     var stmt = try store.db.prepare(
@@ -81,23 +91,6 @@ pub fn removeLocked(store: *Store, server_id: i64, name: []const u8) Db.Error!bo
     try stmt.bindText(2, name);
     _ = try stmt.step();
     return store.db.changes() > 0;
-}
-
-/// `removeLocked` on its own.
-///
-/// **Not what `session rm` uses**, and a caller reaching for it should say why
-/// it is not composing the delete with a terminal receipt: this drops a session
-/// row and cascades that session's memories away with nothing in the ledger
-/// recording that anybody did so. `session rm` goes through
-/// `execution.Execution.settleAndRemoveSession` for exactly that reason. Kept as
-/// the single-statement form because a caller that legitimately has no operation
-/// to settle should still not open its own transaction by hand.
-pub fn remove(store: *Store, server_id: i64, name: []const u8) Db.Error!bool {
-    try store.db.exec("BEGIN IMMEDIATE");
-    errdefer store.db.exec("ROLLBACK") catch {};
-    const had_row = try removeLocked(store, server_id, name);
-    try store.db.exec("COMMIT");
-    return had_row;
 }
 
 pub fn cursor(store: *Store, session_id: i64) Db.Error!i64 {

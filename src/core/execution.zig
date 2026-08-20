@@ -1590,8 +1590,9 @@ pub const Execution = struct {
     ///
     /// This is `session rm`'s last three acts, and they used to be three:
     /// `stillOurs` renewed the lease, then `execution.settle` ran a whole
-    /// transaction of its own writing the proven cancellation, and only then
-    /// `sessions.remove` deleted the row. Two defects fell out of that order.
+    /// transaction of its own writing the proven cancellation, and only then the
+    /// standalone `sessions.remove` wrapper — since deleted — dropped the row.
+    /// Two defects fell out of that order.
     ///
     /// **The window.** A peer's takeover landing between the renewal and the
     /// delete was never re-checked, so the command went on to drop the row — and
@@ -1599,8 +1600,8 @@ pub const Execution = struct {
     /// `1f47542` closed the same `renew → settle → act` window for `cmd_job`'s
     /// kill; this is its recurrence one verb over.
     ///
-    /// **The order.** The terminal was written *first*. A failure in
-    /// `sessions.remove` afterwards left the durable ledger asserting a completed
+    /// **The order.** The terminal was written *first*. A failure in that delete
+    /// afterwards left the durable ledger asserting a completed
     /// removal while the row, its memories and possibly the pane log were all
     /// still there — and a terminal is frozen, so nothing could correct it.
     ///

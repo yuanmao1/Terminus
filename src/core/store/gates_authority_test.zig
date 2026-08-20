@@ -24,6 +24,7 @@ const Db = @import("Db.zig");
 const ids = @import("ids.zig");
 const op_state = @import("op_state.zig");
 const execution = @import("../execution.zig");
+const Control = @import("../control.zig");
 
 // The shared fixtures. Aliased under their own names so a gate reads the
 // same here as it did when every gate was in one file.
@@ -1566,4 +1567,212 @@ test "gate: the settlement `job kill` writes cannot express a destruction" {
     try t.expectEqual(@as(usize, 2), destructions.len);
     try t.expectEqualStrings("session_row", destructions[0].name);
     try t.expectEqualStrings("job_row", destructions[1].name);
+}
+
+// --- The cascading delete has one writer, and the contract is its one caller --
+//
+// One DELETE in this tree destroys more than the row it names. The `sessions`
+// delete cascades that session's memories — `memories.session_id ... ON DELETE
+// CASCADE`, v1 — and memories are the one thing `session rm` destroys that no
+// remote command can put back. (`jobs` is not in that class: nothing references
+// `jobs(id)`, so a job delete takes exactly the row it names. Its route is held
+// by a different mechanism; see `jobs.RemovalGrounds.warrant`.)
+//
+// Until this pass there were two ways to reach that cascade. `removeLocked`,
+// which `execution.commitDestruction` calls with the terminal receipt and the
+// in-transaction claim check beside it, and a public `remove` wrapper beside it
+// that was the same DELETE inside a `BEGIN IMMEDIATE` of its own — no authority,
+// no ledger entry, nothing on record that anybody had done it. It had zero
+// callers, which is exactly why it was dangerous: the next caller that wanted a
+// session row gone would have found the convenient one first, and `40f0ad0` and
+// `d3e169e` closed that door for `session rm` only to leave it standing next to
+// the verb.
+//
+// It is deleted. What this gate holds is that it stays deleted, and that no
+// *new* route grows beside it — which is the part a type cannot say. Zig has no
+// visibility below `pub`, so `removeLocked` has to be public for
+// `execution.zig` to call it, and any file in the tree may call a public
+// function. The compiler will not count callers; the scan does.
+//
+// It walks `src/` rather than reading a list of files, and that is the whole
+// difference between this and a comment. A hand-listed set of files to scan
+// cannot see a call in a file that did not exist when the list was written,
+// which is precisely the regression — a new caller — that this exists to catch.
+// `test/blackbox.zig` is deliberately out of the walk: it drives the built
+// binary as a subprocess and cannot call a store function at all.
+//
+// The three needles are spelled in halves so this file's own text does not
+// satisfy the scan it drives. Skipping this file instead would have made the one
+// file nobody scans the one place a call could hide.
+//
+// The fourth count is about the writer's own file, and it is the one that holds
+// the actual deletion. A wrapper re-added *beside* `removeLocked` would call it
+// unqualified — no `sessions.` prefix to find, no second DELETE, no new file —
+// and every cross-file count above would still read one. So the writer's name is
+// counted where it is defined too, and there it must appear exactly once: as its
+// own header.
+
+/// The DELETE whose blast radius is larger than the row it names.
+const cascade_statement = "DELETE FROM " ++ "sessions";
+
+/// The one function allowed to execute it, as a call is written.
+const cascade_writer = "sessions." ++ "removeLocked(";
+
+/// The same name unqualified, for counting inside the file that defines it.
+const cascade_writer_bare = "removeLocked" ++ "(";
+
+/// The wrapper this gate exists because of. Zero, forever, unless somebody
+/// argues for it out loud.
+const cascade_short_route = "sessions." ++ "remove(";
+
+/// Where the statement lives, relative to the walk root.
+const cascade_writer_file = "core/store/sessions.zig";
+
+/// Where its one caller lives, relative to the walk root.
+const cascade_caller_file = "core/execution.zig";
+
+/// The function that caller has to be, spelled as `Control.bodyOf` wants it.
+const cascade_caller_body = "\npub fn commitDestruction(";
+
+/// One. Deliberate, and it is the count that carries the rule: the statement is
+/// written once, so a second copy of it — in this file or a new one — is a
+/// second route to the cascade however it is guarded, and it fails here before
+/// anybody has to notice it.
+const cascade_statement_count = 1;
+
+/// One, for the same reason and about the other end: `execution.commitDestruction`
+/// is the only caller, so the total across the tree is the total inside that one
+/// body. A test that legitimately needs to drive the writer directly raises this
+/// number, and raising it is the conversation this gate is for.
+const cascade_writer_call_count = 1;
+
+/// One: the definition, and nothing else in the file it is defined in. This is
+/// the count the deleted wrapper would have moved — it was a local call — and it
+/// is what stops the wrapper coming back under any name.
+const cascade_writer_mentions_at_home = 1;
+
+fn occurrences(haystack: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, from, needle)) |at| : (from = at + needle.len) n += 1;
+    return n;
+}
+
+test "gate: the session cascade has one writer and the contract is its one caller" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+
+    var statements: usize = 0;
+    var writer_calls: usize = 0;
+    var short_routes: usize = 0;
+    var mentions_at_home: ?usize = null;
+    var caller_source: ?[]const u8 = null;
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const path = try arena.dupe(u8, entry.path);
+        std.mem.replaceScalar(u8, path, '\\', '/');
+        const text = try entry.dir.readFileAlloc(io, entry.basename, arena, .limited(8 << 20));
+        const at_home = std.mem.eql(u8, path, cascade_writer_file);
+
+        const here = occurrences(text, cascade_statement);
+        if (here != 0 and !at_home) {
+            std.debug.print(
+                \\
+                \\src/{s}: writes the session DELETE, whose cascade takes that
+                \\session's memories with it. That statement belongs to
+                \\{s}, which requires its caller's transaction and is
+                \\reached from execution.commitDestruction alone — the terminal
+                \\receipt and the in-transaction claim check land beside it there.
+                \\
+            , .{ path, cascade_writer_file });
+            return error.CascadingDeleteOutsideItsWriter;
+        }
+        statements += here;
+        short_routes += occurrences(text, cascade_short_route);
+
+        // The writer's own file defines it; every other mention is a call.
+        if (at_home) {
+            mentions_at_home = occurrences(text, cascade_writer_bare);
+            continue;
+        }
+        const calls = occurrences(text, cascade_writer);
+        if (calls != 0 and !std.mem.eql(u8, path, cascade_caller_file)) {
+            std.debug.print(
+                \\
+                \\src/{s}: calls the session-cascade writer. Only
+                \\execution.commitDestruction may: a delete that cascades
+                \\memories has to land in the same transaction as the terminal
+                \\that says it happened, or the ledger asserts a removal whose
+                \\rows are still on disk and no later command can correct it.
+                \\
+            , .{path});
+            return error.CascadingDeleteReachedOutsideTheContract;
+        }
+        writer_calls += calls;
+        if (calls != 0) caller_source = text;
+    }
+
+    // A walk that found nothing would have complained about nothing. The writer's
+    // file has to have been read for any of the counts to mean anything.
+    const home = mentions_at_home orelse {
+        std.debug.print(
+            \\
+            \\the walk never read src/{s}, so every count below it is zero for
+            \\the wrong reason. This gate reads the source tree from the build
+            \\root; nothing here is evidence unless that file was seen.
+            \\
+        , .{cascade_writer_file});
+        return error.CascadeWriterFileWasNotScanned;
+    };
+    if (home != cascade_writer_mentions_at_home) {
+        std.debug.print(
+            \\
+            \\src/{s} names the session-cascade writer {d} times; it may name it
+            \\{d}, its own header and nothing else. A second mention is a local
+            \\caller — the transaction-opening wrapper that used to sit beside it,
+            \\under whatever name — and that is a route to the memory cascade with
+            \\no claim re-read and no terminal receipt beside the delete.
+            \\
+        , .{ cascade_writer_file, home, cascade_writer_mentions_at_home });
+        return error.CascadingDeleteHasASecondLocalRoute;
+    }
+    if (statements != cascade_statement_count) {
+        std.debug.print(
+            \\
+            \\the tree writes the session DELETE {d} times; it may write it {d}.
+            \\
+        , .{ statements, cascade_statement_count });
+        return error.CascadingDeleteIsWrittenTwice;
+    }
+    if (writer_calls != cascade_writer_call_count) {
+        std.debug.print(
+            \\
+            \\the session-cascade writer has {d} callers; it may have {d}, and that
+            \\one is execution.commitDestruction. A caller raising this number is
+            \\raising it deliberately or not at all.
+            \\
+        , .{ writer_calls, cascade_writer_call_count });
+        return error.CascadingDeleteHasASecondCaller;
+    }
+    try t.expectEqual(@as(usize, 0), short_routes);
+
+    // And the call is inside the contract, not merely inside the contract's
+    // file. `commitDestruction` is what re-reads the claim and writes the
+    // terminal; a second function in `execution.zig` calling the writer would
+    // satisfy every count above and have none of that.
+    const body = try Control.bodyOf(caller_source.?, cascade_caller_body);
+    try t.expectEqual(@as(usize, cascade_writer_call_count), occurrences(body, cascade_writer));
 }
