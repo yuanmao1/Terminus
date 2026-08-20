@@ -33,17 +33,55 @@
 //!
 //! **A transfer that did not publish keeps its destination**, so the next one
 //! aimed there is refused rather than walking onto the leftovers
-//! (`State.holdsDestination`). `--restart` is the one way past that, and what it
-//! may release is narrow: `transfers.supersedeLocked` writes `superseded` only
-//! over a *settled failure*, and only when the attempt that owns the checkpoint
-//! can no longer be affecting the host. The three writes a restart is —
-//! the new operation, the supersession, the replacement checkpoint — are one
-//! transaction, in `execution.beginSupersedingCheckpoint`, because a
-//! supersession that committed alone would leave the path free with nothing on
-//! the way to it. Everything else `findHolder` can return is refused by name;
-//! see `wayThrough`, which is also where the limit this command cannot lift is
-//! written down — every abort below parks at `paused`, and `paused` is not a
-//! state supersession may leave.
+//! (`State.holdsDestination`). Two acts get past that, and they are for
+//! different states:
+//!
+//!   * `--resume` **adopts** an adoptable checkpoint — `planned`, `probing`,
+//!     `transferring`, `paused` — and continues it from its confirmed offset.
+//!     Nothing is discarded: the partial's confirmed prefix is proven and kept,
+//!     and the digest the artifact will be judged by is the one the interrupted
+//!     attempt declared before its first byte. `execution.adoptCheckpoint` is
+//!     the hand-over; `transfers.verifyResume` is the rule it must satisfy
+//!     first.
+//!   * `--restart` **supersedes** a settled failure and starts over.
+//!     `transfers.supersedeLocked` writes `superseded` only over a `failed_*`
+//!     state, and only when the attempt that owns the checkpoint can no longer
+//!     be affecting the host. The three writes a restart is — the new
+//!     operation, the supersession, the replacement checkpoint — are one
+//!     transaction, in `execution.beginSupersedingCheckpoint`, because a
+//!     supersession that committed alone would leave the path free with nothing
+//!     on the way to it.
+//!
+//! The two sets are disjoint and every state falls in at most one of them, so
+//! `wayThrough` names exactly one verb per holder. Offering both for a state
+//! only one applies to is worse than the dead end this replaced.
+//!
+//! **A resume is verifiable end to end, and no pass is made for the sake of it.**
+//! A SHA-256 cannot be continued from its own output, so a resumed transfer
+//! appears to need either a whole extra read of the confirmed prefix to rebuild
+//! the hasher or no end-to-end verification at all. Neither: the two readings a
+//! resume must take anyway to be *allowed* — the source, to prove it is still
+//! the one the checkpoint recorded, and the staged prefix, to prove it is the
+//! bytes we counted — are passes over exactly those bytes, and
+//! `transfer.readLocalFile` hands back the hasher as it stood at the mark
+//! alongside the digest it was asked for. So the confirmed offset goes on
+//! advancing behind a prefix digest exactly as on a fresh transfer, the final
+//! digest covers the whole artifact, and the digest it is compared against is
+//! `expected_sha256` — declared before the first byte and *unwritable* by the
+//! resuming attempt, because `recordExpectedHash` refuses a row that already
+//! carries one, is past offset zero, or is no longer before its first byte.
+//!
+//! Which side the prefix is read on follows from where the partial lives: for a
+//! push it is on the host, so the prefix proof is a ranged remote digest and the
+//! hasher comes from the local source's own pass; for a pull it is here, so one
+//! local pass gives both.
+//!
+//! **`--resume` is exec-only above offset zero.** libssh2 offers
+//! `libssh2_scp_send64` and `libssh2_scp_recv2` and nothing ranged: the first
+//! must be told a whole file's length up front and the second fetches a whole
+//! file. So `--via scp` together with `--resume` is refused by name rather than
+//! attempted, and an unpinned resume reports which backend it was left with and
+//! why.
 //!
 //! **Two backends, as before.** scp is tried first and the exec fallback
 //! (base64 over the command channel) is used when the host has no scp binary.
@@ -59,17 +97,19 @@ const digest = Core.digest;
 const transfers = Store.transfers;
 
 const usage =
-    \\usage: terminus push <server> <local-path> <remote-path> [--mode 644] [--via scp|exec] [--restart] [--force] [--json]
-    \\       terminus pull <server> <remote-path> <local-path> [--via scp|exec] [--restart] [--force] [--json]
+    \\usage: terminus push <server> <local-path> <remote-path> [--mode 644] [--via scp|exec] [--resume|--restart] [--force] [--json]
+    \\       terminus pull <server> <remote-path> <local-path> [--via scp|exec] [--resume|--restart] [--force] [--json]
     \\
     \\Bytes are staged beside the destination and renamed into place only after
     \\both ends agree on a SHA-256. A transfer the host cannot hash ends
     \\`completed_unverified`, never `published`.
     \\
     \\A failed transfer keeps its destination: the next transfer aimed there is
-    \\refused until somebody says the leftovers may be discarded. `--restart` is
-    \\where they say it — it releases a *settled failure*'s hold and starts over
-    \\in the same transaction, and refuses anything else.
+    \\refused until somebody says what to do about the leftovers. There are two
+    \\answers and they are for different states. `--resume` continues an
+    \\interrupted transfer from its confirmed offset and discards nothing.
+    \\`--restart` releases a *settled failure*'s hold and starts over in the same
+    \\transaction. Each refuses what the other is for.
     \\
 ;
 
@@ -100,9 +140,21 @@ pub const Outcome = enum {
     /// was available to prove they are the right bytes. The artifact is at the
     /// destination; nothing establishes what it is.
     completed_unverified,
-    /// The source this end sent is not the source this end hashed. Only a push
-    /// can find this, and only by hashing twice.
+    /// The source this end sent is not the source this end hashed. A fresh push
+    /// finds it by hashing twice; a resume in either direction finds it before
+    /// it moves anything, because re-proving the source is what licenses the
+    /// resume at all.
     failed_source_changed,
+    /// The staged partial a resume was going to continue is not the prefix this
+    /// transfer confirmed — the wrong length, or the right length and the wrong
+    /// bytes. Only a resume can find this, and only before it moves anything.
+    ///
+    /// A separate verdict from `failed_source_changed` because they are separate
+    /// facts and they send an operator to different files: one says the thing
+    /// being copied changed, the other says the bytes sitting beside the
+    /// destination are not the ones this transfer counted. Neither of them is
+    /// "start over" — that is `--restart`, and it is the operator's call.
+    failed_remote_partial_mismatch,
     /// The two ends disagreed. Nothing was renamed.
     failed_hash_mismatch,
     /// The rename reported failure. Nothing was renamed.
@@ -128,7 +180,11 @@ pub const Outcome = enum {
     pub fn exitCode(o: Outcome) u8 {
         return switch (o) {
             .published => Cli.exit_code.ok,
-            .failed_source_changed, .failed_hash_mismatch, .failed_publish => Cli.exit_code.failure,
+            .failed_source_changed,
+            .failed_remote_partial_mismatch,
+            .failed_hash_mismatch,
+            .failed_publish,
+            => Cli.exit_code.failure,
             .completed_unverified, .indeterminate_publish, .paused => Cli.exit_code.indeterminate,
         };
     }
@@ -137,12 +193,23 @@ pub const Outcome = enum {
         return @tagName(o);
     }
 
+    /// The outcome that names this checkpoint state, or null when none does.
+    ///
+    /// Derived rather than switched. Every `Outcome` is named after a checkpoint
+    /// state and a gate holds the two vocabularies against each other, so a
+    /// hand-written mapping here would be a third copy of that correspondence
+    /// and the first one to drift.
+    pub fn naming(state: transfers.State) ?Outcome {
+        return std.meta.stringToEnum(Outcome, state.text());
+    }
+
     /// What this outcome establishes, in the field an agent reads before `ok`.
     pub fn proves(o: Outcome) []const u8 {
         return switch (o) {
             .published => "the artifact is at the destination and both ends hashed to the digest declared before the first byte",
             .completed_unverified => "bytes arrived and matched their length; no trustworthy remote digest was available, so nothing establishes they are the right bytes",
-            .failed_source_changed => "the source changed while it was being sent; nothing was renamed and the destination is untouched",
+            .failed_source_changed => "the source is not the one this transfer was about; nothing was renamed and the destination is untouched",
+            .failed_remote_partial_mismatch => "the staged partial beside the destination is not the prefix this transfer confirmed, so nothing could be spliced onto it; nothing was sent and the destination is untouched",
             .failed_hash_mismatch => "the two ends hashed to different digests; nothing was renamed and the destination is untouched",
             .failed_publish => "the rename reported failure; nothing was renamed and the destination is untouched",
             .indeterminate_publish => "the rename was issued and its answer was lost; it may or may not have landed",
@@ -155,8 +222,9 @@ pub const Outcome = enum {
             .published => null,
             .completed_unverified => "install sha256sum or shasum on the host for a verified transfer; this operation stays unresolved until an operator judges it",
             .failed_source_changed, .failed_hash_mismatch, .failed_publish => "the destination still holds what it held; the staged partial is left beside it",
+            .failed_remote_partial_mismatch => "the confirmed prefix could not be proven, so this attempt is over and it published nothing; re-run with --restart to discard the leftovers and start from zero",
             .indeterminate_publish => "read the destination and reconcile this request against what you find ('terminus request reconcile')",
-            .paused => "the checkpoint can be taken over by a later attempt once this request is reconciled",
+            .paused => "re-run with --resume to continue from the confirmed offset; nothing is discarded",
         };
     }
 };
@@ -189,6 +257,21 @@ const Run = struct {
     /// backend, which asks for one byte range at a time and so has to know
     /// where the file ends.
     remote_size: u64 = 0,
+    /// Where this run's first byte goes. Zero on a fresh transfer and on a
+    /// resume whose verdict was `start_over`.
+    resume_from: u64 = 0,
+    /// The stream hasher as it stood at `resume_from`, recovered from the pass
+    /// that proved the resume was allowed. Null when there is nothing to
+    /// recover, which is every fresh transfer.
+    ///
+    /// This one field is what makes a resumed transfer's confirmed offsets and
+    /// final digest mean the same thing a fresh one's do. Without it the running
+    /// digest would cover only this run's bytes, every prefix digest written
+    /// behind an advancing offset would describe a range nobody can re-derive,
+    /// and the end-to-end comparison would be of a tail against a whole file.
+    seed: ?digest.Running = null,
+    /// Why this transfer had no choice of backend, when it had none.
+    backend_reason: ?[]const u8 = null,
     /// Why the ledger declined to resolve a published transfer, when it did.
     /// Null on every other path, including the ones with nothing to resolve.
     resolution_refused: ?[]const u8 = null,
@@ -221,6 +304,29 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
         std.fmt.parseInt(u32, m, 8) catch fatal("invalid --mode '{s}' (octal, e.g. 644)", .{m})
     else
         0o644;
+
+    const want_resume = parsed.boolean("resume");
+    const want_restart = parsed.boolean("restart");
+    // Refused rather than ranked. They are for disjoint sets of states — see
+    // `wayThrough` — so a command carrying both is a command whose author does
+    // not know which situation they are in, and picking one for them would
+    // either discard resume material or refuse a restart that was the right
+    // answer.
+    if (want_resume and want_restart) fatal(
+        "--resume and --restart cannot be combined: --resume continues an interrupted transfer from its confirmed offset and discards nothing, --restart releases a settled failure's hold and starts from zero. They apply to different states; read the holder with 'terminus request ls' and pass one",
+        .{},
+    );
+    // Checked here, before an operation exists and before anything is adopted,
+    // because a resume's offset is not knowable until a checkpoint has been read
+    // and taken over — and refusing after that would leave a live checkpoint
+    // holding the path over a flag combination that was never going to work.
+    // libssh2 has `libssh2_scp_send64` and `libssh2_scp_recv2` and nothing
+    // ranged: the first must be told a whole file's length before the first
+    // byte, the second fetches a whole file. There is no offset to give either.
+    if (want_resume and via != null and std.mem.eql(u8, via.?, "scp")) fatal(
+        "refused: --via scp cannot resume. libssh2's scp support is send64/recv2 — a whole file from byte zero, with no ranged form — so there is nowhere to give it an offset; nothing was sent. Drop --via, or pass --via exec",
+        .{},
+    );
 
     // Both backends drive the host's shell for the probe, the verification and
     // the publish, so the remote path is validated whichever one moves the
@@ -280,9 +386,9 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
     // refusal costs nothing and sends nothing. It is not the binding check —
     // that is the live-destination index, inside the same statement as the write
     // — and it does not need to be: everything it can conclude is a refusal, and
-    // the one reading that proceeds is re-checked by `supersedeLocked`'s own
-    // conjuncts under the write lock.
-    const to_supersede = releaseTarget(ctx, &store, dest_side, dest_path, parsed.boolean("restart"));
+    // the two readings that proceed are re-checked under the write lock by
+    // `supersedeLocked`'s own conjuncts and by the hand-over statement's.
+    const way = wayIn(ctx, &store, dest_side, dest_path, want_resume, want_restart);
 
     // A transfer's blast radius is the path it publishes to, which is what
     // makes two transfers aimed at one directory see each other and a transfer
@@ -315,11 +421,14 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
     // holding the destination every time a host is unreachable. On the restart
     // path the destination was already held when the command started and is
     // still held if the dial fails, so nothing is barred that was not barred
-    // before.
+    // before. The resume path is in the same position for the same reason: the
+    // row it takes over already held the path, and a failed dial leaves it with
+    // the owner it had.
     var restarted_checkpoint: ?i64 = null;
 
     var execution = open: {
-        if (to_supersede) |holding| {
+        if (way == .supersede) {
+            const holding = way.supersede;
             switch (Core.execution.beginSupersedingCheckpoint(
                 &store,
                 ctx.arena,
@@ -352,14 +461,26 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
     var client = Cli.sshConnect(resolved.server, resolved.auth);
     defer client.deinit();
 
-    // The checkpoint, before the probe that reports against it. `create`
-    // refuses unless the operation exists, has not submitted, its kind matches
-    // the direction and its server matches the destination side — so this is
-    // also where a mismatched plan is caught.
-    const checkpoint = if (restarted_checkpoint) |id| id else transfers.create(
-        &store,
-        plan.forRequest(execution.id(), ctx.now),
-    ) catch |err| fatalCreate(err, &execution, &store, ctx.arena, dest_side, dest_path);
+    // Where the checkpoint comes from, one arm per way in.
+    //
+    // `create` refuses unless the operation exists, has not submitted, its kind
+    // matches the direction and its server matches the destination side — so the
+    // fresh arm is also where a mismatched plan is caught. `adoptCheckpoint`
+    // asks the same four things of the *heir* inside the statement that moves
+    // ownership, plus the one a fresh transfer has no equivalent of: the attempt
+    // being displaced must no longer be able to affect the host.
+    const checkpoint = switch (way) {
+        .supersede => restarted_checkpoint.?,
+        .fresh => transfers.create(
+            &store,
+            plan.forRequest(execution.id(), ctx.now),
+        ) catch |err| fatalCreate(err, &execution, &store, ctx.arena, dest_side, dest_path),
+        .adopt => |held| adopt: {
+            execution.adoptCheckpoint(held.id, held.request_id) catch |err|
+                fatalAdopt(err, &execution, held, dest_path);
+            break :adopt held.id;
+        },
+    };
 
     var r: Run = .{
         .ctx = ctx,
@@ -372,13 +493,21 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
         .partial_path = partial_path,
         .source_path = src,
     };
-    // Immediately, and before anything that can fail: `paused` — the state
-    // every abort below parks in, so the checkpoint stays adoptable rather than
-    // holding its destination forever — has no edge from `planned`.
-    r.setState(.probing, null);
 
     const started = std.Io.Timestamp.now(ctx.io, .awake);
-    probe(&r);
+    switch (way) {
+        // Immediately, and before anything that can fail: `paused` — the state
+        // every abort below parks in, so the checkpoint stays adoptable rather
+        // than holding its destination forever — has no edge from `planned`.
+        .fresh, .supersede => {
+            r.setState(.probing, null);
+            probe(&r);
+        },
+        // The resume's own probe. It walks the row to `probing` too, and it
+        // *reads* the two commitments a fresh probe writes rather than writing
+        // them — see `resumeFrom`.
+        .adopt => resumeFrom(&r),
+    }
 
     switch (execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "about to submit")) {
         .submitted => {},
@@ -399,8 +528,12 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
 
     const elapsed_ns = started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds;
     const duration_ms: i64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
+    // This run's bytes, not the artifact's. A resume that moved the last
+    // megabyte of a nine-gigabyte file did not move nine gigabytes, and a rate
+    // computed from the artifact would say it did.
+    const moved_now = streamed.bytes - streamed.resumed_from;
     const mib_s: f64 = if (elapsed_ns > 0)
-        @as(f64, @floatFromInt(streamed.bytes)) / (1 << 20) / (@as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s)
+        @as(f64, @floatFromInt(moved_now)) / (1 << 20) / (@as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s)
     else
         0;
 
@@ -438,7 +571,14 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
             .source = src,
             .destination = dest_path,
             .bytes = streamed.bytes,
+            // Where this run started, so `bytes` can be read as a position in
+            // the artifact rather than as a count of what moved. Zero on every
+            // fresh transfer.
+            .resumedFrom = streamed.resumed_from,
             .backend = streamed.backend,
+            // Why that backend, when there was no choice. Null when the ordinary
+            // scp-then-exec selection was made.
+            .backendReason = streamed.backend_reason,
             .transferState = outcome.text(),
             .status = execution.status.text(),
             // The two digests the verdict rests on, and null when there was
@@ -458,6 +598,13 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
             "{t} {s} -> {s}: {Bi} in {d} ms ({d:.1} MiB/s, via {s}) — {s}\n  {s}\n",
             .{ verb, src, dest_path, streamed.bytes, duration_ms, mib_s, streamed.backend, outcome.text(), outcome.proves() },
         ),
+    }
+    if (streamed.resumed_from > 0 and ctx.out.format == .human) {
+        try ctx.out.print("  resumed from byte {d}{s}{s}\n", .{
+            streamed.resumed_from,
+            if (streamed.backend_reason != null) "; " else "",
+            streamed.backend_reason orelse "",
+        });
     }
     if (r.resolution_refused) |why| {
         if (ctx.out.format == .human) try ctx.out.print("  {s}\n", .{why});
@@ -580,15 +727,323 @@ fn probeRemoteSource(r: *Run) void {
     r.declared_sha256 = sha;
 }
 
+// --- resuming ----------------------------------------------------------------
+
+/// What `failure_reason` records when a resume parks a row whose owner is gone.
+const adopted_reason = "adopted by a resume; the owner that left it here is gone";
+
+/// The two readings a resume is licensed by, taken on the sides they live on.
+const Observed = struct {
+    /// The source as it is *now*. Null when it is gone, which `verifyResume`
+    /// has words for.
+    source: ?transfers.SourceIdentity,
+    partial: transfers.PartialObservation,
+    /// The stream hasher as it stood at the confirmed offset, recovered from
+    /// whichever of the two readings covers the artifact's own prefix: the
+    /// source for a push, because the artifact is a copy of it, and the staged
+    /// partial for a pull, because the artifact *is* it.
+    ///
+    /// Null when the reading it would have come from did not reach the mark —
+    /// which is the same fact that makes `verifyResume` refuse, so nothing ever
+    /// resumes on a null seed.
+    seed: ?digest.Running,
+};
+
+/// The resume's probe: walks the row to `probing`, re-proves what the checkpoint
+/// recorded, and decides where the stream starts.
+///
+/// It is a sibling of `probe` rather than a branch of it because the two do
+/// opposite things with the same two facts. A fresh probe *writes* the source's
+/// identity and the digest the result will be judged by; a resume **reads** both
+/// and may not write either — `recordSourceIdentity` and `recordExpectedHash`
+/// are write-once and are refused on a row past offset zero or past its first
+/// byte. That refusal is not an obstacle to work around, it is the guarantee: the
+/// digest a resumed artifact is judged against is the one the interrupted attempt
+/// committed to before it sent anything, and this attempt cannot substitute a
+/// reading of whatever has landed since.
+fn resumeFrom(r: *Run) void {
+    const row = readCheckpoint(r);
+
+    // `probing`'s predecessors are `planned` and `paused` and nothing else, so a
+    // row adopted in `probing` or `transferring` cannot be probed where it
+    // stands. `paused` is the state each of them is *in* once its owner is gone
+    // — nobody is probing and nobody is transferring — so parking it first is
+    // the accurate write rather than a step taken to satisfy the graph.
+    switch (row.state) {
+        .planned, .paused => {},
+        .probing, .transferring => r.setState(.paused, adopted_reason),
+        // `wayIn` refuses everything `isAdoptable` excludes and the hand-over
+        // statement refuses it again under the write lock, so arriving here means
+        // those two and this switch have come apart. Reported under that
+        // description rather than assumed away.
+        else => fatal(
+            "internal: checkpoint {d} was adopted in state {s}, which is not adoptable",
+            .{ r.checkpoint, row.state.text() },
+        ),
+    }
+    r.setState(.probing, null);
+
+    // Read, never re-declared. Null here means the interrupted attempt never
+    // declared one — a pull from a host that cannot hash — and this attempt
+    // cannot supply what that one could not, so the resume ends
+    // `completed_unverified` exactly as the original would have.
+    r.declared_sha256 = row.expected_sha256;
+    // Off the row rather than off this run's reading: whether a non-zero offset
+    // may be stored at all is a fact about what was committed before the first
+    // byte, and `recordSourceIdentity` cannot be called again to change it.
+    r.identified = if (row.source.file()) |f| f.sha256 != null else false;
+
+    const confirmed: u64 = @intCast(@max(row.confirmed_offset, 0));
+    const observed = observeForResume(r, confirmed);
+
+    switch (transfers.verifyResume(row, observed.source, observed.partial)) {
+        .resume_from => |offset| {
+            r.resume_from = offset;
+            r.seed = observed.seed;
+        },
+        .truncate_then_resume => |cut| {
+            // Prove, then cut. The prefix was proven a conjunct ago and the bytes
+            // above it were never confirmed, so they are discarded rather than
+            // counted — but only in this order, because truncating first would
+            // destroy the only thing that could have proven the prefix.
+            //
+            // At offset zero there is nothing to cut *to*: the stream itself
+            // creates the partial truncating, so a separate truncate would be a
+            // second write saying the same thing.
+            if (cut.offset > 0) truncatePartial(r, cut.offset, cut.partial_len);
+            r.resume_from = cut.offset;
+            r.seed = observed.seed;
+        },
+        // Nothing staged and nothing confirmed. The checkpoint is ours and its
+        // declaration stands; the stream starts at zero, which is not a silent
+        // restart — no confirmed byte is being discarded, because there was none.
+        .start_over => {
+            r.resume_from = 0;
+            r.seed = null;
+        },
+        // The two refusals, as themselves. Neither is "let me just start over":
+        // one says the thing being copied is not the thing this checkpoint is
+        // about, the other says the bytes beside the destination are not the ones
+        // it counted, and discarding either on the operator's behalf is exactly
+        // what `--restart` exists to make them ask for.
+        .source_changed => |why| refuseResume(r, .failed_source_changed, why),
+        .partial_mismatch => |why| refuseResume(r, .failed_remote_partial_mismatch, why),
+        // Unreachable through this driver and handled anyway: the schema's
+        // `offset_needs_source_identity` forbids the row and the observer refuses
+        // to confirm an offset without an identity, so a row in this shape was not
+        // written by this binary. It gets no `failed_*` verdict because none of
+        // them describes "this record should not exist" — reported as the record
+        // fault it is, and parked where it was.
+        .unidentified_source => |why| abort(
+            r,
+            "cannot resume checkpoint {d}: {s}. Its confirmed offset is {d} and it carries no source digest, which the schema forbids",
+            .{ r.checkpoint, why, confirmed },
+        ),
+    }
+
+    // The invariant everything above exists to establish, asserted where it is
+    // cheap. A stream that starts above zero must carry the hasher state at that
+    // offset: without it every prefix digest this run writes describes a range
+    // nobody can re-derive, and the final comparison is a tail against a whole
+    // file — which is a wrong `published`, the one outcome that must never be
+    // reachable by mistake. Unreachable today (every verdict that yields a
+    // non-zero offset has already proven the pass that produces the seed), and
+    // checked anyway, because the cost of being wrong here is silent.
+    if (r.resume_from > 0 and r.seed == null) fatal(
+        "internal: checkpoint {d} was cleared to resume at byte {d} with no digest state for the bytes below it",
+        .{ r.checkpoint, r.resume_from },
+    );
+}
+
+fn readCheckpoint(r: *Run) transfers.Checkpoint {
+    const found = transfers.get(r.store, r.ctx.arena, r.checkpoint) catch |err|
+        Cli.receiptFatal(r.requestId(), err, r.execution.status.text());
+    // The hand-over just committed against this id, so the row exists. Reported
+    // rather than unwrapped: a null here means the row went away between two
+    // statements of ours, and that is a ledger fault and not a transfer verdict.
+    return found orelse Cli.receiptFatal(
+        r.requestId(),
+        error.CheckpointRowMissing,
+        r.execution.status.text(),
+    );
+}
+
+/// Takes the source and the staged prefix, on whichever machine each lives on.
+///
+/// **Both passes are obligations, not costs added for the resume's convenience.**
+/// `verifyResume` will not continue without an observed source identity and,
+/// above offset zero, without a prefix digest of the partial. Those are reads of
+/// exactly the bytes whose hasher state a resumed stream needs, so the state
+/// comes back with them — see `transfer.readLocalFile`. There is no third pass
+/// anywhere, and in particular nothing re-reads a prefix to rebuild a digest.
+fn observeForResume(r: *Run, confirmed: u64) Observed {
+    switch (r.verb) {
+        // The partial is on the host, so its prefix proof is a ranged remote
+        // digest and the hasher comes from the local source's own pass. The
+        // artifact a push publishes is a copy of that source, so the source's
+        // prefix and the partial's prefix are the same bytes when the partial is
+        // sound — which is precisely what the remote reading is compared for.
+        .push => {
+            const pass = Core.transfer.readLocalFile(
+                r.ctx.io,
+                r.ctx.arena,
+                r.source_path,
+                confirmed,
+            ) catch |err| abort(
+                r,
+                "cannot read local file '{s}' ({s})",
+                .{ r.source_path, @errorName(err) },
+            );
+            const remote = Core.transfer.remotePartial(
+                r.executor(),
+                r.ctx.arena,
+                r.partial_path,
+                confirmed,
+            ) catch |err| abort(
+                r,
+                "cannot read the staged partial '{s}' back off the host ({s}: {s})",
+                .{ r.partial_path, @errorName(err), r.client.errorMessage() },
+            );
+            return .{
+                .source = if (pass) |p| .{ .local_file = .{
+                    .path = r.source_path,
+                    .size = p.size,
+                    .mtime_ns = p.mtime_ns,
+                    .sha256 = p.sha256,
+                } } else null,
+                .partial = .{
+                    .exists = remote.exists,
+                    .len = remote.len,
+                    .prefix_sha256 = remote.prefix_sha256,
+                },
+                .seed = if (pass) |p| p.at_mark else null,
+            };
+        },
+        // The partial is here, so one local pass gives the prefix proof, the
+        // length on disk and the hasher at the mark. The source is on the host
+        // and its identity is the host's own reading of it.
+        .pull => {
+            const reading = Core.transfer.probeRemoteFile(
+                r.executor(),
+                r.ctx.arena,
+                r.source_path,
+            ) catch |err| switch (err) {
+                // Not an abort: a source that is gone is a finding
+                // `verifyResume` words as `source_changed`, and reporting it as a
+                // probe failure would leave the checkpoint undecided.
+                error.RemoteFileMissing => return .{
+                    .source = null,
+                    .partial = .{ .exists = false },
+                    .seed = null,
+                },
+                else => abort(r, "cannot read remote file '{s}' ({s}: {s})", .{
+                    r.source_path, @errorName(err), r.client.errorMessage(),
+                }),
+            };
+            r.remote_size = reading.size;
+            const pass = Core.transfer.readLocalFile(
+                r.ctx.io,
+                r.ctx.arena,
+                r.partial_path,
+                confirmed,
+            ) catch |err| abort(
+                r,
+                "cannot read the staged partial '{s}' ({s})",
+                .{ r.partial_path, @errorName(err) },
+            );
+            return .{
+                .source = .{ .remote_file = .{
+                    .path = r.source_path,
+                    .size = reading.size,
+                    .mtime_ns = reading.mtime_ns,
+                    .sha256 = reading.sha256,
+                } },
+                .partial = if (pass) |p| .{
+                    .exists = true,
+                    .len = p.size,
+                    .prefix_sha256 = p.prefix_sha256,
+                } else .{ .exists = false },
+                .seed = if (pass) |p| p.at_mark else null,
+            };
+        },
+    }
+}
+
+/// Cuts the staged partial back to the offset whose prefix was just proven.
+fn truncatePartial(r: *Run, offset: u64, was: u64) void {
+    switch (r.verb) {
+        .push => Core.transfer.truncateRemote(
+            r.executor(),
+            r.ctx.arena,
+            r.partial_path,
+            offset,
+        ) catch |err| abort(
+            r,
+            "cannot cut the staged partial '{s}' back from {d} to the confirmed {d} bytes ({s}: {s})",
+            .{ r.partial_path, was, offset, @errorName(err), r.client.errorMessage() },
+        ),
+        // Done by `pullFile`, which holds the handle it writes through: cutting
+        // here would open the file a second time and leave the resume's own
+        // writer's idea of the length to agree with it by luck.
+        .pull => {},
+    }
+}
+
+/// A resume that refused before it moved anything, recorded as the finding it is.
+///
+/// `never_submitted` is the accurate terminal and it is the one `abort` already
+/// uses in this driver: the probe's readings reached the host, and the transfer
+/// the caller asked for did not run. It settles `failed`, which stops blocking
+/// the scope — so the next command aimed at this path is refused by the
+/// checkpoint's own hold and not by a stale operation.
+///
+/// The checkpoint gets a decided failure, and that is the improvement over the
+/// dead end this replaced. Both states here hold their destination and both are
+/// `isSupersedable`, so `--restart` is the way on: a refused resume turns an
+/// unjudged `paused` row that nothing could release into a judged one that an
+/// operator can.
+fn refuseResume(r: *Run, state: transfers.State, why: []const u8) noreturn {
+    const reason = std.fmt.allocPrint(
+        r.ctx.arena,
+        "refused to resume: {s}; nothing was sent",
+        .{why},
+    ) catch "refused to resume";
+    r.setState(state, reason);
+    _ = r.execution.settle(
+        .{ .never_submitted = .{ .transport_error = reason } },
+        .{},
+    ) catch |err| Cli.receiptFatal(r.requestId(), err, r.execution.status.text());
+    // Derived from the state, so the pair cannot drift: every `Outcome` is named
+    // after a checkpoint state and a gate holds the two lists against each other.
+    const outcome = Outcome.naming(state) orelse fatal(
+        "internal: no transfer outcome names the state {s}",
+        .{state.text()},
+    );
+    reportOutcome(r, outcome, reason);
+}
+
 // --- transferring ------------------------------------------------------------
 
 /// What the streaming step moved, and what it hashed on the way.
 const Streamed = struct {
+    /// Where the artifact ends: this run's bytes plus whatever a resume started
+    /// from. A position in the file, not a count of work.
     bytes: u64,
+    /// Where this run's first byte went. Zero on every fresh transfer.
+    resumed_from: u64,
     backend: []const u8,
-    /// The digest of everything that went through *this* end, taken as the
-    /// bytes moved. One half of the comparison `verifying` makes, in both
-    /// directions.
+    /// Why that backend, when there was no choice to make. Null when the
+    /// ordinary scp-then-exec selection ran.
+    backend_reason: ?[]const u8 = null,
+    /// The digest of the **whole artifact** as this end accounts for it. One half
+    /// of the comparison `verifying` makes, in both directions.
+    ///
+    /// On a fresh transfer that is the digest of the bytes that went past. On a
+    /// resume the same hasher is used, started from the state the licensing pass
+    /// recovered at `resumed_from` — so this covers the confirmed prefix and this
+    /// run's bytes together, and means exactly what it means on a fresh
+    /// transfer. Without that seed it would be a digest of the tail, and every
+    /// comparison downstream would be of a tail against a whole file.
     local_sha256: []const u8,
     /// The digest the *other* end reports, once `verifying` has asked for it.
     /// Null when the host cannot hash at all.
@@ -602,6 +1057,12 @@ const Streamed = struct {
 /// offset is required to carry — and writes an offset down every
 /// `confirm_every` bytes, plus once at the end.
 ///
+/// A resume starts this from `Run.seed` and `Run.resume_from` rather than from
+/// zero, and that is what keeps the two claims it writes true: the offsets are
+/// positions in the artifact, and each prefix digest is a digest of the artifact
+/// up to that position. `moved` arrives absolute from both backends, so nothing
+/// here has to know whether it is resuming.
+///
 /// A ledger failure here stops the transfer rather than being logged past: the
 /// offset is a claim about bytes we can still prove are ours, and carrying on
 /// past a claim we could not record means the next resume splices onto a prefix
@@ -612,6 +1073,14 @@ const Progress = struct {
     stream: digest.Running,
     confirmed: u64 = 0,
     failure: ?anyerror = null,
+
+    fn init(r: *Run) Progress {
+        return .{
+            .r = r,
+            .stream = r.seed orelse .init(),
+            .confirmed = r.resume_from,
+        };
+    }
 
     fn observer(self: *Progress) Core.Ssh.Observer {
         return .{ .context = @ptrCast(self), .on_chunk = onChunk };
@@ -644,6 +1113,9 @@ const Progress = struct {
     }
 };
 
+/// Why a resumed transfer has no backend to choose between.
+const scp_cannot_resume = "scp cannot resume: libssh2 offers send64 and recv2, which move a whole file from byte zero, so the exec backend is the only one that can continue from an offset";
+
 /// Streams the bytes into the staging partial, whichever backend can.
 ///
 /// The scp fallback is narrower than it was, and deliberately: a scp attempt
@@ -652,17 +1124,24 @@ const Progress = struct {
 /// would append to bytes nobody hashed. So the fallback fires only when the
 /// channel never opened — which is the case it exists for, a host with no scp
 /// binary.
+///
+/// Above offset zero scp is not attempted at all, and the reason travels with
+/// the result rather than being left for a caller to work out. `--via scp` with
+/// `--resume` was already refused at the top of `run`, so the only way here is
+/// an unpinned resume, which gets the backend that can do the job and a sentence
+/// saying why it had no alternative.
 fn stream(r: *Run, via: ?[]const u8, mode: u32) Streamed {
     const want_exec = via != null and std.mem.eql(u8, via.?, "exec");
     const pinned_scp = via != null and std.mem.eql(u8, via.?, "scp");
+    const resuming = r.resume_from > 0;
 
-    var progress: Progress = .{ .r = r, .stream = .init() };
+    var progress: Progress = .init(r);
     r.setState(.transferring, null);
 
     var moved: Core.Ssh.Moved = .{};
-    if (!want_exec) {
+    if (!want_exec and !resuming) {
         if (scpAttempt(r, &progress, &moved, mode)) |bytes| {
-            return finishStream(r, &progress, bytes, "scp");
+            return finishStream(r, &progress, bytes, "scp", null);
         } else |err| {
             if (pinned_scp or err != error.ChannelOpenFailed or moved.arrived != 0)
                 abortTransfer(r, &progress, err, moved, "scp");
@@ -671,7 +1150,7 @@ fn stream(r: *Run, via: ?[]const u8, mode: u32) Streamed {
 
     const bytes = execAttempt(r, &progress, &moved, mode) catch |err|
         abortTransfer(r, &progress, err, moved, "exec");
-    return finishStream(r, &progress, bytes, "exec");
+    return finishStream(r, &progress, bytes, "exec", if (resuming) scp_cannot_resume else null);
 }
 
 fn scpAttempt(r: *Run, progress: *Progress, moved: *Core.Ssh.Moved, mode: u32) Core.Ssh.TransferError!u64 {
@@ -708,6 +1187,7 @@ fn execAttempt(r: *Run, progress: *Progress, moved: *Core.Ssh.Moved, mode: u32) 
             r.ctx.io,
             r.source_path,
             r.partial_path,
+            r.resume_from,
             mode,
             progress.observer(),
             moved,
@@ -718,6 +1198,7 @@ fn execAttempt(r: *Run, progress: *Progress, moved: *Core.Ssh.Moved, mode: u32) 
             r.ctx.io,
             r.source_path,
             r.partial_path,
+            r.resume_from,
             r.remote_size,
             progress.observer(),
             moved,
@@ -725,11 +1206,23 @@ fn execAttempt(r: *Run, progress: *Progress, moved: *Core.Ssh.Moved, mode: u32) 
     };
 }
 
-fn finishStream(r: *Run, progress: *Progress, bytes: u64, backend: []const u8) Streamed {
+fn finishStream(
+    r: *Run,
+    progress: *Progress,
+    bytes: u64,
+    backend: []const u8,
+    backend_reason: ?[]const u8,
+) Streamed {
     var buf: [digest.hex_len]u8 = undefined;
     const sha = r.ctx.arena.dupe(u8, progress.stream.finalHex(&buf)) catch
         fatal("out of memory", .{});
-    return .{ .bytes = bytes, .backend = backend, .local_sha256 = sha };
+    return .{
+        .bytes = bytes,
+        .resumed_from = r.resume_from,
+        .backend = backend,
+        .backend_reason = backend_reason,
+        .local_sha256 = sha,
+    };
 }
 
 /// Parks the checkpoint and reports a transfer that stopped mid-stream.
@@ -827,6 +1320,14 @@ fn verifyAndPublish(r: *Run, streamed: *Streamed) Outcome {
     // again as it sent, and two different answers mean the file changed under
     // us. `failed_source_changed`'s predecessors are `probing` and
     // `transferring` for exactly that reason.
+    //
+    // It holds on a resumed push too, and for the same reason it holds on a
+    // fresh one: the stream digest was seeded at the confirmed offset from the
+    // source's own licensing pass, so what is compared here is still the whole
+    // source against the whole declaration. A resume also has the earlier check
+    // — `verifyResume` refuses a changed source before a byte moves — so on that
+    // path this is the narrower window of a change that happened *during* the
+    // resumed stream.
     if (r.verb == .push) {
         if (r.declared_sha256) |declared| {
             if (!std.ascii.eqlIgnoreCase(declared, streamed.local_sha256)) {
@@ -1096,27 +1597,71 @@ fn abort(r: *Run, comptime fmt: []const u8, args: anytype) noreturn {
 
 // --- the destination somebody else is standing on ---------------------------
 
-/// The checkpoint `--restart` is going to supersede, or null when the path is
-/// clear and an ordinary `create` may have it.
+/// How this command gets onto its destination.
 ///
-/// Every other reading exits here. A held path is a refusal without `--restart`
-/// — the operator did not ask, and releasing a failed attempt's destination
-/// behind their back is precisely the act `holdsDestination` exists to make them
-/// look at. With `--restart` it is a refusal whenever `supersedeLocked` would
-/// refuse, and it says so in that function's own two terms rather than trying
-/// the write to find out: the holder must be a *settled failure*, and its owning
-/// attempt must not still be able to affect the host.
-fn releaseTarget(
+/// Three arms, because there are three situations and each is reached by a
+/// different write: nothing holds the path, `--restart` supersedes a settled
+/// failure, `--resume` adopts an adoptable checkpoint. Naming them as one value
+/// is what keeps the two flags from being read twice, in two places, with two
+/// answers.
+const WayIn = union(enum) {
+    fresh,
+    supersede: transfers.Holder,
+    adopt: transfers.Holder,
+};
+
+/// Reads the holder once and decides which way in the caller asked for.
+///
+/// Every reading that is not one of the three exits here. A held path is a
+/// refusal when nobody asked to do anything about it — releasing or taking over a
+/// failed attempt's destination behind an operator's back is precisely the act
+/// `holdsDestination` exists to make them look at.
+///
+/// With a flag it is a refusal whenever the write that flag reaches would refuse,
+/// and it says so in that write's own terms rather than trying it to find out:
+/// supersession wants a *settled failure* whose owning attempt can no longer
+/// affect the host, and the hand-over wants an *adoptable* checkpoint under the
+/// same settled-owner rule. Neither reading is binding — the statements re-ask
+/// under the write lock — and neither needs to be, because everything decided
+/// here is a refusal.
+fn wayIn(
     ctx: *Cli.Ctx,
     store: *Store,
     dest_side: transfers.DestSide,
     dest_path: []const u8,
-    restart: bool,
-) ?transfers.Holder {
+    want_resume: bool,
+    want_restart: bool,
+) WayIn {
     const holder = transfers.findHolder(store, ctx.arena, dest_side, dest_path) catch |err|
         Cli.storeFatal(store, err);
-    const held = holder orelse return null;
-    if (restart and held.releasable()) return held;
+    const held = holder orelse {
+        // `--resume` with nothing to resume is a refusal, not a fresh start. An
+        // operator who asked to continue an interrupted transfer and is silently
+        // given a new one from zero has been told the opposite of what happened,
+        // and on a large file the difference is hours.
+        if (want_resume) fatal(
+            "refused: nothing is holding '{s}', so there is no interrupted transfer to resume; nothing was sent. Run it without --resume to start one",
+            .{dest_path},
+        );
+        return .fresh;
+    };
+
+    if (want_resume) {
+        // Both refusals name the state, because the state is what decides which
+        // verb applies, and an operator told only "refused" cannot tell whether
+        // to reconcile, restart, or wait.
+        if (!held.state.isAdoptable()) fatal(
+            "refused: request {s} is standing on '{s}' and its transfer is {s}, which --resume may not continue — a resume takes over a checkpoint exactly as its row describes it, and {s} is not a state a row can be continued from; nothing was sent.\n  {s}",
+            .{ held.request_id, dest_path, held.state.text(), held.state.text(), wayThrough(ctx.arena, held) },
+        );
+        if (held.owner_may_be_running) fatal(
+            "refused: request {s} holds '{s}' and has not been settled, so a copier on the far side may still be writing to the partial this resume would splice onto; nothing was sent.\n  {s}",
+            .{ held.request_id, dest_path, wayThrough(ctx.arena, held) },
+        );
+        return .{ .adopt = held };
+    }
+
+    if (want_restart and held.releasable()) return .{ .supersede = held };
     refuseHeld(ctx.arena, held, dest_path);
 }
 
@@ -1134,34 +1679,50 @@ fn refuseHeld(arena: std.mem.Allocator, held: transfers.Holder, dest_path: []con
     );
 }
 
-/// What an operator can actually do about this holder.
+/// Which of the two verbs applies to a holder in this state, or null when
+/// neither does.
 ///
-/// Four sentences, because they send an operator to four different places and
-/// three of them are not `--restart`. The order is the order the supersession
-/// statement asks its questions in: the owning attempt first, then the state.
+/// **The two sets are disjoint and neither is total**, which is the whole reason
+/// this is a function and not a sentence repeated in four messages.
+/// `isAdoptable` is the four states a row can be continued from and
+/// `isSupersedable` is the six settled failures; `indeterminate_publish`,
+/// `verifying` and `publishing` are in neither, and the three states that hold no
+/// destination cannot reach a holder at all. A message that offered both verbs
+/// for a state only one applies to would send half its readers to a statement
+/// that refuses them, which is worse than the dead end this replaced.
 ///
 /// `pub` for the reason `verdictFor` and `publishedEffect` are: nothing in this
-/// tree can drive the producer end to end, so a refusal built inline here would
+/// tree can drive the producer end to end, so a correspondence built inline would
 /// be the part of this slice nothing checks — and it is the part this slice
-/// exists to add.
+/// exists to get right.
+pub fn verbFor(state: transfers.State) ?[]const u8 {
+    if (state.isAdoptable()) return "--resume";
+    if (state.isSupersedable()) return "--restart";
+    return null;
+}
+
+/// What an operator can actually do about this holder.
 ///
-/// **The one this slice cannot fix, stated where it is read.** Every abort in
-/// the driver above parks at `paused`, and `paused` is not in
-/// `State.isSupersedable` — supersession is written only over a `failed_*`
-/// state. So the commonest way a transfer ends up holding a path is the one
-/// `--restart` may not release, and widening the predicate is not available:
-/// `paused` means the checkpoint is trustworthy and *adoptable*, so releasing
-/// its path would throw away resume material that is still good, and the verb
-/// for it is a hand-over (`execution.adoptCheckpoint`), which has no CLI. Said
-/// plainly here rather than approximated, because an operator who is told to
-/// try `--restart` and refused by the statement learns less than one who is told
-/// why up front.
+/// The order is the order the two write statements ask their questions in: the
+/// owning attempt first, then the state. An unsettled owner blocks both verbs
+/// through the same conjunct — a copier on the far side may still be writing —
+/// so that branch names the reconcile and then whichever verb the state is for,
+/// rather than guessing.
+///
+/// `pub` for the reason `verbFor` is.
 pub fn wayThrough(arena: std.mem.Allocator, held: transfers.Holder) []const u8 {
-    if (held.owner_may_be_running) return std.fmt.allocPrint(
-        arena,
-        "request {s} has not been settled, so a copier on the far side may still be writing to the partial beside that path. Establish what it did — 'terminus request reconcile {s}' — and then re-run with --restart.",
-        .{ held.request_id, held.request_id },
-    ) catch "reconcile the holding request, then re-run with --restart";
+    if (held.owner_may_be_running) {
+        const verb = verbFor(held.state) orelse return std.fmt.allocPrint(
+            arena,
+            "request {s} has not been settled, so a copier on the far side may still be writing to the partial beside that path — and its checkpoint is {s}, which neither --resume nor --restart may touch. Establish what it did with 'terminus request reconcile {s}'; that is also what decides where a {s} checkpoint goes next.",
+            .{ held.request_id, held.state.text(), held.request_id, held.state.text() },
+        ) catch "reconcile the holding request";
+        return std.fmt.allocPrint(
+            arena,
+            "request {s} has not been settled, so a copier on the far side may still be writing to the partial beside that path. Establish what it did — 'terminus request reconcile {s}' — and then re-run with {s}.",
+            .{ held.request_id, held.request_id, verb },
+        ) catch "reconcile the holding request, then re-run";
+    }
 
     return switch (held.state) {
         .failed_source_changed,
@@ -1172,27 +1733,41 @@ pub fn wayThrough(arena: std.mem.Allocator, held: transfers.Holder) []const u8 {
         .failed_publish,
         => "That attempt is over and it published nothing. Re-run with --restart to release its hold and start over; its record, its digests and its staged partial are all kept.",
 
+        // Interrupted, and its checkpoint still describes a transfer that can be
+        // picked up where it stands. `--restart` would release the path and throw
+        // the confirmed prefix away with it, which is why supersession does not
+        // reach these states and why the sentence does not offer it.
+        .planned,
+        .probing,
+        .transferring,
+        .paused,
+        => std.fmt.allocPrint(
+            arena,
+            "that transfer was interrupted and its checkpoint is {s}, which is resumable. Re-run with --resume: it takes the checkpoint over, re-proves the source and the staged prefix, and continues from the confirmed offset — nothing is discarded and nothing is re-sent.",
+            .{held.state.text()},
+        ) catch "re-run with --resume to continue from the confirmed offset",
+
         // Not settled — unjudged. The rename may already have landed, so the
         // path may already hold an artifact nobody has looked at, and handing it
         // to a rival would let the rival overwrite a result nobody has judged.
         .indeterminate_publish => std.fmt.allocPrint(
             arena,
-            "that transfer issued its rename and never saw the answer, so the artifact may already be at this path. --restart will not discard it: adjudicate it first with 'terminus request reconcile {s}'.",
+            "that transfer issued its rename and never saw the answer, so the artifact may already be at this path. Neither --resume nor --restart will discard it: adjudicate it first with 'terminus request reconcile {s}'.",
             .{held.request_id},
         ) catch "adjudicate the holding request before anything overwrites this path",
 
-        // Settled owner, live checkpoint. `--restart` releases a settled failure
-        // and nothing else, and no verb reaches the hand-over that would take
-        // one of these over. See the note above.
-        .planned,
-        .probing,
-        .transferring,
-        .paused,
+        // The two mid-act states. `adoptCheckpoint` refuses them because there is
+        // no offset left to resume from, and `supersedeLocked` refuses them
+        // because nobody decided the attempt was over. What they need is
+        // `execution.recoverCheckpoint`, which normalises `verifying → paused`
+        // and `publishing → indeterminate_publish` first — a different act with a
+        // different claim behind it, and one this build has no verb for. Said
+        // plainly rather than approximated to whichever flag is nearer.
         .verifying,
         .publishing,
         => std.fmt.allocPrint(
             arena,
-            "that transfer stopped without deciding and its checkpoint is still {s}, which --restart may not discard: supersession releases a settled failure and nothing else. No verb resumes or releases a {s} checkpoint yet, so this path stays held — send to a different destination.",
+            "that transfer's owner stopped in the middle of an act and its checkpoint is still {s}, which is past its last byte. --resume may not continue it — there is no offset left — and --restart may not release it, because nobody decided the attempt was over. Recovering a {s} row is a hand-over of its own ('execution.recoverCheckpoint') and no verb reaches it yet, so this path stays held — send to a different destination.",
             .{ held.state.text(), held.state.text() },
         ) catch "this path stays held; send to a different destination",
 
@@ -1233,6 +1808,52 @@ fn fatalRestart(err: anyerror, held: transfers.Holder, dest_path: []const u8) no
         // was held by before this command ran.
         else => fatal(
             "cannot restart the transfer on '{s}': {s}. Nothing was superseded, nothing was created and nothing was sent — request {s} still holds the destination",
+            .{ dest_path, @errorName(err), held.request_id },
+        ),
+    }
+}
+
+/// Names the refusals of the transaction that moves a checkpoint to a new owner.
+///
+/// The sibling of `fatalRestart`, and it exists for the same reason: the
+/// hand-over's guards are conjuncts of one statement, so a refusal comes back as
+/// a single error and the wording has to be rebuilt from the holder read on the
+/// way in. What differs is that this one has an *heir* clause as well as an
+/// incumbent one, and the two send an operator to opposite places.
+///
+/// The operation is abandoned before every exit. A resume that could not take
+/// the checkpoint over has an operation with nothing to do and no checkpoint of
+/// its own, and leaving it unsettled would bar the scope on behalf of a transfer
+/// that never started — the same reason `fatalCreate` abandons.
+fn fatalAdopt(
+    err: anyerror,
+    execution: *Core.execution.Execution,
+    held: transfers.Holder,
+    dest_path: []const u8,
+) noreturn {
+    execution.abandon("the transfer checkpoint could not be taken over") catch {};
+    switch (err) {
+        // The reading on the way in went stale between it and the write lock: a
+        // peer adopted the row, or its owner stopped being settled. Not an
+        // operator error — they asked for something that was true when they
+        // asked — so the instruction is to look again rather than to do
+        // something different.
+        error.CheckpointNotResumable,
+        error.CheckpointOwnerChanged,
+        error.SurrenderingOperationMayStillBeRunning,
+        => fatal(
+            "refused: request {s} still holds '{s}' — its checkpoint or its attempt changed between the check and the hand-over ({s}), so nothing was taken over and nothing was sent. Re-read it with 'terminus request show {s}' and try again",
+            .{ held.request_id, dest_path, @errorName(err), held.request_id },
+        ),
+        // The heir clause. This attempt is the one at fault, and telling an
+        // operator to reconcile the incumbent would send them to a request that
+        // is fine.
+        error.AdoptingOperationNotEligible => fatal(
+            "refused: this attempt may not take over the checkpoint on '{s}' — the hand-over requires an heir that has not submitted, is bound to the same machine and matches the transfer's direction; nothing was taken over and nothing was sent",
+            .{dest_path},
+        ),
+        else => fatal(
+            "cannot resume the transfer on '{s}': {s}. Nothing was taken over and nothing was sent — request {s} still holds the destination",
             .{ dest_path, @errorName(err), held.request_id },
         ),
     }

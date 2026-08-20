@@ -167,8 +167,11 @@ terminus pull <server> /remote/file ./local-path
 # size. Downloads are slow (libssh2 read speed; the scp backend is no faster)
 # but reliable. push/pull auto-fall back to exec if scp is absent.
 terminus push <server> ./cfg /etc/app/cfg --via exec
-# A path a failed transfer is still standing on is refused. --restart releases
-# it, and only when that transfer is a settled failure — see "File transfer".
+# A path an unfinished transfer is still standing on is refused, and the refusal
+# names which of the two verbs its state calls for — see "File transfer".
+# --resume continues an interrupted one from its confirmed offset (exec only);
+# --restart releases a settled failure's hold and starts from zero.
+terminus push <server> ./app.tar /srv/app/app.tar --resume
 terminus push <server> ./app.tar /srv/app/app.tar --restart
 terminus sync push <server> ./dist /srv/app/dist --exclude node_modules,.git [--dry-run] [--delete]
 terminus sync pull <server> /var/log/myapp ./logs [--exclude *.gz]
@@ -805,8 +808,15 @@ is what to branch on:
   right bytes. The artifact *is* at the destination and the ledger does not say
   so, which is exactly the state you must not read as done. Install `sha256sum`
   or `shasum` on the host.
-- `failed_source_changed` — exit **1**. The local file changed between being
-  hashed and being sent. Nothing was renamed.
+- `failed_source_changed` — exit **1**. The source is not the one this transfer
+  was about: a push found its file hashing differently when it was sent than
+  when it was probed, or a resume found the source changed before it moved
+  anything. Nothing was renamed.
+- `failed_remote_partial_mismatch` — exit **1**. A resume found the staged
+  partial beside the destination was not the prefix this transfer had confirmed
+  — the wrong length, or the right length and the wrong bytes — so there was
+  nothing safe to splice onto. Nothing was sent. This is a different fact from
+  `failed_source_changed` and it points at a different file.
 - `failed_hash_mismatch` — exit **1**. The two ends hashed to different digests.
   Nothing was renamed.
 - `failed_publish` — exit **1**. The rename itself reported failure. Nothing was
@@ -815,7 +825,8 @@ is what to branch on:
   was lost, so it may or may not have landed. Never report this as a failure;
   read the destination and `terminus request reconcile <id>`.
 - `paused` — exit **75**. The transfer stopped before the destination came into
-  it. The destination is untouched and the staged partial is trustworthy.
+  it. The destination is untouched and the staged partial is trustworthy. This
+  is the resumable one: re-run with `--resume`.
 
 A ledger write this command could not make exits **76**, as everywhere else.
 
@@ -825,27 +836,52 @@ a half-told story about what is at it, so the next transfer aimed there is
 refused rather than walking onto the leftovers. The refusal names the request
 holding the path, its transfer's state, and the way past it.
 
-`--restart` is the way past it. It releases the holder's claim and starts the
-replacement in the same transaction — so the path is never free with nothing on
-the way to it — and it refuses everything else. It releases **3** of the seven
-verdicts above: the three proven failures. What to do about the rest:
+There are two ways past it and **they are for different states**. The refusal
+names exactly one; do what it says rather than trying the other.
+
+`--resume` continues an interrupted transfer. It takes the checkpoint over,
+re-proves the source and the staged prefix, and streams on from the confirmed
+offset. Nothing is discarded and nothing already confirmed is re-sent. It
+applies to the four *unfinished* states — `planned`, `probing`, `transferring`,
+`paused` — and every abort parks at `paused`, so this is the common case after
+an interruption.
+
+- the artifact is still judged by the digest the interrupted attempt declared
+  **before its first byte**. A resume cannot re-declare one; it reads it. So a
+  resumed transfer reaching `published` means exactly what a fresh one does.
+- a resume that finds the source changed, or the staged prefix wrong, refuses
+  and says which — `failed_source_changed` or
+  `failed_remote_partial_mismatch` — and moves nothing. Both are decided
+  failures, so `--restart` is then available if you want to start over.
+- **resuming is exec-only.** libssh2's scp support moves a whole file from byte
+  zero and has no ranged form, so `--via scp` with `--resume` is refused; an
+  unpinned resume reports `backendReason` saying why it had no choice.
+  `resumedFrom` in `--json` is where this run's first byte went.
+
+`--restart` releases the holder's claim and starts the replacement in the same
+transaction — so the path is never free with nothing on the way to it — and it
+refuses everything else. It releases **4** of the eight verdicts above:
+the four proven failures. What to do about the rest:
 
 - the holding request is not settled (`indeterminate`): a copier on the far side
-  may still be writing beside that path, so nothing may take it. Establish what
-  it did with `terminus request reconcile <id>`, then `--restart`.
+  may still be writing beside that path, so nothing may take it — neither verb.
+  Establish what it did with `terminus request reconcile <id>`, then re-run with
+  whichever verb its state calls for.
 - the holder is `indeterminate_publish`: the artifact may already be at that
   path and nobody has judged it. Adjudicate it — `terminus request reconcile
   <id>` — before anything overwrites it.
-- the holder is `paused`, or any other unfinished state: its checkpoint is still
-  resumable, and `--restart` releases a settled failure and nothing else. **No
-  verb resumes or releases one yet**, so that path stays held — send to a
-  different destination. This is the common case after an interrupted transfer,
-  because every abort parks at `paused`.
+- the holder is `verifying` or `publishing`: its owner stopped in the middle of
+  an act, so it is past its last byte. `--resume` has no offset to continue from
+  and `--restart` has no decision to release. Recovering one of these is a
+  hand-over of its own and **no verb reaches it yet**, so that path stays held —
+  send to a different destination.
 
 `--restart` never deletes the staged partial. The superseded row, its offsets and
 both its digests are all kept, because the reason you were asked in the first
 place is that there is something at that path worth knowing about; the
-replacement truncates and rewrites the partial on its way through anyway.
+replacement truncates and rewrites the partial on its way through anyway. A
+`--resume` truncates nothing below its confirmed offset — that is the point of
+it — and cuts away only the unconfirmed tail, after proving the prefix.
 
 ## Memory discipline
 

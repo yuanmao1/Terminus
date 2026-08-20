@@ -137,6 +137,12 @@ fn hexOf(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     return digest.hexAlloc(arena, bytes);
 }
 
+/// A bare `wc -c` answer: one number and a newline, which is what the resume's
+/// length checks parse.
+fn replyLen(arena: std.mem.Allocator, len: u64) !Core.Scripted.Step {
+    return reply(try std.fmt.allocPrint(arena, "{d}\n", .{len}));
+}
+
 // --- gate: a short transfer is an error, not a smaller success ---------------
 
 test "gate: a short pull is an error naming what was expected and what arrived" {
@@ -164,6 +170,7 @@ test "gate: a short pull is an error naming what was expected and what arrived" 
         scratch.io,
         "/srv/app/in.bin",
         partial,
+        0,
         900,
         null,
         &moved,
@@ -210,6 +217,7 @@ test "gate: a short exec push is an error, and the count is not the answer" {
         scratch.io,
         source,
         "/srv/app/out.bin",
+        0,
         0o644,
         null,
         &moved,
@@ -252,6 +260,7 @@ test "gate: no failure mode touches the destination, because only the rename doe
             scratch.io,
             "/srv/app/in.bin",
             partial,
+            0,
             4096,
             null,
             &moved,
@@ -276,6 +285,7 @@ test "gate: no failure mode touches the destination, because only the rename doe
             scratch.io,
             "/srv/app/in.bin",
             partial,
+            0,
             body.len,
             null,
             &moved,
@@ -337,6 +347,7 @@ test "gate: a pull stages beside the destination and never opens it" {
         scratch.io,
         "/srv/app/in.bin",
         partial,
+        0,
         16,
         null,
         &moved,
@@ -611,6 +622,7 @@ test "gate: a verified pull walks planned to published and leaves a confirmed pr
         scratch.io,
         "/srv/app/in.bin",
         partial,
+        0,
         total,
         .{ .context = @ptrCast(&recorder), .on_chunk = Recorder.onChunk },
         &moved,
@@ -712,6 +724,7 @@ test "gate: a transfer's peak allocation does not grow with the file" {
             scratch.io,
             "/srv/app/in.bin",
             partial,
+            0,
             total,
             null,
             &moved,
@@ -1005,6 +1018,7 @@ test "gate: completed_unverified is not success, and every outcome says what it 
     try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_hash_mismatch.exitCode());
     try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_publish.exitCode());
     try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_source_changed.exitCode());
+    try t.expectEqual(Cli.exit_code.failure, cmd_transfer.Outcome.failed_remote_partial_mismatch.exitCode());
     // A rename whose answer was lost is never `1`.
     try t.expectEqual(Cli.exit_code.indeterminate, cmd_transfer.Outcome.indeterminate_publish.exitCode());
     try t.expectEqual(Cli.exit_code.indeterminate, cmd_transfer.Outcome.paused.exitCode());
@@ -1021,7 +1035,25 @@ test "gate: completed_unverified is not success, and every outcome says what it 
         texts[seen] = o.proves();
         seen += 1;
     }
-    try t.expectEqual(@as(usize, 7), seen);
+    try t.expectEqual(@as(usize, 8), seen);
+
+    // And every outcome is reachable back from its own state, which is what
+    // `refuseResume` relies on to name a verdict from the row it just wrote.
+    // Counted for the same reason: a member whose name stopped being a state
+    // would make `Outcome.naming` return null on a path that cannot report it.
+    var named: usize = 0;
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
+        const state = try transfers.State.parse(field.name);
+        try t.expectEqual(
+            @as(?cmd_transfer.Outcome, @enumFromInt(field.value)),
+            cmd_transfer.Outcome.naming(state),
+        );
+        named += 1;
+    }
+    try t.expectEqual(@as(usize, 8), named);
+    // A state no outcome is named after answers null rather than the nearest
+    // member, which is what makes the lookup a check and not a guess.
+    try t.expectEqual(@as(?cmd_transfer.Outcome, null), cmd_transfer.Outcome.naming(.failed_no_space));
 }
 
 // --- gates: a held destination, and the one act that gets past it ------------
@@ -1382,7 +1414,7 @@ test "gate: a failure after the supersession leaves the destination held, not fr
     try store.db.exec("ROLLBACK");
 }
 
-test "gate: --restart reaches three of the driver's outcomes and cannot reach paused" {
+test "gate: --restart and --resume divide the driver's outcomes, and neither reaches the other's" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -1399,6 +1431,8 @@ test "gate: --restart reaches three of the driver's outcomes and cannot reach pa
     var outcomes: usize = 0;
     var holders: usize = 0;
     var releasable: usize = 0;
+    var resumable: usize = 0;
+    var both: usize = 0;
     inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
         outcomes += 1;
         const state = transfers.State.parse(field.name) catch
@@ -1406,40 +1440,72 @@ test "gate: --restart reaches three of the driver's outcomes and cannot reach pa
         if (state.holdsDestination()) {
             holders += 1;
             if (state.isSupersedable()) releasable += 1;
+            if (state.isAdoptable()) resumable += 1;
+            if (state.isSupersedable() and state.isAdoptable()) both += 1;
         }
     }
-    try t.expectEqual(@as(usize, 7), outcomes);
-    // Five of the seven leave the destination held: the three decided failures,
+    try t.expectEqual(@as(usize, 8), outcomes);
+    // Six of the eight leave the destination held: the four decided failures,
     // the unjudged publish, and `paused`.
-    try t.expectEqual(@as(usize, 5), holders);
-    // And `--restart` reaches three of those five. This is the number the slice
-    // turns on: if it ever reads 5, `supersedeLocked` has been widened to accept
-    // states that mean "this may still be resumed" and "nobody has judged the
-    // rename", and both releases hand a path to a rival that must not have it.
-    try t.expectEqual(@as(usize, 3), releasable);
+    try t.expectEqual(@as(usize, 6), holders);
+    // `--restart` reaches four of those six and `--resume` reaches one, and the
+    // two sets do not overlap. These are the numbers the pair of flags turns on.
+    // If `releasable` ever counts `paused`, `supersedeLocked` has been widened
+    // to release a path whose confirmed prefix is still good; if `both` is ever
+    // non-zero, some state has become reachable by two verbs that do opposite
+    // things to it and every refusal message has to start guessing.
+    try t.expectEqual(@as(usize, 4), releasable);
+    try t.expectEqual(@as(usize, 1), resumable);
+    try t.expectEqual(@as(usize, 0), both);
 
-    // The two it cannot reach, and why each is right to be out.
+    // The one neither reaches, and why it is right to be out.
     //
-    // `paused` is where **every abort in the driver parks** — the probe, the
-    // stream, the verifier and a pre-submission refusal all land there — so this
-    // is the commonest way a transfer comes to hold a path, and it is the one
-    // `--restart` may not release. That is not an oversight to be patched by
-    // widening `isSupersedable`: `paused` says the checkpoint is trustworthy and
-    // *adoptable*, so releasing its path discards resume material that is still
-    // good. The verb for it is a hand-over, and no CLI reaches one.
+    // `indeterminate_publish` is not settled but *unjudged*: the rename may
+    // already have landed, so the artifact at that path may be one nobody has
+    // looked at. Adjudication is its way out, and it needs evidence.
+    try t.expect(!transfers.State.indeterminate_publish.isSupersedable());
+    try t.expect(!transfers.State.indeterminate_publish.isAdoptable());
+    // And `paused` — where **every abort in the driver parks** — is the one
+    // `--resume` exists for and the one `--restart` may not touch, because it
+    // says the checkpoint is trustworthy and its confirmed prefix is still good.
     try t.expect(transfers.State.paused.holdsDestination());
     try t.expect(transfers.State.paused.isAdoptable());
     try t.expect(!transfers.State.paused.isSupersedable());
-    // `indeterminate_publish` is not settled but *unjudged*: the rename may
-    // already have landed, so the artifact at that path may be one nobody has
-    // looked at.
-    try t.expect(!transfers.State.indeterminate_publish.isSupersedable());
-    try t.expect(!transfers.State.indeterminate_publish.isAdoptable());
 
-    // Now the same two facts as an operator meets them. A settled `paused`
-    // holder — its attempt over, its checkpoint still resumable — is refused, and
-    // the refusal does not offer `--restart`, because offering it would be an
-    // instruction the statement below rejects.
+    // Now the same facts as an operator meets them: every state a holder can be
+    // in gets exactly one verb, or none, and the sentence names that verb and
+    // not the other. Driven over the whole vocabulary rather than over a
+    // hand-picked few, and counted per bucket so an empty region fails.
+    var with_resume: usize = 0;
+    var with_restart: usize = 0;
+    var with_neither: usize = 0;
+    inline for (@typeInfo(transfers.State).@"enum".fields) |field| {
+        const state: transfers.State = @enumFromInt(field.value);
+        if (state.holdsDestination()) {
+            const verb = cmd_transfer.verbFor(state);
+            if (verb) |v| {
+                if (std.mem.eql(u8, v, "--resume")) with_resume += 1 else with_restart += 1;
+            } else with_neither += 1;
+        } else {
+            // A state that holds no destination never reaches a holder at all,
+            // so whatever `verbFor` says about it is unreachable advice — and it
+            // must stay that way. `published`, `completed_unverified` and
+            // `superseded` being non-adoptable is what keeps a settled row out
+            // of `--resume`'s reach: adopting one would revive a checkpoint into
+            // the set the live-destination index polices.
+            try t.expect(!state.isAdoptable());
+        }
+    }
+    // Four unfinished states take `--resume`, six failures take `--restart`, and
+    // `verifying`, `publishing` and `indeterminate_publish` take neither.
+    try t.expectEqual(@as(usize, 4), with_resume);
+    try t.expectEqual(@as(usize, 6), with_restart);
+    try t.expectEqual(@as(usize, 3), with_neither);
+
+    // A settled `paused` holder — its attempt over, its checkpoint still
+    // resumable — is sent to `--resume`, and the sentence does not offer
+    // `--restart`, because offering it would be an instruction the supersession
+    // statement rejects.
     const paused_dest = "/var/tmp/restart_reach_paused.bin";
     const paused = try seedHolder(&store, arena, "reachone", paused_dest, .paused, .settled);
     const paused_holder = (try transfers.findHolder(&store, arena, .local, paused_dest)) orelse
@@ -1447,8 +1513,8 @@ test "gate: --restart reaches three of the driver's outcomes and cannot reach pa
     try t.expect(!paused_holder.owner_may_be_running);
     try t.expect(!paused_holder.releasable());
     const paused_way = cmd_transfer.wayThrough(arena, paused_holder);
-    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, paused_way, "--restart to release"));
-    try t.expect(std.mem.indexOf(u8, paused_way, "stays held") != null);
+    try t.expect(std.mem.indexOf(u8, paused_way, "--resume") != null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, paused_way, "--restart"));
 
     const paused_rival = try seedTransfer(&store, arena, "reachtwo");
     try store.db.exec("BEGIN IMMEDIATE");
@@ -1459,7 +1525,7 @@ test "gate: --restart reaches three of the driver's outcomes and cannot reach pa
     try store.db.exec("ROLLBACK");
 
     // The unjudged publish is refused by the same statement and sent somewhere
-    // else entirely — adjudication, not release.
+    // else entirely — adjudication, not release, and not a resume either.
     const parked_dest = "/var/tmp/restart_reach_parked.bin";
     const parked = try seedHolder(&store, arena, "reachthree", parked_dest, .indeterminate_publish, .settled);
     const parked_holder = (try transfers.findHolder(&store, arena, .local, parked_dest)) orelse
@@ -1468,6 +1534,7 @@ test "gate: --restart reaches three of the driver's outcomes and cannot reach pa
     const parked_way = cmd_transfer.wayThrough(arena, parked_holder);
     try t.expect(std.mem.indexOf(u8, parked_way, "terminus request reconcile") != null);
     try t.expect(std.mem.indexOf(u8, parked_way, "may already be at this path") != null);
+    try t.expect(std.mem.indexOf(u8, parked_way, "Neither --resume nor --restart") != null);
 
     const parked_rival = try seedTransfer(&store, arena, "reachfovr");
     try store.db.exec("BEGIN IMMEDIATE");
@@ -1477,15 +1544,44 @@ test "gate: --restart reaches three of the driver's outcomes and cannot reach pa
     );
     try store.db.exec("ROLLBACK");
 
-    // A live checkpoint whose owner is gone is refused too, and the wording is
-    // the `paused` one rather than the failure one — the two share a sentence
-    // because they share a reason, and that is asserted rather than assumed.
+    // A live checkpoint whose owner is gone gets `--resume` too, and the wording
+    // is the `paused` one rather than the failure one — the four unfinished
+    // states share a sentence because they share a reason, and that is asserted
+    // rather than assumed.
     const live_dest = "/var/tmp/restart_reach_live.bin";
     _ = try seedHolder(&store, arena, "reachfive", live_dest, .transferring, .settled);
     const live_holder = (try transfers.findHolder(&store, arena, .local, live_dest)) orelse
         return error.NothingHoldsTheDestination;
     try t.expect(!live_holder.releasable());
-    try t.expect(std.mem.indexOf(u8, cmd_transfer.wayThrough(arena, live_holder), "stays held") != null);
+    const live_way = cmd_transfer.wayThrough(arena, live_holder);
+    try t.expect(std.mem.indexOf(u8, live_way, "--resume") != null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, live_way, "--restart"));
+
+    // And an unsettled holder is sent to reconcile *and then to the verb its own
+    // state calls for*. This is the message that was wrong before there were two
+    // verbs: it told every unsettled holder to try `--restart`, which for a
+    // `paused` row is an instruction the supersession statement refuses.
+    const busy_dest = "/var/tmp/restart_reach_busy.bin";
+    _ = try seedHolder(&store, arena, "reachsix", busy_dest, .paused, .indeterminate);
+    const busy_holder = (try transfers.findHolder(&store, arena, .local, busy_dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expect(busy_holder.owner_may_be_running);
+    const busy_way = cmd_transfer.wayThrough(arena, busy_holder);
+    try t.expect(std.mem.indexOf(u8, busy_way, "terminus request reconcile") != null);
+    try t.expect(std.mem.indexOf(u8, busy_way, "--resume") != null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, busy_way, "--restart"));
+
+    // The mirror: an unsettled *failure* is sent to reconcile and then to
+    // `--restart`. Without this row the assertion above would pass on a message
+    // that had simply stopped mentioning `--restart` at all.
+    const busy_fail_dest = "/var/tmp/restart_reach_busyfail.bin";
+    _ = try seedHolder(&store, arena, "reachseven", busy_fail_dest, .failed_hash_mismatch, .indeterminate);
+    const busy_fail = (try transfers.findHolder(&store, arena, .local, busy_fail_dest)) orelse
+        return error.NothingHoldsTheDestination;
+    const busy_fail_way = cmd_transfer.wayThrough(arena, busy_fail);
+    try t.expect(std.mem.indexOf(u8, busy_fail_way, "terminus request reconcile") != null);
+    try t.expect(std.mem.indexOf(u8, busy_fail_way, "--restart") != null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, busy_fail_way, "--resume"));
 }
 
 // --- gates: the agent-facing document, held against this file ---------------
@@ -1533,18 +1629,19 @@ test "gate: SKILL.md publishes an exit code for every transfer outcome, and it i
     }
     // Counted, so a section that lost its list fails here rather than passing
     // over an empty region.
-    try t.expectEqual(@as(usize, 7), documented);
+    try t.expectEqual(@as(usize, 8), documented);
 }
 
 test "gate: SKILL.md publishes how many transfer verdicts --restart can release" {
     const t = std.testing;
 
-    // The document tells an agent that `--restart` reaches three of the seven
-    // verdicts. That number is not an opinion: it is how many of them name a
-    // checkpoint state `State.isSupersedable` admits, and it is the number this
-    // whole flag turns on. Widening `supersedeLocked` to accept `paused` — the
-    // state every abort in the driver parks in — would make it 4 and would hand
-    // a resumable transfer's path to a rival; this is where that is noticed.
+    // The document tells an agent how many of the verdicts `--restart` reaches.
+    // That number is not an opinion: it is how many of them name a checkpoint
+    // state `State.isSupersedable` admits, and it is the number the flag turns
+    // on. Widening `supersedeLocked` to accept `paused` — the state every abort
+    // in the driver parks in, and the one `--resume` exists for — would make it
+    // 5 and would hand a resumable transfer's path to a rival; this is where
+    // that is noticed.
     var releasable: usize = 0;
     inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
         const state = transfers.State.parse(field.name) catch
@@ -1563,16 +1660,57 @@ test "gate: SKILL.md publishes how many transfer verdicts --restart can release"
         return error.SkillRestartCountUnreadable;
     try t.expectEqual(releasable, documented);
 
-    // And the sentence that says which three, so the number cannot be right
+    // And the sentence that says which four, so the number cannot be right
     // beside a description that is not.
     const section = try skill_doc.after(skill_doc.text, transfer_section, "the transfer outcome list");
-    try t.expect(std.mem.indexOf(u8, section, "the three proven failures") != null);
-    // The limit this slice could not remove, published rather than left for an
-    // agent to discover by being refused.
+    try t.expect(std.mem.indexOf(u8, section, "the four proven failures") != null);
+    // `paused` is still where every abort parks — published rather than left for
+    // an agent to discover by being refused — and it is now the state the other
+    // verb is for.
     try t.expect(std.mem.indexOf(u8, section, "every abort parks at `paused`") != null);
+    try t.expect(std.mem.indexOf(u8, section, "`--resume` continues an interrupted transfer") != null);
 }
 
-test "gate: --restart is a boolean flag, so it does not swallow whatever follows it" {
+test "gate: SKILL.md tells an agent the two things about --resume that are load-bearing" {
+    const t = std.testing;
+    const section = try skill_doc.after(skill_doc.text, transfer_section, "the transfer outcome list");
+
+    // Two claims an agent will act on, and both are properties of the
+    // implementation rather than prose. The first is why a resumed `published`
+    // means what a fresh one does; the second is why `--via scp --resume` is
+    // refused instead of silently ignored.
+    var claims: usize = 0;
+    for ([_][]const u8{
+        "before its first byte",
+        "resuming is exec-only",
+    }) |needle| {
+        if (std.mem.indexOf(u8, section, needle) == null) {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: the transfer section no longer states "{s}".
+                \\That is not decoration: an agent that does not know a resume reads its
+                \\declaration rather than writing one cannot tell a resumed `published`
+                \\from a re-declared one, and an agent that does not know scp cannot
+                \\resume will read the refusal as a bug.
+                \\
+            , .{needle});
+            return error.SkillResumeClaimMissing;
+        }
+        claims += 1;
+    }
+    try t.expectEqual(@as(usize, 2), claims);
+
+    // And the refusal states it names are the states that really refuse. Read
+    // off the document and compared with the predicate, so a section that starts
+    // promising `--resume` for a `verifying` row fails here.
+    try t.expect(std.mem.indexOf(u8, section, "`verifying` or `publishing`") != null);
+    try t.expect(!transfers.State.verifying.isAdoptable());
+    try t.expect(!transfers.State.publishing.isAdoptable());
+    try t.expect(!transfers.State.verifying.isSupersedable());
+    try t.expect(!transfers.State.publishing.isSupersedable());
+}
+
+test "gate: every boolean flag this command takes is registered, so none swallows the next argument" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -1580,20 +1718,978 @@ test "gate: --restart is a boolean flag, so it does not swallow whatever follows
 
     // A flag missing from `args.bool_flags` is not a compile error and is not
     // visible to any gate that exercises this command's helpers directly: the
-    // parser simply treats it as `--flag <value>`, so `--restart` written last —
-    // which is how it is documented and how it will be typed — fails with "a
-    // flag is missing its value", and `--restart --json` eats the `--json`.
-    // Found by running the binary, so it is asserted here.
-    const trailing = try args.parse(arena, &.{ "smoke", "./local", "/srv/app/out.bin", "--restart" });
-    try t.expect(trailing.boolean("restart"));
-    try t.expectEqual(@as(usize, 3), trailing.positionals.len);
-    try t.expectEqualStrings("/srv/app/out.bin", trailing.positional(2).?);
+    // parser simply treats it as `--flag <value>`, so a flag written last —
+    // which is how they are documented and how they will be typed — fails with
+    // "a flag is missing its value", and one written before another eats it.
+    // Found by running the binary, twice, which is why the list is driven rather
+    // than spot-checked.
+    var checked: usize = 0;
+    for ([_][]const u8{ "restart", "resume", "json", "force" }) |flag| {
+        checked += 1;
+        const trailing = try args.parse(arena, &.{
+            "smoke",
+            "./local",
+            "/srv/app/out.bin",
+            try std.fmt.allocPrint(arena, "--{s}", .{flag}),
+        });
+        try t.expect(trailing.boolean(flag));
+        try t.expectEqual(@as(usize, 3), trailing.positionals.len);
+        try t.expectEqualStrings("/srv/app/out.bin", trailing.positional(2).?);
 
-    // And it consumes nothing when something does follow it.
-    const followed = try args.parse(arena, &.{ "smoke", "./local", "/srv/app/out.bin", "--restart", "--json" });
-    try t.expect(followed.boolean("restart"));
-    try t.expect(followed.boolean("json"));
-    try t.expectEqual(@as(usize, 3), followed.positionals.len);
+        // And it consumes nothing when something does follow it.
+        const followed = try args.parse(arena, &.{
+            "smoke",
+            "./local",
+            "/srv/app/out.bin",
+            try std.fmt.allocPrint(arena, "--{s}", .{flag}),
+            "--json",
+        });
+        try t.expect(followed.boolean(flag));
+        try t.expect(followed.boolean("json"));
+        try t.expectEqual(@as(usize, 3), followed.positionals.len);
+    }
+    // Counted, so a loop that stopped iterating fails rather than passing over
+    // an empty region.
+    try t.expectEqual(@as(usize, 4), checked);
+
+    // The two this command's own flags are, together: `--resume --restart` must
+    // parse as two booleans so `run` can refuse the pair rather than have one of
+    // them eat the other and refuse nothing.
+    const both = try args.parse(arena, &.{ "smoke", "./local", "/srv/app/out.bin", "--resume", "--restart" });
+    try t.expect(both.boolean("resume"));
+    try t.expect(both.boolean("restart"));
+    try t.expectEqual(@as(usize, 3), both.positionals.len);
+}
+
+// --- gates: resuming ---------------------------------------------------------
+//
+// **What is driven, and what is not — read this before the numbers.**
+//
+// The interrupt-then-resume gate below is a *real interruption*: the host
+// refuses a byte range part-way through `Core.transfer.pullFile`, the driver's
+// own observer contract has already written confirmed offsets behind prefix
+// digests, and the checkpoint is parked at `paused` by the same `setState` call
+// `cmd_transfer.abortTransfer` makes. The resume is a second, separate pass over
+// the row the first one left: a fresh operation, a real
+// `execution.adoptCheckpoint` hand-over, a real `transfers.verifyResume`, and a
+// second `pullFile` starting at the confirmed offset. Nothing about the
+// checkpoint is hand-written.
+//
+// What it is *not* is `cmd_transfer.run` called twice. That function dials SSH
+// and exits the process on every terminal path, so nothing in this tree can call
+// it — the same limitation the gates above are written under. The sequence here
+// is the driver's sequence, made of the driver's own exported pieces, and the
+// glue between them (`resumeFrom`, `observeForResume`, `stream`) is the part no
+// gate reaches.
+//
+// The refusal gates further down *do* hand-write their rows, and deliberately:
+// they need a partial of exactly the wrong length and a source with exactly the
+// wrong digest, which a driver cannot be made to produce on cue. Those prove the
+// resume reads the ledger correctly; the one above proves the driver produces a
+// row it can read. Both are needed and they are not the same claim.
+
+/// The driver's observer contract, as `cmd_transfer.Progress` implements it.
+///
+/// Two inputs a fresh transfer leaves at their defaults and a resume does not:
+/// the hasher as it stood at the resume point, and that offset. They are what
+/// make a resumed transfer's confirmed offsets and final digest mean exactly
+/// what a fresh transfer's mean, and passing them explicitly is what lets this
+/// gate assert that they do.
+const Confirmer = struct {
+    store: *Store,
+    checkpoint: i64,
+    request_id: []const u8,
+    stream: digest.Running,
+    confirmed: u64,
+    /// How often an offset is written down, in bytes moved. The driver's is
+    /// `cmd_transfer.confirm_every` (8 MiB); a gate needs a smaller one so an
+    /// interruption can land *between* two confirms, which is the shape that
+    /// leaves unconfirmed bytes for the resume to cut away.
+    every: u64,
+    arena: std.mem.Allocator,
+    clock: i64,
+    /// Every offset written, in order, so a gate can assert the sequence rather
+    /// than only the last value.
+    offsets: std.ArrayList(u64) = .empty,
+    failure: ?anyerror = null,
+
+    fn observer(self: *Confirmer) Core.Ssh.Observer {
+        return .{ .context = @ptrCast(self), .on_chunk = onChunk };
+    }
+
+    fn onChunk(context: *anyopaque, chunk: []const u8, moved: u64, total: u64) Core.Ssh.ChunkError!void {
+        const self: *Confirmer = @ptrCast(@alignCast(context));
+        self.stream.update(chunk);
+        if (moved != total and moved - self.confirmed < self.every) return;
+
+        var buf: [digest.hex_len]u8 = undefined;
+        const prefix = self.stream.peekHex(&buf);
+        self.clock += 1;
+        transfers.confirmOffset(
+            self.store,
+            self.checkpoint,
+            self.request_id,
+            moved,
+            moved,
+            prefix,
+            self.clock,
+        ) catch |err| {
+            self.failure = err;
+            return error.ObserverFailed;
+        };
+        self.confirmed = moved;
+        self.offsets.append(self.arena, moved) catch {
+            self.failure = error.OutOfMemory;
+            return error.ObserverFailed;
+        };
+    }
+};
+
+/// The raw bytes one `appendSlice` command carries, or null when the command is
+/// not an append.
+///
+/// A push's staged partial only exists on the host, so this is how a gate reads
+/// back what a push actually put there: the exec channel carried every byte, in
+/// order, base64'd, and the commands are recorded.
+fn appendedBytes(arena: std.mem.Allocator, cmd: []const u8) !?[]const u8 {
+    const open = "printf '%s' '";
+    if (!std.mem.startsWith(u8, cmd, open)) return null;
+    const rest = cmd[open.len..];
+    const close = std.mem.indexOfScalar(u8, rest, '\'') orelse return error.AppendCommandUnterminated;
+    const encoded = rest[0..close];
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(encoded);
+    const out = try arena.alloc(u8, size);
+    try decoder.decode(out, encoded);
+    return out;
+}
+
+/// Everything a push wrote to its staging partial, in order, decoded.
+fn stagedByPush(arena: std.mem.Allocator, seen: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (seen) |cmd| {
+        if (try appendedBytes(arena, cmd)) |bytes| try out.appendSlice(arena, bytes);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "gate: a hasher snapshotted at a mark, continued, equals hashing the whole file" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    // **This is the mechanism the whole slice rests on.** A SHA-256 cannot be
+    // continued from its own output, so a resumed transfer looks like it needs
+    // either a whole extra read of the confirmed prefix to rebuild the hasher or
+    // no end-to-end verification at all. The way out is that the pass which
+    // *licenses* the resume — re-reading the source to prove it unchanged, or
+    // the staged partial to prove its prefix ours — is a pass over exactly those
+    // bytes, so the hasher state comes back with the digest at no extra cost.
+    // If this ever stops holding, every resumed transfer's confirmed offsets
+    // start carrying prefix digests of a range nobody can re-derive.
+    const total = (1 << 20) + 4321; // more than one internal buffer
+    const body = try arena.alloc(u8, total);
+    for (body, 0..) |*b, i| b.* = @truncate(i * 13 + 5);
+    const path = try scratch.write("mark", body);
+    const whole = try hexOf(arena, body);
+
+    // Marks chosen to sit either side of the read buffer boundary, on it, at
+    // zero and at the end — the four places an off-by-one would hide.
+    const marks = [_]u64{ 0, 7, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, total };
+    var checked: usize = 0;
+    for (marks) |mark| {
+        checked += 1;
+        const pass = (try Core.transfer.readLocalFile(scratch.io, arena, path, mark)).?;
+        try t.expectEqual(@as(u64, total), pass.size);
+        try t.expectEqualStrings(whole, pass.sha256);
+
+        // Asserted before it is unwrapped, so a snapshot that was never taken
+        // fails as the missing snapshot it is rather than as a null-unwrap panic
+        // in the middle of a gate.
+        if (pass.at_mark == null) {
+            std.debug.print(
+                \\
+                \\readLocalFile took no digest snapshot at mark {d} of a {d}-byte file.
+                \\A resume seeded from nothing hashes only its own bytes: every prefix
+                \\digest it writes describes a range nobody can re-derive, and the
+                \\end-to-end comparison becomes a tail against a whole file.
+                \\
+            , .{ mark, total });
+            return error.MarkSnapshotMissing;
+        }
+
+        // The prefix digest, which is what a confirmed offset carries and what
+        // `verifyResume` compares an observed reading against.
+        if (mark == 0) {
+            try t.expectEqual(@as(?[]const u8, null), pass.prefix_sha256);
+        } else {
+            try t.expectEqualStrings(try hexOf(arena, body[0..@intCast(mark)]), pass.prefix_sha256.?);
+        }
+
+        // And the snapshot: fed the rest of the file, it produces the whole
+        // file's digest. This is what the resumed stream does, chunk by chunk.
+        var continued = pass.at_mark.?;
+        continued.update(body[@intCast(mark)..]);
+        var buf: [digest.hex_len]u8 = undefined;
+        try t.expectEqualStrings(whole, continued.finalHex(&buf));
+    }
+    try t.expectEqual(@as(usize, 6), checked);
+
+    // A mark past the end yields no snapshot rather than one taken at the end.
+    // Reporting the end-of-file state as "the state at byte N" would let a
+    // resume splice onto a prefix that was never that long.
+    const past = (try Core.transfer.readLocalFile(scratch.io, arena, path, total + 1)).?;
+    try t.expectEqual(@as(?digest.Running, null), past.at_mark);
+    try t.expectEqual(@as(?[]const u8, null), past.prefix_sha256);
+
+    // And a file that is not there is a stated absence, not an unreadable file.
+    // The two callers mean different things by it — a push's source is gone, a
+    // pull's staging partial was never written — and both are findings
+    // `verifyResume` has words for.
+    try t.expectEqual(
+        @as(?Core.transfer.LocalPass, null),
+        try Core.transfer.readLocalFile(scratch.io, arena, try scratch.path("absent"), 0),
+    );
+}
+
+test "gate: an interrupted pull, resumed, is byte-identical to one that was never interrupted" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+    var store_scratch = try StoreScratch.init(t.allocator, "resume_pull_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    const slice = Core.transfer.pull_slice;
+    const total = slice * 4 + 321;
+    const body = try arena.alloc(u8, total);
+    for (body, 0..) |*b, i| b.* = @truncate(i * 29 + 11);
+    const body_sha = try hexOf(arena, body);
+    const mtime: i128 = 1712345678 * std.time.ns_per_s;
+
+    const dest = try scratch.path("resume_dest");
+    const partial = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix });
+
+    // --- the first attempt, interrupted mid-stream ---------------------------
+
+    const first_id = try seedTransfer(&store, arena, "resvmeone");
+    const cp = try transfers.create(&store, .{
+        .request_id = first_id,
+        .direction = .pull,
+        .dest_side = .local,
+        .dest_path = dest,
+        .partial_path = partial,
+        .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+        .chunk_size = Core.Ssh.chunk_bytes,
+        .total_bytes = total,
+        .now = 100,
+    });
+    try transfers.setState(&store, cp, first_id, .probing, null, 101);
+    // The two commitments, in the order the producer makes them, and the whole
+    // reason the resume below is verifiable: the digest the artifact will be
+    // judged by is written here, before the first byte.
+    try transfers.recordSourceIdentity(&store, cp, first_id, total, mtime, body_sha, 102);
+    try transfers.recordExpectedHash(&store, cp, first_id, body_sha, 103);
+    try Store.operations.advance(&store, first_id, .submitted, 104);
+    try transfers.setState(&store, cp, first_id, .transferring, null, 105);
+
+    var first_confirmer: Confirmer = .{
+        .store = &store,
+        .checkpoint = cp,
+        .request_id = first_id,
+        .stream = .init(),
+        .confirmed = 0,
+        .every = slice * 2,
+        .arena = arena,
+        .clock = 200,
+    };
+
+    // Three ranges land and the fourth is refused. A scripted failure part-way,
+    // not a truncated fixture: `pullFile` runs its real loop and stops inside it.
+    var first_steps: std.ArrayList(Core.Scripted.Step) = .empty;
+    for (0..3) |i| {
+        const from = i * slice;
+        try first_steps.append(arena, try rangeReply(arena, body[from .. from + slice]));
+    }
+    try first_steps.append(arena, replyCode(1, ""));
+    var first_script = Core.Scripted.init(arena, try first_steps.toOwnedSlice(arena));
+
+    var moved: Core.Ssh.Moved = .{};
+    try t.expectError(error.RemoteReadFailed, Core.transfer.pullFile(
+        first_script.executor(),
+        arena,
+        scratch.io,
+        "/srv/app/in.bin",
+        partial,
+        0,
+        total,
+        first_confirmer.observer(),
+        &moved,
+    ));
+    try t.expectEqual(@as(?anyerror, null), first_confirmer.failure);
+
+    // What the driver does with that: park at `paused` and settle
+    // `indeterminate`, exactly as `abortTransfer` does.
+    try transfers.setState(&store, cp, first_id, .paused, "the host refused a byte range", 300);
+    _ = try Store.receipts.settle(&store, first_id, .{ .indeterminate = .{
+        .reason = "the host refused a byte range",
+        .last_observed = .submitted,
+    } }, .{}, 301);
+
+    // The row the interruption left. One confirm landed, at two slices, and the
+    // partial on disk is a slice longer than that — the ordinary shape of an
+    // interruption, and the shape that makes the resume cut a tail away.
+    const parked = (try transfers.get(&store, arena, cp)).?;
+    try t.expectEqual(transfers.State.paused, parked.state);
+    try t.expectEqual(@as(usize, 1), first_confirmer.offsets.items.len);
+    try t.expectEqual(@as(u64, slice * 2), first_confirmer.offsets.items[0]);
+    try t.expectEqual(@as(i64, slice * 2), parked.confirmed_offset);
+    try t.expectEqualStrings(try hexOf(arena, body[0 .. slice * 2]), parked.partial_sha256.?);
+    try t.expectEqual(@as(usize, slice * 3), (try scratch.read(arena, partial)).len);
+
+    // --- the second attempt, resuming that row -------------------------------
+
+    // The cost the design charges for a hand-over: the incumbent must no longer
+    // be able to be affecting the host, and `indeterminate` means nobody knows.
+    // One explicit reconcile, and the checkpoint becomes adoptable.
+    const reconciled = try Store.receipts.resolve(&store, arena, first_id, .failed, .{
+        .operator_override = .{ .reason = "the gate's attempt is over", .by = "gate" },
+    }, 302);
+    try t.expect(std.meta.activeTag(reconciled) == .resolved);
+
+    var heir = switch (try Core.execution.begin(
+        &store,
+        arena,
+        store_scratch.io,
+        pullBegin(dest, .transfer_pull),
+    )) {
+        .ready => |e| e,
+        .blocked => return error.ResumeWasBlocked,
+    };
+    // The heir has to be dialing before it may take a checkpoint over — the
+    // hand-over's heir clause admits `created` and `connecting` and nothing
+    // later — which is the order the driver runs in: begin, connect, adopt.
+    try Store.operations.advance(&store, heir.id(), .connecting, 2_000_000_000);
+    // The real hand-over. Three writes in one transaction; the checkpoint's
+    // offsets, prefix digest and both declarations survive it untouched, which
+    // is what the assertions below turn on.
+    try heir.adoptCheckpoint(cp, first_id);
+    const heir_id = heir.id();
+
+    const adopted = (try transfers.get(&store, arena, cp)).?;
+    try t.expectEqualStrings(heir_id, adopted.request_id);
+    try t.expectEqual(@as(i64, slice * 2), adopted.confirmed_offset);
+    // The declaration the resume is judged by, still the first attempt's. Its
+    // absence is checked before it is unwrapped, because a hand-over that
+    // dropped it is the single most damaging thing that could go wrong here —
+    // the resume would have nothing to be judged against — and it deserves to
+    // fail saying so rather than as a null-unwrap somewhere in a gate.
+    if (adopted.expected_sha256 == null) {
+        std.debug.print(
+            \\
+            \\the hand-over dropped the digest declared before the first byte.
+            \\A resume cannot re-declare one — `recordExpectedHash` refuses a row past
+            \\offset zero — so a checkpoint that loses it on adoption can never reach
+            \\`published` again, and a resume that "verified" against a fresh reading
+            \\would be checking the bytes that landed against themselves.
+            \\
+        , .{});
+        return error.HandoverDroppedTheDeclaration;
+    }
+    try t.expectEqualStrings(body_sha, adopted.expected_sha256.?);
+    try t.expectEqualStrings(body_sha, adopted.source.file().?.sha256.?);
+    // And it cannot be replaced: the write-once guard is what makes a resumed
+    // `published` mean what a fresh one means. Asked of the statement, not
+    // assumed from the comment.
+    try t.expectError(
+        error.ExpectedHashLocked,
+        transfers.recordExpectedHash(&store, cp, heir_id, try hexOf(arena, "something else"), 2_000_000_001),
+    );
+    try t.expectError(
+        error.SourceIdentityLocked,
+        transfers.recordSourceIdentity(&store, cp, heir_id, total, mtime, try hexOf(arena, "else again"), 2_000_000_002),
+    );
+
+    var clock: i64 = 2_000_000_010;
+    try transfers.setState(&store, cp, heir_id, .probing, null, clock);
+
+    // The resume's two readings, taken on the sides they live on. For a pull the
+    // partial is here, so one local pass gives the length, the prefix proof and
+    // the hasher at the mark.
+    const confirmed: u64 = @intCast(adopted.confirmed_offset);
+    const pass = (try Core.transfer.readLocalFile(scratch.io, arena, partial, confirmed)).?;
+    try t.expectEqual(@as(u64, slice * 3), pass.size);
+    try t.expectEqualStrings(parked.partial_sha256.?, pass.prefix_sha256.?);
+
+    const verdict = transfers.verifyResume(adopted, .{ .remote_file = .{
+        .path = "/srv/app/in.bin",
+        .size = total,
+        .mtime_ns = mtime,
+        .sha256 = body_sha,
+    } }, .{
+        .exists = true,
+        .len = pass.size,
+        .prefix_sha256 = pass.prefix_sha256,
+    });
+    // Longer than the confirmed offset is the *normal* shape of an
+    // interruption, and the tail proves nothing, so it is cut — after the head
+    // was proven, never before.
+    try t.expect(verdict == .truncate_then_resume);
+    try t.expectEqual(@as(u64, slice * 2), verdict.truncate_then_resume.offset);
+    try t.expectEqual(@as(u64, slice * 3), verdict.truncate_then_resume.partial_len);
+
+    clock += 1;
+    try Store.operations.advance(&store, heir_id, .submitted, clock);
+    clock += 1;
+    try transfers.setState(&store, cp, heir_id, .transferring, null, clock);
+
+    var second_confirmer: Confirmer = .{
+        .store = &store,
+        .checkpoint = cp,
+        .request_id = heir_id,
+        // Seeded, which is the whole point: the running digest carries the
+        // confirmed prefix into this run, so the offsets it writes and the digest
+        // it ends with cover the artifact and not just this run's share of it.
+        .stream = pass.at_mark.?,
+        .confirmed = confirmed,
+        .every = slice * 2,
+        .arena = arena,
+        .clock = clock + 100,
+    };
+
+    var second_steps: std.ArrayList(Core.Scripted.Step) = .empty;
+    var at: usize = @intCast(confirmed);
+    while (at < total) : (at += slice) {
+        try second_steps.append(arena, try rangeReply(arena, body[at..@min(at + slice, total)]));
+    }
+    var second_script = Core.Scripted.init(arena, try second_steps.toOwnedSlice(arena));
+
+    var second_moved: Core.Ssh.Moved = .{};
+    const received = try Core.transfer.pullFile(
+        second_script.executor(),
+        arena,
+        scratch.io,
+        "/srv/app/in.bin",
+        partial,
+        confirmed,
+        total,
+        second_confirmer.observer(),
+        &second_moved,
+    );
+    try t.expectEqual(@as(?anyerror, null), second_confirmer.failure);
+    // The absolute end of the artifact, not this run's share.
+    try t.expectEqual(@as(u64, total), received);
+    try t.expectEqual(@as(u64, total), second_moved.arrived);
+
+    // It asked for the bytes it was missing and no others. Three ranges, the
+    // first of them starting at the confirmed offset — `tail -c +N` is 1-based.
+    try t.expectEqual(@as(usize, 3), second_script.seen.items.len);
+    const wanted = try std.fmt.allocPrint(arena, "tail -c +{d} ", .{confirmed + 1});
+    try t.expect(std.mem.startsWith(u8, second_script.seen.items[0], wanted));
+
+    // **The confirmed offset advanced from where it was, not from zero.** Every
+    // offset this run wrote is above the one it inherited, and the first of them
+    // is not `slice * 2` again.
+    try t.expectEqual(@as(usize, 2), second_confirmer.offsets.items.len);
+    for (second_confirmer.offsets.items) |o| try t.expect(o > confirmed);
+    try t.expectEqual(@as(u64, slice * 4), second_confirmer.offsets.items[0]);
+    try t.expectEqual(@as(u64, total), second_confirmer.offsets.items[1]);
+
+    // The stream's digest covers the whole artifact and equals the digest
+    // declared before the first byte — end-to-end verification of a resumed
+    // transfer, with nothing re-read to get it.
+    var final_buf: [digest.hex_len]u8 = undefined;
+    const observed = second_confirmer.stream.finalHex(&final_buf);
+    try t.expectEqualStrings(body_sha, observed);
+    try t.expectEqual(cmd_transfer.Verdict.agreed, cmd_transfer.verdictFor(
+        adopted.expected_sha256,
+        observed,
+        adopted.expected_sha256,
+    ));
+
+    // The rest of the walk, as the producer makes it.
+    clock += 10;
+    try transfers.setState(&store, cp, heir_id, .verifying, null, clock);
+    try transfers.recordVerifiedHash(&store, cp, heir_id, observed, clock + 1);
+    try transfers.setState(&store, cp, heir_id, .publishing, null, clock + 2);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.rename(partial, cwd, dest, scratch.io);
+    try transfers.setState(&store, cp, heir_id, .published, null, clock + 3);
+
+    const finished = (try transfers.get(&store, arena, cp)).?;
+    try t.expectEqual(transfers.State.published, finished.state);
+    try t.expectEqual(@as(i64, total), finished.confirmed_offset);
+    try t.expectEqualStrings(body_sha, finished.verified_sha256.?);
+
+    // --- the control: the same body, never interrupted -----------------------
+
+    const clean_partial = try scratch.path("resume_control");
+    var clean_steps: std.ArrayList(Core.Scripted.Step) = .empty;
+    var off: usize = 0;
+    while (off < total) : (off += slice) {
+        try clean_steps.append(arena, try rangeReply(arena, body[off..@min(off + slice, total)]));
+    }
+    var clean_script = Core.Scripted.init(arena, try clean_steps.toOwnedSlice(arena));
+    var clean_moved: Core.Ssh.Moved = .{};
+    _ = try Core.transfer.pullFile(
+        clean_script.executor(),
+        arena,
+        scratch.io,
+        "/srv/app/in.bin",
+        clean_partial,
+        0,
+        total,
+        null,
+        &clean_moved,
+    );
+
+    // Byte-identical, and the same digest. This is the claim the whole flag has
+    // to make: a resumed artifact is the artifact, not something that merely
+    // passed the same checks.
+    const resumed_bytes = try scratch.read(arena, dest);
+    const clean_bytes = try scratch.read(arena, clean_partial);
+    try t.expectEqualSlices(u8, clean_bytes, resumed_bytes);
+    try t.expectEqualStrings(body, resumed_bytes);
+    try t.expectEqualStrings(body_sha, try hexOf(arena, resumed_bytes));
+    // And the staging file is gone, so the rename really was the last act.
+    try t.expect(!scratch.exists(partial));
+}
+
+test "gate: a resuming push appends from the offset and does not truncate the remote partial" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    const slice = Core.transfer.push_slice;
+    const total = slice * 3 + 77;
+    const body = try arena.alloc(u8, total);
+    for (body, 0..) |*b, i| b.* = @truncate(i * 37 + 3);
+    const source = try scratch.write("resume_push_src", body);
+    const remote = "/srv/app/out.bin.terminus-part";
+
+    // --- the first attempt, refused part-way ---------------------------------
+
+    var first_steps = [_]Core.Scripted.Step{
+        reply(""), // the init: `: >` truncate + chmod
+        reply(""), // slice 1 lands
+        reply(""), // slice 2 lands
+        replyCode(1, ""), // slice 3 is refused
+    };
+    var first = Core.Scripted.init(arena, &first_steps);
+    var moved: Core.Ssh.Moved = .{};
+    try t.expectError(error.RemoteWriteFailed, Core.transfer.pushFile(
+        first.executor(),
+        arena,
+        scratch.io,
+        source,
+        remote,
+        0,
+        0o644,
+        null,
+        &moved,
+    ));
+    try t.expectEqual(@as(u64, slice * 2), moved.arrived);
+
+    // A fresh push opens by emptying the partial, which is right for a fresh
+    // push and is the one thing a resume must never do. Pinned here so the
+    // assertion below is a contrast rather than an absence.
+    try t.expect(std.mem.indexOf(u8, first.seen.items[0], ": > ") != null);
+    // The last command is the one the host refused, so its bytes never landed.
+    // `seen` records what was *sent*; what the partial holds is what was
+    // accepted, and confusing the two would credit this run with a slice the
+    // resume below is about to send again.
+    try t.expectEqual(@as(usize, 4), first.seen.items.len);
+    const first_staged = try stagedByPush(arena, first.seen.items[0 .. first.seen.items.len - 1]);
+    try t.expectEqualSlices(u8, body[0 .. slice * 2], first_staged);
+
+    // --- the second attempt, resuming at what landed -------------------------
+
+    const confirmed: u64 = slice * 2;
+    var second_steps: std.ArrayList(Core.Scripted.Step) = .empty;
+    // The resume's opening command asks the host how long the partial is, and
+    // this is the answer that licenses the append.
+    try second_steps.append(arena, try replyLen(arena, confirmed));
+    for (0..2) |_| try second_steps.append(arena, reply(""));
+    var second = Core.Scripted.init(arena, try second_steps.toOwnedSlice(arena));
+
+    var second_moved: Core.Ssh.Moved = .{};
+    const sent = try Core.transfer.pushFile(
+        second.executor(),
+        arena,
+        scratch.io,
+        source,
+        remote,
+        confirmed,
+        0o644,
+        null,
+        &second_moved,
+    );
+    try t.expectEqual(@as(u64, total), sent);
+    try t.expectEqual(@as(u64, total), second_moved.arrived);
+    try t.expectEqual(@as(u64, total), second_moved.expected);
+
+    // **Nothing truncated the partial.** Neither the shell `: >` a fresh push
+    // opens with nor the `dd … seek=` a deliberate cut uses appears anywhere in
+    // what this run sent. Both spellings are checked, because a resume that
+    // reached for either would look like it worked and would have thrown two
+    // slices away.
+    var commands: usize = 0;
+    for (second.seen.items) |cmd| {
+        commands += 1;
+        try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, cmd, ": > "));
+        try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, cmd, "if=/dev/null"));
+    }
+    // One length check plus two appends, counted so a run that sent nothing
+    // could not pass the assertions above by having no commands to inspect.
+    try t.expectEqual(@as(usize, 3), commands);
+    try t.expect(std.mem.indexOf(u8, second.seen.items[0], "wc -c < ") != null);
+    // And the appends are appends.
+    try t.expect(std.mem.indexOf(u8, second.seen.items[1], "base64 -d >> ") != null);
+
+    // It sent exactly the bytes that were missing, and the two runs together are
+    // the file. This is the push side's "byte-identical": the partial lives on
+    // the host, so what it holds is the concatenation of what the channel
+    // carried.
+    const second_staged = try stagedByPush(arena, second.seen.items);
+    try t.expectEqualSlices(u8, body[slice * 2 ..], second_staged);
+    const whole = try std.mem.concat(arena, u8, &.{ first_staged, second_staged });
+    try t.expectEqualSlices(u8, body, whole);
+
+    // A resume told the partial is a different length than it was licensed for
+    // refuses rather than appending at the wrong offset. Somebody else wrote to
+    // it between the verification and the first slice, and there is no reading
+    // of that which ends in the right file.
+    var wrong_steps = [_]Core.Scripted.Step{try replyLen(arena, confirmed + 1)};
+    var wrong = Core.Scripted.init(arena, &wrong_steps);
+    var wrong_moved: Core.Ssh.Moved = .{};
+    try t.expectError(error.RemotePartialLengthChanged, Core.transfer.pushFile(
+        wrong.executor(),
+        arena,
+        scratch.io,
+        source,
+        remote,
+        confirmed,
+        0o644,
+        null,
+        &wrong_moved,
+    ));
+    // It stopped before the first append: one command, the length check.
+    try t.expectEqual(@as(usize, 1), wrong.seen.items.len);
+
+    // And an offset past the end of the source is a refusal, not a clamp. A
+    // clamp would publish a shorter file and call it the one that was asked for.
+    var past_steps = [_]Core.Scripted.Step{try replyLen(arena, total + 1)};
+    var past = Core.Scripted.init(arena, &past_steps);
+    var past_moved: Core.Ssh.Moved = .{};
+    try t.expectError(error.ResumeOffsetPastSource, Core.transfer.pushFile(
+        past.executor(),
+        arena,
+        scratch.io,
+        source,
+        remote,
+        total + 1,
+        0o644,
+        null,
+        &past_moved,
+    ));
+    try t.expectEqual(@as(usize, 0), past.seen.items.len);
+}
+
+test "gate: the host's readings a push's resume rests on" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prefix = "the confirmed prefix";
+    const prefix_sha = try hexOf(arena, prefix);
+
+    // A push's staging partial is on the host, so its prefix proof is a *ranged*
+    // remote digest: `head -c N` and then whichever hash tool the host has.
+    var steps = [_]Core.Scripted.Step{
+        reply(try std.fmt.allocPrint(arena, "{d}\n{s}  -\n", .{ prefix.len + 9, prefix_sha })),
+    };
+    var script = Core.Scripted.init(arena, &steps);
+    const reading = try Core.transfer.remotePartial(script.executor(), arena, "/srv/x.part", prefix.len);
+    try t.expect(reading.exists);
+    try t.expectEqual(@as(u64, prefix.len + 9), reading.len);
+    try t.expectEqualStrings(prefix_sha, reading.prefix_sha256.?);
+    const asked = script.seen.items[0];
+    try t.expect(std.mem.indexOf(u8, asked, "wc -c < ") != null);
+    try t.expect(std.mem.indexOf(u8, asked, "head -c 20 < ") != null);
+    try t.expect(std.mem.indexOf(u8, asked, "sha256sum") != null);
+    try t.expect(std.mem.indexOf(u8, asked, "shasum -a 256") != null);
+
+    // At offset zero there is no prefix. The host will have hashed an empty
+    // stream and produced a perfectly valid digest of nothing; offering it as a
+    // prefix proof would let a resume "prove" a prefix it never read.
+    var zero_steps = [_]Core.Scripted.Step{
+        reply(try std.fmt.allocPrint(arena, "0\n{s}  -\n", .{try hexOf(arena, "")})),
+    };
+    var zero_script = Core.Scripted.init(arena, &zero_steps);
+    const zero = try Core.transfer.remotePartial(zero_script.executor(), arena, "/srv/x.part", 0);
+    try t.expect(zero.exists);
+    try t.expectEqual(@as(?[]const u8, null), zero.prefix_sha256);
+
+    // A partial that is not there is a stated absence, which `verifyResume`
+    // words as a mismatch when bytes had been confirmed — never as a zero-length
+    // partial that happens to match nothing.
+    var missing_steps = [_]Core.Scripted.Step{replyCode(44, "")};
+    var missing_script = Core.Scripted.init(arena, &missing_steps);
+    const missing = try Core.transfer.remotePartial(missing_script.executor(), arena, "/srv/x.part", 8);
+    try t.expect(!missing.exists);
+    try t.expectEqual(@as(u64, 0), missing.len);
+
+    // The cut, and the read-back that makes it a fact rather than a hope. `dd
+    // if=/dev/null … seek=N` is the portable truncate — `truncate -s` is absent
+    // from macOS — and a `dd` that did nothing looks exactly like one that
+    // worked until the next append lands in the wrong place.
+    var cut_steps = [_]Core.Scripted.Step{try replyLen(arena, 4096)};
+    var cut = Core.Scripted.init(arena, &cut_steps);
+    try Core.transfer.truncateRemote(cut.executor(), arena, "/srv/x.part", 4096);
+    try t.expect(std.mem.indexOf(u8, cut.seen.items[0], "dd if=/dev/null of='/srv/x.part' bs=1 seek=4096") != null);
+    try t.expect(std.mem.indexOf(u8, cut.seen.items[0], "wc -c < ") != null);
+
+    // The host answered and the file is still the length it was: refused, and
+    // named as a failed truncate rather than accepted as a success.
+    var bad_steps = [_]Core.Scripted.Step{try replyLen(arena, 8192)};
+    var bad = Core.Scripted.init(arena, &bad_steps);
+    try t.expectError(
+        error.RemoteTruncateFailed,
+        Core.transfer.truncateRemote(bad.executor(), arena, "/srv/x.part", 4096),
+    );
+}
+
+test "gate: a resume refuses a changed source and a wrong partial as different facts, and moves nothing" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+    var store_scratch = try StoreScratch.init(t.allocator, "resume_refuse_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    // Hand-written rows, and deliberately: these need a partial of exactly the
+    // wrong length and a source with exactly the wrong digest, which a driver
+    // cannot be made to produce on cue. What they prove is that the resume reads
+    // the ledger correctly; the gate above proves the driver writes a row it can
+    // read. Both, and they are not the same claim.
+    const body = "the bytes this checkpoint is about, at some length or other";
+    const confirmed: u64 = 20;
+    const body_sha = try hexOf(arena, body);
+    const prefix_sha = try hexOf(arena, body[0..confirmed]);
+    const mtime: i128 = 1712345678 * std.time.ns_per_s;
+
+    const dest = "/var/tmp/resume_refuse_out.bin";
+    const request_id = try seedTransfer(&store, arena, "refvseone");
+    const cp = try transfers.create(&store, .{
+        .request_id = request_id,
+        .direction = .pull,
+        .dest_side = .local,
+        .dest_path = dest,
+        .partial_path = dest ++ cmd_transfer.partial_suffix,
+        .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+        .chunk_size = Core.Ssh.chunk_bytes,
+        .now = 100,
+    });
+    try transfers.setState(&store, cp, request_id, .probing, null, 101);
+    try transfers.recordSourceIdentity(&store, cp, request_id, body.len, mtime, body_sha, 102);
+    try transfers.recordExpectedHash(&store, cp, request_id, body_sha, 103);
+    try Store.operations.advance(&store, request_id, .submitted, 104);
+    try transfers.setState(&store, cp, request_id, .transferring, null, 105);
+    try transfers.confirmOffset(&store, cp, request_id, confirmed, confirmed, prefix_sha, 106);
+    try transfers.setState(&store, cp, request_id, .paused, "interrupted", 107);
+    const row = (try transfers.get(&store, arena, cp)).?;
+
+    const unchanged: transfers.SourceIdentity = .{ .remote_file = .{
+        .path = "/srv/app/in.bin",
+        .size = body.len,
+        .mtime_ns = mtime,
+        .sha256 = body_sha,
+    } };
+    const sound: transfers.PartialObservation = .{
+        .exists = true,
+        .len = confirmed,
+        .prefix_sha256 = prefix_sha,
+    };
+
+    // The control first, so every refusal below is a refusal of one thing.
+    try t.expect(transfers.verifyResume(row, unchanged, sound) == .resume_from);
+    try t.expectEqual(confirmed, transfers.verifyResume(row, unchanged, sound).resume_from);
+
+    // **Three refusals, three different facts.** Counted, and each is checked to
+    // carry its own text, because the tag is what a caller switches on and the
+    // whole point of keeping them apart is that they send an operator to
+    // different files.
+    const changed: transfers.SourceIdentity = .{ .remote_file = .{
+        .path = "/srv/app/in.bin",
+        .size = body.len,
+        .mtime_ns = mtime,
+        .sha256 = try hexOf(arena, "a different file entirely"),
+    } };
+    const cases = [_]struct {
+        source: ?transfers.SourceIdentity,
+        partial: transfers.PartialObservation,
+        want: std.meta.Tag(transfers.ResumeVerdict),
+        state: transfers.State,
+    }{
+        // The source is not the one this checkpoint is about.
+        .{ .source = changed, .partial = sound, .want = .source_changed, .state = .failed_source_changed },
+        // The right length, the wrong bytes. This is the one a length check
+        // alone would wave through, and the reason the prefix digest exists.
+        .{
+            .source = unchanged,
+            .partial = .{ .exists = true, .len = confirmed, .prefix_sha256 = try hexOf(arena, "not our prefix") },
+            .want = .partial_mismatch,
+            .state = .failed_remote_partial_mismatch,
+        },
+        // Shorter than what we counted: bytes we had confirmed are gone.
+        .{
+            .source = unchanged,
+            .partial = .{ .exists = true, .len = confirmed - 1, .prefix_sha256 = prefix_sha },
+            .want = .partial_mismatch,
+            .state = .failed_remote_partial_mismatch,
+        },
+        // Gone entirely, after bytes were confirmed.
+        .{
+            .source = unchanged,
+            .partial = .{ .exists = false },
+            .want = .partial_mismatch,
+            .state = .failed_remote_partial_mismatch,
+        },
+        // The source is gone. Still `source_changed`, not a partial fault.
+        .{ .source = null, .partial = sound, .want = .source_changed, .state = .failed_source_changed },
+    };
+    var refused: usize = 0;
+    for (cases) |c| {
+        refused += 1;
+        const got = transfers.verifyResume(row, c.source, c.partial);
+        try t.expectEqual(c.want, std.meta.activeTag(got));
+        const why = switch (got) {
+            .source_changed => |w| w,
+            .partial_mismatch => |w| w,
+            else => return error.RefusalCarriedNoReason,
+        };
+        try t.expect(why.len > 0);
+        // Each refusal names a checkpoint state, and the state names an outcome
+        // the driver can report. This is the chain `refuseResume` walks.
+        try t.expectEqual(
+            @as(?cmd_transfer.Outcome, if (c.state == .failed_source_changed)
+                .failed_source_changed
+            else
+                .failed_remote_partial_mismatch),
+            cmd_transfer.Outcome.naming(c.state),
+        );
+    }
+    try t.expectEqual(@as(usize, 5), refused);
+
+    // The two states are different rows in the ledger, and both are reachable
+    // from `probing` — which is where a resume is standing when it refuses.
+    try t.expect(transfers.canTransition(.probing, .failed_source_changed));
+    try t.expect(transfers.canTransition(.probing, .failed_remote_partial_mismatch));
+    // And they hold the destination and are supersedable, so a refused resume
+    // leaves a *decided* failure that `--restart` can release — where before
+    // there was an unjudged `paused` row nothing could.
+    try t.expect(transfers.State.failed_source_changed.holdsDestination());
+    try t.expect(transfers.State.failed_source_changed.isSupersedable());
+    try t.expect(transfers.State.failed_remote_partial_mismatch.holdsDestination());
+    try t.expect(transfers.State.failed_remote_partial_mismatch.isSupersedable());
+
+    // Nothing moved: a refusal happens before the stream, so the row is still
+    // where it was and its offset and prefix are untouched.
+    const after = (try transfers.get(&store, arena, cp)).?;
+    try t.expectEqual(transfers.State.paused, after.state);
+    try t.expectEqual(@as(i64, confirmed), after.confirmed_offset);
+    try t.expectEqualStrings(prefix_sha, after.partial_sha256.?);
+}
+
+test "gate: --resume reaches exactly the adoptable states, and the statement refuses the rest" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "resume_states_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    // The message and the statement have to agree, and this is where. `wayIn`
+    // refuses a non-adoptable holder by name; the hand-over refuses it again
+    // under the write lock. A gate that only read the message would pass on a
+    // driver that offered `--resume` for a state `adoptLocked` rejects.
+    const dest = "/var/tmp/resume_states_out.bin";
+    const held = try seedHolder(&store, arena, "statesone", dest, .failed_hash_mismatch, .settled);
+    const holder = (try transfers.findHolder(&store, arena, .local, dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expect(!holder.state.isAdoptable());
+    // The refusal an operator reads names the state and sends them to the other
+    // verb, because that is the one this state is for.
+    const way = cmd_transfer.wayThrough(arena, holder);
+    try t.expect(std.mem.indexOf(u8, way, "--restart") != null);
+    try t.expectEqualStrings("--restart", cmd_transfer.verbFor(holder.state).?);
+
+    var heir = switch (try Core.execution.begin(
+        &store,
+        arena,
+        store_scratch.io,
+        pullBegin("/var/tmp/resume_states_other.bin", .transfer_pull),
+    )) {
+        .ready => |e| e,
+        .blocked => return error.HeirWasBlocked,
+    };
+    // And the statement says the same thing, under its own name.
+    try t.expectError(error.CheckpointNotResumable, heir.adoptCheckpoint(held.checkpoint, held.request_id));
+
+    // The row did not move, so the refusal really declined the hand-over rather
+    // than half-performing one.
+    const after = (try transfers.get(&store, arena, held.checkpoint)).?;
+    try t.expectEqualStrings(held.request_id, after.request_id);
+    try t.expectEqual(transfers.State.failed_hash_mismatch, after.state);
+
+    // The mid-act pair. `verifying` and `publishing` hold their destination,
+    // are past their last byte, and belong to neither verb: `--resume` has no
+    // offset to continue from and `--restart` has no decision to release. They
+    // need `execution.recoverCheckpoint`, which normalises them first — a
+    // different act with a different claim behind it, and one no verb reaches.
+    var mid: usize = 0;
+    for ([_]transfers.State{ .verifying, .publishing }) |state| {
+        mid += 1;
+        try t.expect(state.holdsDestination());
+        try t.expect(!state.isAdoptable());
+        try t.expect(!state.isSupersedable());
+        try t.expect(state.isRecoverable());
+        try t.expectEqual(@as(?[]const u8, null), cmd_transfer.verbFor(state));
+    }
+    try t.expectEqual(@as(usize, 2), mid);
+
+    // Every adoptable state, on the other hand, gets `--resume` — and there are
+    // four of them. Counted from the predicate, so a fifth added without a
+    // sentence for it fails here.
+    var adoptable: usize = 0;
+    inline for (@typeInfo(transfers.State).@"enum".fields) |field| {
+        const state: transfers.State = @enumFromInt(field.value);
+        if (state.isAdoptable()) {
+            adoptable += 1;
+            try t.expectEqualStrings("--resume", cmd_transfer.verbFor(state).?);
+            // Every one of them can also take an offset, which is what makes
+            // "continue it" a thing that can happen rather than a slogan.
+            try t.expect(state.acceptsOffset());
+        }
+    }
+    try t.expectEqual(@as(usize, 4), adoptable);
 }
 
 // --- store fixtures ---------------------------------------------------------

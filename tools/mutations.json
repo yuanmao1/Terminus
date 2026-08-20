@@ -1149,8 +1149,8 @@
       "id": "transfer-pull-writes-destination",
       "rule": "A pull stages into the partial it is given and never opens the destination.",
       "file": "src/core/transfer.zig",
-      "find": "    const file = std.Io.Dir.cwd().createFile(io, partial_path, .{}) catch\n        return error.LocalFileFailed;",
-      "replace": "    const target = if (std.mem.endsWith(u8, partial_path, \".terminus-part\"))\n        partial_path[0 .. partial_path.len - \".terminus-part\".len]\n    else\n        partial_path;\n    const file = std.Io.Dir.cwd().createFile(io, target, .{}) catch\n        return error.LocalFileFailed;",
+      "find": "        std.Io.Dir.cwd().createFile(io, partial_path, .{})",
+      "replace": "        std.Io.Dir.cwd().createFile(io, if (std.mem.endsWith(u8, partial_path, \".terminus-part\")) partial_path[0 .. partial_path.len - \".terminus-part\".len] else partial_path, .{})",
       "expect_gate": "gate: a pull stages beside the destination and never opens it"
     },
     {
@@ -1293,9 +1293,9 @@
       "id": "M3.2-restart-not-a-bool-flag",
       "rule": "`--restart` never consumes the argument after it. A flag missing from `bool_flags` is not a compile error: written last it fails with \"a flag is missing its value\", and written before `--json` it eats it.",
       "file": "src/cli/args.zig",
-      "find": "\"show-script\", \"all\", \"restart\" };",
-      "replace": "\"show-script\", \"all\" };",
-      "expect_gate": "gate: --restart is a boolean flag, so it does not swallow whatever follows it"
+      "find": "\"all\", \"restart\", \"resume\" };",
+      "replace": "\"all\", \"resume\" };",
+      "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
       "id": "M3.2-skill-transfer-exit-code",
@@ -1309,9 +1309,113 @@
       "id": "M3.2-skill-restart-reach-count",
       "rule": "skill/SKILL.md's count of the verdicts `--restart` can release is held against `State.isSupersedable`, so the document cannot tell an agent to restart a transfer the statement will refuse.",
       "file": "skill/SKILL.md",
-      "find": "It releases **3** of the seven\nverdicts above",
-      "replace": "It releases **5** of the seven\nverdicts above",
+      "find": "It releases **4** of the eight verdicts above:",
+      "replace": "It releases **6** of the eight verdicts above:",
       "expect_gate": "gate: SKILL.md publishes how many transfer verdicts --restart can release"
+    },
+    {
+      "id": "M3.3-resume-not-a-bool-flag",
+      "rule": "`--resume` never consumes the argument after it. The sibling of `M3.2-restart-not-a-bool-flag`, and the second time this exact omission would have shipped: a flag missing from `bool_flags` is not a compile error and no helper-level gate sees it.",
+      "file": "src/cli/args.zig",
+      "find": "\"all\", \"restart\", \"resume\" };",
+      "replace": "\"all\", \"restart\" };",
+      "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
+    },
+    {
+      "id": "M3.3-mark-snapshot-not-at-the-mark",
+      "rule": "The hasher a resume continues from is snapshotted at exactly the confirmed offset. Taken at a buffer boundary instead, every prefix digest a resumed transfer writes describes a range nobody can re-derive.",
+      "file": "src/core/transfer.zig",
+      "find": "        const chunk = if (read < mark and read + available.len > mark)\n            available[0..@intCast(mark - read)]\n        else\n            available;",
+      "replace": "        const chunk = available;",
+      "expect_gate": "gate: a hasher snapshotted at a mark, continued, equals hashing the whole file"
+    },
+    {
+      "id": "M3.3-resume-push-truncates-the-partial",
+      "rule": "A resuming push must not truncate the remote staging partial. `beginRemoteFile` opens with `: >`, which is right for a fresh push and throws away every confirmed byte on a resume.",
+      "file": "src/core/transfer.zig",
+      "find": "    if (start_offset == 0)\n        try beginRemoteFile(executor, arena, remote_path, mode)\n    else\n        try resumeRemoteFile(executor, arena, remote_path, start_offset);",
+      "replace": "    try beginRemoteFile(executor, arena, remote_path, mode);",
+      "expect_gate": "gate: a resuming push appends from the offset and does not truncate the remote partial"
+    },
+    {
+      "id": "M3.3-resume-pull-truncates-the-partial",
+      "rule": "A resuming pull opens its staging partial without truncating. Truncating loses the confirmed prefix the resume was licensed to splice onto.",
+      "file": "src/core/transfer.zig",
+      "find": "            .truncate = false,\n            .read = true,",
+      "replace": "            .truncate = true,\n            .read = true,",
+      "expect_gate": "gate: an interrupted pull, resumed, is byte-identical to one that was never interrupted"
+    },
+    {
+      "id": "M3.3-resume-pull-writes-from-zero",
+      "rule": "A resuming pull writes at the confirmed offset, not at the head of the file. Writing from zero overwrites the prefix it just proved and publishes a file whose head is its own tail.",
+      "file": "src/core/transfer.zig",
+      "find": "    writer.pos = start_offset;",
+      "replace": "    writer.pos = 0;",
+      "expect_gate": "gate: an interrupted pull, resumed, is byte-identical to one that was never interrupted"
+    },
+    {
+      "id": "M3.3-push-resume-length-unchecked",
+      "rule": "A resuming push refuses a remote partial that is not the length it was licensed for. Appending to a different length splices at the wrong offset, and the digests only disagree after the whole file has moved.",
+      "file": "src/core/transfer.zig",
+      "find": "    if (now != offset) return error.RemotePartialLengthChanged;",
+      "replace": "    if (now < offset) return error.RemotePartialLengthChanged;",
+      "expect_gate": "gate: a resuming push appends from the offset and does not truncate the remote partial"
+    },
+    {
+      "id": "M3.3-remote-truncate-unverified",
+      "rule": "The cut that discards a partial's unconfirmed tail reads the length back. A `dd` that did nothing is indistinguishable from one that worked until the next append lands in the wrong place.",
+      "file": "src/core/transfer.zig",
+      "find": "    if (now != len) return error.RemoteTruncateFailed;",
+      "replace": "    _ = now;",
+      "expect_gate": "gate: the host's readings a push's resume rests on"
+    },
+    {
+      "id": "M3.3-remote-prefix-of-nothing",
+      "rule": "At offset zero there is no prefix to prove. The host will hash an empty stream and return a perfectly valid digest of nothing; offering it as a prefix proof lets a resume \"prove\" a prefix it never read.",
+      "file": "src/core/transfer.zig",
+      "find": "        .prefix_sha256 = if (prefix_len == 0) null else try parseDigest(arena, digest_line),",
+      "replace": "        .prefix_sha256 = try parseDigest(arena, digest_line),",
+      "expect_gate": "gate: the host's readings a push's resume rests on"
+    },
+    {
+      "id": "M3.3-handover-drops-the-declaration",
+      "rule": "A hand-over moves a checkpoint's owner and nothing else. The digest declared before the first byte has to survive it, because that digest is the only thing a resumed transfer can be judged against — a resume may not re-declare one.",
+      "file": "src/core/store/transfers.zig",
+      "find": "        \\\\UPDATE transfer_checkpoints\n        \\\\   SET request_id = ?1, updated_at = ?2\n        \\\\ WHERE id = ?3",
+      "replace": "        \\\\UPDATE transfer_checkpoints\n        \\\\   SET request_id = ?1, updated_at = ?2, expected_sha256 = NULL\n        \\\\ WHERE id = ?3",
+      "expect_gate": "gate: an interrupted pull, resumed, is byte-identical to one that was never interrupted"
+    },
+    {
+      "id": "M3.3-prefix-compared-by-length",
+      "rule": "The staged prefix is proven by its digest, not by its length. Two digests of the same length are the same length; a partial of exactly the right size can be a different file, a half-written retry, or another writer's work.",
+      "file": "src/core/store/transfers.zig",
+      "find": "        if (!std.mem.eql(u8, recorded, observed))\n            return .{ .partial_mismatch = \"the staging partial's content does not match the checkpoint\" };",
+      "replace": "        if (recorded.len != observed.len)\n            return .{ .partial_mismatch = \"the staging partial's content does not match the checkpoint\" };",
+      "expect_gate": "gate: a resume refuses a changed source and a wrong partial as different facts, and moves nothing"
+    },
+    {
+      "id": "M3.3-adopt-widened-past-adoptable",
+      "rule": "A hand-over may only take over a checkpoint that can be continued as its row describes it. Widened to everything that holds a destination, `--resume` would adopt a settled failure and splice onto a partial that failure already declared untrustworthy.",
+      "file": "src/core/store/transfers.zig",
+      "find": "const adopt_sql = handoverSql(adoptable_sql);",
+      "replace": "const adopt_sql = handoverSql(holds_destination_sql);",
+      "expect_gate": "gate: --resume reaches exactly the adoptable states, and the statement refuses the rest"
+    },
+    {
+      "id": "M3.3-verb-for-collapses",
+      "rule": "Every holder state gets at most one verb, and the two sets are disjoint. A message that offers `--restart` for a state supersession refuses sends half its readers to a statement that turns them away.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "pub fn verbFor(state: transfers.State) ?[]const u8 {\n    if (state.isAdoptable()) return \"--resume\";\n    if (state.isSupersedable()) return \"--restart\";\n    return null;\n}",
+      "replace": "pub fn verbFor(state: transfers.State) ?[]const u8 {\n    if (state.isAdoptable()) return \"--resume\";\n    return \"--restart\";\n}",
+      "expect_gate": "gate: --restart and --resume divide the driver's outcomes, and neither reaches the other's"
+    },
+    {
+      "id": "M3.3-skill-resume-backend",
+      "rule": "skill/SKILL.md says a resume is exec-only. An agent told otherwise reads the `--via scp --resume` refusal as a bug and works around it.",
+      "file": "skill/SKILL.md",
+      "find": "**resuming is exec-only.**",
+      "replace": "**resuming works over either backend.**",
+      "expect_gate": "gate: SKILL.md tells an agent the two things about --resume that are load-bearing"
     }
   ]
 }

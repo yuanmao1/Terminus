@@ -4,7 +4,15 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// Flags that never consume a value.
-const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force", "stdin", "login", "append", "strict", "include-keys", "active", "discard-evidence", "from-log", "read-only", "show-script", "all", "restart" };
+///
+/// A flag missing from this list is not a compile error and is invisible to any
+/// gate that calls a command's helpers directly: the parser falls through to
+/// `--flag <value>`, so the flag written last fails with "a flag is missing its
+/// value" and the flag written before another one silently eats it. Both were
+/// found by running the binary. `cmd_transfer_test` gates `--restart` and
+/// `--resume` against this list for that reason; a new boolean flag belongs
+/// here and in a gate, in the same commit.
+const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force", "stdin", "login", "append", "strict", "include-keys", "active", "discard-evidence", "from-log", "read-only", "show-script", "all", "restart", "resume" };
 
 pub const Parsed = struct {
     positionals: []const []const u8,

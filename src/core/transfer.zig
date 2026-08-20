@@ -70,6 +70,22 @@ pub const Error = Ssh.ExecError || Allocator.Error || error{
     ObserverFailed,
     /// The rename that publishes a staged partial did not report success.
     PublishFailed,
+    /// A resume was asked to start past the end of its own source. Named rather
+    /// than clamped: a clamp would publish a shorter file and call it the one
+    /// that was asked for.
+    ResumeOffsetPastSource,
+    /// The truncate that cuts a remote partial back to a confirmed offset did
+    /// not leave the length it was asked for. Never assumed — a `dd` that did
+    /// nothing looks exactly like one that worked until the next append lands
+    /// in the wrong place.
+    RemoteTruncateFailed,
+    /// At append time the remote staging partial is not the length the resume
+    /// was licensed for. Somebody else wrote to it between the verification and
+    /// the first slice, and appending now would splice at the wrong offset.
+    RemotePartialLengthChanged,
+    /// The local staging partial is shorter than the offset a resume was told to
+    /// continue from. Extending it would fill the gap with zeroes.
+    LocalPartialTooShort,
 };
 
 // --- Remote readings ---------------------------------------------------------
@@ -233,6 +249,196 @@ pub fn remoteHashTool(executor: Executor, arena: Allocator) Error!?[]const u8 {
     return null;
 }
 
+// --- Resume readings ---------------------------------------------------------
+//
+// A resume splices bytes fetched now onto bytes fetched earlier, so before it
+// moves anything it has to prove two things: that the source is still the one
+// the checkpoint recorded, and that the staging partial's confirmed prefix is
+// still the bytes we counted. `transfers.verifyResume` is the rule; these are
+// the two readings it is asked about, and which side each is taken on follows
+// from where the partial lives — on the host for a push, on this machine for a
+// pull.
+//
+// **Both readings double as the SHA-256 state a resume needs.** A digest cannot
+// be resumed from its output: the hasher state at byte N is not recoverable from
+// the prefix digest recorded at N. So a resumed transfer would either have to
+// re-read the prefix to rebuild that state — a whole extra pass, every resume —
+// or stop advancing the confirmed offset, which takes resume with it. Neither is
+// necessary, because the pass that *licenses* the resume is a pass over exactly
+// those bytes: `readLocalFile` hands back the running hasher as it stood at the
+// mark alongside the digest it was asked for. The prefix is read once, for the
+// proof, and the hasher comes free with it.
+
+/// One pass over a local file: its whole identity, and the digest state at a
+/// mark.
+///
+/// `mark` is the offset a resume would continue from. `at_mark` and
+/// `prefix_sha256` are both null when the file ended before it — which is a
+/// finding (`verifyResume` calls it a short partial), not a reason to report a
+/// zero.
+pub const LocalPass = struct {
+    /// Digest of the whole file, as read.
+    sha256: []const u8,
+    /// Bytes actually read, which is the length on disk.
+    size: u64,
+    mtime_ns: i128,
+    /// The hasher after exactly `mark` bytes, for a caller that is about to feed
+    /// it the rest of the file.
+    at_mark: ?digest.Running,
+    /// The hex digest of the first `mark` bytes. Null at `mark == 0`, because a
+    /// digest of nothing is not a prefix proof and must not be offered as one.
+    prefix_sha256: ?[]const u8,
+};
+
+/// Reads `path` once, hashing as it goes, and snapshots the hasher at `mark`.
+///
+/// The same walk `digest.readFile` makes, with the snapshot added — chunks are
+/// split at the mark so the state is taken at exactly that byte and not at
+/// whichever buffer boundary happened to straddle it. Null when there is no such
+/// file, which is a finding rather than an error; see the `FileNotFound` arm.
+pub fn readLocalFile(
+    io: std.Io,
+    arena: Allocator,
+    path: []const u8,
+    mark: u64,
+) Error!?LocalPass {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        // A stated absence. The two callers mean different things by it — a
+        // push's source is gone, a pull's staging partial was never written —
+        // and both are findings `verifyResume` has words for, so neither may be
+        // flattened into "unreadable".
+        error.FileNotFound => return null,
+        else => return error.LocalFileFailed,
+    };
+    defer file.close(io);
+    const info = file.stat(io) catch return error.LocalFileFailed;
+
+    var buffer: [1 << 20]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    var running: digest.Running = .init();
+    var at_mark: ?digest.Running = if (mark == 0) running else null;
+    var prefix: ?[]const u8 = null;
+    var read: u64 = 0;
+    while (true) {
+        const available = reader.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return error.LocalFileFailed,
+        };
+        // Split at the mark, so the snapshot is of exactly `mark` bytes.
+        const chunk = if (read < mark and read + available.len > mark)
+            available[0..@intCast(mark - read)]
+        else
+            available;
+        running.update(chunk);
+        reader.interface.toss(chunk.len);
+        read += chunk.len;
+        if (read == mark and at_mark == null) {
+            at_mark = running;
+            var buf: [digest.hex_len]u8 = undefined;
+            prefix = try arena.dupe(u8, running.peekHex(&buf));
+        }
+    }
+
+    var out: [digest.hex_len]u8 = undefined;
+    return .{
+        .sha256 = try arena.dupe(u8, running.finalHex(&out)),
+        .size = read,
+        .mtime_ns = info.mtime.nanoseconds,
+        .at_mark = at_mark,
+        .prefix_sha256 = prefix,
+    };
+}
+
+/// What the host says about a staging partial a resume is about to append to.
+///
+/// The shape `transfers.PartialObservation` is built from. A local type rather
+/// than that one because the dependency runs the other way: nothing in this
+/// module knows about the checkpoint table, and importing it to borrow a
+/// three-field struct would put the ledger underneath the transport.
+pub const PartialReading = struct {
+    exists: bool,
+    len: u64 = 0,
+    prefix_sha256: ?[]const u8 = null,
+};
+
+/// The host's length and ranged prefix digest for one staging partial.
+///
+/// `head -c N` and not `dd`, for the reason `fetchRange` gives: `dd`'s block
+/// semantics can return short for a full block, and here a short read would
+/// produce the digest of fewer bytes than were asked about — a prefix proof over
+/// the wrong range, which is worse than no proof.
+pub fn remotePartial(
+    executor: Executor,
+    arena: Allocator,
+    remote_path: []const u8,
+    prefix_len: u64,
+) Error!PartialReading {
+    const cmd = try std.fmt.allocPrint(arena,
+        \\[ -f '{[path]s}' ] || exit 44
+        \\wc -c < '{[path]s}' || exit 45
+        \\head -c {[len]d} < '{[path]s}' | if command -v sha256sum >/dev/null 2>&1; then sha256sum
+        \\elif command -v shasum >/dev/null 2>&1; then shasum -a 256
+        \\else echo -
+        \\fi
+    , .{ .path = remote_path, .len = prefix_len });
+    const r = try executor.exec(arena, cmd);
+    switch (r.exit_code) {
+        0 => {},
+        44 => return .{ .exists = false },
+        else => return error.RemoteReadFailed,
+    }
+
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, r.stdout, "\r\n"), '\n');
+    const size_text = std.mem.trim(u8, lines.next() orelse return error.RemoteReplyMalformed, " \t\r");
+    const digest_line = std.mem.trim(u8, lines.next() orelse return error.RemoteReplyMalformed, " \t\r");
+    return .{
+        .exists = true,
+        .len = std.fmt.parseInt(u64, size_text, 10) catch return error.RemoteReplyMalformed,
+        // At zero there is no prefix. The host will have hashed an empty stream
+        // and produced a perfectly valid digest of nothing; offering it as a
+        // prefix proof is the one thing that must not happen here.
+        .prefix_sha256 = if (prefix_len == 0) null else try parseDigest(arena, digest_line),
+    };
+}
+
+/// Cuts a remote staging partial back to `len` bytes, in place.
+///
+/// The bytes above `len` were written and never confirmed — the ordinary shape
+/// of an interruption — and they prove nothing, so a resume discards them. It
+/// discards them only *after* the prefix below `len` has been proven, which is
+/// the order `transfers.ResumeVerdict.truncate_then_resume` exists to state:
+/// truncating first would destroy the only thing that could have proven it.
+///
+/// `dd if=/dev/null of=… seek=N` rather than `truncate -s N`: `truncate` is
+/// GNU/BSD and is absent from macOS, while this form works on GNU coreutils,
+/// the BSDs and busybox. The length is read back and compared rather than
+/// assumed, because a `dd` that did nothing is indistinguishable from one that
+/// worked until the next append lands in the wrong place.
+pub fn truncateRemote(
+    executor: Executor,
+    arena: Allocator,
+    remote_path: []const u8,
+    len: u64,
+) Error!void {
+    const cmd = try std.fmt.allocPrint(arena,
+        \\[ -f '{[path]s}' ] || exit 44
+        \\dd if=/dev/null of='{[path]s}' bs=1 seek={[len]d} 2>/dev/null || exit 42
+        \\wc -c < '{[path]s}' || exit 45
+    , .{ .path = remote_path, .len = len });
+    const r = try executor.exec(arena, cmd);
+    switch (r.exit_code) {
+        0 => {},
+        44 => return error.RemoteFileMissing,
+        else => return error.RemoteTruncateFailed,
+    }
+    const now = std.fmt.parseInt(
+        u64,
+        std.mem.trim(u8, r.stdout, " \t\r\n"),
+        10,
+    ) catch return error.RemoteReplyMalformed;
+    if (now != len) return error.RemoteTruncateFailed;
+}
+
 /// Renames a staged partial over its destination on the host.
 ///
 /// `mv -f` is POSIX `rename(2)` within one filesystem: the destination is
@@ -275,6 +481,47 @@ fn beginRemoteFile(
         41 => return error.RemoteToolMissing,
         else => return error.RemoteWriteFailed,
     }
+}
+
+/// The resuming counterpart of `beginRemoteFile`: **it does not truncate.**
+///
+/// That absence is the whole function. `beginRemoteFile` opens with `: >`, which
+/// empties the partial — correct for a fresh push and the one thing a resume
+/// must never do to the bytes it is about to append to. So the two are separate
+/// entry points rather than one with a flag: a flag defaulting the wrong way, or
+/// read the wrong way once, silently turns every resume into a restart that
+/// reports itself as a resume.
+///
+/// What it checks instead is that the partial is *exactly* `offset` bytes now.
+/// The caller has already proven that prefix and, if the partial was longer,
+/// cut it back; a different length at this point means somebody else wrote to it
+/// in between, and appending would splice at the wrong offset. `chmod` is not
+/// repeated — the mode was set when the partial was created, and re-applying it
+/// would be this function's only write to a file it exists not to write to.
+fn resumeRemoteFile(
+    executor: Executor,
+    arena: Allocator,
+    remote_path: []const u8,
+    offset: u64,
+) Error!void {
+    const cmd = try std.fmt.allocPrint(arena,
+        \\command -v base64 >/dev/null || exit 41
+        \\[ -f '{[path]s}' ] || exit 44
+        \\wc -c < '{[path]s}' || exit 45
+    , .{ .path = remote_path });
+    const r = try executor.exec(arena, cmd);
+    switch (r.exit_code) {
+        0 => {},
+        41 => return error.RemoteToolMissing,
+        44 => return error.RemoteFileMissing,
+        else => return error.RemoteReadFailed,
+    }
+    const now = std.fmt.parseInt(
+        u64,
+        std.mem.trim(u8, r.stdout, " \t\r\n"),
+        10,
+    ) catch return error.RemoteReplyMalformed;
+    if (now != offset) return error.RemotePartialLengthChanged;
 }
 
 /// The fixed buffers one push loop needs, allocated once.
@@ -328,7 +575,14 @@ fn appendSlice(
 ///
 /// `observer` sees every slice as it goes out — the same contract
 /// `Ssh.scpSend`'s does, so a driver hashes and records progress identically
-/// whichever backend moved the bytes.
+/// whichever backend moved the bytes. `moved` counts absolutely: on a resume the
+/// first slice arrives at `start_offset + its length`, because what a caller
+/// records against a checkpoint is a position in the artifact and not a count of
+/// this run's work.
+///
+/// `start_offset` is where the remote partial already ends. At zero the partial
+/// is created and truncated as before; above zero **nothing truncates it** — see
+/// `resumeRemoteFile`.
 ///
 /// Verifies nothing. The digest comparison belongs to the driver, which is the
 /// only thing that knows what was declared before the first byte and which is
@@ -340,6 +594,7 @@ pub fn pushFile(
     io: std.Io,
     local_path: []const u8,
     remote_path: []const u8,
+    start_offset: u64,
     mode: u32,
     observer: ?Ssh.Observer,
     moved: *Ssh.Moved,
@@ -349,8 +604,13 @@ pub fn pushFile(
     defer file.close(io);
     const total = file.length(io) catch return error.LocalFileFailed;
     moved.expected = total;
+    if (start_offset > total) return error.ResumeOffsetPastSource;
+    moved.arrived = start_offset;
 
-    try beginRemoteFile(executor, arena, remote_path, mode);
+    if (start_offset == 0)
+        try beginRemoteFile(executor, arena, remote_path, mode)
+    else
+        try resumeRemoteFile(executor, arena, remote_path, start_offset);
 
     const buffers = try PushBuffers.init(arena, remote_path);
     var scratch = std.heap.ArenaAllocator.init(arena);
@@ -358,7 +618,10 @@ pub fn pushFile(
 
     var read_buffer: [push_slice]u8 = undefined;
     var reader = file.reader(io, &read_buffer);
-    var sent: u64 = 0;
+    // Positional by default, so the first read comes from `start_offset` rather
+    // than from the head of the file.
+    reader.pos = start_offset;
+    var sent: u64 = start_offset;
     while (sent < total) {
         const available = reader.interface.peekGreedy(1) catch |err| switch (err) {
             // The file ended before its own reported length. Nothing here can
@@ -482,9 +745,18 @@ fn fetchRange(
 /// bounded memory.
 ///
 /// **`partial_path` must be a staging path, never the caller's destination.**
-/// The file is created truncating, exactly as `Ssh.scpRecv` does and for the
-/// same reason: a pull that fails halfway must not already have emptied what the
-/// operator had.
+/// At `start_offset == 0` the file is created truncating, exactly as
+/// `Ssh.scpRecv` does and for the same reason: a pull that fails halfway must
+/// not already have emptied what the operator had.
+///
+/// Above zero it opens without truncating and cuts the file back to
+/// `start_offset` — the unconfirmed tail an interruption left, which proves
+/// nothing and is therefore not counted. It refuses a partial that is *shorter*
+/// than the offset rather than extending it, because extending would fill the
+/// gap with zeroes and then hash them as if they had arrived.
+///
+/// `total` is the whole file and `moved` counts absolutely, so a resumed pull
+/// reports its position in the artifact rather than this run's share of it.
 ///
 /// Verifies nothing, for the reason `pushFile` does not.
 pub fn pullFile(
@@ -493,23 +765,44 @@ pub fn pullFile(
     io: std.Io,
     remote_path: []const u8,
     partial_path: []const u8,
+    start_offset: u64,
     total: u64,
     observer: ?Ssh.Observer,
     moved: *Ssh.Moved,
 ) Error!u64 {
     moved.* = .{ .expected = total };
+    if (start_offset > total) return error.ResumeOffsetPastSource;
+    moved.arrived = start_offset;
 
     const buffers = try PullBuffers.init(arena);
     var scratch = std.heap.ArenaAllocator.init(arena);
     defer scratch.deinit();
 
-    const file = std.Io.Dir.cwd().createFile(io, partial_path, .{}) catch
-        return error.LocalFileFailed;
+    const file = (if (start_offset == 0)
+        std.Io.Dir.cwd().createFile(io, partial_path, .{})
+    else
+        // Read access as well as write, and not for reading: a resume has to ask
+        // the file how long it is before it appends, and a write-only handle
+        // cannot be statted on Windows. The fresh path keeps the handle it had.
+        std.Io.Dir.cwd().createFile(io, partial_path, .{
+            .truncate = false,
+            .read = true,
+        })) catch return error.LocalFileFailed;
     defer file.close(io);
+    if (start_offset > 0) {
+        const on_disk = file.length(io) catch return error.LocalFileFailed;
+        if (on_disk < start_offset) return error.LocalPartialTooShort;
+        if (on_disk > start_offset)
+            file.setLength(io, start_offset) catch return error.LocalFileFailed;
+    }
     var write_buffer: [1 << 16]u8 = undefined;
-    var writer = file.writerStreaming(io, &write_buffer);
+    // Positional, with the cursor set where the confirmed prefix ends. A
+    // streaming writer would start at zero and overwrite the bytes this resume
+    // exists to keep.
+    var writer = file.writer(io, &write_buffer);
+    writer.pos = start_offset;
 
-    var received: u64 = 0;
+    var received: u64 = start_offset;
     while (received < total) {
         const want: usize = @intCast(@min(@as(u64, pull_slice), total - received));
         const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);
