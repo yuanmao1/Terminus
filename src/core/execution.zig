@@ -1978,6 +1978,131 @@ fn nonceFrom(request_id: [ids.len]u8) u64 {
     return value;
 }
 
+/// An execution and the checkpoint minted with it, in the one shape where those
+/// two are the product of a single commit.
+pub const StartedTransfer = struct {
+    execution: Execution,
+    checkpoint: i64,
+};
+
+pub const RestartedStart = union(enum) {
+    ready: StartedTransfer,
+    blocked: Blocker,
+};
+
+/// `beginSupersedingCheckpoint` drives the checkpoint table, so it can fail
+/// across that whole vocabulary — the same trade `AdoptError` records, and for
+/// the same reason: one transaction, one error set.
+pub const RestartError = Error || transfers.Error;
+
+/// Releases the checkpoint standing on a destination and puts a new transfer on
+/// the way to it — the operation, the supersession and the replacement
+/// checkpoint, in one transaction or none of them.
+///
+/// **Why this is here rather than in the CLI.** `transfers.supersedeLocked` says
+/// so itself: "a restart is this write plus a new operation and a new
+/// checkpoint, and a supersession that landed while the replacement failed to
+/// would leave the path free with nothing on the way to it. The transaction
+/// belongs to whoever sequences those three." A driver that opened its own
+/// `BEGIN IMMEDIATE` around `begin` would be reimplementing `begin` — the guard,
+/// the operation insert and the override audit — outside the module that owns
+/// them, which is exactly the per-verb copy the destruction contract above
+/// exists to have stopped happening. So the sequencing lives beside the other
+/// two composites over this table (`adoptCheckpoint`, `recoverCheckpoint`) and
+/// the CLI supplies the values.
+///
+/// **The order is forced, not chosen.** Each step is the precondition of the
+/// next, in the statements themselves:
+///
+///  1. the scope guard, which can refuse before anything is written — the same
+///     courtesy check `begin` makes, and the reason it is *inside* this
+///     transaction rather than before it is that a peer claiming the path
+///     between a separate `begin` and this supersession would have its claim
+///     released out from under it;
+///  2. the operation, because `supersede_sql` requires the superseding request
+///     to exist — a supersession naming an operation that was never created
+///     "reads as provenance while being none";
+///  3. the supersession, because the live-destination index refuses the insert
+///     below while the incumbent still holds the path;
+///  4. the replacement checkpoint, last, because it is the one thing whose
+///     existence makes the release safe.
+///
+/// **What a failure leaves.** Anything after (2) takes the whole thing down
+/// through the `errdefer`, so the incumbent keeps its state, keeps its partial
+/// and keeps its hold. That is the property the transaction exists for and the
+/// one worth testing: a supersession that committed alone would leave the
+/// destination free with nothing claiming it, and the next `create` aimed there
+/// would walk straight onto the leftovers an operator was asked about.
+///
+/// This releases a destination and does **not** touch what is on it. The
+/// incumbent's row, its staging partial and both its digests stay exactly as
+/// they were, for the reason `supersedeLocked` keeps them: the point is to stop
+/// claiming the path, not to forget what happened on it. The partial is also the
+/// file the replacement is about to truncate and rewrite, so deleting it here
+/// would buy nothing and would be the one step in this sequence that no
+/// transaction can undo.
+pub fn beginSupersedingCheckpoint(
+    store: *Store,
+    arena: Allocator,
+    io: std.Io,
+    opts: BeginOptions,
+    /// The checkpoint holding the destination, as the caller read it.
+    superseded_checkpoint: i64,
+    plan: transfers.CheckpointPlan,
+) RestartError!RestartedStart {
+    const request_id = ids.generate(io);
+    const capability_json = try opts.capability.toJson(arena);
+
+    try store.db.exec("BEGIN IMMEDIATE");
+    errdefer store.db.exec("ROLLBACK") catch {};
+
+    var advisory: ?Blocker = null;
+    if (try blockerLocked(store, arena, opts.server_id, opts.scope, .coincident(&request_id), opts.now)) |blocker| {
+        if (opts.mutating and !opts.force) {
+            // Nothing was inserted; the commit only keeps the lease expiry pass
+            // the check performed on its way through.
+            try store.db.exec("COMMIT");
+            return .{ .blocked = blocker };
+        }
+        advisory = blocker;
+    }
+
+    try createLocked(store, &request_id, capability_json, opts);
+
+    if (opts.force and advisory != null) {
+        const seq = try receipts.nextSeqLocked(store, &request_id);
+        _ = try receipts.insertLocked(store, .{
+            .request_id = &request_id,
+            .kind = .audit,
+            .observed_at = opts.now,
+            .detail_json = try forcedJson(arena, advisory.?, opts.owner_token),
+        }, seq);
+    }
+
+    try transfers.supersedeLocked(store, superseded_checkpoint, &request_id, opts.now);
+    const checkpoint = try transfers.create(store, plan.forRequest(&request_id, opts.now));
+
+    try store.db.exec("COMMIT");
+
+    return .{ .ready = .{
+        .execution = .{
+            .request_id = request_id,
+            .server_id = opts.server_id,
+            .store = store,
+            .arena = arena,
+            .io = io,
+            .scope = opts.scope,
+            .capability = opts.capability,
+            .mutating = opts.mutating,
+            .force = opts.force,
+            .owner_token = opts.owner_token,
+            .advisory = advisory,
+            .nonce = nonceFrom(request_id),
+        },
+        .checkpoint = checkpoint,
+    } };
+}
+
 fn detachJson(arena: Allocator, note: []const u8) Allocator.Error![]u8 {
     var writer: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{

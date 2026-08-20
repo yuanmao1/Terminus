@@ -29,6 +29,8 @@ const digest = Core.digest;
 const transfers = Store.transfers;
 const cmd_transfer = @import("cmd_transfer.zig");
 const Cli = @import("cli.zig");
+const skill_doc = @import("skill_doc.zig");
+const args = @import("args.zig");
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -1020,6 +1022,578 @@ test "gate: completed_unverified is not success, and every outcome says what it 
         seen += 1;
     }
     try t.expectEqual(@as(usize, 7), seen);
+}
+
+// --- gates: a held destination, and the one act that gets past it ------------
+//
+// A failed transfer keeps its destination (`State.holdsDestination` covers every
+// failure) so the next `create` aimed there is refused until somebody says the
+// leftovers may be discarded. `--restart` is where they say it, and these gates
+// hold the four properties that make it safe to have:
+//
+//   * a held path is a refusal when nobody asked to release it;
+//   * `--restart` over a settled failure releases the hold and puts a new
+//     checkpoint on the path in one commit;
+//   * `--restart` over a holder whose attempt may still be running is refused
+//     and sent to `request reconcile`;
+//   * a failure *after* the supersession leaves the path **held**, which is the
+//     whole reason the three writes are one transaction.
+//
+// The last one is the one that has to be exercised rather than argued, so it is
+// driven by making the replacement `create` fail for a real reason after the
+// release has already landed inside the transaction.
+
+/// The owner's settlement, which is half of whether a hold may be released.
+///
+/// Two arms and not a bool, because the words matter to the thing under test:
+/// `settled` is an attempt that stopped blocking its scope, and `indeterminate`
+/// is the terminal that means *nobody knows* — the one the driver above actually
+/// writes for every transfer that gets past submission, and the one a rule
+/// written against `isTerminal` would have waved through.
+const OwnerEnd = enum { settled, indeterminate };
+
+const Holding = struct {
+    request_id: []const u8,
+    checkpoint: i64,
+};
+
+/// A checkpoint standing on `dest` in `state`, with its owning attempt ended as
+/// `owner` says. Walks the real transition graph to get there — no private edge,
+/// so a state this fixture can reach is one the driver can reach.
+fn seedHolder(
+    store: *Store,
+    arena: std.mem.Allocator,
+    label: []const u8,
+    dest: []const u8,
+    state: transfers.State,
+    owner: OwnerEnd,
+) !Holding {
+    const request_id = try seedTransfer(store, arena, label);
+    const cp = try transfers.create(store, .{
+        .request_id = request_id,
+        .direction = .pull,
+        .dest_side = .local,
+        .dest_path = dest,
+        .partial_path = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix }),
+        .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+        .chunk_size = Core.Ssh.chunk_bytes,
+        .now = 100,
+    });
+
+    // The route to each state, as the driver walks it. `failed_hash_mismatch`
+    // comes out of `verifying`, `indeterminate_publish` out of `publishing`, and
+    // `paused` out of `probing` — which is where every abort in the driver parks.
+    const walk: []const transfers.State = switch (state) {
+        .paused => &.{ .probing, .paused },
+        .failed_hash_mismatch => &.{ .probing, .transferring, .verifying, .failed_hash_mismatch },
+        .failed_publish => &.{ .probing, .transferring, .verifying, .publishing, .failed_publish },
+        .indeterminate_publish => &.{ .probing, .transferring, .verifying, .publishing, .indeterminate_publish },
+        .transferring => &.{ .probing, .transferring },
+        else => return error.SeedHolderHasNoRouteToThatState,
+    };
+    var clock: i64 = 100;
+    for (walk) |step| {
+        clock += 1;
+        try transfers.setState(store, cp, request_id, step, null, clock);
+    }
+
+    switch (owner) {
+        // `local_abandon` settles `cancelled`, which does not block scope. It is
+        // admitted for a transfer on positive grounds — "nothing had been handed
+        // over, so there is nothing to stop" — and it is the evidence that fits
+        // an owner still before submission.
+        .settled => _ = try Store.receipts.settle(
+            store,
+            request_id,
+            .{ .local_abandon = .{ .reason = "the fixture's attempt is over" } },
+            .{},
+            clock + 1,
+        ),
+        // What the driver really writes: after submission a transfer has exactly
+        // one admissible terminal, and it is `indeterminate`. Unresolved, so the
+        // effective status still blocks scope.
+        .indeterminate => {
+            try Store.operations.advance(store, request_id, .submitted, clock + 1);
+            _ = try Store.receipts.settle(
+                store,
+                request_id,
+                .{ .indeterminate = .{ .reason = "the answer never came back", .last_observed = .submitted } },
+                .{},
+                clock + 2,
+            );
+        },
+    }
+
+    return .{ .request_id = request_id, .checkpoint = cp };
+}
+
+fn countRows(store: *Store, sql: [:0]const u8) !i64 {
+    var stmt = try store.db.prepare(sql);
+    defer stmt.deinit();
+    if (!try stmt.step()) return error.CountReturnedNoRow;
+    return stmt.columnInt(0);
+}
+
+/// `BeginOptions` for a `transfer_pull` aimed at `dest`, which is what the CLI
+/// builds for a pull.
+fn pullBegin(dest: []const u8, kind: Store.operations.Kind) Core.execution.BeginOptions {
+    return .{
+        .server_id = 1,
+        .server_name = "gate-host",
+        .kind = kind,
+        .scope = .{ .kind = .path, .key = dest },
+        .mutating = true,
+        .transport = "direct",
+        .owner_token = "gate-profile",
+        .now = 500,
+    };
+}
+
+fn pullPlan(dest: []const u8, partial: []const u8, direction: transfers.Direction) transfers.CheckpointPlan {
+    return .{
+        .direction = direction,
+        .dest_side = .local,
+        .dest_path = dest,
+        .partial_path = partial,
+        .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+        .chunk_size = Core.Ssh.chunk_bytes,
+    };
+}
+
+test "gate: a held destination refuses a fresh transfer and the refusal names the way through" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "held_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    const dest = "/var/tmp/held_gate_out.bin";
+    const held = try seedHolder(&store, arena, "heldone", dest, .failed_hash_mismatch, .settled);
+
+    // The probe that words the refusal reads the same set the index refuses on,
+    // so "nothing holds it" and "create is about to be refused" cannot disagree.
+    const holder = (try transfers.findHolder(&store, arena, .local, dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expectEqual(held.checkpoint, holder.id);
+    try t.expectEqualStrings(held.request_id, holder.request_id);
+    try t.expectEqual(transfers.State.failed_hash_mismatch, holder.state);
+    try t.expect(!holder.owner_may_be_running);
+    try t.expect(holder.releasable());
+
+    // And the refusal is real: a fresh request aimed at the same path is turned
+    // away by the live-destination index, under the name an operator can act on.
+    const rival = try seedTransfer(&store, arena, "heldtwo");
+    try t.expectError(error.DestinationHeld, transfers.create(&store, .{
+        .request_id = rival,
+        .direction = .pull,
+        .dest_side = .local,
+        .dest_path = dest,
+        .partial_path = dest ++ cmd_transfer.partial_suffix,
+        .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+        .chunk_size = Core.Ssh.chunk_bytes,
+        .now = 400,
+    }));
+
+    // Nothing was created for the rival, so the refusal really did decline the
+    // insert rather than land a second row the index tolerated.
+    try t.expectEqual(@as(i64, 1), try countRows(
+        &store,
+        "SELECT COUNT(*) FROM transfer_checkpoints WHERE dest_path = '/var/tmp/held_gate_out.bin'",
+    ));
+
+    // The message. It used to end at "it either has not finished or failed and
+    // has not been released", which described a dead end and stopped. What it has
+    // to carry now is the act that gets past it.
+    const way = cmd_transfer.wayThrough(arena, holder);
+    try t.expect(std.mem.indexOf(u8, way, "--restart") != null);
+    // Not `reconcile`: this holder is settled, so sending an operator to
+    // establish an outcome that is already established is a wrong instruction,
+    // not a cautious one.
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, way, "reconcile"));
+}
+
+test "gate: --restart over a settled holder releases the path and the replacement owns it" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "restart_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    const dest = "/var/tmp/restart_gate_out.bin";
+    const partial = dest ++ cmd_transfer.partial_suffix;
+    const held = try seedHolder(&store, arena, "restone", dest, .failed_hash_mismatch, .settled);
+
+    const started = switch (try Core.execution.beginSupersedingCheckpoint(
+        &store,
+        arena,
+        store_scratch.io,
+        pullBegin(dest, .transfer_pull),
+        held.checkpoint,
+        pullPlan(dest, partial, .pull),
+    )) {
+        .ready => |s| s,
+        .blocked => return error.RestartWasBlocked,
+    };
+
+    // The incumbent stopped claiming the path and kept everything else. That is
+    // the whole of what supersession does: the row, its partial and its digests
+    // stay, because the reason an operator was asked is that there is something
+    // at that path worth knowing about.
+    const before = (try transfers.get(&store, arena, held.checkpoint)).?;
+    try t.expectEqual(transfers.State.superseded, before.state);
+    try t.expect(!before.state.holdsDestination());
+    try t.expectEqualStrings(partial, before.partial_path);
+    // The provenance names the request that released it. Read here rather than
+    // parsed anywhere real — `supersedeLocked` says not to parse this field —
+    // but a gate is exactly where "it points at the right attempt" is checked.
+    try t.expect(std.mem.indexOf(u8, before.failure_reason.?, started.execution.id()) != null);
+
+    // And there is something on the way to the path again, owned by the new
+    // attempt. This is the half a supersession alone would not have.
+    const now_holding = (try transfers.findHolder(&store, arena, .local, dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expectEqual(started.checkpoint, now_holding.id);
+    try t.expectEqualStrings(started.execution.id(), now_holding.request_id);
+    try t.expectEqual(transfers.State.planned, now_holding.state);
+
+    // Two rows on that destination and exactly one of them holds it — asserted as
+    // counts, so a query that found nothing would fail here rather than passing
+    // over an empty region.
+    try t.expectEqual(@as(i64, 2), try countRows(
+        &store,
+        "SELECT COUNT(*) FROM transfer_checkpoints WHERE dest_path = '/var/tmp/restart_gate_out.bin'",
+    ));
+    try t.expectEqual(@as(i64, 1), try countRows(&store,
+        \\SELECT COUNT(*) FROM transfer_checkpoints
+        \\ WHERE dest_path = '/var/tmp/restart_gate_out.bin' AND state <> 'superseded'
+    ));
+}
+
+test "gate: --restart over a holder that may still be running is refused and sent to reconcile" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "unsettled_restart_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    const dest = "/var/tmp/unsettled_restart_out.bin";
+    const held = try seedHolder(&store, arena, "vnsetone", dest, .failed_hash_mismatch, .indeterminate);
+
+    // `failed_*` is a decision about the *transfer*, written by `setState`. It
+    // says nothing about the operation that wrote it, which here is
+    // `indeterminate` — a terminal that means nobody knows — so the remote copier
+    // may still exist and may still be writing to the partial beside that path.
+    const holder = (try transfers.findHolder(&store, arena, .local, dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expect(holder.state.isSupersedable());
+    try t.expect(holder.owner_may_be_running);
+    try t.expect(!holder.releasable());
+
+    // The refusal an operator reads, and the one instruction that actually helps.
+    const way = cmd_transfer.wayThrough(arena, holder);
+    try t.expect(std.mem.indexOf(u8, way, "terminus request reconcile") != null);
+    try t.expect(std.mem.indexOf(u8, way, holder.request_id) != null);
+
+    // And the statement itself refuses, which is what makes the message a
+    // description rather than a policy the CLI enforces on its own. Asked of
+    // `supersedeLocked` directly: the guard is a conjunct of its UPDATE, so this
+    // is the barrier, not a reading taken beside it.
+    // The superseding request is minted before the transaction opens: every
+    // seeding helper here runs a `BEGIN IMMEDIATE` of its own.
+    const rival = try seedTransfer(&store, arena, "vnsettwo");
+    try store.db.exec("BEGIN IMMEDIATE");
+    try t.expectError(
+        error.SurrenderingOperationMayStillBeRunning,
+        transfers.supersedeLocked(&store, held.checkpoint, rival, 600),
+    );
+    try store.db.exec("ROLLBACK");
+
+    // Nothing moved.
+    try t.expectEqual(
+        transfers.State.failed_hash_mismatch,
+        (try transfers.get(&store, arena, held.checkpoint)).?.state,
+    );
+}
+
+test "gate: a failure after the supersession leaves the destination held, not free" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "restart_atomic_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    const dest = "/var/tmp/restart_atomic_out.bin";
+    const partial = dest ++ cmd_transfer.partial_suffix;
+    const held = try seedHolder(&store, arena, "atomone", dest, .failed_hash_mismatch, .settled);
+    const operations_before = try countRows(&store, "SELECT COUNT(*) FROM operations");
+
+    // The injection, and it is a real refusal rather than a seam: the operation
+    // this mints is a `transfer_push` and the checkpoint it asks for is a `pull`,
+    // so `create`'s `INSERT ... SELECT` matches no row and it returns
+    // `CheckpointOperationMismatch`. That happens *after* `supersedeLocked` has
+    // already released the path inside the same transaction, which is exactly the
+    // window the transaction exists for.
+    try t.expectError(error.CheckpointOperationMismatch, Core.execution.beginSupersedingCheckpoint(
+        &store,
+        arena,
+        store_scratch.io,
+        pullBegin(dest, .transfer_push),
+        held.checkpoint,
+        pullPlan(dest, partial, .pull),
+    ));
+
+    // The supersession went back with it. Under three separate writes this row
+    // would read `superseded` — the path free, and nothing on the way to it, so
+    // the next `create` aimed there walks straight onto the leftovers an operator
+    // was supposed to be asked about.
+    const after = (try transfers.get(&store, arena, held.checkpoint)).?;
+    try t.expectEqual(transfers.State.failed_hash_mismatch, after.state);
+    try t.expect(after.state.holdsDestination());
+
+    // Read the other way round too, through the predicate the index enforces:
+    // the path is still held, and still by the same checkpoint.
+    const still = (try transfers.findHolder(&store, arena, .local, dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expectEqual(held.checkpoint, still.id);
+
+    // The operation went back as well, so a supersession's provenance can never
+    // point at an attempt that exists because of a restart that did not happen.
+    try t.expectEqual(operations_before, try countRows(&store, "SELECT COUNT(*) FROM operations"));
+    try t.expectEqual(@as(i64, 1), try countRows(
+        &store,
+        "SELECT COUNT(*) FROM transfer_checkpoints WHERE dest_path = '/var/tmp/restart_atomic_out.bin'",
+    ));
+
+    // And the transaction really is closed — the `errdefer` rolled back rather
+    // than leaving the connection inside a `BEGIN` that the next writer inherits.
+    try store.db.exec("BEGIN IMMEDIATE");
+    try store.db.exec("ROLLBACK");
+}
+
+test "gate: --restart reaches three of the driver's outcomes and cannot reach paused" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store_scratch = try StoreScratch.init(t.allocator, "restart_reach_gate");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    // Every `Outcome` this driver can report names a checkpoint state, so the two
+    // vocabularies can be held against each other rather than compared by eye.
+    // An outcome whose name is not a state fails here, which is the only way to
+    // be told the driver has grown a verdict the ledger has no row for.
+    var outcomes: usize = 0;
+    var holders: usize = 0;
+    var releasable: usize = 0;
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
+        outcomes += 1;
+        const state = transfers.State.parse(field.name) catch
+            return error.OutcomeNamesNoCheckpointState;
+        if (state.holdsDestination()) {
+            holders += 1;
+            if (state.isSupersedable()) releasable += 1;
+        }
+    }
+    try t.expectEqual(@as(usize, 7), outcomes);
+    // Five of the seven leave the destination held: the three decided failures,
+    // the unjudged publish, and `paused`.
+    try t.expectEqual(@as(usize, 5), holders);
+    // And `--restart` reaches three of those five. This is the number the slice
+    // turns on: if it ever reads 5, `supersedeLocked` has been widened to accept
+    // states that mean "this may still be resumed" and "nobody has judged the
+    // rename", and both releases hand a path to a rival that must not have it.
+    try t.expectEqual(@as(usize, 3), releasable);
+
+    // The two it cannot reach, and why each is right to be out.
+    //
+    // `paused` is where **every abort in the driver parks** — the probe, the
+    // stream, the verifier and a pre-submission refusal all land there — so this
+    // is the commonest way a transfer comes to hold a path, and it is the one
+    // `--restart` may not release. That is not an oversight to be patched by
+    // widening `isSupersedable`: `paused` says the checkpoint is trustworthy and
+    // *adoptable*, so releasing its path discards resume material that is still
+    // good. The verb for it is a hand-over, and no CLI reaches one.
+    try t.expect(transfers.State.paused.holdsDestination());
+    try t.expect(transfers.State.paused.isAdoptable());
+    try t.expect(!transfers.State.paused.isSupersedable());
+    // `indeterminate_publish` is not settled but *unjudged*: the rename may
+    // already have landed, so the artifact at that path may be one nobody has
+    // looked at.
+    try t.expect(!transfers.State.indeterminate_publish.isSupersedable());
+    try t.expect(!transfers.State.indeterminate_publish.isAdoptable());
+
+    // Now the same two facts as an operator meets them. A settled `paused`
+    // holder — its attempt over, its checkpoint still resumable — is refused, and
+    // the refusal does not offer `--restart`, because offering it would be an
+    // instruction the statement below rejects.
+    const paused_dest = "/var/tmp/restart_reach_paused.bin";
+    const paused = try seedHolder(&store, arena, "reachone", paused_dest, .paused, .settled);
+    const paused_holder = (try transfers.findHolder(&store, arena, .local, paused_dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expect(!paused_holder.owner_may_be_running);
+    try t.expect(!paused_holder.releasable());
+    const paused_way = cmd_transfer.wayThrough(arena, paused_holder);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, paused_way, "--restart to release"));
+    try t.expect(std.mem.indexOf(u8, paused_way, "stays held") != null);
+
+    const paused_rival = try seedTransfer(&store, arena, "reachtwo");
+    try store.db.exec("BEGIN IMMEDIATE");
+    try t.expectError(
+        error.CheckpointNotSupersedable,
+        transfers.supersedeLocked(&store, paused.checkpoint, paused_rival, 700),
+    );
+    try store.db.exec("ROLLBACK");
+
+    // The unjudged publish is refused by the same statement and sent somewhere
+    // else entirely — adjudication, not release.
+    const parked_dest = "/var/tmp/restart_reach_parked.bin";
+    const parked = try seedHolder(&store, arena, "reachthree", parked_dest, .indeterminate_publish, .settled);
+    const parked_holder = (try transfers.findHolder(&store, arena, .local, parked_dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expect(!parked_holder.releasable());
+    const parked_way = cmd_transfer.wayThrough(arena, parked_holder);
+    try t.expect(std.mem.indexOf(u8, parked_way, "terminus request reconcile") != null);
+    try t.expect(std.mem.indexOf(u8, parked_way, "may already be at this path") != null);
+
+    const parked_rival = try seedTransfer(&store, arena, "reachfovr");
+    try store.db.exec("BEGIN IMMEDIATE");
+    try t.expectError(
+        error.CheckpointNotSupersedable,
+        transfers.supersedeLocked(&store, parked.checkpoint, parked_rival, 701),
+    );
+    try store.db.exec("ROLLBACK");
+
+    // A live checkpoint whose owner is gone is refused too, and the wording is
+    // the `paused` one rather than the failure one — the two share a sentence
+    // because they share a reason, and that is asserted rather than assumed.
+    const live_dest = "/var/tmp/restart_reach_live.bin";
+    _ = try seedHolder(&store, arena, "reachfive", live_dest, .transferring, .settled);
+    const live_holder = (try transfers.findHolder(&store, arena, .local, live_dest)) orelse
+        return error.NothingHoldsTheDestination;
+    try t.expect(!live_holder.releasable());
+    try t.expect(std.mem.indexOf(u8, cmd_transfer.wayThrough(arena, live_holder), "stays held") != null);
+}
+
+// --- gates: the agent-facing document, held against this file ---------------
+
+/// The heading the two gates below read from, so a reflow that moved the section
+/// fails once with a name rather than twice with a needle.
+const transfer_section = "## File transfer: what a push or a pull leaves behind";
+
+test "gate: SKILL.md publishes an exit code for every transfer outcome, and it is the one we exit with" {
+    const t = std.testing;
+    const section = try skill_doc.after(skill_doc.text, transfer_section, "the transfer outcome list");
+
+    // A number in prose that no gate reads is how `session rm`'s survived-kill
+    // bullet came to publish 75 for a branch that exits 1. These are the numbers
+    // an agent is told to branch on, so they are read off the document and
+    // compared with `Outcome.exitCode` rather than trusted.
+    var documented: usize = 0;
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
+        const bullet = "- `" ++ field.name ++ "` — exit **";
+        const at = std.mem.indexOf(u8, section, bullet) orelse {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: the transfer outcome list publishes no exit code for
+                \\`{s}`.
+                \\  looked for the literal: "{s}"
+                \\Every `cmd_transfer.Outcome` has to appear there with the code it really
+                \\exits with, because that list is what an agent branches on.
+                \\
+            , .{ field.name, bullet });
+            return error.SkillTransferOutcomeMissing;
+        };
+        // Once. A second bullet for the same outcome would let the two disagree
+        // and let this gate read whichever came first.
+        try t.expectEqual(
+            @as(?usize, null),
+            std.mem.indexOfPos(u8, section, at + 1, bullet),
+        );
+        const rest = section[at + bullet.len ..];
+        const close = std.mem.indexOf(u8, rest, "**") orelse return error.SkillTransferExitCodeUnterminated;
+        const claimed = std.fmt.parseInt(u8, rest[0..close], 10) catch
+            return error.SkillTransferExitCodeUnreadable;
+        const outcome: cmd_transfer.Outcome = @enumFromInt(field.value);
+        try t.expectEqual(outcome.exitCode(), claimed);
+        documented += 1;
+    }
+    // Counted, so a section that lost its list fails here rather than passing
+    // over an empty region.
+    try t.expectEqual(@as(usize, 7), documented);
+}
+
+test "gate: SKILL.md publishes how many transfer verdicts --restart can release" {
+    const t = std.testing;
+
+    // The document tells an agent that `--restart` reaches three of the seven
+    // verdicts. That number is not an opinion: it is how many of them name a
+    // checkpoint state `State.isSupersedable` admits, and it is the number this
+    // whole flag turns on. Widening `supersedeLocked` to accept `paused` — the
+    // state every abort in the driver parks in — would make it 4 and would hand
+    // a resumable transfer's path to a rival; this is where that is noticed.
+    var releasable: usize = 0;
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
+        const state = transfers.State.parse(field.name) catch
+            return error.OutcomeNamesNoCheckpointState;
+        if (state.holdsDestination() and state.isSupersedable()) releasable += 1;
+    }
+
+    const claim = try skill_doc.after(
+        skill_doc.text,
+        "It releases **",
+        "the count of verdicts `--restart` can release",
+    );
+    const close = std.mem.indexOf(u8, claim, "**") orelse
+        return error.SkillRestartCountUnterminated;
+    const documented = std.fmt.parseInt(usize, claim[0..close], 10) catch
+        return error.SkillRestartCountUnreadable;
+    try t.expectEqual(releasable, documented);
+
+    // And the sentence that says which three, so the number cannot be right
+    // beside a description that is not.
+    const section = try skill_doc.after(skill_doc.text, transfer_section, "the transfer outcome list");
+    try t.expect(std.mem.indexOf(u8, section, "the three proven failures") != null);
+    // The limit this slice could not remove, published rather than left for an
+    // agent to discover by being refused.
+    try t.expect(std.mem.indexOf(u8, section, "every abort parks at `paused`") != null);
+}
+
+test "gate: --restart is a boolean flag, so it does not swallow whatever follows it" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A flag missing from `args.bool_flags` is not a compile error and is not
+    // visible to any gate that exercises this command's helpers directly: the
+    // parser simply treats it as `--flag <value>`, so `--restart` written last —
+    // which is how it is documented and how it will be typed — fails with "a
+    // flag is missing its value", and `--restart --json` eats the `--json`.
+    // Found by running the binary, so it is asserted here.
+    const trailing = try args.parse(arena, &.{ "smoke", "./local", "/srv/app/out.bin", "--restart" });
+    try t.expect(trailing.boolean("restart"));
+    try t.expectEqual(@as(usize, 3), trailing.positionals.len);
+    try t.expectEqualStrings("/srv/app/out.bin", trailing.positional(2).?);
+
+    // And it consumes nothing when something does follow it.
+    const followed = try args.parse(arena, &.{ "smoke", "./local", "/srv/app/out.bin", "--restart", "--json" });
+    try t.expect(followed.boolean("restart"));
+    try t.expect(followed.boolean("json"));
+    try t.expectEqual(@as(usize, 3), followed.positionals.len);
 }
 
 // --- store fixtures ---------------------------------------------------------

@@ -1240,6 +1240,78 @@
       "find": "        const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);",
       "replace": "        _ = try arena.dupe(u8, remote_path);\n        const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);",
       "expect_gate": "gate: a transfer's peak allocation does not grow with the file"
+    },
+    {
+      "id": "M3.2-restart-held-message-dead-end",
+      "rule": "The refusal for a held destination names the act that gets past it, not just the fact that it is held.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "Re-run with --restart to release its hold and start over",
+      "replace": "Nothing can be done about it here",
+      "expect_gate": "gate: a held destination refuses a fresh transfer and the refusal names the way through"
+    },
+    {
+      "id": "M3.2-restart-holder-owner-conjunct",
+      "rule": "A hold may only be released when the attempt that owns it can no longer be affecting the host — a `failed_*` state is a decision about the transfer, not about its operation.",
+      "file": "src/core/store/transfers.zig",
+      "find": "        return h.state.isSupersedable() and !h.owner_may_be_running;",
+      "replace": "        return h.state.isSupersedable();",
+      "expect_gate": "gate: --restart over a holder that may still be running is refused and sent to reconcile"
+    },
+    {
+      "id": "M3.2-restart-holder-query-predicate",
+      "rule": "The probe that words a `DestinationHeld` reads the same state set the index refuses on, so “nothing holds it” and “`create` is about to be refused” cannot disagree.",
+      "file": "src/core/store/transfers.zig",
+      "find": "    \\\\SELECT o.status, o.resolved_status, c.id, c.request_id, c.state\n    \\\\  FROM transfer_checkpoints c\n    \\\\  JOIN operations o ON o.request_id = c.request_id\n    \\\\ WHERE c.dest_side = ?1 AND c.dest_path = ?2\n    \\\\   AND c.state IN ({s})\n, .{holds_destination_sql});",
+      "replace": "    \\\\SELECT o.status, o.resolved_status, c.id, c.request_id, c.state\n    \\\\  FROM transfer_checkpoints c\n    \\\\  JOIN operations o ON o.request_id = c.request_id\n    \\\\ WHERE c.dest_side = ?1 AND c.dest_path = ?2\n    \\\\   AND c.state IN ({s})\n, .{adoptable_sql});",
+      "expect_gate": "gate: a held destination refuses a fresh transfer and the refusal names the way through"
+    },
+    {
+      "id": "M3.2-restart-supersede-before-create",
+      "rule": "The supersession comes before the replacement checkpoint: the live-destination index refuses the insert while the incumbent still holds the path.",
+      "file": "src/core/execution.zig",
+      "find": "    try transfers.supersedeLocked(store, superseded_checkpoint, &request_id, opts.now);\n    const checkpoint = try transfers.create(store, plan.forRequest(&request_id, opts.now));",
+      "replace": "    const checkpoint = try transfers.create(store, plan.forRequest(&request_id, opts.now));\n    try transfers.supersedeLocked(store, superseded_checkpoint, &request_id, opts.now);",
+      "expect_gate": "gate: --restart over a settled holder releases the path and the replacement owns it"
+    },
+    {
+      "id": "M3.2-restart-not-atomic",
+      "rule": "A restart that failed after the supersession leaves the destination held. A supersession that commits alone leaves the path free with nothing on the way to it.",
+      "file": "src/core/execution.zig",
+      "find": "    errdefer store.db.exec(\"ROLLBACK\") catch {};\n\n    var advisory: ?Blocker = null;\n    if (try blockerLocked(store, arena, opts.server_id, opts.scope, .coincident(&request_id), opts.now)) |blocker| {\n        if (opts.mutating and !opts.force) {\n            // Nothing was inserted; the commit only keeps the lease expiry pass",
+      "replace": "    errdefer store.db.exec(\"COMMIT\") catch {};\n\n    var advisory: ?Blocker = null;\n    if (try blockerLocked(store, arena, opts.server_id, opts.scope, .coincident(&request_id), opts.now)) |blocker| {\n        if (opts.mutating and !opts.force) {\n            // Nothing was inserted; the commit only keeps the lease expiry pass",
+      "expect_gate": "gate: a failure after the supersession leaves the destination held, not free"
+    },
+    {
+      "id": "M3.2-restart-releases-paused",
+      "rule": "`--restart` may not release a `paused` checkpoint. `paused` is adoptable — the checkpoint is trustworthy and still resumable — so releasing its path discards resume material that is still good, and it is where every abort in the transfer driver parks.",
+      "file": "src/core/store/transfers.zig",
+      "find": "        return switch (s) {\n            .failed_source_changed,\n            .failed_remote_partial_mismatch,\n            .failed_hash_mismatch,\n            .failed_no_space,\n            .failed_clobber_conflict,\n            .failed_publish,\n            => true,\n            .planned,\n            .probing,\n            .transferring,\n            .paused,\n",
+      "replace": "        return switch (s) {\n            .failed_source_changed,\n            .failed_remote_partial_mismatch,\n            .failed_hash_mismatch,\n            .failed_no_space,\n            .failed_clobber_conflict,\n            .failed_publish,\n            .paused,\n            => true,\n            .planned,\n            .probing,\n            .transferring,\n",
+      "expect_gate": "gate: --restart reaches three of the driver's outcomes and cannot reach paused"
+    },
+    {
+      "id": "M3.2-restart-not-a-bool-flag",
+      "rule": "`--restart` never consumes the argument after it. A flag missing from `bool_flags` is not a compile error: written last it fails with \"a flag is missing its value\", and written before `--json` it eats it.",
+      "file": "src/cli/args.zig",
+      "find": "\"show-script\", \"all\", \"restart\" };",
+      "replace": "\"show-script\", \"all\" };",
+      "expect_gate": "gate: --restart is a boolean flag, so it does not swallow whatever follows it"
+    },
+    {
+      "id": "M3.2-skill-transfer-exit-code",
+      "rule": "skill/SKILL.md's published exit code for each transfer verdict is the one the binary really exits with. A number in prose that no gate reads is how the survived-kill bullet came to publish 75 for a branch that exits 1.",
+      "file": "skill/SKILL.md",
+      "find": "- `paused` — exit **75**.",
+      "replace": "- `paused` — exit **1**.",
+      "expect_gate": "gate: SKILL.md publishes an exit code for every transfer outcome, and it is the one we exit with"
+    },
+    {
+      "id": "M3.2-skill-restart-reach-count",
+      "rule": "skill/SKILL.md's count of the verdicts `--restart` can release is held against `State.isSupersedable`, so the document cannot tell an agent to restart a transfer the statement will refuse.",
+      "file": "skill/SKILL.md",
+      "find": "It releases **3** of the seven\nverdicts above",
+      "replace": "It releases **5** of the seven\nverdicts above",
+      "expect_gate": "gate: SKILL.md publishes how many transfer verdicts --restart can release"
     }
   ]
 }

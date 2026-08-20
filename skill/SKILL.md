@@ -163,11 +163,13 @@ terminus session rm <server> <name> --json
 terminus push <server> ./local-file /remote/path [--mode 755]
 terminus pull <server> /remote/file ./local-path
 # No scp binary on the server (minimal images, OpenSSH 9+)? add --via exec
-# — moves bytes over the plain command channel (needs base64 and md5sum on
-# the host), any size, md5-verified. Downloads are slow (libssh2 read speed;
-# the scp backend is no faster) but reliable. push/pull auto-fall back to exec
-# if scp is absent.
+# — moves bytes over the plain command channel (needs base64 on the host), any
+# size. Downloads are slow (libssh2 read speed; the scp backend is no faster)
+# but reliable. push/pull auto-fall back to exec if scp is absent.
 terminus push <server> ./cfg /etc/app/cfg --via exec
+# A path a failed transfer is still standing on is refused. --restart releases
+# it, and only when that transfer is a settled failure — see "File transfer".
+terminus push <server> ./app.tar /srv/app/app.tar --restart
 terminus sync push <server> ./dist /srv/app/dist --exclude node_modules,.git [--dry-run] [--delete]
 terminus sync pull <server> /var/log/myapp ./logs [--exclude *.gz]
 
@@ -784,6 +786,66 @@ kills that pid and deletes the socket and pidfile. (The pid kill is implemented
 on Windows only; elsewhere `--force` amounts to the graceful stop plus the file
 cleanup.) Remote tmux jobs are unaffected — they live on the server, not in the
 daemon. Commands always fall back to direct SSH meanwhile.
+
+## File transfer: what a push or a pull leaves behind
+
+Every byte goes to `<destination>.terminus-part` beside the destination, and the
+last act is a rename. So a hash mismatch, a full disk and a failed publish all
+leave what was at the destination exactly as it was. Both ends hash with
+SHA-256 (`sha256sum`, or `shasum -a 256` where there is no `sha256sum`), and the
+rename happens only once the two agree.
+
+`transferState` in `--json` is the verdict. It is *not* `ok`, and the exit code
+is what to branch on:
+
+- `published` — exit **0**. Both ends hashed to the digest declared before the
+  first byte and the rename was watched. The only outcome that exits 0.
+- `completed_unverified` — exit **75**. The bytes arrived and matched their
+  length and the host could not hash them, so nothing establishes they are the
+  right bytes. The artifact *is* at the destination and the ledger does not say
+  so, which is exactly the state you must not read as done. Install `sha256sum`
+  or `shasum` on the host.
+- `failed_source_changed` — exit **1**. The local file changed between being
+  hashed and being sent. Nothing was renamed.
+- `failed_hash_mismatch` — exit **1**. The two ends hashed to different digests.
+  Nothing was renamed.
+- `failed_publish` — exit **1**. The rename itself reported failure. Nothing was
+  renamed.
+- `indeterminate_publish` — exit **75**. The rename was issued and its answer
+  was lost, so it may or may not have landed. Never report this as a failure;
+  read the destination and `terminus request reconcile <id>`.
+- `paused` — exit **75**. The transfer stopped before the destination came into
+  it. The destination is untouched and the staged partial is trustworthy.
+
+A ledger write this command could not make exits **76**, as everywhere else.
+
+**A transfer that did not publish keeps its destination**, and that is
+deliberate rather than a leak: a failed run leaves a partial beside the path and
+a half-told story about what is at it, so the next transfer aimed there is
+refused rather than walking onto the leftovers. The refusal names the request
+holding the path, its transfer's state, and the way past it.
+
+`--restart` is the way past it. It releases the holder's claim and starts the
+replacement in the same transaction — so the path is never free with nothing on
+the way to it — and it refuses everything else. It releases **3** of the seven
+verdicts above: the three proven failures. What to do about the rest:
+
+- the holding request is not settled (`indeterminate`): a copier on the far side
+  may still be writing beside that path, so nothing may take it. Establish what
+  it did with `terminus request reconcile <id>`, then `--restart`.
+- the holder is `indeterminate_publish`: the artifact may already be at that
+  path and nobody has judged it. Adjudicate it — `terminus request reconcile
+  <id>` — before anything overwrites it.
+- the holder is `paused`, or any other unfinished state: its checkpoint is still
+  resumable, and `--restart` releases a settled failure and nothing else. **No
+  verb resumes or releases one yet**, so that path stays held — send to a
+  different destination. This is the common case after an interrupted transfer,
+  because every abort parks at `paused`.
+
+`--restart` never deletes the staged partial. The superseded row, its offsets and
+both its digests are all kept, because the reason you were asked in the first
+place is that there is something at that path worth knowing about; the
+replacement truncates and rewrites the partial on its way through anyway.
 
 ## Memory discipline
 

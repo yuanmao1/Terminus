@@ -1152,6 +1152,48 @@ pub const CreateOptions = struct {
     now: i64,
 };
 
+/// `CreateOptions` without the two values a caller cannot supply yet.
+///
+/// A restart mints its operation *inside* the transaction that supersedes the
+/// incumbent — the supersession's own statement requires the superseding request
+/// to exist, so the id does not exist until that transaction is already open.
+/// A caller therefore has everything about the new checkpoint except its owner,
+/// and this is that shape.
+///
+/// Two fields rather than one: `now` is dropped for the same reason. The
+/// transaction reads its clock after it has the write lock (see
+/// `execution.commitDestruction` for why), so a stamp taken while assembling
+/// this would date the checkpoint before the guard that licensed it.
+///
+/// Not a `request_id: ?[]const u8` on `CreateOptions`: `create` requires one,
+/// and an optional there would make "I have not minted it yet" and "there is no
+/// owner" the same value at every one of that function's other call sites.
+pub const CheckpointPlan = struct {
+    direction: Direction,
+    dest_side: DestSide,
+    dest_path: []const u8,
+    partial_path: []const u8,
+    source: SourceIdentity,
+    chunk_size: i64,
+    total_bytes: ?u64 = null,
+    no_clobber: bool = false,
+
+    pub fn forRequest(p: CheckpointPlan, request_id: []const u8, now: i64) CreateOptions {
+        return .{
+            .request_id = request_id,
+            .direction = p.direction,
+            .dest_side = p.dest_side,
+            .dest_path = p.dest_path,
+            .partial_path = p.partial_path,
+            .source = p.source,
+            .chunk_size = p.chunk_size,
+            .total_bytes = p.total_bytes,
+            .no_clobber = p.no_clobber,
+            .now = now,
+        };
+    }
+};
+
 fn narrowMtime(mtime_ns: ?i128) Error!?i64 {
     const v = mtime_ns orelse return null;
     return std.math.cast(i64, v) orelse error.MtimeOutOfRange;
@@ -1448,6 +1490,81 @@ const find_resumable_sql = std.fmt.comptimePrint(select_columns ++
     \\ WHERE dest_side = ?1 AND dest_path = ?2
     \\   AND state IN ({s})
 , .{adoptable_sql});
+
+/// The transfer standing on a destination, as a refusal has to name it.
+///
+/// Four facts, and each one decides a different sentence: which request to send
+/// an operator to, what its transfer is doing, whether `supersedeLocked` may
+/// release it, and — the one a checkpoint's own row cannot answer — whether the
+/// attempt that owns it may still be affecting the host.
+pub const Holder = struct {
+    id: i64,
+    request_id: []const u8,
+    state: State,
+    /// `releasesScopeSql`'s question about the owning operation, read off the
+    /// same two columns the supersession statement reads. True means a remote
+    /// copier may still be writing to the partial beside that path.
+    owner_may_be_running: bool,
+
+    /// Whether `supersedeLocked` would release this hold.
+    ///
+    /// Both conjuncts, because they are the two the statement carries and either
+    /// one alone is a different refusal to report: a `paused` row whose owner is
+    /// settled is not supersedable at all, and a `failed_hash_mismatch` whose
+    /// owner is `indeterminate` is supersedable and still refused.
+    pub fn releasable(h: Holder) bool {
+        return h.state.isSupersedable() and !h.owner_may_be_running;
+    }
+};
+
+/// The checkpoint occupying a destination, if any.
+///
+/// A sibling of `findResumable` and filtered the other way: on
+/// `holdsDestination`, which is the predicate the partial unique index is
+/// rendered from and therefore the exact set `create` is refused by. That is
+/// what makes this the right read for wording a `DestinationHeld` — a probe
+/// filtered on anything narrower would report "nothing holds it" about a path
+/// the very next `create` is refused on.
+///
+/// At most one row can match: the index enforces one live checkpoint per
+/// destination, so this is a lookup and not a pick.
+///
+/// The join is inner, and its absence is `null` rather than a partial answer.
+/// `request_id` is a foreign key into `operations` with foreign keys on, so a
+/// checkpoint with no owner means the database is not the shape this binary was
+/// built against — and reporting the row while silently guessing its owner is
+/// live would be worse than reporting nothing. `supersedeLocked` refuses such a
+/// row under its own name, which is where that fact belongs.
+pub fn findHolder(
+    store: *Store,
+    arena: Allocator,
+    dest_side: DestSide,
+    dest_path: []const u8,
+) Error!?Holder {
+    var stmt = try store.db.prepare(find_holder_sql);
+    defer stmt.deinit();
+    var side_buf: [dest_side_buf_len]u8 = undefined;
+    try stmt.bindText(1, dest_side.text(&side_buf));
+    try stmt.bindText(2, dest_path);
+    if (!try stmt.step()) return null;
+    // The status pair comes first so `statusPairBlocksScope` — the Zig half of
+    // `releasesScopeSql`, shared with the hand-over and the supersession — reads
+    // the columns it already reads everywhere else.
+    return .{
+        .owner_may_be_running = try statusPairBlocksScope(&stmt),
+        .id = stmt.columnInt(2),
+        .request_id = try arena.dupe(u8, stmt.columnText(3)),
+        .state = try State.parse(stmt.columnText(4)),
+    };
+}
+
+const find_holder_sql = std.fmt.comptimePrint(
+    \\SELECT o.status, o.resolved_status, c.id, c.request_id, c.state
+    \\  FROM transfer_checkpoints c
+    \\  JOIN operations o ON o.request_id = c.request_id
+    \\ WHERE c.dest_side = ?1 AND c.dest_path = ?2
+    \\   AND c.state IN ({s})
+, .{holds_destination_sql});
 
 /// Observed state of the staging partial, as probed before resuming.
 pub const PartialObservation = struct {

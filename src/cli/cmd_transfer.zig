@@ -31,6 +31,20 @@
 //! rename. So a hash mismatch, a full disk and a failed publish all leave what
 //! was at the destination exactly as it was — by construction, not by care.
 //!
+//! **A transfer that did not publish keeps its destination**, so the next one
+//! aimed there is refused rather than walking onto the leftovers
+//! (`State.holdsDestination`). `--restart` is the one way past that, and what it
+//! may release is narrow: `transfers.supersedeLocked` writes `superseded` only
+//! over a *settled failure*, and only when the attempt that owns the checkpoint
+//! can no longer be affecting the host. The three writes a restart is —
+//! the new operation, the supersession, the replacement checkpoint — are one
+//! transaction, in `execution.beginSupersedingCheckpoint`, because a
+//! supersession that committed alone would leave the path free with nothing on
+//! the way to it. Everything else `findHolder` can return is refused by name;
+//! see `wayThrough`, which is also where the limit this command cannot lift is
+//! written down — every abort below parks at `paused`, and `paused` is not a
+//! state supersession may leave.
+//!
 //! **Two backends, as before.** scp is tried first and the exec fallback
 //! (base64 over the command channel) is used when the host has no scp binary.
 //! Both are streaming now. Both directions run remote shell commands regardless
@@ -45,12 +59,17 @@ const digest = Core.digest;
 const transfers = Store.transfers;
 
 const usage =
-    \\usage: terminus push <server> <local-path> <remote-path> [--mode 644] [--via scp|exec] [--force] [--json]
-    \\       terminus pull <server> <remote-path> <local-path> [--via scp|exec] [--force] [--json]
+    \\usage: terminus push <server> <local-path> <remote-path> [--mode 644] [--via scp|exec] [--restart] [--force] [--json]
+    \\       terminus pull <server> <remote-path> <local-path> [--via scp|exec] [--restart] [--force] [--json]
     \\
     \\Bytes are staged beside the destination and renamed into place only after
     \\both ends agree on a SHA-256. A transfer the host cannot hash ends
     \\`completed_unverified`, never `published`.
+    \\
+    \\A failed transfer keeps its destination: the next transfer aimed there is
+    \\refused until somebody says the leftovers may be discarded. `--restart` is
+    \\where they say it — it releases a *settled failure*'s hold and starts over
+    \\in the same transaction, and refuses anything else.
     \\
 ;
 
@@ -221,58 +240,21 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
     const partial_path = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ dest_path, partial_suffix });
     const summary = try std.fmt.allocPrint(ctx.arena, "{t} {s} -> {s}", .{ verb, src, dst });
 
-    // A transfer's blast radius is the path it publishes to, which is what
-    // makes two transfers aimed at one directory see each other and a transfer
-    // invisible to work elsewhere on the host. A local destination given
-    // relatively is a weaker key than an absolute one — two pulls run from
-    // different directories into `out.bin` would not collide here — and the
-    // live-destination index is what still refuses that pair.
-    const start = Core.execution.begin(&store, ctx.arena, ctx.io, .{
-        .server_id = resolved.server.id,
-        .server_name = resolved.server.name,
-        .kind = switch (verb) {
-            .push => .transfer_push,
-            .pull => .transfer_pull,
-        },
-        .scope = .{ .kind = .path, .key = dest_path },
-        .mutating = true,
-        .argv_redacted = Store.history.redactSecrets(ctx.arena, summary) catch
-            fatal("cannot redact the transfer description for the audit record", .{}),
-        .transport = "direct",
-        .owner_token = owner_token,
-        .force = parsed.boolean("force"),
-        .now = ctx.now,
-    }) catch |err| Cli.storeFatal(&store, err);
-
-    var execution = switch (start) {
-        .ready => |e| e,
-        .blocked => |blocker| reportBlocked(blocker),
+    const dest_side: transfers.DestSide = switch (verb) {
+        .push => .{ .server = resolved.server.id },
+        .pull => .local,
     };
-    Cli.registerExecution(&execution);
-    defer {
-        Cli.clearExecution();
-        execution.deinit();
-    }
 
-    execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
-
-    var client = Cli.sshConnect(resolved.server, resolved.auth);
-    defer client.deinit();
-
-    // The checkpoint, before the probe that reports against it. `create`
-    // refuses unless the operation exists, has not submitted, its kind matches
-    // the direction and its server matches the destination side — so this is
-    // also where a mismatched plan is caught.
-    const checkpoint = transfers.create(&store, .{
-        .request_id = execution.id(),
+    // Everything about the checkpoint except its owner. The restart path mints
+    // that id inside the transaction that supersedes the incumbent, so it cannot
+    // be named here; the ordinary path fills it in below. One value either way,
+    // because a second literal is a second thing to keep in step.
+    const plan: transfers.CheckpointPlan = .{
         .direction = switch (verb) {
             .push => .push,
             .pull => .pull,
         },
-        .dest_side = switch (verb) {
-            .push => .{ .server = resolved.server.id },
-            .pull => .local,
-        },
+        .dest_side = dest_side,
         .dest_path = dest_path,
         .partial_path = partial_path,
         .source = switch (verb) {
@@ -292,8 +274,92 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
         // overwriting rename, so recording a no-clobber claim would be a
         // promise the driver does not keep. POSIX `link()` is the later slice.
         .no_clobber = false,
+    };
+
+    // Read before an operation exists and before the connection is opened, so a
+    // refusal costs nothing and sends nothing. It is not the binding check —
+    // that is the live-destination index, inside the same statement as the write
+    // — and it does not need to be: everything it can conclude is a refusal, and
+    // the one reading that proceeds is re-checked by `supersedeLocked`'s own
+    // conjuncts under the write lock.
+    const to_supersede = releaseTarget(ctx, &store, dest_side, dest_path, parsed.boolean("restart"));
+
+    // A transfer's blast radius is the path it publishes to, which is what
+    // makes two transfers aimed at one directory see each other and a transfer
+    // invisible to work elsewhere on the host. A local destination given
+    // relatively is a weaker key than an absolute one — two pulls run from
+    // different directories into `out.bin` would not collide here — and the
+    // live-destination index is what still refuses that pair.
+    const begin_opts: Core.execution.BeginOptions = .{
+        .server_id = resolved.server.id,
+        .server_name = resolved.server.name,
+        .kind = switch (verb) {
+            .push => .transfer_push,
+            .pull => .transfer_pull,
+        },
+        .scope = .{ .kind = .path, .key = dest_path },
+        .mutating = true,
+        .argv_redacted = Store.history.redactSecrets(ctx.arena, summary) catch
+            fatal("cannot redact the transfer description for the audit record", .{}),
+        .transport = "direct",
+        .owner_token = owner_token,
+        .force = parsed.boolean("force"),
         .now = ctx.now,
-    }) catch |err| fatalCreate(err, &execution, dest_path);
+    };
+
+    // Non-null only on the restart path: the supersession, the operation and the
+    // replacement checkpoint are one commit, so that path already has its
+    // checkpoint by the time the connection is opened. The ordinary path still
+    // mints its checkpoint after the dial, and that difference is deliberate —
+    // a `create` before the connection would leave a `planned` checkpoint
+    // holding the destination every time a host is unreachable. On the restart
+    // path the destination was already held when the command started and is
+    // still held if the dial fails, so nothing is barred that was not barred
+    // before.
+    var restarted_checkpoint: ?i64 = null;
+
+    var execution = open: {
+        if (to_supersede) |holding| {
+            switch (Core.execution.beginSupersedingCheckpoint(
+                &store,
+                ctx.arena,
+                ctx.io,
+                begin_opts,
+                holding.id,
+                plan,
+            ) catch |err| fatalRestart(err, holding, dest_path)) {
+                .ready => |started| {
+                    restarted_checkpoint = started.checkpoint;
+                    break :open started.execution;
+                },
+                .blocked => |blocker| reportBlocked(blocker),
+            }
+        }
+        break :open switch (Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
+            Cli.storeFatal(&store, err)) {
+            .ready => |e| e,
+            .blocked => |blocker| reportBlocked(blocker),
+        };
+    };
+    Cli.registerExecution(&execution);
+    defer {
+        Cli.clearExecution();
+        execution.deinit();
+    }
+
+    execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
+
+    var client = Cli.sshConnect(resolved.server, resolved.auth);
+    defer client.deinit();
+
+    // The checkpoint, before the probe that reports against it. `create`
+    // refuses unless the operation exists, has not submitted, its kind matches
+    // the direction and its server matches the destination side — so this is
+    // also where a mismatched plan is caught.
+    const checkpoint = if (restarted_checkpoint) |id| id else transfers.create(
+        &store,
+        plan.forRequest(execution.id(), ctx.now),
+    ) catch |err| fatalCreate(err, &execution, &store, ctx.arena, dest_side, dest_path);
 
     var r: Run = .{
         .ctx = ctx,
@@ -1028,14 +1094,185 @@ fn abort(r: *Run, comptime fmt: []const u8, args: anytype) noreturn {
     fatal("{s}", .{reason});
 }
 
+// --- the destination somebody else is standing on ---------------------------
+
+/// The checkpoint `--restart` is going to supersede, or null when the path is
+/// clear and an ordinary `create` may have it.
+///
+/// Every other reading exits here. A held path is a refusal without `--restart`
+/// — the operator did not ask, and releasing a failed attempt's destination
+/// behind their back is precisely the act `holdsDestination` exists to make them
+/// look at. With `--restart` it is a refusal whenever `supersedeLocked` would
+/// refuse, and it says so in that function's own two terms rather than trying
+/// the write to find out: the holder must be a *settled failure*, and its owning
+/// attempt must not still be able to affect the host.
+fn releaseTarget(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    dest_side: transfers.DestSide,
+    dest_path: []const u8,
+    restart: bool,
+) ?transfers.Holder {
+    const holder = transfers.findHolder(store, ctx.arena, dest_side, dest_path) catch |err|
+        Cli.storeFatal(store, err);
+    const held = holder orelse return null;
+    if (restart and held.releasable()) return held;
+    refuseHeld(ctx.arena, held, dest_path);
+}
+
+/// The refusal, in one wording, for every way a destination can be occupied.
+///
+/// It used to end at "it either has not finished or failed and has not been
+/// released; nothing was sent", which described a dead end and stopped —
+/// because before checkpoints had a producer there was nothing to name. There
+/// is now: the request holding the path, what its transfer is doing, and the one
+/// act that gets past it.
+fn refuseHeld(arena: std.mem.Allocator, held: transfers.Holder, dest_path: []const u8) noreturn {
+    fatal(
+        "refused: request {s} is standing on '{s}' — its transfer is {s} and still holds the destination; nothing was sent.\n  {s}",
+        .{ held.request_id, dest_path, held.state.text(), wayThrough(arena, held) },
+    );
+}
+
+/// What an operator can actually do about this holder.
+///
+/// Four sentences, because they send an operator to four different places and
+/// three of them are not `--restart`. The order is the order the supersession
+/// statement asks its questions in: the owning attempt first, then the state.
+///
+/// `pub` for the reason `verdictFor` and `publishedEffect` are: nothing in this
+/// tree can drive the producer end to end, so a refusal built inline here would
+/// be the part of this slice nothing checks — and it is the part this slice
+/// exists to add.
+///
+/// **The one this slice cannot fix, stated where it is read.** Every abort in
+/// the driver above parks at `paused`, and `paused` is not in
+/// `State.isSupersedable` — supersession is written only over a `failed_*`
+/// state. So the commonest way a transfer ends up holding a path is the one
+/// `--restart` may not release, and widening the predicate is not available:
+/// `paused` means the checkpoint is trustworthy and *adoptable*, so releasing
+/// its path would throw away resume material that is still good, and the verb
+/// for it is a hand-over (`execution.adoptCheckpoint`), which has no CLI. Said
+/// plainly here rather than approximated, because an operator who is told to
+/// try `--restart` and refused by the statement learns less than one who is told
+/// why up front.
+pub fn wayThrough(arena: std.mem.Allocator, held: transfers.Holder) []const u8 {
+    if (held.owner_may_be_running) return std.fmt.allocPrint(
+        arena,
+        "request {s} has not been settled, so a copier on the far side may still be writing to the partial beside that path. Establish what it did — 'terminus request reconcile {s}' — and then re-run with --restart.",
+        .{ held.request_id, held.request_id },
+    ) catch "reconcile the holding request, then re-run with --restart";
+
+    return switch (held.state) {
+        .failed_source_changed,
+        .failed_remote_partial_mismatch,
+        .failed_hash_mismatch,
+        .failed_no_space,
+        .failed_clobber_conflict,
+        .failed_publish,
+        => "That attempt is over and it published nothing. Re-run with --restart to release its hold and start over; its record, its digests and its staged partial are all kept.",
+
+        // Not settled — unjudged. The rename may already have landed, so the
+        // path may already hold an artifact nobody has looked at, and handing it
+        // to a rival would let the rival overwrite a result nobody has judged.
+        .indeterminate_publish => std.fmt.allocPrint(
+            arena,
+            "that transfer issued its rename and never saw the answer, so the artifact may already be at this path. --restart will not discard it: adjudicate it first with 'terminus request reconcile {s}'.",
+            .{held.request_id},
+        ) catch "adjudicate the holding request before anything overwrites this path",
+
+        // Settled owner, live checkpoint. `--restart` releases a settled failure
+        // and nothing else, and no verb reaches the hand-over that would take
+        // one of these over. See the note above.
+        .planned,
+        .probing,
+        .transferring,
+        .paused,
+        .verifying,
+        .publishing,
+        => std.fmt.allocPrint(
+            arena,
+            "that transfer stopped without deciding and its checkpoint is still {s}, which --restart may not discard: supersession releases a settled failure and nothing else. No verb resumes or releases a {s} checkpoint yet, so this path stays held — send to a different destination.",
+            .{ held.state.text(), held.state.text() },
+        ) catch "this path stays held; send to a different destination",
+
+        // `findHolder` is rendered from `holdsDestination` and these three are
+        // the states it excludes, so one arriving here means the query and the
+        // predicate have come apart. Reported under that description rather than
+        // given a sentence, which would read as advice about a real situation.
+        .published,
+        .completed_unverified,
+        .superseded,
+        => fatal(
+            "internal: checkpoint {d} came back from a destination-holding query in state {s}, which holds no destination",
+            .{ held.id, held.state.text() },
+        ),
+    };
+}
+
+/// Names the refusals of the one transaction that releases a destination.
+///
+/// Its guards are conjuncts of a single statement, so a refusal comes back as
+/// one error rather than as a reading the caller can take apart — which is the
+/// point (a status checked outside the transaction can change before the write
+/// lands). What that costs is this function: the wording has to be rebuilt from
+/// the holder we read on the way in.
+fn fatalRestart(err: anyerror, held: transfers.Holder, dest_path: []const u8) noreturn {
+    switch (err) {
+        // The two `supersedeLocked` refusals that mean the reading above went
+        // stale between it and the write lock — a peer settled, reconciled or
+        // adjudicated the holder in between. Not an operator error: they asked
+        // for something that was true when they asked.
+        error.CheckpointNotSupersedable, error.SurrenderingOperationMayStillBeRunning => fatal(
+            "refused: request {s} still holds '{s}' — its transfer or its attempt changed between the check and the write ({s}), so nothing was superseded and nothing was sent. Re-read it with 'terminus request show {s}' and try again",
+            .{ held.request_id, dest_path, @errorName(err), held.request_id },
+        ),
+        // The supersession landed and the replacement did not, or the reverse —
+        // neither is on disk, which is the whole reason the three are one
+        // transaction. The destination is still held by the same checkpoint it
+        // was held by before this command ran.
+        else => fatal(
+            "cannot restart the transfer on '{s}': {s}. Nothing was superseded, nothing was created and nothing was sent — request {s} still holds the destination",
+            .{ dest_path, @errorName(err), held.request_id },
+        ),
+    }
+}
+
 /// Names the two `create` refusals that mean opposite things to an operator.
-fn fatalCreate(err: anyerror, execution: *Core.execution.Execution, dest_path: []const u8) noreturn {
+///
+/// `DestinationHeld` is reachable here despite the read at the top of `run`,
+/// and only by losing a race: another transfer took the path between that read
+/// and this insert. So the holder is re-read rather than remembered — the row
+/// that refused us is the newer one, and naming the older one would send an
+/// operator to a request that has nothing to do with it.
+fn fatalCreate(
+    err: anyerror,
+    execution: *Core.execution.Execution,
+    store: *Store,
+    arena: std.mem.Allocator,
+    dest_side: transfers.DestSide,
+    dest_path: []const u8,
+) noreturn {
     execution.abandon("the transfer checkpoint could not be created") catch {};
     switch (err) {
-        error.DestinationHeld => fatal(
-            "refused: another transfer is standing on '{s}' — it either has not finished or failed and has not been released; nothing was sent",
-            .{dest_path},
-        ),
+        error.DestinationHeld => {
+            // Three answers, and each gets its own sentence. A read that *failed*
+            // is not "nobody holds it": saying so would describe a path as
+            // contested by nothing while the index has just refused it, so the
+            // failure is named beside the refusal it could not word.
+            const found = transfers.findHolder(store, arena, dest_side, dest_path) catch |read_err| fatal(
+                "refused: another transfer is standing on '{s}'; nothing was sent. Which one could not be read back ({s}) — 'terminus request ls' will show it",
+                .{ dest_path, @errorName(read_err) },
+            );
+            if (found) |held| refuseHeld(arena, held, dest_path);
+            // Refused by the index and gone by the time we looked, which means a
+            // peer released or finished it in between. Nothing of ours was
+            // written either way, so this is a retry, not a dead end.
+            fatal(
+                "refused: another transfer was standing on '{s}' when this one tried to claim it and had let go by the time we looked; nothing was sent. Run it again",
+                .{dest_path},
+            );
+        },
         error.CheckpointAlreadyExists => fatal(
             "refused: this request already has a checkpoint; nothing was sent",
             .{},
