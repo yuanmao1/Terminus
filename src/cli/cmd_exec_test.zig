@@ -1,17 +1,17 @@
-//! Gates for the command's input channel, and for the line endings of the
-//! command itself.
+//! Gates for the command's input channel, for the ceiling on its output, and
+//! for the line endings of the command itself.
 //!
 //! **What is driven, and what is not — read this before the assertions.**
 //!
-//! The bytes end up in `libssh2_channel_write_ex` on a channel opened against a
-//! live server, and there is no server here: the test host's key exists only
-//! inside a database these tests may not touch, and a libssh2 channel cannot be
-//! stood up without one. So the channel itself is **reviewed, not proven**, and
-//! nothing below claims otherwise.
+//! The bytes end up in `libssh2_channel_write_ex` and `libssh2_channel_read_ex`
+//! on a channel opened against a live server, and there is no server here: the
+//! test host's key exists only inside a database these tests may not touch, and a
+//! libssh2 channel cannot be stood up without one. So the channel itself is
+//! **reviewed, not proven**, and nothing below claims otherwise.
 //!
 //! What *is* driven is everything above it, which is where the failures this
 //! change is about live. `Ssh.pumpInput` is the production loop — the same
-//! function `Ssh.execWithStdin` calls — and it takes its destination as an
+//! function `Ssh.execRetained` calls — and it takes its destination as an
 //! interface, so these gates run it against a stand-in sink that can do the
 //! three things a real channel does and a test cannot ask one to do on cue:
 //! accept everything, accept part of an offer, and stop accepting. Driven this
@@ -31,12 +31,15 @@
 //!  * the terminal receipt carries the accepted count and its digest, read back
 //!    out of a real ledger.
 //!
-//! Only two links are unproven: `ChannelInput.offer`'s call into
-//! `libssh2_channel_write_ex` and `ChannelInput.end`'s call into
+//! Only two links are unproven on the input side: `ChannelInput.offer`'s call
+//! into `libssh2_channel_write_ex` and `ChannelInput.end`'s call into
 //! `libssh2_channel_send_eof`. Both are four lines, both are the shape the two
 //! scp send paths in the same file already use, and the rules they could get
 //! wrong (a short write is normal, a zero is not, a discarded EOF hangs the
 //! remote) are held above them where they can be.
+//!
+//! The output ceiling divides the same way, and its own section below says which
+//! side of the line each of its gates is on.
 const std = @import("std");
 const Cli = @import("cli.zig");
 const Core = @import("../core/core.zig");
@@ -643,6 +646,537 @@ test "gate: an input run and a plain run agree that a missing exit marker is ind
     try t.expectEqualStrings(statuses[1], statuses[0]);
     try t.expectEqual(@as(?i32, null), codes[0]);
     try t.expectEqual(codes[1], codes[0]);
+}
+
+// --- gates: the output ceiling ------------------------------------------------
+//
+// The same division applies here as to the input channel above. The bytes come
+// out of `libssh2_channel_read_ex` on a channel opened against a live server and
+// there is no server here, so `drainBoth`'s two read calls are **reviewed, not
+// proven**. Everything they hand their reads to is driven: `Ssh.Capture` is the
+// production retention, `Ssh.retain` is the production function the daemon
+// transport and `Core.Scripted` both call, and `Core.Scripted` feeds it in
+// `Ssh.read_bytes` pieces so the head/ring arithmetic meets the same boundaries
+// a real drain would produce.
+//
+// What is driven below: the two ends survive at, one below and one above the
+// ceiling; the digest covers every byte including the dropped ones; the receipt's
+// count is the total and not the retained amount; a stream that fitted is
+// byte-identical with no marker in it; the ring returns the true last bytes
+// whatever the read sizes were; an exit marker split across two reads is still
+// found; a command far larger than the ceiling settles with its own exit code
+// rather than `indeterminate`; and the peak allocation does not move with the
+// output.
+
+/// One buffer holding what a supervised command's stdout looks like on the wire:
+/// the identity line first, `body_len` bytes of the command's own output, the
+/// exit line last.
+///
+/// Built in a single allocation on purpose — the bounded-memory gate runs this at
+/// 32 MiB, and a fixture that copied itself would be the thing that grew.
+///
+/// The body's last byte is always a newline, so the exit marker starts a line at
+/// every length. Without that a fixture would put the marker on the end of a line
+/// of output, `parseShell` would not recognise it, and every gate below would be
+/// measuring a broken fixture instead of the ceiling.
+fn wireOutput(gpa: std.mem.Allocator, nonce: u64, body_len: usize, code: i32) ![]u8 {
+    var head_buf: [96]u8 = undefined;
+    var tail_buf: [64]u8 = undefined;
+    const head = try std.fmt.bufPrint(
+        &head_buf,
+        "__TERMINUS_START_{d}__ pid=4242 pgid=4242 token=99\n",
+        .{nonce},
+    );
+    const tail = try std.fmt.bufPrint(&tail_buf, "__TERMINUS_EXIT_{d}__ code={d}\n", .{ nonce, code });
+
+    const out = try gpa.alloc(u8, head.len + body_len + tail.len);
+    @memcpy(out[0..head.len], head);
+    const middle = out[head.len..][0..body_len];
+    for (middle, 0..) |*ch, i| {
+        ch.* = if (i + 1 == body_len or (i + 1) % 64 == 0)
+            '\n'
+        else
+            // Printable, never a marker, never a newline of its own.
+            '0' + @as(u8, @intCast(i % 64));
+    }
+    @memcpy(out[head.len + body_len ..], tail);
+    return out;
+}
+
+test "gate: the output ceiling keeps both ends at the boundary and drops only above it" {
+    const t = std.testing;
+    const ceiling = Ssh.output_ceiling.total();
+
+    // One below, exactly at, and one above. The middle case is the one an
+    // off-by-one would take: a ceiling that dropped a byte at exactly its own
+    // size would report `truncated` on a stream it had every byte of.
+    const cases = [_]struct { total: usize, dropped: u64 }{
+        .{ .total = ceiling - 1, .dropped = 0 },
+        .{ .total = ceiling, .dropped = 0 },
+        .{ .total = ceiling + 1, .dropped = 1 },
+    };
+
+    var checked: usize = 0;
+    for (cases) |case| {
+        checked += 1;
+        const payload = try body(t.allocator, case.total);
+        defer t.allocator.free(payload);
+
+        var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var output: Ssh.Retained = .{};
+        const result = try Ssh.retain(
+            arena,
+            .{ .exit_code = 0, .stdout = payload, .stderr = "" },
+            &output,
+            Ssh.read_bytes,
+        );
+
+        // The count is of everything that passed, and the digest is of exactly
+        // those bytes — the same digest whether or not a middle was dropped,
+        // which is the property that makes a truncated run auditable.
+        try t.expectEqual(@as(u64, case.total), output.stdout.bytes);
+        try t.expectEqualStrings(try hexOf(arena, payload), output.stdout.sha256[0..]);
+        try t.expectEqual(case.dropped > 0, output.stdout.truncated);
+
+        if (case.dropped == 0) {
+            // Byte-for-byte what arrived, and no marker anywhere in it. Both
+            // halves matter: the marker's absence is what makes its presence
+            // mean something.
+            //
+            // Compared by hand rather than with `expectEqualSlices`, which
+            // prints its diff a byte at a time and dies of it at a megabyte —
+            // the failure has to be readable or this gate cannot be acted on.
+            try t.expectEqual(payload.len, result.stdout.len);
+            if (std.mem.indexOfDiff(u8, payload, result.stdout)) |at| {
+                std.debug.print(
+                    \\
+                    \\a stream that fitted under the ceiling came back altered.
+                    \\
+                    \\  {d} bytes passed, first difference at byte {d}
+                    \\  arrived 0x{X:0>2}, came back 0x{X:0>2}
+                    \\
+                    \\Nothing was dropped, so the rendering had to be the stream itself.
+                    \\
+                , .{ case.total, at, payload[at], result.stdout[at] });
+                return error.RetainedStreamAltered;
+            }
+            try t.expect(std.mem.indexOf(u8, result.stdout, Ssh.gap_marker) == null);
+        } else {
+            // Both ends whole, which is what the two markers live in.
+            try t.expect(std.mem.startsWith(u8, result.stdout, payload[0..Ssh.output_ceiling.head]));
+            try t.expect(std.mem.endsWith(u8, result.stdout, payload[payload.len - Ssh.output_ceiling.tail ..]));
+            // And the published number a reader acts on is how much is missing.
+            const said = try std.fmt.allocPrint(arena, "{s} dropped={d} of {d} byte(s)", .{
+                Ssh.gap_marker, case.dropped, case.total,
+            });
+            try t.expect(std.mem.indexOf(u8, result.stdout, said) != null);
+            // The gap sits exactly between the two ends, on a line of its own,
+            // and what surrounds it is the ceiling to the byte — so `truncated`
+            // and the retained size cannot disagree.
+            const at = std.mem.indexOf(u8, result.stdout, Ssh.gap_marker).?;
+            try t.expectEqual(Ssh.output_ceiling.head + 1, at);
+            const after = std.mem.indexOfScalarPos(u8, result.stdout, at, '\n').? + 1;
+            try t.expectEqual(Ssh.output_ceiling.tail, result.stdout.len - after);
+        }
+    }
+    try t.expectEqual(@as(usize, 3), checked);
+}
+
+test "gate: the tail ring returns the last bytes of the stream whatever the read boundaries were" {
+    const t = std.testing;
+    // Small enough to check exhaustively, and misaligned on purpose: a ring
+    // whose two-span wrapping copy or whose eviction arithmetic is wrong shows
+    // up here at sizes a person can hold, and not only at 512 KiB where the
+    // reads happen to divide it evenly.
+    const tiny: Ssh.Ceiling = .{ .head = 8, .tail = 13 };
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const payload = try body(t.allocator, 200);
+    defer t.allocator.free(payload);
+
+    var checked: usize = 0;
+    for ([_]usize{ 1, 2, 3, 5, 7, 11, 17 }) |piece| {
+        for ([_]usize{ 0, 1, 7, 8, 9, 20, 21, 22, 63, 64, 128, 199, 200 }) |total| {
+            checked += 1;
+            var capture: Ssh.Capture = .init(arena, tiny);
+            var offset: usize = 0;
+            while (offset < total) {
+                const end = @min(offset + piece, total);
+                try capture.push(payload[offset..end]);
+                offset = end;
+            }
+            const passed = capture.passed();
+            try t.expectEqual(@as(u64, total), passed.bytes);
+            try t.expectEqualStrings(try hexOf(arena, payload[0..total]), passed.sha256[0..]);
+            try t.expectEqual(total > tiny.total(), passed.truncated);
+
+            const rendered = try capture.render(arena);
+            const kept_head = @min(total, tiny.head);
+            try t.expect(std.mem.startsWith(u8, rendered, payload[0..kept_head]));
+            const kept_tail = @min(total - kept_head, tiny.tail);
+            try t.expect(std.mem.endsWith(u8, rendered, payload[total - kept_tail .. total]));
+            if (total <= tiny.total()) try t.expectEqualSlices(u8, payload[0..total], rendered);
+        }
+    }
+    // Counted, so a loop that stopped iterating fails rather than passing over
+    // an empty region.
+    try t.expectEqual(@as(usize, 7 * 13), checked);
+}
+
+test "gate: a command far larger than the output ceiling still reports its own exit code" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "exec_ceiling_huge");
+    defer h.deinit();
+
+    var execution = try h.begin();
+    defer execution.deinit();
+    try execution.connecting();
+
+    // Four times the ceiling, so the middle is unambiguously gone.
+    const wire = try wireOutput(t.allocator, execution.nonce, 4 * Ssh.output_ceiling.total(), 42);
+    defer t.allocator.free(wire);
+    try t.expect(wire.len > Ssh.output_ceiling.total());
+
+    var script = Core.Scripted.init(h.arena, &.{.{
+        .reply = .{
+            .exit_code = 0, // the channel's, never the command's
+            .stdout = wire,
+            .stderr = "",
+        },
+    }});
+
+    const result = try Core.execution.runCommand(&execution, script.executor(), "yes | head -c 4M", null);
+    try t.expect(result == .ran);
+
+    // The whole point. A head-only cap loses the exit marker, and this run then
+    // reads `indeterminate` — a command whose status was never in doubt reported
+    // as unknown, which is strictly worse than the memory it saved.
+    //
+    // A nonzero code on purpose: `failed` here is the command's own answer, and
+    // a `42` that survived four megabytes of output cannot have come from a
+    // default.
+    try t.expect(result.ran.status != .indeterminate);
+    try t.expectEqualStrings("failed", result.ran.status.text());
+    try t.expectEqual(@as(?i32, 42), result.ran.exit_code);
+    // And a tail-only cap loses this, so the attempt could not be reconciled.
+    try t.expectEqual(@as(i64, 4242), result.ran.identity.?.pid);
+    try t.expectEqual(@as(i64, 4242), result.ran.identity.?.pgid.?);
+
+    // The caller cannot mistake this for complete output.
+    try t.expect(result.ran.output.?.stdout.truncated);
+    try t.expect(std.mem.indexOf(u8, result.ran.stdout, Ssh.gap_marker) != null);
+    try t.expect(result.ran.stdout.len < wire.len);
+
+    const row = try h.terminalRow(execution.id());
+    try t.expectEqualStrings("failed", row.status.?);
+    try t.expectEqual(@as(?i64, 42), row.exit_code);
+    // The true total that passed. `observed.stdout.len` was recorded here and
+    // is none of the three numbers a reader could want: not the total, not the
+    // retained amount, and not even a prefix of either once a middle is gone.
+    try t.expectEqual(@as(?i64, @intCast(wire.len)), row.stdout_bytes);
+    try t.expect(row.stdout_bytes.? > @as(i64, @intCast(result.ran.stdout.len)));
+    // The digest of a truncated run is the digest of the same bytes hashed
+    // whole — the receipt proves what came out of a command whose middle
+    // nobody was given.
+    try t.expectEqualStrings(try hexOf(h.arena, wire), row.stdout_sha256.?);
+    try t.expectEqual(@as(?bool, true), row.stdout_truncated);
+    // stderr said nothing and must not be described as truncated for it.
+    try t.expectEqual(@as(?i64, 0), row.stderr_bytes);
+    try t.expectEqual(@as(?bool, false), row.stderr_truncated);
+    try t.expectEqualStrings(Ssh.empty_sha256, row.stderr_sha256.?);
+}
+
+test "gate: an exit marker split across two reads is still found" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "exec_ceiling_straddle");
+    defer h.deinit();
+
+    var execution = try h.begin();
+    defer execution.deinit();
+    try execution.connecting();
+
+    const wire = try wireOutput(t.allocator, execution.nonce, 3 * Ssh.output_ceiling.total(), 7);
+    defer t.allocator.free(wire);
+
+    // Where the exit line starts, found the way `parseShell` would.
+    const marker = try std.fmt.allocPrint(h.arena, "__TERMINUS_EXIT_{d}__ ", .{execution.nonce});
+    const exit_at = std.mem.lastIndexOf(u8, wire, marker).?;
+
+    // A read size whose last boundary lands *inside* that line. This is the case
+    // a "keep the last read" tail would fail and a ring does not: the ring holds
+    // the last N bytes of the stream, and where the reads stopped is not one of
+    // its inputs.
+    const mid = wire.len - (wire.len - exit_at) / 2;
+    var script = Core.Scripted.init(h.arena, &.{.{ .reply = .{
+        .exit_code = 0,
+        .stdout = wire,
+        .stderr = "",
+    } }});
+    script.reads_of = mid / 3;
+    // Asserted, not assumed: a fixture that stopped straddling would make the
+    // rest of this gate vacuous.
+    const boundary = script.reads_of * 3;
+    try t.expect(boundary > exit_at);
+    try t.expect(boundary < wire.len);
+
+    const result = try Core.execution.runCommand(&execution, script.executor(), "big", null);
+    try t.expect(result.ran.status != .indeterminate);
+    try t.expectEqualStrings("failed", result.ran.status.text());
+    try t.expectEqual(@as(?i32, 7), result.ran.exit_code);
+    try t.expectEqual(@as(i64, 4242), result.ran.identity.?.pid);
+    try t.expect(result.ran.output.?.stdout.truncated);
+}
+
+test "gate: a run under the output ceiling is unchanged and its receipt says nothing was dropped" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "exec_ceiling_fits");
+    defer h.deinit();
+
+    var execution = try h.begin();
+    defer execution.deinit();
+    try execution.connecting();
+
+    // Comfortably under, which is every command anybody actually runs.
+    const wire = try wireOutput(t.allocator, execution.nonce, 4096, 0);
+    defer t.allocator.free(wire);
+
+    var script = Core.Scripted.init(h.arena, &.{.{ .reply = .{
+        .exit_code = 0,
+        .stdout = wire,
+        .stderr = try h.arena.dupe(u8, "a warning\n"),
+    } }});
+
+    const result = try Core.execution.runCommand(&execution, script.executor(), "ls", null);
+    try t.expectEqualStrings("completed", result.ran.status.text());
+    try t.expectEqual(@as(?i32, 0), result.ran.exit_code);
+
+    // Byte-identical to what the ceiling-free version produced: the two marker
+    // lines removed and nothing else touched.
+    const expected = try Core.supervisor.parseShell(h.arena, execution.nonce, wire, "a warning\n");
+    try t.expectEqualStrings(expected.stdout, result.ran.stdout);
+    try t.expectEqualStrings("a warning\n", result.ran.stderr);
+    try t.expect(std.mem.indexOf(u8, result.ran.stdout, Ssh.gap_marker) == null);
+    try t.expect(!result.ran.output.?.stdout.truncated);
+    try t.expect(!result.ran.output.?.stderr.truncated);
+
+    const row = try h.terminalRow(execution.id());
+    // Still the total that passed rather than the marker-stripped length, and
+    // the two differ even here — which is why this is the number to record.
+    try t.expectEqual(@as(?i64, @intCast(wire.len)), row.stdout_bytes);
+    try t.expect(row.stdout_bytes.? > @as(i64, @intCast(result.ran.stdout.len)));
+    try t.expectEqualStrings(try hexOf(h.arena, wire), row.stdout_sha256.?);
+    try t.expectEqual(@as(?bool, false), row.stdout_truncated);
+    try t.expectEqual(@as(?i64, "a warning\n".len), row.stderr_bytes);
+    try t.expectEqualStrings(try hexOf(h.arena, "a warning\n"), row.stderr_sha256.?);
+    try t.expectEqual(@as(?bool, false), row.stderr_truncated);
+}
+
+test "gate: the output ceiling's tail cannot lose the exit marker" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The widest nonce there is, so the marker text is at its longest.
+    const nonce = std.math.maxInt(u64);
+    const wrapped = try Core.supervisor.wrapShell(arena, "true", nonce);
+    const printed = try std.fmt.allocPrint(arena, "__TERMINUS_EXIT_{d}__ code=", .{nonce});
+    // The supervisor really does print this text — without this the bound below
+    // is arithmetic over a string nothing emits.
+    try t.expect(std.mem.indexOf(u8, wrapped, printed) != null);
+
+    // Plus the widest exit status and a CRLF for a shell that sends one.
+    const widest = printed.len + std.fmt.comptimePrint("{d}", .{std.math.minInt(i32)}).len + 2;
+    try t.expectEqual(widest, Core.execution.exit_marker_max_line);
+    // Held at compile time in `execution.zig` as well; asserted here so the
+    // literal and the line it describes cannot drift apart silently.
+    try t.expect(Ssh.output_ceiling.tail >= widest);
+    try t.expect(Ssh.output_ceiling.tail >= Ssh.read_bytes);
+}
+
+test "gate: the truncation notice appears exactly when something was dropped" {
+    const t = std.testing;
+    var f = try TextFixture.init(t.allocator, "echo hi\n");
+    defer f.deinit();
+
+    // No reading at all: a session exec never sees the two streams apart, and a
+    // notice there would be about a ceiling that never ran.
+    try t.expectEqual(@as(?[]const u8, null), cmd_exec.truncationNotice(&f.ctx, null));
+    // A reading with nothing dropped must stay silent, or a reader learns to
+    // ignore the line that matters.
+    try t.expectEqual(@as(?[]const u8, null), cmd_exec.truncationNotice(&f.ctx, .{}));
+
+    var said: usize = 0;
+    for ([_]struct { out: bool, err: bool, which: []const u8 }{
+        .{ .out = true, .err = false, .which = "stdout exceeded" },
+        .{ .out = false, .err = true, .which = "stderr exceeded" },
+        .{ .out = true, .err = true, .which = "stdout and stderr exceeded" },
+    }) |case| {
+        said += 1;
+        const note = cmd_exec.truncationNotice(&f.ctx, .{
+            .stdout = .{ .truncated = case.out },
+            .stderr = .{ .truncated = case.err },
+        }).?;
+        try t.expect(std.mem.startsWith(u8, note, case.which));
+        // The marker a parser would find, so the two readers are told the same
+        // thing in the terms each of them can act on.
+        try t.expect(std.mem.indexOf(u8, note, Ssh.gap_marker) != null);
+        // And the way out of the ceiling, rather than only the news of it.
+        try t.expect(std.mem.indexOf(u8, note, "terminus pull") != null);
+    }
+    try t.expectEqual(@as(usize, 3), said);
+}
+
+test "gate: the skill document describes the output ceiling an agent will meet" {
+    const t = std.testing;
+    const heading = "## What a command's output does when there is a lot of it";
+    // Found by name, never by position: this document is appended to.
+    const at = std.mem.indexOf(u8, skill_doc.text, heading) orelse {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md has no "{s}" section. An agent that does not know the
+            \\ceiling exists will read a stdout whose middle is gone and draw a conclusion
+            \\from it, which is the one failure this slice is about.
+            \\
+        , .{heading});
+        return error.SkillCeilingSectionMissing;
+    };
+    const rest = skill_doc.text[at + heading.len ..];
+    const section = rest[0 .. std.mem.indexOf(u8, rest, "\n## ") orelse rest.len];
+
+    var claims: usize = 0;
+    for ([_][]const u8{
+        // The marker an agent has to look for, spelled exactly as the code
+        // emits it.
+        Ssh.gap_marker,
+        // The rule that makes the marker worth looking for in both directions.
+        "If it is absent, you have every byte",
+        // The three numbers, and the fact that the first is not what came back.
+        "`stdoutBytes`",
+        "`stdoutSha256`",
+        "`stdoutTruncated`",
+        "not the amount you were given",
+        // Why both ends, which is the thing a reader would otherwise assume is
+        // arbitrary — and the outcome a head-only cap would produce.
+        "indeterminate",
+        // What to do instead of hoping for a bigger ceiling.
+        "terminus pull",
+    }) |needle| {
+        if (std.mem.indexOf(u8, section, needle) == null) {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: the output-ceiling section no longer states "{s}".
+                \\
+            , .{needle});
+            return error.SkillCeilingClaimMissing;
+        }
+        claims += 1;
+    }
+    try t.expectEqual(@as(usize, 8), claims);
+
+    // The size the document publishes is the size the code enforces. A document
+    // naming a different number would send an agent looking for a marker at the
+    // wrong point, or tell it output was complete when it was not.
+    const published = try std.fmt.allocPrint(t.allocator, "**{d} MiB**", .{Ssh.output_ceiling.total() / (1 << 20)});
+    defer t.allocator.free(published);
+    try t.expect(std.mem.indexOf(u8, section, published) != null);
+    const halves = try std.fmt.allocPrint(t.allocator, "first {d} KiB and the last {d} KiB", .{
+        Ssh.output_ceiling.head / 1024, Ssh.output_ceiling.tail / 1024,
+    });
+    defer t.allocator.free(halves);
+    try t.expect(std.mem.indexOf(u8, section, halves) != null);
+}
+
+// --- gate: bounded memory, the output side -----------------------------------
+
+test "gate: the output ceiling's peak allocation does not grow with the output" {
+    const t = std.testing;
+
+    // The same fixed budget for every size, and every allocation the retention
+    // path makes comes out of it: the head buffer, the tail ring, and the
+    // rendering handed back to the caller. Generous enough for those three at
+    // the ceiling, and far below the larger run — so anything proportional to
+    // the output fails on the big one while passing on the small one, which is
+    // the signature this gate exists to catch. The version this replaced
+    // appended every byte to an `ArrayList` and would fail both.
+    //
+    // `sizes` is where a by-hand run over 10 GiB goes.
+    const budget = 8 << 20;
+    const ceiling = Ssh.output_ceiling.total();
+    const sizes = [_]usize{ ceiling * 2, ceiling * 32 };
+
+    var proven: usize = 0;
+    // The first size's allocation, which the second one has to match exactly.
+    var settled: ?usize = null;
+    for (sizes) |total| {
+        proven += 1;
+        // On the test allocator, not the measured one: the fixture stands in for
+        // a remote host and its cost is not the ceiling's.
+        const wire = try wireOutput(t.allocator, 7, total, 3);
+        defer t.allocator.free(wire);
+
+        const buffer = try t.allocator.alloc(u8, budget);
+        defer t.allocator.free(buffer);
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        const arena = fixed.allocator();
+
+        // `Scripted` dupes every command it is handed onto the allocator it was
+        // built with and appends it to a list that never shrinks — the harness's
+        // own growth, not the ceiling's. Given a zero-length allocator both fail
+        // and are swallowed, so `seen` stays empty and what is being measured is
+        // the retention path.
+        var none = std.heap.FixedBufferAllocator.init(&[_]u8{});
+        var script = Core.Scripted.init(none.allocator(), &.{.{ .reply = .{
+            .exit_code = 0,
+            .stdout = wire,
+            .stderr = "",
+        } }});
+
+        var output: Ssh.Retained = .{};
+        const result = try script.executor().execRetained(arena, "big", null, &output);
+        try t.expectEqual(@as(u64, wire.len), output.stdout.bytes);
+        try t.expect(output.stdout.truncated);
+        try t.expectEqual(@as(usize, 0), script.seen.items.len);
+        // The retained rendering is the ceiling plus one gap line, at both
+        // sizes — so what came back is bounded and not merely what was counted.
+        try t.expect(result.stdout.len > ceiling);
+        try t.expect(result.stdout.len < ceiling + 512);
+
+        std.debug.print(
+            "\n  output bounded-memory gate: {d} bytes passed, {d} bytes allocated (budget {d})\n",
+            .{ wire.len, fixed.end_index, budget },
+        );
+        try t.expect(fixed.end_index < budget);
+        // Thirty-two times the bytes, and the allocation has to be the *same*
+        // number — not merely another one under the budget. `< budget` alone
+        // would pass an implementation allocating `total / 1000`, which is
+        // proportional to the output and fits twice over. Equality is what says
+        // the cost does not depend on the size, which is the whole claim.
+        if (settled) |before| {
+            if (fixed.end_index != before) {
+                std.debug.print(
+                    \\
+                    \\the output ceiling's allocation moved with the size of the output.
+                    \\
+                    \\  {d} bytes passed -> {d} bytes allocated
+                    \\  {d} bytes passed -> {d} bytes allocated
+                    \\
+                    \\Both fit the budget, so neither run failed on its own. What fails is that
+                    \\they differ: a cost that tracks the output is the unbounded drain this
+                    \\ceiling was built to replace, wearing a smaller constant.
+                    \\
+                , .{ sizes[0], before, total, fixed.end_index });
+                return error.OutputAllocationTracksTheOutputSize;
+            }
+        } else settled = fixed.end_index;
+    }
+    try t.expectEqual(@as(usize, 2), proven);
 }
 
 // --- gates: the command's own line endings ------------------------------------

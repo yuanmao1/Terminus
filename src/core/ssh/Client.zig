@@ -203,7 +203,14 @@ pub const ExecError = error{
 };
 
 /// Runs one command over a fresh session channel and drains stdout/stderr
-/// to completion.
+/// to completion, **keeping the whole of both**.
+///
+/// No ceiling, deliberately, and one caller is the reason: `transfer.pullBytes`
+/// verifies a SHA-256 over the entire object it downloads, so it must hold the
+/// entire object. Everything else on this entry point asks a question with a
+/// small answer — a stat, a `command -v`, one 128 KiB range of a file. The
+/// command path, where the answer's size is the *user's* choice and there is no
+/// upper bound on it at all, goes through `execRetained` instead.
 ///
 /// The session's 30s timeout guards connect/handshake/auth, but a command
 /// may legitimately stay silent for many minutes (large table scans,
@@ -235,9 +242,9 @@ pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!Ex
     // then restore the default timeout *before* channel teardown so a slow
     // close can't wedge the next exec on the pooled connection.
     c.libssh2_session_set_timeout(client.session, 0);
-    var stdout: std.ArrayList(u8) = .empty;
-    var stderr: std.ArrayList(u8) = .empty;
-    const drain_result = drainBoth(channel, arena, &stdout, &stderr);
+    var stdout: Capture = .init(arena, null);
+    var stderr: Capture = .init(arena, null);
+    const drain_result = drainBoth(channel, &stdout, &stderr);
     c.libssh2_session_set_timeout(client.session, 30_000);
     try drain_result;
 
@@ -247,8 +254,8 @@ pub fn exec(client: *Client, arena: Allocator, command: []const u8) ExecError!Ex
 
     return .{
         .exit_code = exit_code,
-        .stdout = try stdout.toOwnedSlice(arena),
-        .stderr = try stderr.toOwnedSlice(arena),
+        .stdout = try stdout.render(arena),
+        .stderr = try stderr.render(arena),
     };
 }
 
@@ -407,24 +414,40 @@ const ChannelInput = struct {
     }
 };
 
-/// Runs a command with `source` streamed to its standard input, then drains
-/// stdout/stderr. The channel is 8-bit clean, so arbitrary binary goes through
-/// unchanged — no base64, no shell quoting of the payload.
+/// Runs a command under a ceiling on what is kept from its output, optionally
+/// streaming `input` to its standard input first. The channel is 8-bit clean, so
+/// arbitrary binary goes through unchanged in both directions — no base64, no
+/// shell quoting of the payload.
 ///
-/// `taken` is filled whether this succeeds or fails, and it is what the receipt
-/// records: the count the channel accepted and the digest of those same bytes.
+/// `input.accepted` is filled whether this succeeds or fails, and it is what the
+/// receipt records: the count the channel accepted and the digest of those same
+/// bytes. `output` is likewise filled on every path, including the failing ones,
+/// so a caller reading it after an error is reading this call's numbers rather
+/// than the last call's — and it carries the whole truth about the output even
+/// though only the ends of it survive. See `Capture`.
 ///
-/// Unlike `exec`, the 30s session timeout stays armed while the input flows:
-/// input should move continuously, so a 30s stall means the channel is wedged
-/// (an intermittent libssh2 blocking-read issue under bulk traffic) and the
-/// caller retries rather than hanging forever.
-pub fn execWithStdin(
+/// Optional input rather than a second function: this and a no-input variant
+/// differ in the two lines that pump, and in fifty identical ones. `runCommand`
+/// makes the same choice for the same reason, and one function needs no gate
+/// holding two copies of the drain against each other.
+///
+/// The 30s session timeout stays armed while the input flows: input should move
+/// continuously, so a 30s stall means the channel is wedged (an intermittent
+/// libssh2 blocking-read issue under bulk traffic) and the caller retries rather
+/// than hanging forever. It is lifted only for the drain, where a command may
+/// legitimately stay silent for minutes, and restored *before* channel teardown
+/// so a slow close cannot wedge the next exec on the pooled connection. The
+/// stdin path used to restore it on a `defer` instead, i.e. after teardown; two
+/// orderings existed because two functions did, and this is the one with the
+/// reason written beside it.
+pub fn execRetained(
     client: *Client,
     arena: Allocator,
     command: []const u8,
-    source: *std.Io.Reader,
-    taken: *Accepted,
+    input: ?InputStream,
+    output: *Retained,
 ) (ExecError || InputError)!ExecResult {
+    output.* = .{};
     const channel = c.libssh2_channel_open_ex(
         client.session,
         "session",
@@ -444,39 +467,48 @@ pub fn execWithStdin(
         @intCast(command.len),
     ) != 0) return error.ExecFailed;
 
-    var input: ChannelInput = .{ .channel = channel };
-    try pumpInput(source, input.sink(), taken);
+    if (input) |in| {
+        var sink: ChannelInput = .{ .channel = channel };
+        try pumpInput(in.source, sink.sink(), in.accepted);
+    }
 
     c.libssh2_session_set_timeout(client.session, 0);
-    defer c.libssh2_session_set_timeout(client.session, 30_000);
-
-    var stdout: std.ArrayList(u8) = .empty;
-    var stderr: std.ArrayList(u8) = .empty;
-    try drainBoth(channel, arena, &stdout, &stderr);
+    var stdout: Capture = .init(arena, output_ceiling);
+    var stderr: Capture = .init(arena, output_ceiling);
+    const drain_result = drainBoth(channel, &stdout, &stderr);
+    c.libssh2_session_set_timeout(client.session, 30_000);
+    // Before the error is raised, so a transport loss reports what did arrive
+    // rather than a zero.
+    output.stdout = stdout.passed();
+    output.stderr = stderr.passed();
+    try drain_result;
 
     _ = c.libssh2_channel_close(channel);
     _ = c.libssh2_channel_wait_closed(channel);
 
     return .{
         .exit_code = c.libssh2_channel_get_exit_status(channel),
-        .stdout = try stdout.toOwnedSlice(arena),
-        .stderr = try stderr.toOwnedSlice(arena),
+        .stdout = try stdout.render(arena),
+        .stderr = try stderr.render(arena),
     };
 }
 
 /// Interleaved blocking drain of stdout+stderr until channel EOF. Reading
 /// one stream to EOF before the other can deadlock — libssh2's per-channel
-/// receive window is shared, so draining both keeps it moving. Callers
-/// keep any single command's stdout under a few hundred KiB (see
-/// core/transfer.zig chunking); beyond that libssh2's blocking reader can
-/// still wedge on window bookkeeping.
+/// receive window is shared, so draining both keeps it moving.
+///
+/// The reads are a fixed `read_bytes` and the captures bound what they keep, so
+/// this loop's own cost does not move with the size of the output. What libssh2
+/// does under bulk traffic is a separate matter: beyond a few hundred KiB its
+/// blocking reader can still wedge on window bookkeeping, which is why
+/// `core/transfer.zig` asks for one bounded range at a time rather than relying
+/// on a ceiling here.
 fn drainBoth(
     channel: *c.LIBSSH2_CHANNEL,
-    arena: Allocator,
-    out: *std.ArrayList(u8),
-    err: *std.ArrayList(u8),
+    out: *Capture,
+    err: *Capture,
 ) ExecError!void {
-    var buffer: [256 * 1024]u8 = undefined;
+    var buffer: [read_bytes]u8 = undefined;
     var out_eof = false;
     var err_eof = false;
     while (!out_eof or !err_eof) {
@@ -486,7 +518,7 @@ fn drainBoth(
         if (!out_eof) {
             const no = c.libssh2_channel_read_ex(channel, 0, &buffer, buffer.len);
             if (no > 0) {
-                try out.appendSlice(arena, buffer[0..@intCast(no)]);
+                try out.push(buffer[0..@intCast(no)]);
                 continue; // keep pulling stdout while it flows
             } else if (no == 0) {
                 out_eof = true;
@@ -497,11 +529,346 @@ fn drainBoth(
         if (!err_eof) {
             const ne = c.libssh2_channel_read_ex(channel, c.SSH_EXTENDED_DATA_STDERR, &buffer, buffer.len);
             if (ne > 0) {
-                try err.appendSlice(arena, buffer[0..@intCast(ne)]);
+                try err.push(buffer[0..@intCast(ne)]);
             } else {
                 err_eof = true; // 0 (EOF) or error: stop reading stderr
             }
         }
+    }
+}
+
+// --- the output ceiling ------------------------------------------------------
+//
+// A command's output has no upper bound. `drainBoth` used to append every byte
+// of it into an `ArrayList` on the arena, so a command that printed ten
+// gigabytes cost ten gigabytes of local memory. What follows bounds that, and
+// the shape it bounds it into is decided by the supervisor's markers rather than
+// chosen for elegance.
+//
+// `supervisor.wrapShell` puts an identity line **first** on stdout and an exit
+// line **last**, with the command's own output between them, and
+// `supervisor.parseShell` needs both. So:
+//
+//   * a head-only cap loses the exit marker, and every large-output command
+//     settles `indeterminate` — a working command turned into an unknown
+//     outcome, which is far worse than the memory it saved;
+//   * a tail-only cap loses the start marker, and the attempt loses the
+//     pid/pgid it would be reconciled by.
+//
+// Retention therefore keeps **both ends and drops the middle**. The tail is a
+// ring, which is what makes it independent of where the reads happened to fall:
+// it holds the last `tail` bytes of the stream whether or not a 256 KiB read
+// stopped in the middle of the exit-marker line.
+//
+// Two things are true of every byte regardless of whether it was kept. It is
+// **counted**, and it is **hashed**. That is the load-bearing idea here: the
+// receipt can prove exactly what came out of a command whose middle the caller
+// never sees, so a truncated run is still an auditable one.
+//
+// The digest is of the stream **as it arrived on the channel**, supervision
+// markers included. Not a compromise: nothing can know which line is the exit
+// marker until it has seen the whole stream, and a digest taken incrementally
+// must therefore be taken before parsing. Shell mode already declares
+// `binary_framing = false` for precisely this reason — the stream it produces is
+// annotated and is not the command's bytes — so hashing what arrived is the only
+// honest reading available, and it is the one the ledger stores.
+
+/// The read size `drainBoth` uses, and the unit a transport that hands its reply
+/// over whole is treated as having handed it over in. `pub` so a harness can
+/// reproduce a read boundary falling inside the exit marker.
+pub const read_bytes = 256 * 1024;
+
+/// How much of a stream survives: the first `head` bytes and the last `tail`.
+pub const Ceiling = struct {
+    head: usize,
+    tail: usize,
+
+    pub fn total(self: Ceiling) usize {
+        return self.head + self.tail;
+    }
+};
+
+/// The ceiling on a command's output.
+///
+/// 1 MiB, split evenly, and each half of the split is doing something:
+///
+///   * The **head** carries the start-marker line, so the attempt keeps its
+///     pid/pgid identity no matter how much followed it.
+///   * The **tail** carries the exit-marker line, so the outcome is still known.
+///     `execution.exit_marker_max_line` holds a compile-time floor under it —
+///     losing that line is the one truncation that would change a command's
+///     answer rather than merely shortening it.
+///
+/// The size is 1 MiB for three reasons. It is the same order as the daemon
+/// transport's own reply frame (`daemon/Client.roundTrip` reads through a 1 MiB
+/// buffer), so the two transports agree about what counts as a large output
+/// rather than one truncating what the other refuses. It is four times
+/// `read_bytes`, so the ring is never smaller than a single read and the
+/// straddle case has margin rather than exact arithmetic. And a megabyte of text
+/// is ten to fifteen thousand lines — more than any operator or agent reads in
+/// full, and more than any command this tree issues through `runCommand`
+/// produces.
+pub const output_ceiling: Ceiling = .{ .head = 512 * 1024, .tail = 512 * 1024 };
+
+comptime {
+    // The ring holds the last `tail` bytes whatever the read boundaries were,
+    // but only if it is at least as big as one read — otherwise a single read
+    // overwrites it entirely and the margin above is a claim rather than a fact.
+    std.debug.assert(output_ceiling.tail >= read_bytes);
+    std.debug.assert(output_ceiling.head >= read_bytes);
+}
+
+/// The line `render` writes where the middle went.
+///
+/// In the stream itself, and not only beside it. A caller that pipes stdout to a
+/// parser never sees a note on stderr or a field in a JSON envelope it did not
+/// ask for, and an agent parsing output whose middle silently vanished draws a
+/// wrong conclusion and never learns that it did. This is the one place a
+/// truncated stream cannot be mistaken for a complete one.
+pub const gap_marker = "__TERMINUS_OUTPUT_TRUNCATED__";
+
+/// The gap line, at its widest.
+///
+/// A constant, so the whole retained rendering is a constant-size allocation:
+/// without it a run's peak would move by the decimal width of its own byte
+/// counts, and "the cost does not depend on the size of the output" would be
+/// true only to within a few characters. Derived from the format string itself at
+/// its maximum arguments, so it cannot drift from the line it bounds.
+pub const gap_line_max = std.fmt.comptimePrint(gap_line_format, .{
+    std.math.maxInt(u64),
+    std.math.maxInt(u64),
+    std.math.maxInt(usize),
+    std.math.maxInt(usize),
+    std.math.maxInt(u64),
+    "f" ** digest.hex_len,
+}).len;
+
+const gap_line_format = "\n" ++ gap_marker ++
+    " dropped={d} of {d} byte(s), keeping the first {d} and the last {d}; sha256 of all {d} is {s}\n";
+
+/// What passed through one output stream, and whether all of it was kept.
+///
+/// The output counterpart of `Accepted`, and the same three-way discipline: the
+/// count is of everything that passed rather than of what was retained, the
+/// digest is of exactly those bytes, and `truncated` says whether the two can
+/// differ. A receipt whose `bytes` reported the retained amount would describe a
+/// 10 GiB run and a 1 MiB run identically.
+pub const Passed = struct {
+    /// Every byte that came off the channel, kept or dropped.
+    bytes: u64 = 0,
+    /// Hex SHA-256 of exactly `bytes` bytes, markers included.
+    sha256: [digest.hex_len]u8 = empty_sha256.*,
+    /// Whether the middle was dropped.
+    truncated: bool = false,
+};
+
+/// Both output streams of one command.
+pub const Retained = struct {
+    stdout: Passed = .{},
+    stderr: Passed = .{},
+};
+
+/// Local bytes for a command's standard input, and where the count of what the
+/// channel accepted lands.
+///
+/// The two travel together because a caller that has one always has the other:
+/// `accepted` is the only thing it learns about a rejected input, so a source
+/// without somewhere to report its acceptance is a source whose failure is
+/// unreportable.
+pub const InputStream = struct {
+    source: *std.Io.Reader,
+    accepted: *Accepted,
+};
+
+/// One stream being drained under a ceiling.
+///
+/// `null` for the ceiling keeps the whole stream, which is `exec`'s contract and
+/// one caller's requirement rather than a default: see `exec`.
+///
+/// Nothing is allocated until bytes arrive, and the ring is not allocated until
+/// the head has filled — so `echo hi` costs three bytes and ten gigabytes costs
+/// `Ceiling.total()`. Both are constants; neither moves with the output.
+pub const Capture = struct {
+    arena: Allocator,
+    ceiling: ?Ceiling,
+    /// The first `ceiling.head` bytes. With no ceiling, the whole stream.
+    head: std.ArrayList(u8) = .empty,
+    /// The last `ceiling.tail` bytes, as a ring: `ring_len` bytes starting at
+    /// `ring_at` and wrapping. Allocated on the first byte that outlives the
+    /// head.
+    ring: []u8 = &.{},
+    ring_at: usize = 0,
+    ring_len: usize = 0,
+    /// Bytes that passed and were kept by neither end.
+    dropped: u64 = 0,
+    /// Bytes that passed, kept or not.
+    total: u64 = 0,
+    running: digest.Running,
+
+    pub fn init(arena: Allocator, ceiling: ?Ceiling) Capture {
+        return .{ .arena = arena, .ceiling = ceiling, .running = .init() };
+    }
+
+    /// Takes one read's worth of stream.
+    pub fn push(self: *Capture, chunk: []const u8) Allocator.Error!void {
+        // No ceiling, no accounting. The caller is being handed every byte and
+        // can hash them itself if it wants them hashed — and hashing here would
+        // put a second SHA-256 pass over every byte of every file transfer,
+        // which is the caller `exec` exists to serve.
+        const ceiling = self.ceiling orelse
+            return self.head.appendSlice(self.arena, chunk);
+
+        // Counted and hashed before anything is retained or discarded, so the
+        // two cannot disagree about which bytes passed.
+        self.running.update(chunk);
+        self.total += chunk.len;
+
+        var rest = chunk;
+        if (self.head.items.len < ceiling.head) {
+            const n = @min(ceiling.head - self.head.items.len, rest.len);
+            try self.head.appendSlice(self.arena, rest[0..n]);
+            rest = rest[n..];
+        }
+        if (rest.len == 0) return;
+        if (self.ring.len == 0) {
+            if (ceiling.tail == 0) {
+                self.dropped += rest.len;
+                return;
+            }
+            self.ring = try self.arena.alloc(u8, ceiling.tail);
+        }
+
+        // A chunk at least as large as the ring replaces it whole: only its own
+        // last `ring.len` bytes can survive, and everything they displaced —
+        // whatever the ring held, plus the front of this chunk — is dropped.
+        if (rest.len >= self.ring.len) {
+            self.dropped += self.ring_len + (rest.len - self.ring.len);
+            @memcpy(self.ring, rest[rest.len - self.ring.len ..]);
+            self.ring_at = 0;
+            self.ring_len = self.ring.len;
+            return;
+        }
+
+        const free = self.ring.len - self.ring_len;
+        if (rest.len > free) {
+            const evicted = rest.len - free;
+            self.ring_at = (self.ring_at + evicted) % self.ring.len;
+            self.ring_len -= evicted;
+            self.dropped += evicted;
+        }
+        // Into at most two spans, so the cost is the chunk and not its bytes.
+        var at = (self.ring_at + self.ring_len) % self.ring.len;
+        while (rest.len > 0) {
+            const n = @min(self.ring.len - at, rest.len);
+            @memcpy(self.ring[at..][0..n], rest[0..n]);
+            self.ring_len += n;
+            at = (at + n) % self.ring.len;
+            rest = rest[n..];
+        }
+    }
+
+    /// What passed, for the receipt. Valid at any point in the stream.
+    ///
+    /// Only a bounded capture has an answer: an unbounded one keeps everything
+    /// and takes no digest, so asking it would report a count of zero and the
+    /// digest of nothing as though they were observations.
+    pub fn passed(self: *const Capture) Passed {
+        std.debug.assert(self.ceiling != null);
+        var out: Passed = .{ .bytes = self.total, .truncated = self.dropped > 0 };
+        _ = self.running.peekHex(&out.sha256);
+        return out;
+    }
+
+    /// The retained bytes in stream order, with the gap named where the middle
+    /// went.
+    ///
+    /// A stream that fitted under the ceiling renders byte-for-byte as it
+    /// arrived, with no marker anywhere in it — so the marker's presence means
+    /// bytes are missing and its absence means none are.
+    ///
+    /// The allocation is `head + gap_line_max + tail` whatever the stream was,
+    /// and the returned slice is a prefix of it. Sizing it to the gap line's
+    /// actual width would make a run's peak move by the number of digits in its
+    /// own byte count, which is a small dependency on the size of the output but
+    /// is still one.
+    pub fn render(self: *const Capture, arena: Allocator) Allocator.Error![]u8 {
+        if (self.ring_len == 0 and self.dropped == 0) return self.head.items;
+
+        var gap_buf: [gap_line_max]u8 = undefined;
+        const gap: []const u8 = if (self.dropped == 0) "" else self.gapLine(&gap_buf);
+        const out = try arena.alloc(u8, self.head.items.len + gap_line_max + self.ring_len);
+        @memcpy(out[0..self.head.items.len], self.head.items);
+        @memcpy(out[self.head.items.len..][0..gap.len], gap);
+
+        const tail = out[self.head.items.len + gap.len ..][0..self.ring_len];
+        const first = @min(self.ring.len - self.ring_at, self.ring_len);
+        @memcpy(tail[0..first], self.ring[self.ring_at..][0..first]);
+        @memcpy(tail[first..], self.ring[0 .. self.ring_len - first]);
+        return out[0 .. self.head.items.len + gap.len + self.ring_len];
+    }
+
+    /// Its own line, on both sides, so it cannot merge with a line of real
+    /// output and cannot be read as one. Carries the digest of the whole stream:
+    /// a caller holding nothing but this stdout can still check it against the
+    /// receipt.
+    ///
+    /// Written into the caller's buffer rather than allocated, for the reason
+    /// `digest.hex` is: the buffer is a compile-time constant and the allocation
+    /// it would otherwise make is inside the one path whose whole point is that
+    /// its cost is fixed.
+    fn gapLine(self: *const Capture, out: *[gap_line_max]u8) []const u8 {
+        var sha: [digest.hex_len]u8 = undefined;
+        _ = self.running.peekHex(&sha);
+        return std.fmt.bufPrint(out, gap_line_format, .{
+            self.dropped,
+            self.total,
+            self.head.items.len,
+            self.ring_len,
+            self.total,
+            sha[0..],
+        }) catch unreachable; // `gap_line_max` is this format at its widest.
+    }
+};
+
+/// Applies the ceiling to output a transport handed over whole.
+///
+/// Two callers need it. The daemon protocol frames a reply as one message, so
+/// `daemon/Client.exec` is already holding every byte by the time anything can
+/// look at it; and `Scripted` replays a fixture. Neither gets a smaller peak out
+/// of this — what it buys is that the receipt's three numbers mean the same
+/// thing on every transport, and that a caller's stdout is bounded and its gap
+/// marked whichever transport served it.
+///
+/// `pieces` is the size of the handovers the bytes are fed in. The daemon passes
+/// its whole reply, because that is what actually happened; a harness passes
+/// `read_bytes` to reproduce the channel's own boundaries.
+pub fn retain(
+    arena: Allocator,
+    result: ExecResult,
+    output: *Retained,
+    pieces: usize,
+) Allocator.Error!ExecResult {
+    output.* = .{};
+    var stdout: Capture = .init(arena, output_ceiling);
+    var stderr: Capture = .init(arena, output_ceiling);
+    try feed(&stdout, result.stdout, pieces);
+    try feed(&stderr, result.stderr, pieces);
+    output.stdout = stdout.passed();
+    output.stderr = stderr.passed();
+    return .{
+        .exit_code = result.exit_code,
+        .stdout = try stdout.render(arena),
+        .stderr = try stderr.render(arena),
+    };
+}
+
+fn feed(capture: *Capture, bytes: []const u8, pieces: usize) Allocator.Error!void {
+    const step = @max(pieces, 1);
+    var rest = bytes;
+    while (rest.len > 0) {
+        const n = @min(step, rest.len);
+        try capture.push(rest[0..n]);
+        rest = rest[n..];
     }
 }
 

@@ -1536,6 +1536,86 @@
       "find": "    const normalize = parsed.boolean(\"normalize-lf\");",
       "replace": "    const normalize = !parsed.boolean(\"normalize-lf\");",
       "expect_gate": "gate: the command keeps its carriage returns unless normalization is asked for"
+    },
+    {
+      "id": "M4-output-ceiling-keeps-both-ends",
+      "rule": "A stream over the ceiling renders as its head *and* its tail. Returning the head alone loses the exit-marker line the supervisor puts last, so every large-output command settles `indeterminate` — a command whose status was never in doubt reported as unknown.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        return out[0 .. self.head.items.len + gap.len + self.ring_len];",
+      "replace": "        return out[0 .. self.head.items.len];",
+      "expect_gate": "gate: a command far larger than the output ceiling still reports its own exit code"
+    },
+    {
+      "id": "M4-output-peak-does-not-track-the-output",
+      "rule": "The retained rendering is a constant-size allocation. A cost proportional to the output — even a thousandth of it — is the unbounded drain this ceiling replaced wearing a smaller constant: it fits any budget twice over and still grows without limit.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        const out = try arena.alloc(u8, self.head.items.len + gap_line_max + self.ring_len);",
+      "replace": "        const out = try arena.alloc(u8, self.head.items.len + gap_line_max + self.ring_len + @as(usize, @intCast(self.total / 1000)));",
+      "expect_gate": "gate: the output ceiling's peak allocation does not grow with the output"
+    },
+    {
+      "id": "M4-output-count-is-every-byte-that-passed",
+      "rule": "`Passed.bytes` counts every byte off the channel, not the last read. A count that described only part of the stream would make a 10 GiB run and a 1 MiB run indistinguishable on the receipt.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        self.total += chunk.len;",
+      "replace": "        self.total = chunk.len;",
+      "expect_gate": "gate: the output ceiling keeps both ends at the boundary and drops only above it"
+    },
+    {
+      "id": "M4-output-digest-covers-the-dropped-bytes",
+      "rule": "The digest is taken over the whole stream including the middle nobody was given. A digest of only part of it cannot be checked against a full copy fetched later, which is the entire reason a truncated run is still auditable.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        self.running.update(chunk);",
+      "replace": "        self.running.update(chunk[0 .. chunk.len / 2]);",
+      "expect_gate": "gate: the output ceiling keeps both ends at the boundary and drops only above it"
+    },
+    {
+      "id": "M4-truncation-is-marked-in-the-stream",
+      "rule": "The gap marker is written when bytes were dropped and never when they were not. Its absence is what makes its presence mean something: an agent parsing a stdout whose middle silently vanished draws a wrong conclusion and never learns that it did.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        const gap: []const u8 = if (self.dropped == 0) \"\" else self.gapLine(&gap_buf);",
+      "replace": "        const gap: []const u8 = if (self.dropped != 0) \"\" else self.gapLine(&gap_buf);",
+      "expect_gate": "gate: the output ceiling keeps both ends at the boundary and drops only above it"
+    },
+    {
+      "id": "M4-tail-keeps-the-end-of-an-oversized-read",
+      "rule": "A read at least as large as the ring leaves its *last* `ring.len` bytes behind, not its first. Keeping the front of it puts the middle of the stream where the end belongs, so the exit marker is gone while `truncated` still reports the truth.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "            @memcpy(self.ring, rest[rest.len - self.ring.len ..]);",
+      "replace": "            @memcpy(self.ring, rest[0..self.ring.len]);",
+      "expect_gate": "gate: the tail ring returns the last bytes of the stream whatever the read boundaries were"
+    },
+    {
+      "id": "M4-receipt-records-the-output-total",
+      "rule": "`stdout_bytes` is the total that came off the channel. `observed.stdout.len` — the marker-stripped length — was recorded here, and under a ceiling it is none of the numbers a reader could want: not the total, not the retained amount, and not a prefix of either.",
+      "file": "src/core/execution.zig",
+      "find": "            .bytes = @intCast(output.stdout.bytes),",
+      "replace": "            .bytes = @intCast(observed.stdout.len),",
+      "expect_gate": "gate: a run under the output ceiling is unchanged and its receipt says nothing was dropped"
+    },
+    {
+      "id": "M4-receipt-records-that-output-was-truncated",
+      "rule": "The receipt says whether the middle of a stream was dropped. A column reading `false` on a truncated run is the pseudo-success this slice exists to prevent: the caller has partial output and a ledger telling it the output is complete.",
+      "file": "src/core/execution.zig",
+      "find": "            .truncated = output.stdout.truncated,",
+      "replace": "            .truncated = false,",
+      "expect_gate": "gate: a command far larger than the output ceiling still reports its own exit code"
+    },
+    {
+      "id": "M4-exit-marker-bound-is-the-widest-line",
+      "rule": "The floor under the ceiling's tail is the widest exit-marker line the supervisor can print — a `u64` nonce and the widest exit status. A bound computed from narrower arguments would let the tail shrink below a line it must always hold whole.",
+      "file": "src/core/execution.zig",
+      "find": "    .{ std.math.maxInt(u64), std.math.minInt(i32) },",
+      "replace": "    .{ std.math.maxInt(u32), std.math.minInt(i8) },",
+      "expect_gate": "gate: the output ceiling's tail cannot lose the exit marker"
+    },
+    {
+      "id": "M4-truncation-notice-names-the-stream-that-was-cut",
+      "rule": "The human notice names which stream lost its middle. Reporting both when only one was cut tells an operator that stderr is incomplete when it is whole, which is the same class of wrong answer in the other direction.",
+      "file": "src/cli/cmd_exec.zig",
+      "find": "    const which: []const u8 = if (retained.stdout.truncated and retained.stderr.truncated)",
+      "replace": "    const which: []const u8 = if (retained.stdout.truncated or retained.stderr.truncated)",
+      "expect_gate": "gate: the truncation notice appears exactly when something was dropped"
     }
   ]
 }

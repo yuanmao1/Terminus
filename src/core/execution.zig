@@ -2223,6 +2223,13 @@ pub const RunOutcome = struct {
     stdout: []const u8,
     stderr: []const u8,
     identity: ?supervisor.Identity,
+    /// What passed through the two output streams, and whether the middle of
+    /// either was dropped on the way to `stdout`/`stderr` above.
+    ///
+    /// Null on a path that drained no exec channel: an exec inside a tmux
+    /// session reads the pane through a cursor and never sees the two streams
+    /// apart, so it has no such reading rather than a zero one.
+    output: ?Ssh.Retained = null,
 };
 
 /// Either the command ran (however it ended), or the guard refused to let it
@@ -2246,10 +2253,29 @@ pub const RunResult = union(enum) {
 /// `accepted` is written by the pump on **every** path including the failing
 /// ones, so it is the only thing a caller learns about a rejected input, and it
 /// is what the receipt records rather than the source's length.
-pub const Input = struct {
-    source: *std.Io.Reader,
-    accepted: *Ssh.Accepted,
-};
+pub const Input = Ssh.InputStream;
+
+/// The longest an exit-marker line `supervisor.wrapShell` can emit.
+///
+/// Every field in it is a bounded integer, so this is a real bound and not an
+/// estimate: the marker text, a `u64` nonce, and the `$?` the subshell reports,
+/// rendered at their widest, plus a CRLF for a shell that sends one.
+/// `wrapShell`'s own output is held against it by a gate, so the literal below
+/// cannot drift away from the line it describes.
+pub const exit_marker_max_line = std.fmt.comptimePrint(
+    "__TERMINUS_EXIT_{d}__ code={d}\r\n",
+    .{ std.math.maxInt(u64), std.math.minInt(i32) },
+).len;
+
+comptime {
+    // The floor under the output ceiling's tail, and the reason the ceiling
+    // keeps a tail at all. Below this a large-output command loses its exit
+    // marker, `parseShell` finds no status, and `runCommand` settles
+    // `indeterminate` — a command whose outcome was never in doubt reported as
+    // unknown. A compile-time fact rather than a hope: nobody can shrink the
+    // tail past it without the build saying so.
+    std.debug.assert(Ssh.output_ceiling.tail >= exit_marker_max_line);
+}
 
 pub fn runCommand(
     execution: *Execution,
@@ -2264,10 +2290,9 @@ pub fn runCommand(
         .refused => |blocker| return .{ .refused = blocker },
     }
 
-    const result = (if (input) |in|
-        executor.execWithStdin(execution.arena, wrapped, in.source, in.accepted)
-    else
-        executor.exec(execution.arena, wrapped)) catch |err| {
+    // Filled on every path, so a transport loss still reports what arrived.
+    var output: Ssh.Retained = .{};
+    const result = executor.execRetained(execution.arena, wrapped, input, &output) catch |err| {
         // We do not know whether the remote ran it. Say so — and when there was
         // an input, say how much of it went, because a command that read a
         // prefix may have acted on it.
@@ -2281,6 +2306,7 @@ pub fn runCommand(
             .stdout = "",
             .stderr = "",
             .identity = null,
+            .output = output,
         } };
     };
 
@@ -2306,8 +2332,23 @@ pub fn runCommand(
             .bytes = @intCast(in.accepted.bytes),
             .sha256 = in.accepted.sha256[0..],
         } else .{},
-        .stdout = .{ .bytes = @intCast(observed.stdout.len) },
-        .stderr = .{ .bytes = @intCast(observed.stderr.len) },
+        // Everything that passed, and whether the caller got all of it.
+        //
+        // `observed.stdout.len` was here, and it was the marker-stripped length
+        // of what came back — neither the total that passed nor the amount
+        // retained, and under a ceiling it is not even a subset of one of them.
+        // The columns exist to answer "how much came out of this command", and
+        // the only reading that answers it is the channel's own.
+        .stdout = .{
+            .bytes = @intCast(output.stdout.bytes),
+            .sha256 = output.stdout.sha256[0..],
+            .truncated = output.stdout.truncated,
+        },
+        .stderr = .{
+            .bytes = @intCast(output.stderr.bytes),
+            .sha256 = output.stderr.sha256[0..],
+            .truncated = output.stderr.truncated,
+        },
         .remote_pid = if (observed.identity) |i| i.pid else null,
         .remote_pgid = if (observed.identity) |i| i.pgid else null,
         .remote_start_token = if (observed.identity) |i| i.start_token else null,
@@ -2321,6 +2362,7 @@ pub fn runCommand(
             .stdout = observed.stdout,
             .stderr = observed.stderr,
             .identity = observed.identity,
+            .output = output,
         } };
     }
 
@@ -2338,6 +2380,7 @@ pub fn runCommand(
         .stdout = observed.stdout,
         .stderr = observed.stderr,
         .identity = observed.identity,
+        .output = output,
     } };
 }
 

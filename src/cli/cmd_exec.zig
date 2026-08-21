@@ -223,6 +223,17 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             // different fact from a zero-byte input.
             .stdinBytes = if (input == null) null else @as(?i64, @intCast(accepted.bytes)),
             .stdinSha256 = if (input == null) null else @as(?[]const u8, accepted.sha256[0..]),
+            // What came out, from the channel's own count rather than from the
+            // length of the text above — those two differ once the ceiling has
+            // dropped a middle, and `stdout` above is then the shorter one.
+            // `stdoutSha256` covers every byte that passed, including the ones
+            // no caller was given, so a truncated run is still checkable.
+            .stdoutBytes = if (outcome.output) |o| @as(?i64, @intCast(o.stdout.bytes)) else null,
+            .stdoutSha256 = if (outcome.output) |o| @as(?[]const u8, o.stdout.sha256[0..]) else null,
+            .stdoutTruncated = if (outcome.output) |o| @as(?bool, o.stdout.truncated) else null,
+            .stderrBytes = if (outcome.output) |o| @as(?i64, @intCast(o.stderr.bytes)) else null,
+            .stderrSha256 = if (outcome.output) |o| @as(?[]const u8, o.stderr.sha256[0..]) else null,
+            .stderrTruncated = if (outcome.output) |o| @as(?bool, o.stderr.truncated) else null,
             // The command text's line endings, as read. 0.2.0 sends them
             // unchanged, so an agent that needs LF asks for it and can see
             // whether it got it.
@@ -232,6 +243,11 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         .human => {
             try ctx.out.print("{s}", .{outcome.stdout});
             if (outcome.stderr.len != 0) std.debug.print("{s}", .{outcome.stderr});
+            // Said out here as well as marked in the stream, because the two
+            // reach different readers: the marker is for whatever parses
+            // stdout, and this line is for the person watching.
+            if (truncationNotice(ctx, outcome.output)) |note|
+                std.debug.print("terminus: {s}\n", .{note});
             if (advisoryText(ctx, execution.advisory)) |note|
                 std.debug.print("note: {s}\n", .{note});
             if (outcome.exit_code) |code| {
@@ -331,6 +347,7 @@ fn runOneShot(
         else
             outcome.stderr,
         .identity = outcome.identity,
+        .output = outcome.output,
     };
 }
 
@@ -433,6 +450,33 @@ fn runInSession(
         .stderr = "",
         .identity = null,
     };
+}
+
+/// What to tell a person when the ceiling dropped the middle of a stream.
+///
+/// Null when nothing was dropped, and null on a path with no such reading at
+/// all — a session exec never sees the two streams apart. `pub` so a gate holds
+/// the sentence and the condition together: the number a reader acts on is how
+/// much is *missing*, and a notice that appeared on a complete run would train
+/// them to ignore it.
+pub fn truncationNotice(ctx: *Cli.Ctx, output: ?Core.Ssh.Retained) ?[]const u8 {
+    const retained = output orelse return null;
+    const which: []const u8 = if (retained.stdout.truncated and retained.stderr.truncated)
+        "stdout and stderr"
+    else if (retained.stdout.truncated)
+        "stdout"
+    else if (retained.stderr.truncated)
+        "stderr"
+    else
+        return null;
+    return std.fmt.allocPrint(
+        ctx.arena,
+        "{s} exceeded the {d} KiB output ceiling; the middle was dropped and marked in the stream " ++
+            "with {s}. The receipt records the full byte count and a SHA-256 over every byte that " ++
+            "passed, so nothing here is unaccounted for — re-run writing to a remote file and " ++
+            "'terminus pull' it to keep all of it",
+        .{ which, Core.Ssh.output_ceiling.total() / 1024, Core.Ssh.gap_marker },
+    ) catch null;
 }
 
 fn advisoryText(ctx: *Cli.Ctx, advisory: ?Core.execution.Blocker) ?[]const u8 {

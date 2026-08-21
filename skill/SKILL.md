@@ -1051,3 +1051,53 @@ When it does not work:
 - it needs a direct SSH connection: the local daemon's pooled protocol carries
   a command and an answer and no third channel. terminus takes a direct
   connection for you and reports it in `transport`/`daemonError`.
+
+## What a command's output does when there is a lot of it
+
+A command's output is capped at **1 MiB**, and the cap keeps **both ends**: the
+first 512 KiB and the last 512 KiB. Anything between them is dropped and the
+place it went is marked, in the stream, with a line beginning
+`__TERMINUS_OUTPUT_TRUNCATED__`.
+
+Read that marker as authoritative. **If it is absent, you have every byte the
+command printed.** If it is present, you do not — and you must not draw a
+conclusion from output whose middle is missing without saying so.
+
+```bash
+# Nothing to think about: output under 1 MiB comes back byte-for-byte.
+terminus exec web --cmd "systemctl status nginx"
+
+# Large output. Read the marker and the counts, not just the text.
+terminus exec web --json --cmd "journalctl -u api --no-pager"
+```
+
+`--json` carries the whole story, and the receipt (`terminus history`) stores the
+same three numbers:
+
+- `stdoutBytes` — every byte that **passed**, not the amount you were given. On a
+  truncated run this is larger than the `stdout` you can see.
+- `stdoutSha256` — the SHA-256 of **all** of those bytes, including the ones that
+  were dropped. It is computed as the output streams, so a truncated run is still
+  provable: you can check a full copy you fetch later against this digest.
+- `stdoutTruncated` — `true` exactly when the middle was dropped. `stderrBytes`,
+  `stderrSha256` and `stderrTruncated` say the same for the other stream, which
+  is capped the same way.
+
+Why both ends rather than a simple head or tail: terminus reads the command's
+process identity from the *first* line of the stream and its exit status from the
+*last*. A head-only cap would lose the exit status and report a perfectly ordinary
+command as `indeterminate` (exit 75); a tail-only cap would lose the pid and pgid
+the attempt is reconciled by. Keeping both is what lets a command that prints ten
+gigabytes still come back with its own exit code.
+
+**When you need all of it, do not raise the ceiling — move the bytes as a file.**
+
+```bash
+terminus exec web --cmd "journalctl -u api --no-pager > /tmp/api.log"
+terminus pull web /tmp/api.log ./api.log   # any size, resumable, digest-verified
+```
+
+Peak local memory is fixed at the cap and does not grow with the output, so a
+command that prints ten gigabytes costs the same as one that prints ten
+kilobytes. Note that this cap is on a **command's** output; `terminus pull` and
+`terminus push` stream and are not subject to it.

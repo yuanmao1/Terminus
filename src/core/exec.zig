@@ -24,28 +24,45 @@ pub const Executor = union(enum) {
         };
     }
 
-    /// `exec`, with local bytes streamed to the command's standard input.
+    /// `exec` under a ceiling on what is kept from the command's output, with
+    /// local bytes optionally streamed to its standard input.
     ///
-    /// `taken` is filled whether this succeeds or fails: it is the count the
-    /// channel accepted and the digest of exactly those bytes, and it is what
-    /// the terminal receipt records.
-    pub fn execWithStdin(
+    /// The command path's entry point, and the reason it is not `exec`: a
+    /// command's output is as large as the user's command chooses to make it,
+    /// while every other caller of `exec` asks a question with a bounded answer
+    /// and one of them (`transfer.pullBytes`) must hold the whole reply to verify
+    /// a digest over it. See `Ssh.exec` and `Ssh.Capture`.
+    ///
+    /// `input.accepted` is filled whether this succeeds or fails: it is the count
+    /// the channel accepted and the digest of exactly those bytes. `output` is
+    /// filled on every path too, and it is what the terminal receipt records
+    /// about the streams that came back.
+    pub fn execRetained(
         e: Executor,
         arena: Allocator,
         command: []const u8,
-        source: *std.Io.Reader,
-        taken: *Ssh.Accepted,
+        input: ?Ssh.InputStream,
+        output: *Ssh.Retained,
     ) (Ssh.ExecError || Ssh.InputError)!Ssh.ExecResult {
         return switch (e) {
-            .direct => |client| client.execWithStdin(arena, command, source, taken),
+            .direct => |client| client.execRetained(arena, command, input, output),
             // The daemon protocol carries a command and an answer and nothing
             // else — there is no third channel to stream into. Refused rather
             // than run without its input: a command that reads stdin and is
             // handed an immediate EOF reports success having done nothing. The
             // CLI keeps this unreachable by taking a direct connection when an
             // input source was named; this is the refusal behind that.
-            .daemon => error.InputUnsupported,
-            .scripted => |client| client.execWithStdin(arena, command, source, taken),
+            //
+            // Without an input it serves the command path like any other
+            // transport, and its reply goes through the same ceiling so the
+            // receipt says the same kind of thing whichever one answered. The
+            // peak on this path is the protocol's, not the ceiling's: the reply
+            // is one framed message and `roundTrip` has already read all of it.
+            .daemon => |client| if (input != null)
+                error.InputUnsupported
+            else
+                Ssh.retain(arena, try client.exec(arena, command), output, std.math.maxInt(usize)),
+            .scripted => |client| client.execRetained(arena, command, input, output),
         };
     }
 
@@ -100,6 +117,10 @@ pub const Scripted = struct {
     /// How many times bytes were offered, so a gate can tell a single write
     /// from a loop that re-offered what a short write left behind.
     offers: usize = 0,
+    /// The size of the pieces a reply's output is handed to the ceiling in.
+    /// Defaults to the real channel's read size, so a gate gets the same
+    /// boundaries `drainBoth` produces unless it asks for different ones.
+    reads_of: usize = Ssh.read_bytes,
 
     /// What the scripted channel does with offered input.
     pub const Intake = union(enum) {
@@ -171,23 +192,40 @@ pub const Scripted = struct {
         };
     }
 
-    /// `exec`, after streaming `source` into this channel.
+    /// `exec`, after streaming `source` into this channel and under the same
+    /// output ceiling the real channel applies.
     ///
-    /// The input is pumped through the same `Ssh.pumpInput` the real channel
-    /// uses, so what a gate drives here is the production loop with a
-    /// stand-in for the one part of it a test cannot reach. A rejected input
-    /// never reaches `exec`, which is the real ordering: the write happens
+    /// Two production loops run here with a stand-in for the one part of each a
+    /// test cannot reach. The input is pumped through `Ssh.pumpInput`, and the
+    /// output goes through `Ssh.Capture` in `reads_of`-sized pieces — the
+    /// channel's own read size by default, so a gate drives the same head/ring
+    /// arithmetic against the same boundaries `drainBoth` produces, including a
+    /// read that stops in the middle of the exit-marker line. A rejected input
+    /// never reaches the reply, which is the real ordering: the write happens
     /// before the output is drained.
-    pub fn execWithStdin(
+    pub fn execRetained(
         s: *Scripted,
         arena: Allocator,
         command: []const u8,
-        source: *std.Io.Reader,
-        taken: *Ssh.Accepted,
+        input: ?Ssh.InputStream,
+        output: *Ssh.Retained,
     ) (Ssh.ExecError || Ssh.InputError)!Ssh.ExecResult {
-        var input: Input = .{ .owner = s };
-        try Ssh.pumpInput(source, input.sink(), taken);
-        return s.exec(arena, command);
+        output.* = .{};
+        if (input) |in| {
+            var sink: Input = .{ .owner = s };
+            try Ssh.pumpInput(in.source, sink.sink(), in.accepted);
+        }
+        s.seen.append(s.arena, s.arena.dupe(u8, command) catch command) catch {};
+        if (s.index >= s.steps.len) return error.ExecFailed;
+        const step = s.steps[s.index];
+        s.index += 1;
+        return switch (step) {
+            // Not duped onto `arena` first: a harness that copied the whole
+            // fixture before the ceiling saw it would be the thing that grew,
+            // and the bounded-memory gate would be measuring the harness.
+            .reply => |r| Ssh.retain(arena, r, output, s.reads_of),
+            .transport_error => |err| err,
+        };
     }
 
     pub fn errorMessage(s: *const Scripted) []const u8 {
