@@ -4,8 +4,17 @@
 //! Failure policy: acquire() returns a diagnosis instead of silently
 //! returning null — the caller (cli.connect) decides to fall back to
 //! direct SSH but always *reports* which transport served the request and
-//! why the daemon was skipped. A version-mismatched daemon (stale binary)
-//! is stopped and respawned once, transparently.
+//! why the daemon was skipped.
+//!
+//! **A daemon from another build is named, not respawned over.** The CLI
+//! auto-starts the daemon, so a stale one from a previous build can already hold
+//! the socket when a new client arrives. Spawning cannot displace it — the bind
+//! fails, the new process sees a live socket and exits — and its own `stop`
+//! cannot reach it either, because a stop request in this build's protocol is
+//! one the old daemon refuses. So the skew is reported by name, with the command
+//! that clears it, and the CLI falls back to direct SSH loudly. It used to
+//! report "mismatch after respawn", which described a respawn that had not
+//! happened and named no way out.
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const Server = @import("Server.zig");
@@ -38,11 +47,23 @@ pub fn acquire(
 
     if (connectTo(io, path)) |stream| {
         var client: DaemonClient = .{ .io = io, .arena = arena, .stream = stream, .request = request };
-        // Version handshake: a stale daemon (older binary) must not serve
-        // new-protocol requests. Stop it and respawn below.
-        if (client.ping()) |_| return .{ .ok = client };
-        client.stop() catch {};
-        client.deinit();
+        // Version handshake: a stale daemon (older build) must not serve
+        // new-protocol requests.
+        switch (client.handshake()) {
+            .ok => return .{ .ok = client },
+            // Spawning past it is impossible and stopping it is impossible; the
+            // operator is the only one who can clear it. See the file header.
+            .skew => |reason| {
+                client.deinit();
+                return .{ .unavailable = reason };
+            },
+            // Connected, then the conversation broke for a reason that is not a
+            // version. Best-effort stop, then respawn below.
+            .broken => {
+                client.stop() catch {};
+                client.deinit();
+            },
+        }
     }
 
     spawnDaemon(io, environ) catch |err| {
@@ -55,9 +76,17 @@ pub fn acquire(
         std.Io.sleep(io, .{ .nanoseconds = @intCast(delay_ms * std.time.ns_per_ms) }, .awake) catch {};
         if (connectTo(io, path)) |stream| {
             var client: DaemonClient = .{ .io = io, .arena = arena, .stream = stream, .request = request };
-            if (client.ping()) |_| return .{ .ok = client };
-            client.deinit();
-            return .{ .unavailable = "daemon protocol version mismatch after respawn" };
+            switch (client.handshake()) {
+                .ok => return .{ .ok = client },
+                .skew => |reason| {
+                    client.deinit();
+                    return .{ .unavailable = reason };
+                },
+                .broken => {
+                    client.deinit();
+                    return .{ .unavailable = "daemon did not answer a ping after respawn" };
+                },
+            }
         }
         delay_ms *= 2;
     }
@@ -73,55 +102,175 @@ pub fn errorMessage(client: *const DaemonClient) []const u8 {
     return client.last_error;
 }
 
-/// Sends the exec request over the daemon socket. Error surface matches
-/// Ssh.exec so the Executor union stays uniform.
+/// Sends the exec request over the daemon socket, keeping the whole reply.
+/// Error surface matches Ssh.exec so the Executor union stays uniform.
 pub fn exec(client: *DaemonClient, arena: std.mem.Allocator, command: []const u8) Ssh.ExecError!Ssh.ExecResult {
+    const response = try client.execExchange(arena, command, .whole);
+    return .{
+        .exit_code = response.exitCode,
+        .stdout = response.stdout.bytes,
+        .stderr = response.stderr.bytes,
+    };
+}
+
+/// `exec` under `Ssh.output_ceiling`, applied by the daemon at the channel it
+/// drained rather than by this process at a reply it already holds.
+///
+/// That is the whole of why this exists as its own entry point. The ceiling
+/// cannot be applied here: by the time a reply is in hand every byte of it has
+/// already been read, so a ceiling on this side would bound nothing and the
+/// daemon's own peak would still grow with the command's output. Applied over
+/// there, one constant — the same `Ssh.output_ceiling` the direct transport uses
+/// — bounds the daemon's peak, this process's peak, and the width of the frame
+/// between them.
+///
+/// `output` is filled from the accounting the daemon sends back, which is the
+/// accounting its `Ssh.Capture` took over the bytes as they arrived. Not
+/// recomputed here: a second pass over the *retained* rendering would describe
+/// the truncated stream and report it as the whole one.
+pub fn execRetained(
+    client: *DaemonClient,
+    arena: std.mem.Allocator,
+    command: []const u8,
+    output: *Ssh.Retained,
+) Ssh.ExecError!Ssh.ExecResult {
+    output.* = .{};
+    const response = try client.execExchange(arena, command, .retained);
+    // A reply with no accounting is a reply to some other question — a `.whole`
+    // run took no digest and has none to give. Refused rather than defaulted:
+    // zeros here would become a receipt claiming an empty stream was observed.
+    const passed = response.passed orelse {
+        client.last_error = "daemon replied without the output accounting a retained request asks for";
+        return error.ExecFailed;
+    };
+    output.stdout = protocol.passedFrom(passed.stdout) catch return client.badReply();
+    output.stderr = protocol.passedFrom(passed.stderr) catch return client.badReply();
+    return .{
+        .exit_code = response.exitCode,
+        .stdout = response.stdout.bytes,
+        .stderr = response.stderr.bytes,
+    };
+}
+
+fn execExchange(
+    client: *DaemonClient,
+    arena: std.mem.Allocator,
+    command: []const u8,
+    output: protocol.Request.Output,
+) Ssh.ExecError!protocol.Response {
     var request = client.request;
     request.v = protocol.version;
     request.op = .exec;
     request.command = command;
+    request.output = output;
 
-    const response = client.roundTrip(protocol.Response, request) orelse {
-        client.last_error = "daemon connection lost mid-request";
-        return error.ExecFailed;
+    // The caller's arena, not this client's: the reply's payloads are decoded
+    // straight onto it and are the largest thing a command produces, so they
+    // have to die when the caller's work does. `pullBytes` asks a hundred of
+    // these questions in a row.
+    const response = switch (client.roundTrip(arena, request)) {
+        .reply => |r| r,
+        .skew => |peer| {
+            client.last_error = skewReason(client.arena, peer);
+            return error.ExecFailed;
+        },
+        .broken => {
+            client.last_error = "daemon connection lost mid-request";
+            return error.ExecFailed;
+        },
     };
     if (!response.ok) {
-        client.last_error = arena.dupe(u8, response.@"error" orelse "daemon error") catch "daemon error";
+        // Onto this client's arena, because the message is read after the
+        // caller's work — and its arena — may be gone.
+        client.last_error = client.arena.dupe(u8, response.@"error" orelse "daemon error") catch "daemon error";
         return error.ExecFailed;
     }
-    return .{
-        .exit_code = response.exitCode,
-        .stdout = arena.dupe(u8, response.stdout) catch return error.OutOfMemory,
-        .stderr = arena.dupe(u8, response.stderr) catch return error.OutOfMemory,
-    };
+    return response;
 }
+
+/// A reply this build could parse but could not believe: an accounting whose
+/// digest is not one. Refused rather than stored — see `protocol.passedFrom`.
+fn badReply(client: *DaemonClient) Ssh.ExecError {
+    client.last_error = "daemon reported an output digest that is not a SHA-256";
+    return error.ExecFailed;
+}
+
+/// What one request/response exchange produced.
+const Exchange = union(enum) {
+    reply: protocol.Response,
+    /// The peer answered, but not in this build's protocol. Carries the version
+    /// it claimed, when the reply was well-formed enough to read one — an older
+    /// daemon's reply is not, because it is not framed.
+    skew: ?u32,
+    /// The conversation broke.
+    broken,
+};
 
 /// Pings over this client's connection; returns the daemon pid, or null
 /// on any failure (including protocol version mismatch).
 pub fn ping(client: *DaemonClient) ?u32 {
-    const response = client.roundTrip(protocol.Response, protocol.Request{
-        .v = protocol.version,
-        .op = .ping,
-    }) orelse return null;
-    return if (response.ok) response.pid else null;
+    return switch (client.handshake()) {
+        .ok => |pid| pid,
+        .skew, .broken => null,
+    };
+}
+
+const Handshake = union(enum) {
+    ok: u32,
+    /// A daemon speaking some other protocol, and the sentence that says so.
+    skew: []const u8,
+    /// Connected, but the conversation broke for a reason that is not a version.
+    broken,
+};
+
+fn handshake(client: *DaemonClient) Handshake {
+    return switch (client.roundTrip(client.arena, protocol.Request{ .v = protocol.version, .op = .ping })) {
+        .reply => |response| if (response.ok) .{ .ok = response.pid } else .broken,
+        .skew => |peer| .{ .skew = skewReason(client.arena, peer) },
+        .broken => .broken,
+    };
+}
+
+fn skewReason(arena: std.mem.Allocator, peer: ?u32) []const u8 {
+    const fallback = "a daemon from another build holds the socket and does not speak this build's protocol; run `terminus daemon restart --force`, then retry";
+    if (peer) |v| return std.fmt.allocPrint(
+        arena,
+        "a daemon from another build holds the socket (it speaks protocol v{d}, this build speaks v{d}); run `terminus daemon restart --force`, then retry",
+        .{ v, protocol.version },
+    ) catch fallback;
+    return fallback;
 }
 
 pub fn stop(client: *DaemonClient) !void {
-    _ = client.roundTrip(protocol.Response, protocol.Request{
-        .v = protocol.version,
-        .op = .stop,
-    }) orelse return error.StopFailed;
+    switch (client.roundTrip(client.arena, protocol.Request{ .v = protocol.version, .op = .stop })) {
+        .reply => {},
+        .skew, .broken => return error.StopFailed,
+    }
 }
 
-fn roundTrip(client: *DaemonClient, comptime R: type, request: anytype) ?R {
+fn roundTrip(client: *DaemonClient, arena: std.mem.Allocator, request: protocol.Request) Exchange {
     var write_buffer: [1 << 16]u8 = undefined;
     var writer = client.stream.writer(client.io, &write_buffer);
-    protocol.writeMessage(&writer.interface, request) catch return null;
+    protocol.writeMessage(&writer.interface, request) catch return .broken;
 
-    var read_buffer: [1 << 20]u8 = undefined;
+    // Eight bytes is all this has to hold: the payload is read into an
+    // allocation of exactly its announced size. The buffer used to be a 1 MiB
+    // stack array that the whole reply had to fit inside, which is what turned a
+    // large successful command into an unknown outcome.
+    var read_buffer: [1 << 12]u8 = undefined;
     var reader = client.stream.reader(client.io, &read_buffer);
-    const line = (reader.interface.takeDelimiter('\n') catch return null) orelse return null;
-    return protocol.parseMessage(R, client.arena, line) catch null;
+    const payload = (protocol.readFrame(&reader.interface, arena) catch |err| switch (err) {
+        // An unframed answer is what a daemon from an older build sends. Its
+        // version is unreadable from here, so the skew is named without one.
+        error.MalformedFrame, error.FrameTooLarge => return .{ .skew = null },
+        else => return .broken,
+    }) orelse return .broken;
+
+    const response = protocol.parseMessage(protocol.Response, arena, payload) catch |err| switch (err) {
+        error.VersionMismatch => return .{ .skew = protocol.peerVersion(arena, payload) },
+        error.MalformedMessage => return .broken,
+    };
+    return .{ .reply = response };
 }
 
 fn connectTo(io: std.Io, path: []const u8) ?std.Io.net.Stream {

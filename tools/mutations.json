@@ -38,7 +38,19 @@
     "also become unrunnable for a second reason: its `find` text now appears",
     "twice in migrate.zig, once in the DDL and once in the `frozenStatement`",
     "call that pins it, which is why it reported NOT_APPLIED rather than",
-    "BUILD_ERROR.)"
+    "BUILD_ERROR.)",
+    "Unanchored gate, recorded so nobody reads its absence as the rule lapsing:",
+    "`gate: the daemon reply path's peak allocation does not grow with the",
+    "output` (src/core/daemon/protocol_test.zig) has no entry of its own. What it",
+    "measures is `Ssh.Capture` fed in the channel's read size plus the whole",
+    "reply-building path on top; the reply-building path allocates nothing, so",
+    "every allocation the gate can see belongs to the ceiling and is already",
+    "mutation-proven one layer down by `M4-output-peak-does-not-track-the-output`",
+    "at src/core/ssh/Client.zig. The daemon-side half of the same claim — that",
+    "the daemon is asked for the bounded discipline rather than the whole reply —",
+    "is `M4d-daemon-asks-for-the-ceiling`. An entry that mutated protocol.zig",
+    "here would have to allocate from an allocator the gate does not measure, and",
+    "would report SURVIVED for a rule that is in fact enforced."
   ],
   "mutations": [
     {
@@ -1688,6 +1700,110 @@
       "find": "        !containsAny(input, &policy.builtin_secret_env) and\n        !containsBuiltinSecretHeader(input))",
       "replace": "        !containsAny(input, &policy.builtin_secret_env))",
       "expect_gate": "every builtin secret name is masked by the production redactor"
+    },
+    {
+      "id": "M4d-frame-read-at-announced-width",
+      "rule": "A framed payload is read at the width its header announced, never at the capacity of the buffer reading it. Reading it through a fixed buffer is the cliff that turned a large successful command into an unknown outcome: the read failed, the failure became `error.ExecFailed`, and `runCommand` records that as a transport loss.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "    const payload = reader.readAlloc(arena, len) catch |err| switch (err) {",
+      "replace": "    const payload = reader.readAlloc(arena, @min(len, 1 << 20)) catch |err| switch (err) {",
+      "expect_gate": "gate: a reply far larger than the old frame arrives whole with its exit code"
+    },
+    {
+      "id": "M4d-oversized-reply-refused-whole",
+      "rule": "A payload wider than the frame is refused before a byte goes out, and never shortened into one that fits: a truncated reply is a wrong answer and this protocol exists not to produce those.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "    const len = try payloadLen(value);\n    if (len > max_frame_bytes) return error.FrameTooLarge;",
+      "replace": "    const len = try payloadLen(value);\n    if (len > max_frame_bytes * 2) return error.FrameTooLarge;",
+      "expect_gate": "gate: a reply at the frame limit passes, one byte over is refused by name"
+    },
+    {
+      "id": "M4d-envelope-reserve-is-real",
+      "rule": "`exec_envelope_bytes` must really cover every non-payload field of a reply at its widest. The comptime proof that a retained reply always fits a frame rests on that reserve, so a reserve smaller than the envelope makes the proof say nothing.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "pub const exec_envelope_bytes = 1024;",
+      "replace": "pub const exec_envelope_bytes = 256;",
+      "expect_gate": "gate: the exec reply envelope fits the width the frame bound reserves for it"
+    },
+    {
+      "id": "M4d-header-is-the-payload-width",
+      "rule": "The eight-hex header is the width of the payload that follows it. This is the one disagreement in the protocol that is a hang rather than an error: a header that overstates its payload leaves every reader on a real socket waiting for a remainder that is never sent.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "    writer.print(\"{x:0>8}\", .{len}) catch return error.WriteFailed;",
+      "replace": "    writer.print(\"{x:0>8}\", .{len + 1}) catch return error.WriteFailed;",
+      "expect_gate": "gate: the frame's header is the length of the payload that follows it"
+    },
+    {
+      "id": "M4d-each-stream-keeps-its-digest",
+      "rule": "Each output stream's accounting on the wire is that stream's own. One stream's digest standing in for both is how stdout's receipt came to claim stderr's hash — and on the daemon path that hash is the only record of bytes the CLI never saw.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "            .stderr = streamOf(r.stderr),",
+      "replace": "            .stderr = streamOf(r.stdout),",
+      "expect_gate": "gate: each stream's accounting comes back as its own, digest and all"
+    },
+    {
+      "id": "M4d-reply-payloads-are-their-streams",
+      "rule": "A reply's two payloads are its two streams, in that order. A wire that put stdout in the stderr field would hand a caller output it never produced on the stream it was watching.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "        .stderr = .{ .bytes = result.stderr },",
+      "replace": "        .stderr = .{ .bytes = result.stdout },",
+      "expect_gate": "gate: output under the ceiling crosses the wire byte-for-byte"
+    },
+    {
+      "id": "M4d-base64-window-is-a-triple",
+      "rule": "Every base64 window is a multiple of three, so only the last group of a payload can be partial. A window that is not makes every window pad in the middle of the string and the concatenation stops being decodable — which is invisible for output small enough to fit one window, and so is a rule only a large reply can hold.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "        const group = 3 * 1024;",
+      "replace": "        const group = 1000;",
+      "expect_gate": "gate: a reply far larger than the old frame arrives whole with its exit code"
+    },
+    {
+      "id": "M4d-truncation-flag-crosses-the-wire",
+      "rule": "A retained reply reports whether the middle was dropped. A wire that always answers `truncated: false` makes a truncated run and a complete one produce the same receipt, which is the one thing the output ceiling exists to prevent.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "    return .{ .bytes = p.bytes, .sha256 = p.sha256, .truncated = p.truncated };",
+      "replace": "    return .{ .bytes = p.bytes, .sha256 = p.sha256, .truncated = false };",
+      "expect_gate": "gate: over the ceiling, both transports say the same thing about the same output"
+    },
+    {
+      "id": "M4d-whole-run-carries-no-accounting",
+      "rule": "A `.whole` run applies no ceiling and takes no digest, so its reply carries no accounting at all — the field is absent, never zeroed. Zeros would read as an observation that an empty stream came back.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "        } else null,",
+      "replace": "        } else .{ .stdout = streamOf(.{}), .stderr = streamOf(.{}) },",
+      "expect_gate": "gate: a reply with no accounting is refused rather than read as zeros"
+    },
+    {
+      "id": "M4d-version-must-match-exactly",
+      "rule": "A message whose protocol version is not this build's is refused. A build that also accepted the next version would read a frame it does not understand as one it does, and the skew would be answered wrongly instead of named.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "    if (value.v != version) return error.VersionMismatch;",
+      "replace": "    if (value.v != version and value.v != version + 1) return error.VersionMismatch;",
+      "expect_gate": "gate: a version skew is refused by name and hangs neither side"
+    },
+    {
+      "id": "M4d-daemon-asks-for-the-ceiling",
+      "rule": "On the daemon transport the command path asks for the bounded output discipline, so the ceiling is applied at the end that drains the channel and the accounting comes back on the wire. Asking for the whole reply instead leaves the receipt with nothing at all to say about the streams.",
+      "file": "src/core/exec.zig",
+      "find": "                client.execRetained(arena, command, output),",
+      "replace": "                client.exec(arena, command),",
+      "expect_gate": "gate: a large successful command over the daemon socket settles with its real exit code"
+    },
+    {
+      "id": "M4d-receipt-uses-the-wire-accounting",
+      "rule": "The receipt's stream numbers on the daemon path are the accounting the daemon took as the bytes arrived, not a second reading of the reply that came back. A count taken here describes the retained rendering and would report a truncated stream as the whole one.",
+      "file": "src/core/daemon/Client.zig",
+      "find": "    output.stdout = protocol.passedFrom(passed.stdout) catch return client.badReply();",
+      "replace": "    output.stdout = .{ .bytes = response.stdout.bytes.len, .truncated = false };",
+      "expect_gate": "gate: over the ceiling the daemon path settles the same way the direct one does"
+    },
+    {
+      "id": "M4d-partial-group-is-encoded-too",
+      "rule": "A payload's last, partial group is base64 like the rest of it. Bytes that travel unencoded put NULs, quotes and the frame's own newline terminator inside the payload — a command's output is bytes, not text, and that is the whole reason this field is encoded at all.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "            try jw.writer.writeAll(b64.Encoder.encode(window[0..b64.Encoder.calcSize(rest.len)], rest));",
+      "replace": "            try jw.writer.writeAll(rest);",
+      "expect_gate": "gate: every byte value crosses the wire unchanged"
     }
   ]
 }

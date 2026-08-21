@@ -28,6 +28,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Terminus = @import("Terminus");
 const Store = Terminus.Core.Store;
+const Ssh = Terminus.Core.Ssh;
 const protocol = Terminus.Core.daemon_protocol;
 
 const exe_path = build_options.terminus_exe;
@@ -1278,6 +1279,20 @@ const FakeHost = struct {
         defer arena_state.deinit();
 
         while (true) {
+            // **One wait per request, and it is for that request's first bytes.**
+            // `peekGreedy` blocks until the eight-byte header is buffered and
+            // then hands back everything that arrived; the frame is parsed out of
+            // *that*, through a `.fixed` reader which cannot block. Reading the
+            // frame straight off the socket instead is a deadlock waiting for a
+            // wire defect to find it, and one did: with the reply header
+            // deliberately overstating its payload by a byte, this loop waited
+            // for a byte after the frame while the binary waited for its answer,
+            // and the blackbox step of `zig build test` never returned. Neither
+            // side could time the other out — so the fix is that no byte sequence
+            // can make this harness wait for a *second* piece of input. A request
+            // that does not fit what arrived fails the parse and is answered as
+            // unparseable. Fail, never wait.
+            //
             // End of file is the ordinary end of a conversation: the client
             // finished and closed its socket, which every exit in the binary
             // now does — see `Cli.closeDaemonSocket`. Nothing to report.
@@ -1292,12 +1307,24 @@ const FakeHost = struct {
             // that failed, and reporting it is the difference between a gate
             // that noticed the conversation diverged and one that scored it as
             // complete.
-            const line = (reader.interface.takeDelimiter('\n') catch |err| {
+            const arrived = reader.interface.peekGreedy(protocol.header_len) catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => {
+                    host.conversationBroke(err);
+                    return err;
+                },
+            };
+            var framed: std.Io.Reader = .fixed(arrived);
+            const payload = (protocol.readFrame(&framed, arena_state.allocator()) catch |err| {
                 host.conversationBroke(err);
                 return err;
             }) orelse return;
-            if (line.len == 0) continue;
-            const request = protocol.parseMessage(protocol.Request, arena_state.allocator(), line) catch {
+            // Past the frame on the real reader, since the parse above consumed
+            // a copy of it. Exactly what a whole frame occupies: the header, the
+            // payload the header announced, and the terminator.
+            reader.interface.toss(protocol.header_len + payload.len + 1);
+            if (payload.len == 0) continue;
+            const request = protocol.parseMessage(protocol.Request, arena_state.allocator(), payload) catch {
                 try protocol.writeMessage(&writer.interface, protocol.Response{
                     .v = protocol.version,
                     .ok = false,
@@ -1314,13 +1341,44 @@ const FakeHost = struct {
                     break :blk .{ .v = protocol.version, .ok = true, .pid = 1 };
                 },
                 .stop => .{ .v = protocol.version, .ok = true },
-                .exec => host.replyTo(request.command),
+                .exec => try host.replyTo(arena_state.allocator(), request),
             };
             try protocol.writeMessage(&writer.interface, response);
         }
     }
 
-    fn replyTo(host: *FakeHost, command: []const u8) protocol.Response {
+    /// The scripted answer, packed the way the real daemon packs one: the output
+    /// streams base64-encoded, and under `Ssh.output_ceiling` with its accounting
+    /// when the request asked for the retained discipline. Not a shortcut around
+    /// `protocol.execResponse` — a fake that encoded replies its own way would
+    /// stop being a stand-in for the daemon the moment the two drifted.
+    fn replyTo(host: *FakeHost, arena: std.mem.Allocator, request: protocol.Request) !protocol.Response {
+        const scripted = host.scriptFor(request.command);
+        if (scripted.@"error") |message| return .{
+            .v = protocol.version,
+            .ok = false,
+            .@"error" = message,
+        };
+        var retained: Ssh.Retained = .{};
+        const served = try Ssh.retain(arena, .{
+            .exit_code = scripted.exit_code,
+            .stdout = try arena.dupe(u8, scripted.stdout),
+            .stderr = try arena.alloc(u8, 0),
+        }, &retained, Ssh.read_bytes);
+        return protocol.execResponse(
+            served,
+            if (request.output == .retained) retained else null,
+        );
+    }
+
+    const Scripted = struct {
+        exit_code: i32 = 0,
+        stdout: []const u8 = "",
+        /// Set when no rule answered, or when a rule refused on purpose.
+        @"error": ?[]const u8 = null,
+    };
+
+    fn scriptFor(host: *FakeHost, command: []const u8) Scripted {
         host.record(command);
         for (host.rules) |*rule| {
             if (rule.uses == 0) continue;
@@ -1333,24 +1391,13 @@ const FakeHost = struct {
                 // `error.ExecFailed`. Recorded as traffic (the command *was*
                 // delivered) and not counted as unscripted, because it is.
                 if (rule.refuse) return .{
-                    .v = protocol.version,
-                    .ok = false,
                     .@"error" = "the gate's fake host refused to answer this command",
                 };
-                return .{
-                    .v = protocol.version,
-                    .ok = true,
-                    .exitCode = rule.exit_code,
-                    .stdout = rule.stdout,
-                };
+                return .{ .exit_code = rule.exit_code, .stdout = rule.stdout };
             }
         }
         _ = host.unscripted.fetchAdd(1, .monotonic);
-        return .{
-            .v = protocol.version,
-            .ok = false,
-            .@"error" = "the gate's fake host has no reply scripted for this command",
-        };
+        return .{ .@"error" = "the gate's fake host has no reply scripted for this command" };
     }
 
     fn record(host: *FakeHost, command: []const u8) void {

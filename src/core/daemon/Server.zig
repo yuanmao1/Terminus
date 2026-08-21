@@ -176,17 +176,33 @@ fn handleConnection(
     gpa: std.mem.Allocator,
     stream: *std.Io.net.Stream,
 ) !bool {
-    var read_buffer: [1 << 20]u8 = undefined;
+    // Eight bytes is all this has to hold — the payload is read into the
+    // per-request arena at exactly its announced size. It was a 1 MiB array on
+    // every connection thread's stack.
+    var read_buffer: [1 << 12]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     var write_buffer: [1 << 16]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
     while (true) {
-        // takeDelimiter consumes the '\n' (unlike takeDelimiterExclusive,
-        // which leaves it to poison the next read) and returns null on a
-        // clean client disconnect.
-        const line = (reader.interface.takeDelimiter('\n') catch return false) orelse return false;
-        if (line.len == 0) continue;
+        // Per-request arena: request/response buffers die with the request. It
+        // owns the frame payload too, so it must outlive the parse below.
+        var request_arena = std.heap.ArenaAllocator.init(gpa);
+        defer request_arena.deinit();
+        const arena = request_arena.allocator();
+
+        const payload = protocol.readFrame(&reader.interface, arena) catch |err| {
+            // A framing error cannot be resynchronised — the stream position is
+            // no longer known, so reading on would turn one bad frame into a
+            // run of them. Say so once and end the connection. This is also the
+            // path a *older* client lands on: its unframed line fails the
+            // header, it gets one framed refusal terminated by the newline it
+            // is delimiting on, and it falls back to direct SSH rather than
+            // waiting for a reply that would never come.
+            respondError(&writer.interface, @errorName(err)) catch {};
+            return false;
+        } orelse return false;
+        if (payload.len == 0) continue;
         last_activity_ns.store(nowNs(io), .monotonic);
         _ = active_requests.fetchAdd(1, .monotonic);
         defer {
@@ -194,12 +210,7 @@ fn handleConnection(
             last_activity_ns.store(nowNs(io), .monotonic);
         }
 
-        // Per-request arena: request/response buffers die with the request.
-        var request_arena = std.heap.ArenaAllocator.init(gpa);
-        defer request_arena.deinit();
-        const arena = request_arena.allocator();
-
-        const request = protocol.parseMessage(protocol.Request, arena, line) catch |err| {
+        const request = protocol.parseMessage(protocol.Request, arena, payload) catch |err| {
             try respondError(&writer.interface, @errorName(err));
             continue;
         };
@@ -223,29 +234,50 @@ fn handleConnection(
             .exec => {},
         }
 
-        const result = execRequest(io, arena, request) catch |err| {
+        var retained: Ssh.Retained = .{};
+        const result = execRequest(io, arena, request, &retained) catch |err| {
             try respondError(&writer.interface, @errorName(err));
             continue;
         };
 
-        try protocol.writeMessage(&writer.interface, protocol.Response{
-            .v = protocol.version,
-            .ok = true,
-            .exitCode = result.exit_code,
-            .stdout = result.stdout,
-            .stderr = result.stderr,
-        });
+        const response = protocol.execResponse(
+            result,
+            if (request.output == .retained) retained else null,
+        );
+
+        protocol.writeMessage(&writer.interface, response) catch |err| switch (err) {
+            // Only a `.whole` request can get here: `.retained` output is
+            // bounded by `Ssh.output_ceiling` and a comptime assertion in
+            // `protocol` holds its widest encoding under the frame. Refused by
+            // name and never shortened — a `.whole` caller asked for every byte
+            // precisely because it is going to verify a digest over them.
+            error.FrameTooLarge => try respondTooLarge(&writer.interface, response),
+            else => return err,
+        };
     }
 }
+
+/// What running one exec can fail with. Named rather than inferred so the
+/// signature says which layer each failure came from.
+pub const RunError = Ssh.ExecError || Ssh.InputError || Ssh.ConnectError ||
+    Ssh.AuthError || error{AuthMissing};
 
 /// Runs one exec, preferring the pooled connection. If another thread
 /// holds it (a long-running command), dial a fresh one-shot connection
 /// rather than queue — concurrent CLI calls stay independent.
-fn execRequest(io: std.Io, arena: std.mem.Allocator, request: protocol.Request) !Ssh.ExecResult {
+///
+/// `retained` carries the accounting for a `.retained` request and is left at
+/// its zero value for a `.whole` one, which takes no digest.
+fn execRequest(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    request: protocol.Request,
+    retained: *Ssh.Retained,
+) RunError!Ssh.ExecResult {
     if (pool_mutex.tryLock()) {
         defer pool_mutex.unlock(io);
         const client = acquirePooledLocked(request) catch |err| return err;
-        return client.exec(arena, request.command) catch |err| {
+        return runOn(client, arena, request, retained) catch |err| {
             // Pooled connection may have died (server restart, network
             // drop); drop it so the next request reconnects fresh.
             if (pool) |*p| p.deinit();
@@ -257,7 +289,30 @@ fn execRequest(io: std.Io, arena: std.mem.Allocator, request: protocol.Request) 
     // Pool busy: independent short-lived connection for this request.
     var client = try connectFor(request);
     defer client.deinit();
-    return client.exec(arena, request.command);
+    return runOn(&client, arena, request, retained);
+}
+
+/// The one place the daemon chooses an output discipline.
+///
+/// `.retained` goes through `Ssh.execRetained`, which applies
+/// `Ssh.output_ceiling` **as the channel is drained** — so the daemon's own peak
+/// is the ceiling and not the command's output. It used to call `Ssh.exec` for
+/// everything, which keeps every byte by contract, and so a command printing ten
+/// gigabytes cost the daemon ten gigabytes.
+fn runOn(
+    client: *Ssh,
+    arena: std.mem.Allocator,
+    request: protocol.Request,
+    retained: *Ssh.Retained,
+) RunError!Ssh.ExecResult {
+    return switch (request.output) {
+        .whole => client.exec(arena, request.command),
+        // No input: the protocol carries a command and an answer and no third
+        // channel, and `Executor.execRetained` refuses on this transport before
+        // anything is sent rather than handing a stdin-reading command an
+        // immediate EOF.
+        .retained => client.execRetained(arena, request.command, null, retained),
+    };
 }
 
 /// Caller holds pool_mutex.
@@ -300,8 +355,26 @@ fn respondError(writer: *std.Io.Writer, message: []const u8) !void {
     try protocol.writeMessage(writer, protocol.Response{
         .v = protocol.version,
         .ok = false,
-        .@"error" = message,
+        // Bounded here, because this is the one field of a reply whose width is
+        // not a function of the output ceiling.
+        .@"error" = message[0..@min(message.len, protocol.max_error_bytes)],
     });
+}
+
+/// The refusal for a reply that will not fit a frame.
+///
+/// Names both numbers, because "too large" without them tells an operator
+/// nothing about whether the request was unreasonable or the limit is. The
+/// remedy is the direct transport, which frames nothing.
+fn respondTooLarge(writer: *std.Io.Writer, response: protocol.Response) !void {
+    var buffer: [protocol.max_error_bytes]u8 = undefined;
+    const size = protocol.payloadLen(response) catch 0;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "reply of {d} bytes exceeds the {d}-byte daemon protocol frame; rerun with --no-daemon",
+        .{ size, protocol.max_frame_bytes },
+    ) catch "reply exceeds the daemon protocol frame; rerun with --no-daemon";
+    try respondError(writer, message);
 }
 
 fn currentPid() u32 {

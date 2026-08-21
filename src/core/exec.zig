@@ -54,14 +54,16 @@ pub const Executor = union(enum) {
             // input source was named; this is the refusal behind that.
             //
             // Without an input it serves the command path like any other
-            // transport, and its reply goes through the same ceiling so the
-            // receipt says the same kind of thing whichever one answered. The
-            // peak on this path is the protocol's, not the ceiling's: the reply
-            // is one framed message and `roundTrip` has already read all of it.
+            // transport, and under the same `Ssh.output_ceiling` — applied by
+            // the daemon at the channel it drained, not here. A ceiling here
+            // would bound nothing: by the time a reply is in hand every byte of
+            // it has already been read, and the daemon would still have held all
+            // of them. The accounting comes back on the wire because it is an
+            // observation of bytes this process never saw.
             .daemon => |client| if (input != null)
                 error.InputUnsupported
             else
-                Ssh.retain(arena, try client.exec(arena, command), output, std.math.maxInt(usize)),
+                client.execRetained(arena, command, output),
             .scripted => |client| client.execRetained(arena, command, input, output),
         };
     }
