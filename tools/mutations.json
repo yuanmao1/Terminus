@@ -1664,6 +1664,30 @@
       "find": "        provenSettlementExtra(ctx.arena, probe),",
       "replace": "        .{ .stdout = .{ .bytes = @intCast(probe.output.len) }, .source = .reconcile },",
       "expect_gate": "gate: the fifth settlement path builds its receipt extra through the shared one"
+    },
+    {
+      "id": "M16-phase-status-image",
+      "rule": "Every PhaseStatus variant must be produced by fromOperation; a status nobody can construct is a second vocabulary, and this module just lost two of those to deletion.",
+      "file": "src/core/store/plans.zig",
+      "find": "    timed_out,\n    cancelled,\n    indeterminate,\n",
+      "replace": "    timed_out,\n    cancelled,\n    indeterminate,\n    skipped,\n",
+      "expect_gate": "PhaseStatus is exactly the image of fromOperation"
+    },
+    {
+      "id": "M17-builtin-secret-header",
+      "rule": "A builtin secret header's value must never reach the audit record in clear. redactSecrets is the sole redactor for the operations ledger's argv_redacted at five call sites, so a header it cannot see is a credential in the append-only record.",
+      "file": "src/core/store/history.zig",
+      "find": "    return policy.isBuiltinSecretHeader(input[start..colon]);",
+      "replace": "    return false;",
+      "expect_gate": "every builtin secret name is masked by the production redactor"
+    },
+    {
+      "id": "M18-redaction-fast-path",
+      "rule": "The redaction fast path must trigger on every declared secret name, or the scan that would mask it never runs. A header whose value contains none of the old trigger words returns early and is stored in the clear.",
+      "file": "src/core/store/history.zig",
+      "find": "        !containsAny(input, &policy.builtin_secret_env) and\n        !containsBuiltinSecretHeader(input))",
+      "replace": "        !containsAny(input, &policy.builtin_secret_env))",
+      "expect_gate": "every builtin secret name is masked by the production redactor"
     }
   ]
 }

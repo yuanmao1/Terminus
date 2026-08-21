@@ -9,9 +9,13 @@ pub const sessions = @import("sessions.zig");
 pub const memories = @import("memories.zig");
 pub const jobs = @import("jobs.zig");
 pub const facts = @import("facts.zig");
+/// The local record of `push` / `pull` / `sync`, and the one redactor
+/// (`redactSecrets`) the operations ledger below also runs its command text
+/// through. Not the audit trail: `exec`, `run`, `job` and `write` write no
+/// history row. See `history.zig`.
 pub const history = @import("history.zig");
-/// Operation ledger (0.2.0): immutable identity + append-only receipts.
-/// `history` stays readable but is no longer an authoritative record.
+/// Operation ledger (0.2.0): immutable identity + append-only receipts. This
+/// is the audit trail, read by `terminus request ls|show`.
 pub const ids = @import("ids.zig");
 pub const op_state = @import("op_state.zig");
 pub const operations = @import("operations.zig");
@@ -19,8 +23,15 @@ pub const receipts = @import("receipts.zig");
 pub const transfers = @import("transfers.zig");
 pub const job_attempts = @import("job_attempts.zig");
 pub const leases = @import("leases.zig");
+/// The fail-stop phase-ordering rule (`canSubmit`) and nothing else — no
+/// orchestrator, no persistence, no `plan` verb. The `plan_runs` /
+/// `phase_attempts` tables exist ahead of goal 16; the CRUD written against a
+/// guess at that decision has been removed. Nothing here has a caller, which
+/// is why the module compile-checks itself.
 pub const plans = @import("plans.zig");
 pub const host_pins = @import("host_pins.zig");
+/// Builtin secret classification (the lists `history.redactSecrets` reads) and
+/// this machine's audit identity (`ownerToken`).
 pub const policy = @import("policy.zig");
 /// Public because `openDiagnosed`'s `Refusal` is the only place the numbers
 /// behind a refused open exist, and the CLI has to read them to say anything

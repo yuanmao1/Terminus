@@ -49,7 +49,7 @@ const usage =
     \\  pull       download a file over SCP
     \\  sync       recursive directory transfer      (push/pull; tar+md5)
     \\  doctor     probe remote environment capabilities
-    \\  history    local audit trail of remote actions
+    \\  history    local record of push/pull/sync    (audit trail: request ls)
     \\  export     dump all servers+memories+facts as JSON
     \\  import     merge an export (dry-run plan, conflict strategies)
     \\  setup      install the Terminus skill into coding agents

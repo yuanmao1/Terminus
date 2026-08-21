@@ -1,63 +1,52 @@
-//! Fail-stop plan runs (`plan_runs`, `phase_attempts`).
+//! The fail-stop ordering rule for plan phases — **the rule only**.
 //!
-//! A plan is only an orchestration of `operations` — it owns no execution
-//! model of its own. Its single job is to enforce ordering rules that a bare
-//! sequence of commands cannot:
+//! ## What is implemented
 //!
-//! * a phase is never submitted while the previous one is not `completed`;
-//! * a mutating phase additionally needs an explicit approval;
-//! * a phase that ended `indeterminate` halts the run until reconciled —
-//!   proceeding would risk applying a change twice;
-//! * nothing is retried automatically and no compensation runs on its own.
+//! `canSubmit`, a pure function answering "may this phase run now?", and
+//! `PhaseStatus.fromOperation`, which projects an operation's outcome onto a
+//! phase. Both are total, allocation-free and covered by the tests below.
 //!
-//! `canSubmit` is a pure function so those rules are testable without a
-//! database or a network, and so there is exactly one place that decides.
+//! ## What is not implemented, and is not pending here
+//!
+//! There is no orchestrator, no persistence, and no `plan` verb. Nothing in
+//! the tree calls `canSubmit`; `dispatch.TopCommand` has no `plan`, and the
+//! only reference to this module is `Store.plans`.
+//!
+//! The `plan_runs` and `phase_attempts` tables exist and stay
+//! (`migrate.zig` v7) — they are a deliberate advance on goal 16 (fail-stop
+//! PlanRun / PhaseAttempt), which `docs/v2.0-progress.md` records as blocked
+//! on an undecided question: plan mutation approval and reconciliation
+//! semantics. This module used to also carry seven `plan_runs` /
+//! `phase_attempts` CRUD functions written ahead of that decision. They had
+//! no caller and no test, and because Zig analyses function bodies lazily and
+//! `refAllDecls` is not recursive, their bodies were never semantically
+//! analysed by `zig build test` at all — a `@compileError` planted in one of
+//! them left 409/409 passing. They were seven unchecked guesses at an
+//! undecided design, so they were removed; whoever settles goal 16 writes the
+//! persistence against the answer rather than against them.
+//!
+//! The rule is kept because it is decidable without that answer: an
+//! `indeterminate` phase must halt the run whatever the storage looks like.
+//!
+//! `refAllDecls` at the bottom is what stops the same rot recurring here: it
+//! forces every declaration in this file to be analysed even while no
+//! production caller exists.
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-const Store = @import("Store.zig");
-const Db = @import("Db.zig");
 const op_state = @import("op_state.zig");
 
-pub const schema_version: i64 = 1;
-
-pub const RunStatus = enum {
-    created,
-    running,
-    completed,
-    failed,
-    timed_out,
-    cancelled,
-    indeterminate,
-    awaiting_approval,
-    awaiting_reconcile,
-
-    pub fn parse(raw: []const u8) error{UnknownRunStatus}!RunStatus {
-        return std.meta.stringToEnum(RunStatus, raw) orelse error.UnknownRunStatus;
-    }
-
-    pub fn text(s: RunStatus) []const u8 {
-        return @tagName(s);
-    }
-};
-
+/// The state of one phase attempt.
+///
+/// Exactly the image of `fromOperation` — every variant is reachable from
+/// some `op_state.Status`, and nothing else may be added without a producer.
+/// `phaseStatusIsExactlyTheImageOfFromOperation` below holds that.
 pub const PhaseStatus = enum {
     pending,
-    awaiting_approval,
     submitted,
     completed,
     failed,
     timed_out,
     cancelled,
     indeterminate,
-    skipped,
-
-    pub fn parse(raw: []const u8) error{UnknownPhaseStatus}!PhaseStatus {
-        return std.meta.stringToEnum(PhaseStatus, raw) orelse error.UnknownPhaseStatus;
-    }
-
-    pub fn text(s: PhaseStatus) []const u8 {
-        return @tagName(s);
-    }
 
     /// Maps an operation's outcome onto the phase. Note the deliberate
     /// absence of any mapping that turns `indeterminate` into a failure.
@@ -77,8 +66,6 @@ pub const PhaseStatus = enum {
     }
 };
 
-pub const Error = Db.Error || error{ UnknownRunStatus, UnknownPhaseStatus, OutOfMemory };
-
 /// Why a phase may not be submitted right now.
 pub const Blocker = enum {
     /// The previous phase has not completed.
@@ -97,6 +84,12 @@ pub const SubmitDecision = union(enum) {
 };
 
 /// The single gate for "may this phase run now?".
+///
+/// Approval is the `approved` parameter, not a status: a phase waiting on one
+/// is `.pending` with `approved = false`. There used to be an
+/// `awaiting_approval` variant as well, which encoded the same fact a second
+/// way and could disagree with this argument; and a `skipped` variant that
+/// nothing could produce or skip. Both are gone.
 pub fn canSubmit(
     previous: ?PhaseStatus,
     phase_status: PhaseStatus,
@@ -104,11 +97,11 @@ pub fn canSubmit(
     approved: bool,
 ) SubmitDecision {
     switch (phase_status) {
-        .pending, .awaiting_approval => {},
+        .pending => {},
         else => return .{ .blocked = .already_settled },
     }
     if (previous) |prev| switch (prev) {
-        .completed, .skipped => {},
+        .completed => {},
         // An unsettled predecessor is the dangerous case: its effect may or
         // may not have landed, so continuing could double-apply.
         .indeterminate => return .{ .blocked = .previous_indeterminate },
@@ -116,185 +109,6 @@ pub fn canSubmit(
     };
     if (is_mutation and !approved) return .{ .blocked = .needs_approval };
     return .allowed;
-}
-
-pub const Run = struct {
-    run_id: []const u8,
-    server_id: ?i64,
-    server_name: []const u8,
-    name: ?[]const u8,
-    plan_sha256: []const u8,
-    plan_body_redacted: ?[]const u8,
-    status: RunStatus,
-    created_at: i64,
-    updated_at: i64,
-};
-
-pub const CreateRunOptions = struct {
-    run_id: []const u8,
-    server_id: ?i64,
-    server_name: []const u8,
-    name: ?[]const u8 = null,
-    plan_sha256: []const u8,
-    plan_body_redacted: ?[]const u8 = null,
-    now: i64,
-};
-
-pub fn createRun(store: *Store, opts: CreateRunOptions) Error!void {
-    var stmt = try store.db.prepare(
-        \\INSERT INTO plan_runs (run_id, schema_version, server_id, server_name,
-        \\                       name, plan_sha256, plan_body_redacted,
-        \\                       status, created_at, updated_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8, ?8)
-    );
-    defer stmt.deinit();
-    try stmt.bindText(1, opts.run_id);
-    try stmt.bindInt(2, schema_version);
-    try stmt.bindOptInt(3, opts.server_id);
-    try stmt.bindText(4, opts.server_name);
-    try stmt.bindOptText(5, opts.name);
-    try stmt.bindText(6, opts.plan_sha256);
-    try stmt.bindOptText(7, opts.plan_body_redacted);
-    try stmt.bindInt(8, opts.now);
-    _ = try stmt.step();
-}
-
-pub fn setRunStatus(store: *Store, run_id: []const u8, status: RunStatus, now: i64) Error!void {
-    var stmt = try store.db.prepare(
-        "UPDATE plan_runs SET status = ?1, updated_at = ?2 WHERE run_id = ?3",
-    );
-    defer stmt.deinit();
-    try stmt.bindText(1, status.text());
-    try stmt.bindInt(2, now);
-    try stmt.bindText(3, run_id);
-    _ = try stmt.step();
-}
-
-pub fn getRun(store: *Store, arena: Allocator, run_id: []const u8) Error!?Run {
-    var stmt = try store.db.prepare(
-        \\SELECT run_id, server_id, server_name, name, plan_sha256,
-        \\       plan_body_redacted, status, created_at, updated_at
-        \\FROM plan_runs WHERE run_id = ?1
-    );
-    defer stmt.deinit();
-    try stmt.bindText(1, run_id);
-    if (!try stmt.step()) return null;
-    return .{
-        .run_id = try arena.dupe(u8, stmt.columnText(0)),
-        .server_id = stmt.columnOptInt(1),
-        .server_name = try arena.dupe(u8, stmt.columnText(2)),
-        .name = if (stmt.columnOptText(3)) |v| try arena.dupe(u8, v) else null,
-        .plan_sha256 = try arena.dupe(u8, stmt.columnText(4)),
-        .plan_body_redacted = if (stmt.columnOptText(5)) |v| try arena.dupe(u8, v) else null,
-        .status = try RunStatus.parse(stmt.columnText(6)),
-        .created_at = stmt.columnInt(7),
-        .updated_at = stmt.columnInt(8),
-    };
-}
-
-pub const Phase = struct {
-    id: i64,
-    run_id: []const u8,
-    phase_index: i64,
-    phase_id: []const u8,
-    attempt_no: i64,
-    is_mutation: bool,
-    approved_at: ?i64,
-    approved_by: ?[]const u8,
-    request_id: ?[]const u8,
-    status: PhaseStatus,
-    created_at: i64,
-    updated_at: i64,
-};
-
-pub const CreatePhaseOptions = struct {
-    run_id: []const u8,
-    phase_index: i64,
-    phase_id: []const u8,
-    attempt_no: i64 = 1,
-    is_mutation: bool = false,
-    now: i64,
-};
-
-pub fn createPhase(store: *Store, opts: CreatePhaseOptions) Error!i64 {
-    var stmt = try store.db.prepare(
-        \\INSERT INTO phase_attempts (run_id, phase_index, phase_id, attempt_no,
-        \\                            is_mutation, status, created_at, updated_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)
-    );
-    defer stmt.deinit();
-    try stmt.bindText(1, opts.run_id);
-    try stmt.bindInt(2, opts.phase_index);
-    try stmt.bindText(3, opts.phase_id);
-    try stmt.bindInt(4, opts.attempt_no);
-    try stmt.bindInt(5, if (opts.is_mutation) 1 else 0);
-    try stmt.bindInt(6, opts.now);
-    _ = try stmt.step();
-    return store.db.lastInsertRowId();
-}
-
-/// Records an explicit approval (B13: `--approve <phase-id>`; no interactive
-/// prompt, so the decision is auditable rather than ambient).
-pub fn approve(store: *Store, run_id: []const u8, phase_id: []const u8, by: []const u8, now: i64) Error!bool {
-    var stmt = try store.db.prepare(
-        \\UPDATE phase_attempts SET approved_at = ?1, approved_by = ?2, updated_at = ?1
-        \\ WHERE run_id = ?3 AND phase_id = ?4 AND approved_at IS NULL
-    );
-    defer stmt.deinit();
-    try stmt.bindInt(1, now);
-    try stmt.bindText(2, by);
-    try stmt.bindText(3, run_id);
-    try stmt.bindText(4, phase_id);
-    _ = try stmt.step();
-    return store.db.changes() > 0;
-}
-
-pub fn setPhaseStatus(
-    store: *Store,
-    id: i64,
-    status: PhaseStatus,
-    request_id: ?[]const u8,
-    now: i64,
-) Error!void {
-    var stmt = try store.db.prepare(
-        \\UPDATE phase_attempts
-        \\   SET status = ?1, request_id = COALESCE(?2, request_id), updated_at = ?3
-        \\ WHERE id = ?4
-    );
-    defer stmt.deinit();
-    try stmt.bindText(1, status.text());
-    try stmt.bindOptText(2, request_id);
-    try stmt.bindInt(3, now);
-    try stmt.bindInt(4, id);
-    _ = try stmt.step();
-}
-
-pub fn phases(store: *Store, arena: Allocator, run_id: []const u8) Error![]Phase {
-    var out: std.ArrayList(Phase) = .empty;
-    var stmt = try store.db.prepare(
-        \\SELECT id, run_id, phase_index, phase_id, attempt_no, is_mutation,
-        \\       approved_at, approved_by, request_id, status, created_at, updated_at
-        \\FROM phase_attempts WHERE run_id = ?1 ORDER BY phase_index, attempt_no
-    );
-    defer stmt.deinit();
-    try stmt.bindText(1, run_id);
-    while (try stmt.step()) {
-        try out.append(arena, .{
-            .id = stmt.columnInt(0),
-            .run_id = try arena.dupe(u8, stmt.columnText(1)),
-            .phase_index = stmt.columnInt(2),
-            .phase_id = try arena.dupe(u8, stmt.columnText(3)),
-            .attempt_no = stmt.columnInt(4),
-            .is_mutation = stmt.columnInt(5) != 0,
-            .approved_at = stmt.columnOptInt(6),
-            .approved_by = if (stmt.columnOptText(7)) |v| try arena.dupe(u8, v) else null,
-            .request_id = if (stmt.columnOptText(8)) |v| try arena.dupe(u8, v) else null,
-            .status = try PhaseStatus.parse(stmt.columnText(9)),
-            .created_at = stmt.columnInt(10),
-            .updated_at = stmt.columnInt(11),
-        });
-    }
-    return out.toOwnedSlice(arena);
 }
 
 test "canSubmit enforces fail-stop ordering" {
@@ -344,4 +158,42 @@ test "an indeterminate operation never becomes a failed phase" {
     try t.expectEqual(PhaseStatus.indeterminate, PhaseStatus.fromOperation(.indeterminate));
     try t.expectEqual(PhaseStatus.completed, PhaseStatus.fromOperation(.completed));
     try t.expectEqual(PhaseStatus.failed, PhaseStatus.fromOperation(.failed));
+}
+
+// The gate on the reduction above.
+//
+// This module has no production caller, so nothing but this test stands
+// between it and a second vocabulary of statuses nobody can produce — which
+// is what `awaiting_approval`, `skipped` and the whole `RunStatus` enum were.
+// Every `PhaseStatus` variant must be the image of some `op_state.Status`,
+// and every `op_state.Status` must land somewhere. Adding a variant to either
+// enum without wiring `fromOperation` fails here.
+test "PhaseStatus is exactly the image of fromOperation" {
+    const t = std.testing;
+    const fields = @typeInfo(PhaseStatus).@"enum".fields;
+    var produced = [_]bool{false} ** fields.len;
+    inline for (@typeInfo(op_state.Status).@"enum".fields) |f| {
+        produced[@intFromEnum(PhaseStatus.fromOperation(@field(op_state.Status, f.name)))] = true;
+    }
+    inline for (fields, 0..) |f, idx| {
+        t.expect(produced[idx]) catch {
+            std.debug.print(
+                "PhaseStatus.{s} has no op_state.Status that produces it\n",
+                .{f.name},
+            );
+            return error.PhaseStatusVariantHasNoProducer;
+        };
+    }
+}
+
+// Forces every declaration in this file to be analysed.
+//
+// Not decoration: before the reduction, seven `pub fn`s here were referenced
+// by nothing — not by production, not by a test, and not by `Store.zig`'s
+// `refAllDecls(Store)`, which is a single-level `inline for` over `Store`'s
+// own decls and does not descend into an imported module's. Zig analyses a
+// function body only when something references it, so those seven were never
+// compiled by `zig build test`. Same reasoning as `control.zig`'s.
+test "every decl in this module is compile-checked" {
+    std.testing.refAllDecls(@This());
 }
