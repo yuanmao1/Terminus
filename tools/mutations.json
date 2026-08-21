@@ -1287,7 +1287,7 @@
       "file": "src/core/store/transfers.zig",
       "find": "        return switch (s) {\n            .failed_source_changed,\n            .failed_remote_partial_mismatch,\n            .failed_hash_mismatch,\n            .failed_no_space,\n            .failed_clobber_conflict,\n            .failed_publish,\n            => true,\n            .planned,\n            .probing,\n            .transferring,\n            .paused,\n",
       "replace": "        return switch (s) {\n            .failed_source_changed,\n            .failed_remote_partial_mismatch,\n            .failed_hash_mismatch,\n            .failed_no_space,\n            .failed_clobber_conflict,\n            .failed_publish,\n            .paused,\n            => true,\n            .planned,\n            .probing,\n            .transferring,\n",
-      "expect_gate": "gate: --restart reaches three of the driver's outcomes and cannot reach paused"
+      "expect_gate": "gate: --restart and --resume divide the driver's outcomes, and neither reaches the other's"
     },
     {
       "id": "M3.2-restart-not-a-bool-flag",

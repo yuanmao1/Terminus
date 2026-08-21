@@ -135,6 +135,34 @@ def run_gates(zig: str) -> tuple[int, str]:
 GATE_FAILURE = re.compile(r"error: '(.+?)' (?:failed|exited with code)")
 
 
+def gate_names() -> list[str]:
+    """Every gate name `zig build test` could print, synthesised from the source.
+
+    `--check-anchors` runs no builds, which is the whole point of it, so the
+    names have to be derived rather than observed. Zig spells a failing test as
+    `<module path>.test.<name>` for a named test and `<module path>.decltest.<id>`
+    for a declaration test, where the module path is the file's path under its
+    build root with `/` as `.` and no extension: `src/cli/cmd_job.zig` gives
+    `cli.cmd_job`, and `test/blackbox.zig` gives `blackbox`.
+
+    Derived rather than hand-listed for the same reason the cascade set is: a
+    list cannot see a test in a file that did not exist when it was written.
+    """
+    names: list[str] = []
+    for root in ("src", "test"):
+        base = REPO / root
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.zig")):
+            module = ".".join(path.relative_to(base).with_suffix("").parts)
+            text = path.read_bytes().decode("utf-8", errors="replace")
+            for name in re.findall(r'\btest\s+"([^"]*)"', text):
+                names.append(f"{module}.test.{name}")
+            for ident in re.findall(r"\btest\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{", text):
+                names.append(f"{module}.decltest.{ident}")
+    return names
+
+
 def failing_gate_names(output: str) -> list[str]:
     """Zig prints `error: 'module.test.NAME' failed:` for each failing test."""
     names = []
@@ -437,13 +465,33 @@ def main() -> int:
                 print(f"DRIFTED  {m.id}")
                 print(f"         {m.file}: `find` occurs {n} times, needs exactly 1")
                 print(f"         rule: {m.rule}")
+
+        # ...and the other axis, which cost a full pass before it was checked.
+        #
+        # `M3.2-restart-releases-paused` pointed at a test that had been renamed.
+        # Its `find` still occurred exactly once, so the check above was clean and
+        # said so; but `run_one` decides KILLED with `expect_gate in gate_name`, so
+        # a name nothing matches can only ever report WRONG_GATE, and `main`
+        # returns 1 on any non-KILLED. The whole 197-entry pass was therefore
+        # unpassable, and the only way to find that out was to spend the thirty
+        # minutes. A `find` and an `expect_gate` are two halves of one pointer and
+        # drift independently: the first follows the code, the second follows a
+        # test name, and renaming a test moves only the second.
+        for m in muts:
+            if not any(m.expect_gate in name for name in gate_names()):
+                worst = 1
+                print(f"UNRESOLVED  {m.id}")
+                print(f"            expect_gate: {m.expect_gate}")
+                print(f"            no test in the tree would produce a gate name containing that.")
+                print(f"            rule: {m.rule}")
+
         if worst:
             print(
                 f"\nA drifted anchor tests nothing. Re-derive it from current source, "
                 f"then confirm it still goes red: python tools/mutate.py --id <id>"
             )
             return 1
-        print(f"{len(muts)} anchor(s) each occur exactly once")
+        print(f"{len(muts)} anchor(s) each occur exactly once, and every expect_gate resolves")
         return 0
 
     zig = find_zig()
