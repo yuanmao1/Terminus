@@ -2050,15 +2050,32 @@ fn fatalCreate(
     }
 }
 
-/// Remote paths land inside single-quoted shell strings and, for the probe and
-/// the publish, as arguments to `stat`, `tail` and `mv`.
+/// The one thing a remote path may not be.
 ///
-/// The leading-dash rejection is the one that is not about quoting: a path
-/// beginning with `-` is read as an option by every one of those, and
-/// `mv -f -rf x` is not a rename.
+/// This used to refuse `'`, `"`, `` ` ``, `$` and newlines as well, and the
+/// reason it did was that `core/transfer.zig` spliced the path into
+/// single-quoted shell words without escaping it — thirty places. The refusal
+/// was standing in for a quoter. It stood there badly: it never covered the
+/// space, which is the metacharacter paths actually contain, and it refused
+/// `/data/John's files/x`, which is not an attack, it is a directory named after
+/// a person. An operator with that directory could not use `terminus push` at
+/// all, and the message told them their path was malformed.
+///
+/// Every value that now reaches a remote script goes through `shell.Word`, which
+/// quotes it, so none of those five bytes is syntax any more and none of them is
+/// refused. The `--via scp` path never went through a shell of ours at all:
+/// libssh2 1.11.1 quotes the path itself before putting it in the `scp -t`/`-f`
+/// command line (`shell_quotearg`, vendor/libssh2/src/scp.c).
+///
+/// **The leading dash stays, and it is the one rule that was never about
+/// quoting.** `stat`, `wc`, `head`, `tail`, `dd`, `mv` and `ln` all read a
+/// leading `-` as an option, and they do it *after* the shell has taken the
+/// quotes off: `mv -f '-f' x` is not a rename. Quoting cannot help, `--` is not
+/// portably accepted by all of them, and prefixing `./` would silently transfer
+/// to a path the operator did not name.
 pub fn validateRemotePath(path: []const u8) void {
-    if (path.len == 0 or std.mem.indexOfAny(u8, path, "'\"\n`$") != null)
-        fatal("remote path must not contain quotes, backticks, '$' or newlines", .{});
+    if (path.len == 0)
+        fatal("remote path must not be empty", .{});
     if (path[0] == '-')
         fatal("remote path must not begin with '-' (it would be read as an option)", .{});
 }

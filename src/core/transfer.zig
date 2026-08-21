@@ -26,11 +26,24 @@
 //! against a fake host — which is the only way any of it is provable without a
 //! server. The two `*Ssh` entry points are wrappers, kept because `cmd_sync`
 //! calls them with a client.
+//!
+//! **Every value in these scripts is a `shell.Word`.** The paths in this file
+//! are the operator's own arguments, and until this pass they were spliced into
+//! single-quoted shell words with no escaping — thirty places, `'{[path]s}'` and
+//! friends. `/data/John's files/x` is an ordinary path, and the apostrophe in it
+//! ended the word early; what followed was whatever the rest of the path spelled,
+//! run by the host. The CLI was refusing those paths in front of this module,
+//! which turned a class of injection into a class of ordinary path Terminus
+//! simply could not carry — a smaller defect, not a fixed one, and a refusal
+//! standing where a quoter belonged. `shell.Word` cannot be formatted with `{s}`
+//! at all, so the templates below have no spelling for a raw value; see
+//! `shell.scan` for the half of that guarantee the compiler cannot give.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ssh = @import("ssh/Client.zig");
 const Executor = @import("exec.zig").Executor;
 const digest = @import("digest.zig");
+const shell = @import("shell.zig");
 
 /// Raw push slice: base64 → ~24 KiB in the command string, safely under the
 /// ~32 KiB exec-command ceiling.
@@ -134,7 +147,7 @@ pub const RemoteReading = struct {
 /// has to choose `completed_unverified`, and cannot mistake a missing tool for a
 /// digest that agreed.
 ///
-/// Both are fed on **stdin** (`< 'path'`) rather than given the path as an
+/// Both are fed on **stdin** (`< <path>`) rather than given the path as an
 /// argument, so a filename is never parsed as an option and the two tools'
 /// different `--` support stops mattering. The cost is that the output's second
 /// field is `-` instead of the name, which nothing here reads.
@@ -143,11 +156,11 @@ pub const RemoteReading = struct {
 /// There is no third portable spelling; a host with neither simply cannot have
 /// its files identified, which is a smaller loss than a fabricated timestamp.
 const probe_script =
-    \\[ -f '{[path]s}' ] || exit 44
-    \\wc -c < '{[path]s}' || exit 45
-    \\stat -c %Y '{[path]s}' 2>/dev/null || stat -f %m '{[path]s}' 2>/dev/null || echo -
-    \\if command -v sha256sum >/dev/null 2>&1; then sha256sum < '{[path]s}'
-    \\elif command -v shasum >/dev/null 2>&1; then shasum -a 256 < '{[path]s}'
+    \\[ -f {[path]f} ] || exit 44
+    \\wc -c < {[path]f} || exit 45
+    \\stat -c %Y {[path]f} 2>/dev/null || stat -f %m {[path]f} 2>/dev/null || echo -
+    \\if command -v sha256sum >/dev/null 2>&1; then sha256sum < {[path]f}
+    \\elif command -v shasum >/dev/null 2>&1; then shasum -a 256 < {[path]f}
     \\else echo -
     \\fi
 ;
@@ -158,7 +171,7 @@ pub fn probeRemoteFile(
     arena: Allocator,
     remote_path: []const u8,
 ) Error!RemoteReading {
-    const cmd = try std.fmt.allocPrint(arena, probe_script, .{ .path = remote_path });
+    const cmd = try std.fmt.allocPrint(arena, probe_script, .{ .path = shell.word(remote_path) });
     const r = try executor.exec(arena, cmd);
     switch (r.exit_code) {
         0 => {},
@@ -219,12 +232,12 @@ pub fn remoteDigest(
     remote_path: []const u8,
 ) Error!?[]const u8 {
     const cmd = try std.fmt.allocPrint(arena,
-        \\[ -f '{[path]s}' ] || exit 44
-        \\if command -v sha256sum >/dev/null 2>&1; then sha256sum < '{[path]s}'
-        \\elif command -v shasum >/dev/null 2>&1; then shasum -a 256 < '{[path]s}'
+        \\[ -f {[path]f} ] || exit 44
+        \\if command -v sha256sum >/dev/null 2>&1; then sha256sum < {[path]f}
+        \\elif command -v shasum >/dev/null 2>&1; then shasum -a 256 < {[path]f}
         \\else echo -
         \\fi
-    , .{ .path = remote_path });
+    , .{ .path = shell.word(remote_path) });
     const r = try executor.exec(arena, cmd);
     switch (r.exit_code) {
         0 => {},
@@ -388,13 +401,13 @@ pub fn remotePartial(
     prefix_len: u64,
 ) Error!PartialReading {
     const cmd = try std.fmt.allocPrint(arena,
-        \\[ -f '{[path]s}' ] || exit 44
-        \\wc -c < '{[path]s}' || exit 45
-        \\head -c {[len]d} < '{[path]s}' | if command -v sha256sum >/dev/null 2>&1; then sha256sum
+        \\[ -f {[path]f} ] || exit 44
+        \\wc -c < {[path]f} || exit 45
+        \\head -c {[len]d} < {[path]f} | if command -v sha256sum >/dev/null 2>&1; then sha256sum
         \\elif command -v shasum >/dev/null 2>&1; then shasum -a 256
         \\else echo -
         \\fi
-    , .{ .path = remote_path, .len = prefix_len });
+    , .{ .path = shell.word(remote_path), .len = prefix_len });
     const r = try executor.exec(arena, cmd);
     switch (r.exit_code) {
         0 => {},
@@ -435,10 +448,10 @@ pub fn truncateRemote(
     len: u64,
 ) Error!void {
     const cmd = try std.fmt.allocPrint(arena,
-        \\[ -f '{[path]s}' ] || exit 44
-        \\dd if=/dev/null of='{[path]s}' bs=1 seek={[len]d} 2>/dev/null || exit 42
-        \\wc -c < '{[path]s}' || exit 45
-    , .{ .path = remote_path, .len = len });
+        \\[ -f {[path]f} ] || exit 44
+        \\dd if=/dev/null of={[path]f} bs=1 seek={[len]d} 2>/dev/null || exit 42
+        \\wc -c < {[path]f} || exit 45
+    , .{ .path = shell.word(remote_path), .len = len });
     const r = try executor.exec(arena, cmd);
     switch (r.exit_code) {
         0 => {},
@@ -505,8 +518,8 @@ pub fn publishRemote(
     if (!no_clobber) {
         const cmd = try std.fmt.allocPrint(
             arena,
-            "mv -f '{s}' '{s}'",
-            .{ partial_path, dest_path },
+            "mv -f {[part]f} {[dest]f}",
+            .{ .part = shell.word(partial_path), .dest = shell.word(dest_path) },
         );
         const r = try executor.exec(arena, cmd);
         if (r.exit_code != 0) return error.PublishFailed;
@@ -514,10 +527,10 @@ pub fn publishRemote(
     }
 
     const cmd = try std.fmt.allocPrint(arena,
-        \\if ln '{[part]s}' '{[dest]s}' 2>/dev/null; then rm -f '{[part]s}'; exit 0; fi
-        \\if [ -e '{[dest]s}' ] || [ -L '{[dest]s}' ]; then exit 47; fi
+        \\if ln {[part]f} {[dest]f} 2>/dev/null; then rm -f {[part]f}; exit 0; fi
+        \\if [ -e {[dest]f} ] || [ -L {[dest]f} ]; then exit 47; fi
         \\exit 48
-    , .{ .part = partial_path, .dest = dest_path });
+    , .{ .part = shell.word(partial_path), .dest = shell.word(dest_path) });
     const r = try executor.exec(arena, cmd);
     switch (r.exit_code) {
         0 => {},
@@ -592,16 +605,21 @@ pub fn publishLocal(
 // --- Push --------------------------------------------------------------------
 
 /// Truncates (or creates) the remote staging file and sets its mode.
+///
+/// `remote_path` is a `shell.Word` rather than a slice, and every private helper
+/// below that holds a script template takes one for the same reason: these are
+/// the functions a later line of shell gets added to, and a parameter that is
+/// already a shell word leaves the author of that line nothing to get wrong.
 fn beginRemoteFile(
     executor: Executor,
     arena: Allocator,
-    remote_path: []const u8,
+    remote_path: shell.Word,
     mode: u32,
 ) Error!void {
     const init = try std.fmt.allocPrint(arena,
         \\command -v base64 >/dev/null || exit 41
-        \\: > '{[path]s}' || exit 42
-        \\chmod {[mode]o} '{[path]s}'
+        \\: > {[path]f} || exit 42
+        \\chmod {[mode]o} {[path]f}
     , .{ .path = remote_path, .mode = mode });
     const r = try executor.exec(arena, init);
     switch (r.exit_code) {
@@ -629,13 +647,13 @@ fn beginRemoteFile(
 fn resumeRemoteFile(
     executor: Executor,
     arena: Allocator,
-    remote_path: []const u8,
+    remote_path: shell.Word,
     offset: u64,
 ) Error!void {
     const cmd = try std.fmt.allocPrint(arena,
         \\command -v base64 >/dev/null || exit 41
-        \\[ -f '{[path]s}' ] || exit 44
-        \\wc -c < '{[path]s}' || exit 45
+        \\[ -f {[path]f} ] || exit 44
+        \\wc -c < {[path]f} || exit 45
     , .{ .path = remote_path });
     const r = try executor.exec(arena, cmd);
     switch (r.exit_code) {
@@ -662,12 +680,19 @@ const PushBuffers = struct {
     encoded: []u8,
     command: []u8,
 
-    fn init(arena: Allocator, remote_path: []const u8) Error!PushBuffers {
+    fn init(arena: Allocator, remote_path: shell.Word) Error!PushBuffers {
         const encoded_max = encoder.calcSize(push_slice);
-        // `printf '%s' '<encoded>' | base64 -d >> '<path>'` plus slack for the
-        // literal text. Checked rather than assumed: `bufPrint` returns
-        // `NoSpaceLeft` and this module turns that into a named refusal.
-        const command_max = encoded_max + remote_path.len + 64;
+        // `printf '%s' <encoded> | base64 -d >> <path>` plus slack for the
+        // literal text. Sized from the *quoted* lengths, not the raw ones: a
+        // path of n apostrophes quotes to 4n + 2 bytes, so sizing from
+        // `remote_path.raw.len` would leave `bufPrint` short and report a path
+        // holding two apostrophes as `RemotePathTooLong` — a refusal naming a
+        // length that is not the problem. The payload's own two quote bytes are
+        // a constant: base64's alphabet holds no apostrophe, so its quoted
+        // length is always its length plus two. Checked rather than assumed
+        // either way: `bufPrint` returns `NoSpaceLeft` and this module turns
+        // that into a named refusal.
+        const command_max = encoded_max + 2 + shell.quotedLen(remote_path.raw) + 64;
         return .{
             .encoded = try arena.alloc(u8, encoded_max),
             .command = try arena.alloc(u8, command_max),
@@ -681,14 +706,19 @@ fn appendSlice(
     scratch: *std.heap.ArenaAllocator,
     buffers: PushBuffers,
     chunk: []const u8,
-    remote_path: []const u8,
+    remote_path: shell.Word,
 ) Error!void {
     const encoded = buffers.encoded[0..encoder.calcSize(chunk.len)];
     _ = encoder.encode(encoded, chunk);
+    // The payload goes through `shell.Word` as well. Base64's alphabet holds no
+    // apostrophe, so quoting it is a no-op on every byte it can contain — and
+    // that is the point: an exception with a proof attached is still an
+    // exception, and `shell.scan` would have to be taught to forgive this one
+    // line. It is cheaper to have no exceptions.
     const cmd = std.fmt.bufPrint(
         buffers.command,
-        "printf '%s' '{s}' | base64 -d >> '{s}'",
-        .{ encoded, remote_path },
+        "printf '%s' {[b64]f} | base64 -d >> {[path]f}",
+        .{ .b64 = shell.word(encoded), .path = remote_path },
     ) catch return error.RemotePathTooLong;
 
     // The exec's own stdout/stderr allocations go here and are handed back
@@ -735,12 +765,13 @@ pub fn pushFile(
     if (start_offset > total) return error.ResumeOffsetPastSource;
     moved.arrived = start_offset;
 
+    const remote = shell.word(remote_path);
     if (start_offset == 0)
-        try beginRemoteFile(executor, arena, remote_path, mode)
+        try beginRemoteFile(executor, arena, remote, mode)
     else
-        try resumeRemoteFile(executor, arena, remote_path, start_offset);
+        try resumeRemoteFile(executor, arena, remote, start_offset);
 
-    const buffers = try PushBuffers.init(arena, remote_path);
+    const buffers = try PushBuffers.init(arena, remote);
     var scratch = std.heap.ArenaAllocator.init(arena);
     defer scratch.deinit();
 
@@ -762,7 +793,7 @@ pub fn pushFile(
             else => return error.LocalFileFailed,
         };
         const chunk = available[0..@min(available.len, @as(usize, @intCast(total - sent)))];
-        try appendSlice(executor, &scratch, buffers, chunk, remote_path);
+        try appendSlice(executor, &scratch, buffers, chunk, remote);
         reader.interface.toss(chunk.len);
         sent += chunk.len;
         moved.arrived = sent;
@@ -786,16 +817,17 @@ pub fn pushBytes(
     mode: u32,
 ) Error!void {
     const executor: Executor = .{ .direct = client };
-    try beginRemoteFile(executor, arena, remote_path, mode);
+    const remote = shell.word(remote_path);
+    try beginRemoteFile(executor, arena, remote, mode);
 
-    const buffers = try PushBuffers.init(arena, remote_path);
+    const buffers = try PushBuffers.init(arena, remote);
     var scratch = std.heap.ArenaAllocator.init(arena);
     defer scratch.deinit();
 
     var offset: usize = 0;
     while (offset < data.len) {
         const end = @min(offset + push_slice, data.len);
-        try appendSlice(executor, &scratch, buffers, data[offset..end], remote_path);
+        try appendSlice(executor, &scratch, buffers, data[offset..end], remote);
         offset = end;
     }
 
@@ -835,7 +867,7 @@ fn fetchRange(
     executor: Executor,
     scratch: *std.heap.ArenaAllocator,
     buffers: PullBuffers,
-    remote_path: []const u8,
+    remote_path: shell.Word,
     offset: u64,
     want: usize,
 ) Error![]const u8 {
@@ -843,8 +875,8 @@ fn fetchRange(
     const alloc = scratch.allocator();
     const cmd = try std.fmt.allocPrint(
         alloc,
-        "tail -c +{d} '{s}' | head -c {d} | base64",
-        .{ offset + 1, remote_path, want },
+        "tail -c +{[from]d} {[path]f} | head -c {[want]d} | base64",
+        .{ .from = offset + 1, .path = remote_path, .want = want },
     );
     const r = try executor.exec(alloc, cmd);
     if (r.exit_code != 0) return error.RemoteReadFailed;
@@ -931,9 +963,10 @@ pub fn pullFile(
     writer.pos = start_offset;
 
     var received: u64 = start_offset;
+    const remote = shell.word(remote_path);
     while (received < total) {
         const want: usize = @intCast(@min(@as(u64, pull_slice), total - received));
-        const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);
+        const chunk = try fetchRange(executor, &scratch, buffers, remote, received, want);
         // Short of the range asked for, before the end of the file: the source
         // shrank, or the host truncated the pipe. Either way the partial is not
         // the file, and reporting the smaller number is the pseudo-success this
@@ -971,8 +1004,8 @@ pub fn pullBytes(
 
     const cmd = try std.fmt.allocPrint(arena,
         \\command -v base64 >/dev/null || exit 41
-        \\base64 < '{s}'
-    , .{remote_path});
+        \\base64 < {[path]f}
+    , .{ .path = shell.word(remote_path) });
     const r = try executor.exec(arena, cmd);
     switch (r.exit_code) {
         0 => {},

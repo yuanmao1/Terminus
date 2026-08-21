@@ -1858,7 +1858,7 @@ pub fn stripCarriageReturns(arena: std.mem.Allocator, content: []const u8) ![]co
 /// job-control warnings that -i emits without a tty are stripped from
 /// stderr by `stripLoginNoise`.
 pub fn loginWrap(arena: std.mem.Allocator, command: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "bash -ilc {s}", .{try Core.Tmux.shellQuote(arena, command)});
+    return std.fmt.allocPrint(arena, "bash -ilc {s}", .{try Core.shell.quote(arena, command)});
 }
 
 /// Removes bash's tty-less interactive-mode warnings from stderr.

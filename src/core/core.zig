@@ -6,6 +6,9 @@ pub const DaemonClient = @import("daemon/Client.zig");
 pub const daemon_protocol = @import("daemon/protocol.zig");
 pub const Executor = @import("exec.zig").Executor;
 pub const script = @import("script.zig");
+/// POSIX shell words: the one place a value spliced into a remote script
+/// becomes an argument rather than syntax.
+pub const shell = @import("shell.zig");
 pub const transfer = @import("transfer.zig");
 /// Incremental SHA-256: the digest a transfer is judged by, taken over a file
 /// nobody can hold in memory.

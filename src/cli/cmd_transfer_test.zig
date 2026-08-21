@@ -3300,3 +3300,474 @@ fn seedTransfer(store: *Store, arena: std.mem.Allocator, label: []const u8) ![]c
     try Store.operations.advance(store, owned, .connecting, 101);
     return owned;
 }
+
+// --- gate: a value in a remote script is a value, not syntax -----------------
+//
+// Every script this module sends is built by splicing the operator's own
+// arguments into shell text. Thirty of those splices were `'{[path]s}'` — quotes
+// owned by the template, no escaping of the value — so a path holding an
+// apostrophe ended its word early and the rest of the path was read as shell.
+//
+// **These gates read the generated script the way the host reads it.** Not
+// "does the text contain quote marks" — that is a question about bytes, and the
+// bytes looked fine before. `shell.words` applies POSIX word splitting and
+// single-quote removal and hands back the words a shell would produce, so the
+// assertion is on what the host would *do*. A path that survives quoting comes
+// back out as one word equal to itself; a path that does not comes back as
+// several, or takes the rest of the script with it.
+//
+// **What is not proven here.** There is no live server in this suite, so nothing
+// below observes a real `sh` splitting these words — the splitting is modelled
+// by `shell.words`, which refuses (rather than guesses at) any construct it does
+// not implement. `pushBytes` and `pullBytes` take a `*Ssh` and cannot be driven
+// by `Scripted`; their script text comes from `beginRemoteFile`, `appendSlice`,
+// `probeRemoteFile` and `remoteDigest`, all of which are driven below, except
+// `pullBytes`' own `base64 < <path>` line, which is covered only by the source
+// scan in `core/shell.zig`.
+
+const shell = Core.shell;
+
+/// A path that, spliced into a template's own single quotes, closes the word and
+/// runs a command.
+const injection = "/tmp/x'; rm -rf $HOME; echo '";
+
+/// Paths that are ordinary on an ordinary host, and each of which holds a byte
+/// the shell reads as syntax when it is not quoted.
+const hostile_paths = [_][]const u8{
+    // The one that started this. `John's` is a directory named after a person.
+    "/data/John's files/x",
+    "/srv/two words/a b",
+    "/srv/\"double\"/x",
+    "/srv/$HOME/x",
+    "/srv/`whoami`/x",
+    "/srv/a\nb/x",
+    // Twelve apostrophes, which is a length problem and not a quoting one. Each
+    // one costs four bytes quoted instead of one, and a push sizes its per-slice
+    // command buffer once for the whole transfer — from `shell.quotedLen`, not
+    // from `raw.len`, because eleven apostrophes is where the old arithmetic ran
+    // out and started reporting `RemotePathTooLong` about a path that is 20 bytes
+    // long.
+    "/srv/''''''''''''/x",
+    // Every one of them at once, arranged so the old templates ran it.
+    injection,
+};
+
+/// The words `text` splits into, with the count asserted so a gate cannot pass
+/// by reading a script that is not there.
+fn wordsOf(arena: std.mem.Allocator, text: []const u8, want: usize) ![]const []const u8 {
+    const got = try shell.words(arena, text);
+    try std.testing.expectEqual(want, got.len);
+    return got;
+}
+
+/// How many of `text`'s words are exactly `value`.
+fn wordsEqual(arena: std.mem.Allocator, text: []const u8, value: []const u8) !usize {
+    return shell.wordCount(arena, text, value);
+}
+
+test "gate: the probe, the resume and the publish scripts are exactly what the host would run" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    // The three scripts named because they are the three a transfer cannot skip:
+    // the probe reads the far end before anything moves, the resume licenses an
+    // append onto bytes already there, and the publish is the one command that
+    // touches the operator's destination. Asserted as the whole word list rather
+    // than by searching for a substring: a word list states what the host does
+    // with every byte, including the ones a substring search never looks at.
+    const p = injection;
+
+    // --- the probe -----------------------------------------------------------
+    var probe = Core.Scripted.init(arena, &.{});
+    _ = Core.transfer.probeRemoteFile(probe.executor(), arena, p) catch {};
+    try t.expectEqual(@as(usize, 1), probe.seen.items.len);
+    try t.expectEqualDeep(@as([]const []const u8, &.{
+        "[",          "-f",      p,      "]",           "||",          "exit",  "44",
+        "wc",         "-c",      "<",    p,             "||",          "exit",  "45",
+        "stat",       "-c",      "%Y",   p,             "2>/dev/null", "||",    "stat",
+        "-f",         "%m",      p,      "2>/dev/null", "||",          "echo",  "-",
+        "if",         "command", "-v",   "sha256sum",   ">/dev/null",  "2>&1;", "then",
+        "sha256sum",  "<",       p,      "elif",        "command",     "-v",    "shasum",
+        ">/dev/null", "2>&1;",   "then", "shasum",      "-a",          "256",   "<",
+        p,            "else",    "echo", "-",           "fi",
+    }), try wordsOf(arena, probe.seen.items[0], 54));
+
+    // --- the resume ----------------------------------------------------------
+    // Driven through `pushFile` rather than called directly, because
+    // `resumeRemoteFile` is private and what matters is the command a resume
+    // actually puts on the wire.
+    const body = try arena.alloc(u8, 8);
+    @memset(body, 'z');
+    const source = try scratch.write("quoted_resume_src", body);
+    var resuming = Core.Scripted.init(arena, &.{ try replyLen(arena, 4), reply("") });
+    var resume_moved: Core.Ssh.Moved = .{};
+    _ = try Core.transfer.pushFile(
+        resuming.executor(),
+        arena,
+        scratch.io,
+        source,
+        p,
+        4,
+        0o644,
+        null,
+        &resume_moved,
+    );
+    try t.expectEqual(@as(usize, 2), resuming.seen.items.len);
+    try t.expectEqualDeep(@as([]const []const u8, &.{
+        "command", "-v", "base64", ">/dev/null", "||", "exit", "41",
+        "[",       "-f", p,        "]",          "||", "exit", "44",
+        "wc",      "-c", "<",      p,            "||", "exit", "45",
+    }), try wordsOf(arena, resuming.seen.items[0], 21));
+    // And the append that follows it. The payload is base64, which cannot hold
+    // an apostrophe, but it goes through the same quoter — an exception with a
+    // proof attached is still an exception.
+    const appended = try wordsOf(arena, resuming.seen.items[1], 8);
+    try t.expectEqualStrings(">>", appended[6]);
+    try t.expectEqualStrings(p, appended[7]);
+
+    // --- the publish, replacing ---------------------------------------------
+    const part = try std.fmt.allocPrint(arena, "{s}.terminus-part", .{p});
+    var publish = Core.Scripted.init(arena, &.{reply("")});
+    try Core.transfer.publishRemote(publish.executor(), arena, part, p, false);
+    try t.expectEqualDeep(
+        @as([]const []const u8, &.{ "mv", "-f", part, p }),
+        try wordsOf(arena, publish.seen.items[0], 4),
+    );
+
+    // --- the publish, refusing to replace -----------------------------------
+    // `<part>;` and `];` are the shell operators the template always glued on;
+    // what matters is that the path ends where the quote ends, so the operator
+    // is an operator and not part of a filename.
+    var no_clobber = Core.Scripted.init(arena, &.{replyCode(47, "")});
+    try t.expectError(
+        error.DestinationExists,
+        Core.transfer.publishRemote(no_clobber.executor(), arena, part, p, true),
+    );
+    try t.expectEqualDeep(@as([]const []const u8, &.{
+        "if",  "ln", part,                                           p,      "2>/dev/null;", "then",
+        "rm",  "-f", try std.fmt.allocPrint(arena, "{s};", .{part}), "exit", "0;",           "fi",
+        "if",  "[",  "-e",                                           p,      "]",            "||",
+        "[",   "-L", p,                                              "];",   "then",         "exit",
+        "47;", "fi", "exit",                                         "48",
+    }), try wordsOf(arena, no_clobber.seen.items[0], 28));
+}
+
+test "gate: the payload that used to run is a filename now, and the old shape still runs it" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The contrast is the gate. One that only checks the fixed code cannot tell
+    // "the quoting works" from "this payload was never dangerous", so the defect
+    // is reproduced here against the same reader that certifies the fix: the
+    // shape `transfer.zig` used to have, on the same path, with `rm` and `-rf`
+    // arriving as words of their own.
+    const was = try std.fmt.allocPrint(arena, "[ -f '{s}' ] || exit 44", .{injection});
+    const old_words = try shell.words(arena, was);
+    try t.expectEqual(@as(usize, 1), try wordsEqual(arena, was, "rm"));
+    try t.expectEqual(@as(usize, 1), try wordsEqual(arena, was, "-rf"));
+    try t.expectEqual(@as(usize, 0), try wordsEqual(arena, was, injection));
+    // `-f`'s operand is a path that stops at the apostrophe, and what follows it
+    // is a command. `/tmp/x;` rather than `/tmp/x` because `shell.words` splits
+    // on blanks and removes quotes — it does not recognise `;` as an operator,
+    // which it does not need to: the separator arriving *attached to the value*
+    // is itself the finding, and `rm` and `-rf` above are words of their own
+    // either way.
+    try t.expectEqualStrings("/tmp/x;", old_words[2]);
+
+    // The same path through the same script builder today. Six words are the
+    // path, whole; none of them is a command.
+    var probe = Core.Scripted.init(arena, &.{});
+    _ = Core.transfer.probeRemoteFile(probe.executor(), arena, injection) catch {};
+    const now = probe.seen.items[0];
+    try t.expectEqual(@as(usize, 6), try wordsEqual(arena, now, injection));
+    try t.expectEqual(@as(usize, 0), try wordsEqual(arena, now, "rm"));
+    try t.expectEqual(@as(usize, 0), try wordsEqual(arena, now, "-rf"));
+    try t.expectEqual(@as(usize, 0), try wordsEqual(arena, now, "$HOME"));
+    // And the text still holds the payload's bytes — the fix is quoting, not
+    // stripping. A sanitiser would pass every assertion above while reading and
+    // writing a path the operator did not name.
+    try t.expect(std.mem.indexOf(u8, now, "rm -rf $HOME") != null);
+}
+
+test "gate: every script this module sends holds each path as exactly one word" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    const body = try arena.alloc(u8, 16);
+    for (body, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    const source = try scratch.write("quoted_sweep_src", body);
+    const local_partial = try scratch.path("quoted_sweep_dst");
+
+    // Counted, per builder, so a sweep that stopped calling one of them fails
+    // here rather than reporting that it found nothing wrong.
+    var builders_driven: usize = 0;
+
+    for (hostile_paths) |p| {
+        const part = try std.fmt.allocPrint(arena, "{s}.terminus-part", .{p});
+
+        // probeRemoteFile: six readings of the one path.
+        var probe = Core.Scripted.init(arena, &.{});
+        _ = Core.transfer.probeRemoteFile(probe.executor(), arena, p) catch {};
+        try t.expectEqual(@as(usize, 6), try wordsEqual(arena, probe.seen.items[0], p));
+        builders_driven += 1;
+
+        // remoteDigest: three.
+        var dig = Core.Scripted.init(arena, &.{reply("")});
+        _ = Core.transfer.remoteDigest(dig.executor(), arena, p) catch {};
+        try t.expectEqual(@as(usize, 3), try wordsEqual(arena, dig.seen.items[0], p));
+        builders_driven += 1;
+
+        // remotePartial: three.
+        var partial = Core.Scripted.init(arena, &.{reply("4\nx\n")});
+        _ = Core.transfer.remotePartial(partial.executor(), arena, p, 4) catch {};
+        try t.expectEqual(@as(usize, 3), try wordsEqual(arena, partial.seen.items[0], p));
+        builders_driven += 1;
+
+        // truncateRemote: two bare, plus `of=<path>` — `dd`'s operand syntax
+        // glues the name to the keyword, and the quote still closes where the
+        // path ends.
+        var cut = Core.Scripted.init(arena, &.{try replyLen(arena, 4)});
+        try Core.transfer.truncateRemote(cut.executor(), arena, p, 4);
+        try t.expectEqual(@as(usize, 2), try wordsEqual(arena, cut.seen.items[0], p));
+        try t.expectEqual(@as(usize, 1), try wordsEqual(
+            arena,
+            cut.seen.items[0],
+            try std.fmt.allocPrint(arena, "of={s}", .{p}),
+        ));
+        builders_driven += 1;
+
+        // publishRemote, both primitives.
+        var mv = Core.Scripted.init(arena, &.{reply("")});
+        try Core.transfer.publishRemote(mv.executor(), arena, part, p, false);
+        try t.expectEqual(@as(usize, 1), try wordsEqual(arena, mv.seen.items[0], part));
+        try t.expectEqual(@as(usize, 1), try wordsEqual(arena, mv.seen.items[0], p));
+        builders_driven += 1;
+
+        var ln = Core.Scripted.init(arena, &.{reply("")});
+        try Core.transfer.publishRemote(ln.executor(), arena, part, p, true);
+        try t.expectEqual(@as(usize, 1), try wordsEqual(arena, ln.seen.items[0], part));
+        try t.expectEqual(@as(usize, 3), try wordsEqual(arena, ln.seen.items[0], p));
+        builders_driven += 1;
+
+        // pushFile, fresh: the `: >` open names the path twice, each append once.
+        var push = Core.Scripted.init(arena, &.{ reply(""), reply("") });
+        var pushed: Core.Ssh.Moved = .{};
+        _ = try Core.transfer.pushFile(
+            push.executor(),
+            arena,
+            scratch.io,
+            source,
+            p,
+            0,
+            0o644,
+            null,
+            &pushed,
+        );
+        try t.expectEqual(@as(usize, 2), push.seen.items.len);
+        try t.expectEqual(@as(usize, 2), try wordsEqual(arena, push.seen.items[0], p));
+        try t.expectEqual(@as(usize, 1), try wordsEqual(arena, push.seen.items[1], p));
+        builders_driven += 1;
+
+        // pushFile, resuming: the length check names it twice.
+        var again = Core.Scripted.init(arena, &.{ try replyLen(arena, 8), reply("") });
+        var again_moved: Core.Ssh.Moved = .{};
+        _ = try Core.transfer.pushFile(
+            again.executor(),
+            arena,
+            scratch.io,
+            source,
+            p,
+            8,
+            0o644,
+            null,
+            &again_moved,
+        );
+        try t.expectEqual(@as(usize, 2), try wordsEqual(arena, again.seen.items[0], p));
+        builders_driven += 1;
+
+        // pullFile: one byte-range command, naming the remote once.
+        var pull = Core.Scripted.init(arena, &.{try rangeReply(arena, body)});
+        var pulled: Core.Ssh.Moved = .{};
+        _ = try Core.transfer.pullFile(
+            pull.executor(),
+            arena,
+            scratch.io,
+            p,
+            local_partial,
+            0,
+            body.len,
+            null,
+            &pulled,
+        );
+        try t.expectEqual(@as(usize, 1), pull.seen.items.len);
+        try t.expectEqual(@as(usize, 1), try wordsEqual(arena, pull.seen.items[0], p));
+        builders_driven += 1;
+    }
+
+    // Nine builders across eight paths. A count, because a loop like this is
+    // exactly what quietly stops covering a builder when one is renamed.
+    try t.expectEqual(@as(usize, 9 * hostile_paths.len), builders_driven);
+
+    // --- and the same thing at full slice width ------------------------------
+    //
+    // Everything above sends 16-byte chunks, which is nowhere near the per-slice
+    // command buffer a push sizes once for the whole transfer — so none of it
+    // can reach that buffer's edge. The edge is where the quoting costs
+    // something: an apostrophe is one byte raw and four quoted, so a buffer
+    // sized from `raw.len` is short by three per apostrophe, and at twelve of
+    // them a full slice no longer fits. `bufPrint` then returns `NoSpaceLeft`
+    // and this module reports `RemotePathTooLong` — about a path 26 bytes long,
+    // for a reason that is not its length.
+    const wide = "/srv/''''''''''''''''''''/x";
+    const full = try arena.alloc(u8, Core.transfer.push_slice);
+    for (full, 0..) |*b, i| b.* = @truncate(i * 13 + 2);
+    const full_source = try scratch.write("quoted_full_slice_src", full);
+    var wide_push = Core.Scripted.init(arena, &.{ reply(""), reply("") });
+    var wide_moved: Core.Ssh.Moved = .{};
+    const wide_sent = try Core.transfer.pushFile(
+        wide_push.executor(),
+        arena,
+        scratch.io,
+        full_source,
+        wide,
+        0,
+        0o644,
+        null,
+        &wide_moved,
+    );
+    try t.expectEqual(@as(u64, Core.transfer.push_slice), wide_sent);
+    // One whole slice, in one command, with the path still one word.
+    try t.expectEqual(@as(usize, 2), wide_push.seen.items.len);
+    try t.expectEqual(@as(usize, 1), try wordsEqual(arena, wide_push.seen.items[1], wide));
+    try t.expectEqualSlices(u8, full, try stagedByPush(arena, wide_push.seen.items));
+}
+
+test "gate: a push and a pull of a path holding an apostrophe land where the operator said" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    const slice = Core.transfer.push_slice;
+    const total = slice + 129;
+    const body = try arena.alloc(u8, total);
+    for (body, 0..) |*b, i| b.* = @truncate(i * 31 + 5);
+
+    const dest = "/data/John's files/report.bin";
+    const part = dest ++ ".terminus-part";
+
+    // --- push ---------------------------------------------------------------
+    const source = try scratch.write("apostrophe_src", body);
+    var push = Core.Scripted.init(arena, &.{ reply(""), reply(""), reply("") });
+    var moved: Core.Ssh.Moved = .{};
+    const sent = try Core.transfer.pushFile(
+        push.executor(),
+        arena,
+        scratch.io,
+        source,
+        part,
+        0,
+        0o644,
+        null,
+        &moved,
+    );
+    try t.expectEqual(@as(u64, total), sent);
+    // The bytes that went out are the file — the staging partial on the host is
+    // the concatenation of what the channel carried, decoded from the same
+    // commands a real host would have run.
+    try t.expectEqualSlices(u8, body, try stagedByPush(arena, push.seen.items));
+    // …and they went to the staging path, whole. Two appends, each naming it.
+    try t.expectEqual(@as(usize, 3), push.seen.items.len);
+    for (push.seen.items[1..]) |cmd| {
+        const w = try shell.words(arena, cmd);
+        try t.expectEqualStrings(part, w[w.len - 1]);
+    }
+
+    // The publish moves the staging path onto the destination the operator
+    // named, and nothing else. Both of them hold the apostrophe.
+    var publish = Core.Scripted.init(arena, &.{reply("")});
+    try Core.transfer.publishRemote(publish.executor(), arena, part, dest, false);
+    try t.expectEqualDeep(
+        @as([]const []const u8, &.{ "mv", "-f", part, dest }),
+        try shell.words(arena, publish.seen.items[0]),
+    );
+
+    // --- pull ---------------------------------------------------------------
+    // The remote path carries the apostrophe; the staging and destination paths
+    // are local, and land on this machine's filesystem. Its own body, sized off
+    // `pull_slice`, because a pull's byte range is not a push's slice — one
+    // range would otherwise cover the whole of it and the loop would never run
+    // twice.
+    const pull_total = Core.transfer.pull_slice + 77;
+    const pull_body = try arena.alloc(u8, pull_total);
+    for (pull_body, 0..) |*b, i| b.* = @truncate(i * 17 + 9);
+    const local_part = try scratch.path("Johns_part");
+    const local_dest = try scratch.path("Johns_dest");
+
+    var pull = Core.Scripted.init(arena, &.{
+        try rangeReply(arena, pull_body[0..Core.transfer.pull_slice]),
+        try rangeReply(arena, pull_body[Core.transfer.pull_slice..]),
+    });
+    var pulled: Core.Ssh.Moved = .{};
+    const got = try Core.transfer.pullFile(
+        pull.executor(),
+        arena,
+        scratch.io,
+        dest,
+        local_part,
+        0,
+        pull_total,
+        null,
+        &pulled,
+    );
+    try t.expectEqual(@as(u64, pull_total), got);
+    try t.expectEqual(@as(usize, 2), pull.seen.items.len);
+    for (pull.seen.items) |cmd| {
+        try t.expectEqual(@as(usize, 1), try wordsEqual(arena, cmd, dest));
+    }
+
+    // The staged partial holds the file, and publishing it puts it at the
+    // destination — the local half of "lands where the operator said".
+    try t.expectEqualSlices(u8, pull_body, try scratch.read(arena, local_part));
+    try Core.transfer.publishLocal(scratch.io, local_part, local_dest, false);
+    try t.expect(!scratch.exists(local_part));
+    try t.expectEqualSlices(u8, pull_body, try scratch.read(arena, local_dest));
+}
+
+test "gate: the CLI no longer refuses the paths this module can now carry" {
+    const t = std.testing;
+    // `validateRemotePath` ends in `fatal`, so it cannot be called from a test
+    // without ending the test runner. What can be read is the rule it applies.
+    // It stood in front of `transfer.zig` refusing `'`, `"`, backtick, `$` and
+    // newlines because those splices were unescaped — a refusal doing a quoter's
+    // job, and doing it wrong: it never covered the space, and it refused
+    // `/data/John's files/x`, which is a directory, not an attack.
+    const body = try Core.control.bodyOf(
+        @embedFile("cmd_transfer.zig"),
+        "\npub fn validateRemotePath(",
+    );
+
+    // The character-class refusal is gone. `indexOfAny` is how this tree spells
+    // one, and the gate names the spelling rather than the five bytes so a
+    // refusal reinstated over a different set is caught too.
+    try t.expect(std.mem.indexOf(u8, body, "indexOfAny") == null);
+
+    // The leading dash stays, and it is the one rule that was never about
+    // quoting: `stat`, `tail`, `mv` and `ln` read a leading `-` as an option
+    // *after* the shell has taken the quotes off, so no amount of quoting helps.
+    try t.expect(std.mem.indexOf(u8, body, "path[0] == '-'") != null);
+    // And an empty path is still not a path.
+    try t.expect(std.mem.indexOf(u8, body, "path.len == 0") != null);
+}

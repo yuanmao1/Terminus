@@ -1153,8 +1153,8 @@
       "id": "transfer-publish-not-atomic",
       "rule": "Publishing is one rename, so a failure leaves the destination as it was.",
       "file": "src/core/transfer.zig",
-      "find": "        \"mv -f '{s}' '{s}'\",",
-      "replace": "        \"cat '{s}' > '{s}'\",",
+      "find": "            \"mv -f {[part]f} {[dest]f}\",",
+      "replace": "            \"cat {[part]f} > {[dest]f}\",",
       "expect_gate": "gate: no failure mode touches the destination, because only the rename does"
     },
     {
@@ -1249,8 +1249,8 @@
       "id": "transfer-allocates-a-little-per-chunk",
       "rule": "A transfer's peak allocation is the same number at every size, not merely a number under some budget. This is the weakly-proportional case: one small allocation per chunk on the long-lived arena instead of the per-chunk scratch - the regression class `Scripted`'s own `seen` list is an instance of. It costs ~900 bytes across a 16x size change, so it stays far inside the budget and the `< budget` assertion this replaced passed both runs.",
       "file": "src/core/transfer.zig",
-      "find": "        const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);",
-      "replace": "        _ = try arena.dupe(u8, remote_path);\n        const chunk = try fetchRange(executor, &scratch, buffers, remote_path, received, want);",
+      "find": "        const chunk = try fetchRange(executor, &scratch, buffers, remote, received, want);",
+      "replace": "        _ = try arena.dupe(u8, remote_path);\n        const chunk = try fetchRange(executor, &scratch, buffers, remote, received, want);",
       "expect_gate": "gate: a transfer's peak allocation does not grow with the file"
     },
     {
@@ -1345,8 +1345,8 @@
       "id": "M3.3-resume-push-truncates-the-partial",
       "rule": "A resuming push must not truncate the remote staging partial. `beginRemoteFile` opens with `: >`, which is right for a fresh push and throws away every confirmed byte on a resume.",
       "file": "src/core/transfer.zig",
-      "find": "    if (start_offset == 0)\n        try beginRemoteFile(executor, arena, remote_path, mode)\n    else\n        try resumeRemoteFile(executor, arena, remote_path, start_offset);",
-      "replace": "    try beginRemoteFile(executor, arena, remote_path, mode);",
+      "find": "    if (start_offset == 0)\n        try beginRemoteFile(executor, arena, remote, mode)\n    else\n        try resumeRemoteFile(executor, arena, remote, start_offset);",
+      "replace": "    try beginRemoteFile(executor, arena, remote, mode);",
       "expect_gate": "gate: a resuming push appends from the offset and does not truncate the remote partial"
     },
     {
@@ -1449,16 +1449,16 @@
       "id": "M3-noclobber-remote-links-rather-than-renames",
       "rule": "A no-clobber push publishes with `ln`, never with a form of `mv`: `mv` replaces, and `mv -n` is a check followed by a rename.",
       "file": "src/core/transfer.zig",
-      "find": "        \\\\if ln '{[part]s}' '{[dest]s}' 2>/dev/null; then rm -f '{[part]s}'; exit 0; fi\n",
-      "replace": "        \\\\if mv -f '{[part]s}' '{[dest]s}' 2>/dev/null; then exit 0; fi\n",
+      "find": "        \\\\if ln {[part]f} {[dest]f} 2>/dev/null; then rm -f {[part]f}; exit 0; fi\n",
+      "replace": "        \\\\if mv -f {[part]f} {[dest]f} 2>/dev/null; then exit 0; fi\n",
       "expect_gate": "gate: a no-clobber push links rather than renames, and tells a taken name from a host that cannot link"
     },
     {
       "id": "M3-noclobber-remote-symlink-is-an-occupied-name",
       "rule": "`[ -e ]` follows symlinks, so a dangling one at the destination is a name `ln` refuses and `-e` alone calls absent; `-L` is what stops that being reported as a host that cannot link.",
       "file": "src/core/transfer.zig",
-      "find": "        \\\\if [ -e '{[dest]s}' ] || [ -L '{[dest]s}' ]; then exit 47; fi\n",
-      "replace": "        \\\\if [ -e '{[dest]s}' ]; then exit 47; fi\n",
+      "find": "        \\\\if [ -e {[dest]f} ] || [ -L {[dest]f} ]; then exit 47; fi\n",
+      "replace": "        \\\\if [ -e {[dest]f} ]; then exit 47; fi\n",
       "expect_gate": "gate: a no-clobber push links rather than renames, and tells a taken name from a host that cannot link"
     },
     {
@@ -1804,6 +1804,46 @@
       "find": "            try jw.writer.writeAll(b64.Encoder.encode(window[0..b64.Encoder.calcSize(rest.len)], rest));",
       "replace": "            try jw.writer.writeAll(rest);",
       "expect_gate": "gate: every byte value crosses the wire unchanged"
+    },
+    {
+      "id": "M7-quote-placeholder-back-inside-the-quotes",
+      "rule": "No value in a remote script may be spliced inside quotes the template owns. That shape - `'{[path]s}'` - is what all thirty sites had: the quotes are literal text, nothing escapes the value, and the first apostrophe in an operator's path ends the word. The compiler cannot see it, because a `shell.Word` formats perfectly well with quotes around it; it just produces `''<path>''`, which is a different word.",
+      "file": "src/core/transfer.zig",
+      "find": "    \\\\wc -c < {[path]f} || exit 45\n    \\\\stat -c %Y {[path]f}",
+      "replace": "    \\\\wc -c < '{[path]f}' || exit 45\n    \\\\stat -c %Y {[path]f}",
+      "expect_gate": "gate: transfer.zig has no spelling for a raw value in a remote script"
+    },
+    {
+      "id": "M7-quote-raw-slice-reaches-a-template",
+      "rule": "No `{s}` may reach a remote script template in transfer.zig: every string this module splices into a command is a shell word, so a `{s}` is a raw slice standing where a `shell.Word` belongs. This is the thirty-first site, and it is the one the type system cannot refuse - `'{[path]s}'` with a `[]const u8` argument compiles. Chosen in `pullBytes` on purpose: it takes a `*Ssh`, so no `Scripted` gate can drive it and only the source scan is holding it.",
+      "file": "src/core/transfer.zig",
+      "find": "        \\\\base64 < {[path]f}\n    , .{ .path = shell.word(remote_path) });",
+      "replace": "        \\\\base64 < {[path]s}\n    , .{ .path = remote_path });",
+      "expect_gate": "gate: transfer.zig has no spelling for a raw value in a remote script"
+    },
+    {
+      "id": "M7-quote-drops-the-embedded-apostrophe",
+      "rule": "`shell.Word` closes, escapes and reopens an embedded apostrophe ('\\''). Emitting the apostrophe bare instead keeps every other byte literal, so a path with no apostrophe is unaffected and only the case the whole pass exists for breaks - and it breaks by running the rest of the path.",
+      "file": "src/core/shell.zig",
+      "find": "            try writer.writeAll(\"'\\\\''\");",
+      "replace": "            try writer.writeByte('\\'');",
+      "expect_gate": "gate: the payload that used to run is a filename now, and the old shape still runs it"
+    },
+    {
+      "id": "M7-push-buffer-sized-from-the-unquoted-path",
+      "rule": "A push sizes its per-slice command buffer once for the whole transfer, and must size it from the path's quoted length. An apostrophe costs four bytes quoted instead of one, so sizing from `raw.len` overruns at eleven apostrophes and reports `RemotePathTooLong` - a refusal naming a length - about a path twenty bytes long.",
+      "file": "src/core/transfer.zig",
+      "find": "        const command_max = encoded_max + 2 + shell.quotedLen(remote_path.raw) + 64;",
+      "replace": "        const command_max = encoded_max + 2 + remote_path.raw.len + 64;",
+      "expect_gate": "gate: every script this module sends holds each path as exactly one word"
+    },
+    {
+      "id": "M7-remote-path-refusal-reinstated",
+      "rule": "`validateRemotePath` may refuse only what quoting cannot fix. The character-class refusal it used to carry was standing in for the quoter that is now in `shell.Word`, and it refused `/data/John's files/x` - a directory named after a person, not an attack - while never covering the space, which is the metacharacter paths actually contain.",
+      "file": "src/cli/cmd_transfer.zig",
+      "find": "    if (path.len == 0)\n        fatal(\"remote path must not be empty\", .{});",
+      "replace": "    if (path.len == 0 or std.mem.indexOfAny(u8, path, \"'\\\"\\n`$\") != null)\n        fatal(\"remote path must not contain quotes, backticks, '$' or newlines\", .{});",
+      "expect_gate": "gate: the CLI no longer refuses the paths this module can now carry"
     }
   ]
 }

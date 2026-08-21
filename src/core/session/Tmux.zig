@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ssh = @import("../ssh/Client.zig");
 const Executor = @import("../exec.zig").Executor;
+const shell = @import("../shell.zig");
 
 const log_dir = "$HOME/.terminus/logs";
 
@@ -91,21 +92,6 @@ fn logPath(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
 /// `tmux attach -t <terminus name>` names a session that is not there.
 pub fn targetName(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
     return std.fmt.allocPrint(arena, "t-{s}", .{name});
-}
-
-/// Wraps `s` in single quotes for POSIX shells ('a'\''b' pattern).
-pub fn shellQuote(arena: Allocator, s: []const u8) Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.append(arena, '\'');
-    for (s) |ch| {
-        if (ch == '\'') {
-            try out.appendSlice(arena, "'\\''");
-        } else {
-            try out.append(arena, ch);
-        }
-    }
-    try out.append(arena, '\'');
-    return out.toOwnedSlice(arena);
 }
 
 fn run(executor: Executor, arena: Allocator, command: []const u8) Error!Ssh.ExecResult {
@@ -735,9 +721,16 @@ pub fn removeLog(executor: Executor, arena: Allocator, name: []const u8) Error!v
 
 /// Types `input` into the session as if at the keyboard, plus Enter unless
 /// `no_enter`. Does not wait for any output.
+///
+/// `input` is the operator's own command line, so it is quoted as one shell word
+/// (`shell.quote`) before `send-keys -l --` sees it. The quoter used to live in
+/// this file, which is why `core/transfer.zig` — a transport module with no
+/// business importing a session module — did not use it and hand-rolled thirty
+/// unescaped shell words instead. It lives in `core/shell.zig` now, underneath
+/// both.
 pub fn sendKeys(executor: Executor, arena: Allocator, name: []const u8, input: []const u8, no_enter: bool) Error!void {
     const tname = try targetName(arena, name);
-    const quoted = try shellQuote(arena, input);
+    const quoted = try shell.quote(arena, input);
     // Pane targets need the trailing ':' (exact session, default window):
     // a bare '=name' is rejected as a pane target by some tmux versions.
     const script = try std.fmt.allocPrint(arena,
