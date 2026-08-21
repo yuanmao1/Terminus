@@ -377,6 +377,89 @@ test "gate: job attempts survive a same-name rerun and job rm" {
     try t.expectEqual(@as(i64, 2100), probe.last_probed_at.?);
 }
 
+// The same rule as the test above, for the column it was not applied to.
+//
+// `parser_carry` holds the bytes a probe held back because a `__TERMINUS_PROGRESS__`
+// line straddled its read window; the next probe is the only thing that can ever
+// use them. It was the one of the four observation columns written unconditionally,
+// and the single production caller (`cmd_job.zig`'s `refresh`) sets neither it nor
+// two of its neighbours — so it bound the struct default `null` and every
+// `job status` and every `job read` overwrote the column with NULL. A split marker
+// could not survive a second look, which is the one thing this column exists for.
+//
+// Driven with the caller's own shape: the second `recordProbe` here sets exactly
+// what `refresh` sets. That is what makes this the hot path and not a hypothetical.
+test "gate: a second probe does not erase the carry the first one held back" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_probe_carry");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try seedServer(&store);
+
+    const request_id = "01CCCCCCCC0123456789ABCDEF";
+    try Store.operations.create(&store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .kind = .job,
+        .alias = "carry",
+        .now = 3000,
+    });
+    _ = try Store.job_attempts.create(&store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "lease-host",
+        .job_name = "carry",
+        .attempt_no = 1,
+        .now = 3000,
+    });
+
+    // A read that ended mid-marker. The tail is kept for the next one.
+    const held_back = "__TERMINUS_PROG";
+    try Store.job_attempts.recordProbe(&store, request_id, .{
+        .probe_cursor = 1024,
+        .parser_carry = held_back,
+        .session_alive = true,
+        .now = 3100,
+    });
+    try t.expectEqualStrings(
+        held_back,
+        (try Store.job_attempts.probeState(&store, arena, request_id)).?.parser_carry.?,
+    );
+
+    // …and the next probe, spelled exactly the way `refresh` spells it: a cursor,
+    // a business result and liveness, and nothing about the carry.
+    try Store.job_attempts.recordProbe(&store, request_id, .{
+        .probe_cursor = 2048,
+        .latest_business_result = "{\"ok\":true}",
+        .session_alive = true,
+        .now = 3200,
+    });
+
+    const after = (try Store.job_attempts.probeState(&store, arena, request_id)).?;
+    if (after.parser_carry == null) {
+        std.debug.print(
+            \\
+            \\the second probe erased `parser_carry`. It is the only one of the four
+            \\observation columns whose UPDATE is not a `COALESCE`, and the one production
+            \\caller does not set it — so the split marker the first probe held back is gone
+            \\on every `job status` and every `job read`.
+            \\
+        , .{});
+        return error.ProbeCarryErased;
+    }
+    try t.expectEqualStrings(held_back, after.parser_carry.?);
+    // The columns that *were* meant to move, did. A COALESCE applied to the wrong
+    // side would freeze the cursor instead, which is the opposite failure.
+    try t.expectEqual(@as(i64, 2048), after.probe_cursor);
+    try t.expectEqualStrings("{\"ok\":true}", after.latest_business_result.?);
+}
+
 /// One thread racing to claim a job name, the way `run --name deploy` does.
 /// Each carries its own request id, because that is what owns the row.
 const ReserveCtx = struct {

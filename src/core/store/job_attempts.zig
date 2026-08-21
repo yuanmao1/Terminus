@@ -244,6 +244,16 @@ pub fn sentinelForLocked(
 
 /// Latest observation of a running attempt. `last_probed_at` travels with
 /// every field so a stale reading is always identifiable as such.
+///
+/// **Nothing in production reads this row.** `probeState` below has no caller
+/// outside `gates_leases_test.zig`, and `probe_cursor` is written from
+/// `Tmux.probeTail`'s `next_cursor` and never fed back — `probeTail` takes a
+/// `tail_bytes` window, not a cursor. So the whole nine-column table is written and
+/// not read today, and that is the honest description of it: the columns are
+/// correct, and the mechanisms they exist for are not wired up. `parser_carry` in
+/// particular is now preserved across probes rather than destroyed by them, which
+/// is what a reader would need — it does not mean a split
+/// `__TERMINUS_PROGRESS__` line is currently reassembled anywhere.
 pub const ProbeState = struct {
     request_id: []const u8,
     probe_cursor: i64,
@@ -268,9 +278,16 @@ pub const ProbeUpdate = struct {
     now: i64,
 };
 
-/// Upserts the observation cache. Progress, business result and phase are
-/// only overwritten when a new value was actually seen — a probe that reads
-/// no new output must not erase what an earlier one established.
+/// Upserts the observation cache. Carry, progress, business result and phase are
+/// only overwritten when a new value was actually seen — a probe that reads no new
+/// output must not erase what an earlier one established.
+///
+/// `parser_carry` was the one of the four not behind a `COALESCE`, and its single
+/// production caller (`cmd_job.zig`'s `refresh`) sets neither it nor two of its
+/// neighbours: it bound the struct default `null`, so every `job status` and every
+/// `job read` overwrote the column with NULL. What that column holds is the bytes
+/// held back because a marker straddled the read window, which is precisely the
+/// state that has to survive from one probe to the next — see `ProbeState`.
 pub fn recordProbe(store: *Store, request_id: []const u8, update: ProbeUpdate) Error!void {
     var stmt = try store.db.prepare(
         \\INSERT INTO job_probe_state (
@@ -280,7 +297,7 @@ pub fn recordProbe(store: *Store, request_id: []const u8, update: ProbeUpdate) E
         \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
         \\ON CONFLICT(request_id) DO UPDATE SET
         \\  probe_cursor = ?2,
-        \\  parser_carry = ?3,
+        \\  parser_carry           = COALESCE(?3, parser_carry),
         \\  latest_progress_json   = COALESCE(?4, latest_progress_json),
         \\  latest_business_result = COALESCE(?5, latest_business_result),
         \\  latest_phase           = COALESCE(?6, latest_phase),

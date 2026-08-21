@@ -811,6 +811,107 @@ test "gate: the claim-reporting receipt envelope is the shared one plus the leas
     }
 }
 
+/// The *audit* ledger's failure envelope, for a verb that has no operation to
+/// name. No defaults, on the same rule as the two above.
+const AuditFatalJson = struct {
+    ok: bool,
+    @"error": []const u8,
+    errorCode: []const u8,
+    action: []const u8,
+    server: []const u8,
+    effect: []const u8,
+    cause: []const u8,
+    hint: []const u8,
+};
+
+const audit_fatal_error = "could not record the action in the audit ledger";
+const audit_fatal_hint = "the action was already carried out; what failed is the record of it";
+
+/// A write to the `history` ledger failed, on a verb that opened no operation.
+///
+/// **Why this is not `receiptFatal`.** That envelope names a `requestId` and every
+/// caller of it has an `Execution` to take one from. `sync` has neither: it holds
+/// no scope lease and opens no operation row, so the only way to reach
+/// `receiptFatal` from it would be to invent an id — the same falsehood as the
+/// `catch {}` this replaces, written more convincingly.
+///
+/// **What does carry over is the rule and the exit code.** The rule is the one
+/// stated above `receiptFatal`: if we cannot record what we did, we do not get to
+/// claim we did it cleanly. The code is **76** and not 1, because 1 means "it did
+/// not work" and the files demonstrably moved — that distinction is the whole
+/// reason `receipt_persist_failed` is not `failure`.
+///
+/// `effect` is what the verb actually did, in its own words, because the caller is
+/// being handed an incomplete audit trail and this sentence is now the only place
+/// that fact exists.
+///
+/// **For a caller holding no claim**, which is what "no operation row" means here:
+/// nothing registers a claim without opening one. A verb that took a lease and
+/// wants this envelope needs the two lease keys on it first, the way every other
+/// document path in this file carries them.
+pub fn auditFatal(
+    action: []const u8,
+    server: []const u8,
+    effect: []const u8,
+    err: anyerror,
+) noreturn {
+    closeDaemonSocket();
+    if (active_ctx) |ctx| {
+        writeAuditFatal(ctx, action, server, effect, err);
+        ctx.out.flush() catch {};
+    }
+    std.process.exit(exit_code.receipt_persist_failed);
+}
+
+/// The document, split from the exit so a gate can read it.
+fn writeAuditFatal(
+    ctx: *Ctx,
+    action: []const u8,
+    server: []const u8,
+    effect: []const u8,
+    err: anyerror,
+) void {
+    switch (ctx.out.format) {
+        .json => ctx.out.json(AuditFatalJson{
+            .ok = false,
+            .@"error" = audit_fatal_error,
+            .errorCode = "AUDIT_PERSIST_FAILED",
+            .action = action,
+            .server = server,
+            .effect = effect,
+            .cause = @errorName(err),
+            .hint = audit_fatal_hint,
+        }) catch {},
+        .human => ctx.out.print(
+            "AUDIT_PERSIST_FAILED: {s}\n  action: {s} on {s}\n  what happened: {s}\n  {s}\n",
+            .{ @errorName(err), action, server, effect, audit_fatal_hint },
+        ) catch {},
+    }
+}
+
+// The envelope, driven. What this holds is the one thing the defect got wrong:
+// a failed audit write is reported as a failure, with a code a caller can branch
+// on and an exit that is not 1. The route from `cmd_sync` into here is held by
+// that file's own gate, which reads the call site — this path ends in
+// `std.process.exit`, so nothing can drive it whole.
+test "gate: a failed audit write is published as a failure, not as a clean run" {
+    const t = std.testing;
+    var buffer: [4096]u8 = undefined;
+    var captured: Captured = .init(&buffer);
+    writeAuditFatal(captured.ctxPtr(), "sync", "prod", "push ./src -> /srv/app", error.Sqlite);
+
+    const text = captured.text();
+    try t.expect(std.mem.indexOf(u8, text, "\"ok\": false") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"errorCode\": \"AUDIT_PERSIST_FAILED\"") != null);
+    // The effect is named. A caller told only that a write failed cannot tell
+    // whether anything reached the host.
+    try t.expect(std.mem.indexOf(u8, text, "push ./src -> /srv/app") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"cause\": \"Sqlite\"") != null);
+    // Not 1: the transfer happened, so "it did not work" is the wrong answer and
+    // a blind retry is the wrong next step.
+    try t.expect(exit_code.receipt_persist_failed != exit_code.failure);
+}
+
 /// How much of a job log's *end* a state probe reads. The sentinel is one
 /// short line at the very end, so this only has to be large enough to survive
 /// a burst of trailing output.
@@ -889,6 +990,176 @@ test "only an unsettled job blocker is worth opening a connection for" {
         .expires_at = 1750003600,
     };
     try t.expect(!blockerMayBeProvable(.{ .lease = lease }));
+}
+
+/// The store's vocabulary for what a probe found at a job's result-record
+/// address, ready to travel into the terminal receipt.
+///
+/// An exhaustive switch and not a cast: `Store.receipts.ResultRecordReading` is a
+/// separate type because nothing under `store/` may import `session/`, so this is
+/// the seam where the two could drift. Adding a reading to `Tmux.SidecarReading`
+/// is a compile error here until it has been named on the store side too, which is
+/// the only thing keeping the receipt's vocabulary and the probe's the same list.
+///
+/// Every reading is carried, not just the four defective ones. "We looked and there
+/// was nothing" and "we did not look" are different facts about the settlement, and
+/// a receipt that recorded only anomalies could not tell either of them from a
+/// settlement that predates this field.
+///
+/// **Why it lives here rather than beside its four callers in `cmd_job.zig`, which
+/// is where it was.** There are five job-settlement paths and the fifth is in this
+/// file: `settleProvableBlocker`. `cli.zig` cannot import `cmd_job.zig` —
+/// `cmd_job.zig` imports this — so the seam above reached four of the five, and the
+/// fifth duly wrote its terminal with the reading dropped. A new
+/// `Tmux.SidecarReading` variant broke four settlements at compile time and was
+/// structurally invisible to the one that had no switch to break. One home fixes
+/// that for the fifth and for the sixth.
+///
+/// Takes the arena rather than the `Ctx` it used to, because the arena is all it
+/// ever read and a `Ctx` is not something the gate below could honestly build.
+pub fn resultRecordOf(
+    arena: std.mem.Allocator,
+    reading: Core.Tmux.SidecarReading,
+) Store.receipts.TerminalExtra.ResultRecord {
+    return .{
+        .arena = arena,
+        .reading = switch (reading) {
+            .not_requested => .not_requested,
+            .absent => .absent,
+            .malformed => .malformed,
+            .unknown_schema => .unknown_schema,
+            .exit_code_out_of_range => .exit_code_out_of_range,
+            .foreign => |claimed| .{ .foreign = claimed },
+            .present => .present,
+        },
+    };
+}
+
+/// The receipt extra for a settlement proved by reading a blocking job's own log.
+///
+/// **A function taking the whole probe, and that is the fix rather than the
+/// tidying.** The call site was a three-key literal, and there is nothing about a
+/// literal that can be *missing* a key: `settleProvableBlocker` wrote its terminal
+/// with `stdout` and `source` and no `result_record`, so a settlement that had just
+/// read a foreign or unparseable document at this request's own address recorded
+/// the null that `receipts.TerminalExtra.result_record` reserves for "this is not a
+/// job observation". This is one. Here there is no argument list the sidecar can be
+/// left out of — the probe arrives whole — so the reading reaches the receipt for
+/// the same reason the byte count does.
+fn provenSettlementExtra(
+    arena: std.mem.Allocator,
+    probe: Core.Tmux.JobProbe,
+) Store.receipts.TerminalExtra {
+    return .{
+        .stdout = .{ .bytes = @intCast(probe.output.len) },
+        .source = .reconcile,
+        // The case this field exists for: the settlement can be perfectly sound —
+        // the log sentinel answered — while a document that is not ours, or not
+        // readable, sits at this request's own address. The verdict is right and
+        // the anomaly is still a fact about the host.
+        .result_record = resultRecordOf(arena, probe.sidecar),
+    };
+}
+
+// The fifth job-settlement path, held to the four the compiler already holds.
+//
+// Driven over every `SidecarReading` there is, so a reading added to the probe has
+// to appear here too — the loop is exhaustive by construction rather than by a list
+// somebody keeps. What it checks is the one thing the fifth path got wrong: the
+// extra it hands to `settleAttachedAndSyncJob` carries a reading at all, and the
+// reading it carries is the one `resultRecordOf` gives the other four for the same
+// probe.
+test "gate: the proved settlement records what it read at the result-record address" {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const readings = [_]Core.Tmux.SidecarReading{
+        .not_requested,
+        .absent,
+        .malformed,
+        .{ .unknown_schema = 9 },
+        .{ .exit_code_out_of_range = 300 },
+        .{ .foreign = "01SOMEBODYELSE0123456789AB" },
+        .present,
+    };
+    // Every variant, or the loop is checking a subset of the seam it claims to
+    // hold. `@typeInfo` counts them; the list above supplies the payloads.
+    try t.expectEqual(@typeInfo(Core.Tmux.SidecarReading).@"union".fields.len, readings.len);
+
+    for (readings) |reading| {
+        const probe: Core.Tmux.JobProbe = .{
+            .output = "hello\n",
+            .next_cursor = 6,
+            .exit_code = 0,
+            .session_alive = true,
+            .sidecar = reading,
+        };
+        const extra = provenSettlementExtra(arena, probe);
+        const record = extra.result_record orelse {
+            std.debug.print(
+                \\
+                \\`settleProvableBlocker`'s settlement recorded nothing about the result record
+                \\for a probe that read `{s}`. Null is `receipts.TerminalExtra`'s word for "this
+                \\settlement is not a job observation"; this one is. The other four job paths
+                \\pass `resultRecordOf` and this one is the only one with no switch of its own to
+                \\break, so nothing but this notices.
+                \\
+            , .{reading.code()});
+            return error.ProvedSettlementDroppedTheReading;
+        };
+        // The same word the other four record for the same probe.
+        try t.expectEqualStrings(
+            resultRecordOf(arena, reading).reading.code(),
+            record.reading.code(),
+        );
+        // …and the reading is the probe's own, not a placeholder that happens to
+        // be non-null.
+        try t.expectEqualStrings(reading.code(), record.reading.code());
+        // The two facts that were already there stay there.
+        try t.expectEqual(@as(?i64, @intCast(probe.output.len)), extra.stdout.bytes);
+        try t.expectEqual(Store.receipts.Source.reconcile, extra.source);
+    }
+}
+
+// …and the other half, which the gate above cannot see: that the fifth path
+// actually uses it.
+//
+// `settleProvableBlocker` needs a store, a live `Executor` and a host with a tmux
+// session before it will settle anything, so nothing in this process can drive it
+// and read the receipt back. What can be read is the call, and the call is the
+// whole defect: the path wrote a three-key `TerminalExtra` literal of its own, and
+// a literal cannot fail to compile for want of a key. `.source = .reconcile` is the
+// fingerprint of that literal — it is the one field only this path sets — so a
+// hand-built extra reappearing here is caught by its own signature.
+test "gate: the fifth settlement path builds its receipt extra through the shared one" {
+    const body = try Control.bodyOf(@embedFile("cli.zig"), "\npub fn settleProvableBlocker(");
+    // Assembled so this gate's own text is not what it finds, on the same rule as
+    // the `releaseClaim()` gate at the bottom of this file.
+    const shared = "provenSettlement" ++ "Extra(";
+    if (std.mem.indexOf(u8, body, shared) == null) {
+        std.debug.print(
+            \\
+            \\`settleProvableBlocker` no longer builds its terminal extra through
+            \\`provenSettlementExtra`. That function takes the whole probe precisely so there
+            \\is no argument list the sidecar reading can be left out of; a literal here has
+            \\no such property, and the last one settled a job observation with
+            \\`result_record` null — the store's word for "this is not a job observation".
+            \\
+        , .{});
+        return error.FifthPathBuildsItsOwnExtra;
+    }
+    if (std.mem.indexOf(u8, body, ".source = " ++ ".reconcile") != null) {
+        std.debug.print(
+            \\
+            \\`settleProvableBlocker` sets `.source = .reconcile` itself, which means it is
+            \\assembling a `TerminalExtra` rather than asking `provenSettlementExtra` for one.
+            \\That is the shape the reading went missing from.
+            \\
+        , .{});
+        return error.FifthPathBuildsItsOwnExtra;
+    }
 }
 
 /// One opportunistic attempt to settle a blocker that has already finished.
@@ -1017,10 +1288,11 @@ pub fn settleProvableBlocker(
     // row that `run --name X` checks first still said `running`. That gap is
     // what this composition closes.
     const sync = jobCacheSync(store, ctx.arena, op.request_id, code, probe.finished_at, ctx.now);
-    const settled = execution.settleAttachedAndSyncJob(.{ .exited = .{ .exit_code = code } }, .{
-        .stdout = .{ .bytes = @intCast(probe.output.len) },
-        .source = .reconcile,
-    }, sync) catch |err| {
+    const settled = execution.settleAttachedAndSyncJob(
+        .{ .exited = .{ .exit_code = code } },
+        provenSettlementExtra(ctx.arena, probe),
+        sync,
+    ) catch |err| {
         std.debug.print(
             "terminus: could not record the outcome of blocking request {s}: {s}; leaving it blocked\n",
             .{ op.request_id, @errorName(err) },

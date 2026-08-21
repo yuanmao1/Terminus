@@ -221,6 +221,78 @@ fn countRows(store: *Store, comptime table: []const u8, server_id: i64) Db.Error
     return stmt.columnInt(0);
 }
 
+/// The cascade volume as one number: is there anything here to warn about.
+///
+/// **Derived, and that is the substance rather than the style.** `server rm` used
+/// to add the seven up by hand — seven terms with nothing tying them to the seven
+/// fields — at the one link of a chain that is held at every other joint. The
+/// schema's own foreign keys are held against `gates_schema_test.zig`'s
+/// `server_cascade`, that declaration is held against `CascadeCounts` in both
+/// directions, and `cascadeCounts` above is held to `CascadeCounts` by the
+/// compiler. An eighth cascading table therefore fails the schema gate, is told to
+/// add the declaration and the field, is made to write the assignment — and the
+/// hand-written sum went on adding seven. A server whose only non-empty cascading
+/// table was the eighth totalled zero, so `server rm` deleted it with no `--force`
+/// prompt and no sentence naming it: the failure the header above calls the least
+/// acceptable one to lose without being told, recurring one layer up.
+///
+/// Generic over the struct so the derivation is *observable*: a gate can hand this
+/// a copy of `CascadeCounts` carrying an eighth field and watch the total move,
+/// which a body fixed to this one type could be given no way to demonstrate.
+pub fn cascadeTotal(counts: anytype) i64 {
+    var sum: i64 = 0;
+    inline for (@typeInfo(@TypeOf(counts)).@"struct".fields) |f| sum += @field(counts, f.name);
+    return sum;
+}
+
+/// `CascadeCounts` with one more counted table on it, built rather than written
+/// out: the eighth field has to be the eighth field of *this* struct, not of a
+/// transcription of it that could fall behind.
+fn WithAnotherCountedTable(comptime name: []const u8) type {
+    const existing = @typeInfo(CascadeCounts).@"struct".fields;
+    var names: [existing.len + 1][]const u8 = undefined;
+    var types: [existing.len + 1]type = undefined;
+    var attrs: [existing.len + 1]std.builtin.Type.StructField.Attributes = undefined;
+    for (existing, 0..) |f, i| {
+        names[i] = f.name;
+        types[i] = f.type;
+        attrs[i] = .{ .@"comptime" = f.is_comptime, .@"align" = f.alignment };
+    }
+    names[existing.len] = name;
+    types[existing.len] = i64;
+    attrs[existing.len] = .{};
+    const field_names = names;
+    const field_types = types;
+    const field_attrs = attrs;
+    return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+}
+
+// The gate for the link that was not held: does a cascading table nobody has
+// thought of yet move the number `server rm` decides on?
+//
+// Driven rather than asserted. A test that checked the current seven would pass
+// against the hand-written sum it exists to reject, which is exactly how that sum
+// survived every other gate in this chain.
+test "gate: the cascade total counts every field, including one nobody has added yet" {
+    const t = std.testing;
+    const fields = @typeInfo(CascadeCounts).@"struct".fields;
+
+    // The control: each counted table contributes exactly one.
+    var one_each: CascadeCounts = undefined;
+    inline for (fields) |f| @field(one_each, f.name) = 1;
+    try t.expectEqual(@as(i64, @intCast(fields.len)), cascadeTotal(one_each));
+
+    // …and the case the hand-written sum got wrong. Everything the seven fields
+    // count is empty; the only rows on this server belong to a table that joined
+    // the cascade after the sum was written. A total of zero here is a `server rm`
+    // that deletes them with no `--force` prompt and no sentence naming them.
+    const Eighth = WithAnotherCountedTable("policy_pins");
+    var only_the_eighth: Eighth = undefined;
+    inline for (@typeInfo(Eighth).@"struct".fields) |f| @field(only_the_eighth, f.name) = 0;
+    only_the_eighth.policy_pins = 3;
+    try t.expectEqual(@as(i64, 3), cascadeTotal(only_the_eighth));
+}
+
 pub fn list(store: *Store, arena: Allocator) (Db.Error || Allocator.Error)![]Server {
     var out: std.ArrayList(Server) = .empty;
     var stmt = try store.db.prepare(select_columns ++ " ORDER BY s.name");

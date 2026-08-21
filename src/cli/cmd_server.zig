@@ -169,11 +169,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             ),
             .needs_force => |counts| Cli.failWithCode(
                 "SERVER_CASCADE_NOT_CONFIRMED",
-                "removing '{s}' also deletes {d} memories, {d} facts, {d} sessions, {d} jobs, {d} history entries, " ++
-                    "{d} lease records and {d} redaction rules. The lease records are the history of who held what on " ++
-                    "this host and how it was given back, which the lease barrier stops covering the moment nothing is " ++
-                    "held; the redaction rules are declared secret locations, so losing them puts what they hid back on " ++
-                    "pattern guessing. Re-run with --force",
+                cascade_not_confirmed,
                 .{
                     name,        counts.memories, counts.facts,  counts.sessions,
                     counts.jobs, counts.history,  counts.leases, counts.redaction_rules,
@@ -245,6 +241,47 @@ fn reportRemoved(out: *Cli.Output, name: []const u8, orphaned: ?[]const u8) !voi
     }
 }
 
+/// The `SERVER_CASCADE_NOT_CONFIRMED` sentence, named so a gate can count its
+/// slots.
+///
+/// One `{d}` per counted table, plus the `{s}` for the server. `leases` is named
+/// as well as barriered because the two answer different questions — the barrier
+/// refuses over live claims, this counts the released history that goes when there
+/// are none — and `redaction_rules` is named because destroying a declared secret
+/// location in silence is the worst of the seven.
+///
+/// **What the gate below holds, and what it deliberately does not.** It holds the
+/// number of slots against the number of `CascadeCounts` fields, because that is
+/// the failure an eighth cascading table produces today: every other joint of the
+/// chain moves, and the operator is handed a sentence that names seven of eight.
+/// It does not hold the *order*. The sentence leads with the two an operator is
+/// most likely to regret and the argument list is written to match, so an order
+/// check would be a check on a wording decision rather than on drift — and the one
+/// thing an order check would catch, two counts swapped, is not made more likely by
+/// adding a table.
+const cascade_not_confirmed =
+    "removing '{s}' also deletes {d} memories, {d} facts, {d} sessions, {d} jobs, {d} history entries, " ++
+    "{d} lease records and {d} redaction rules. The lease records are the history of who held what on " ++
+    "this host and how it was given back, which the lease barrier stops covering the moment nothing is " ++
+    "held; the redaction rules are declared secret locations, so losing them puts what they hid back on " ++
+    "pattern guessing. Re-run with --force";
+
+test "gate: the cascade refusal has a slot for every counted table" {
+    const fields = @typeInfo(Store.servers.CascadeCounts).@"struct".fields;
+    const slots = std.mem.count(u8, cascade_not_confirmed, "{d}");
+    if (slots != fields.len) {
+        std.debug.print(
+            \\
+            \\`cascade_not_confirmed` has {d} `{{d}}` slot(s) and `CascadeCounts` has {d} field(s).
+            \\A table in the cascade and out of this sentence is deleted without ever being
+            \\named: `--force` is asked for on the strength of a total that now includes it,
+            \\and the operator is shown the other {d}.
+            \\
+        , .{ slots, fields.len, slots });
+        return error.CascadeSentenceIncomplete;
+    }
+}
+
 /// What `server rm` decided, before any of it is worded.
 const RmOutcome = union(enum) {
     /// The server is gone, and the payload is the private key the removal left
@@ -305,14 +342,13 @@ fn removeServer(
     // that matters. The numbers that *do* matter are counted inside the
     // transaction that deletes.
     const counts = try Store.servers.cascadeCounts(store, server_id);
-    // All seven, so a table cannot be in the cascade and out of the sentence.
-    // `leases` is counted as well as barriered because the two answer different
-    // questions — the barrier refuses over live claims, this counts the released
-    // history that goes when there are none — and `redaction_rules` is counted
-    // because destroying a declared secret location in silence is the worst of
-    // the seven.
-    const total = counts.sessions + counts.memories + counts.jobs + counts.facts +
-        counts.history + counts.leases + counts.redaction_rules;
+    // Every field, derived. This was seven terms added up by hand against a
+    // seven-field struct with nothing tying the two together — the one link of
+    // this chain that was not held, and the one an eighth cascading table would
+    // have walked straight through: schema gate, declaration, field and
+    // assignment all move, and the sum went on adding seven. See
+    // `servers.cascadeTotal`.
+    const total = Store.servers.cascadeTotal(counts);
     if (total > 0 and !force) return .{ .needs_force = counts };
 
     return switch (try Store.servers.remove(store, name, now)) {

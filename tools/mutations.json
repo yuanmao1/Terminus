@@ -1616,6 +1616,54 @@
       "find": "    const which: []const u8 = if (retained.stdout.truncated and retained.stderr.truncated)",
       "replace": "    const which: []const u8 = if (retained.stdout.truncated or retained.stderr.truncated)",
       "expect_gate": "gate: the truncation notice appears exactly when something was dropped"
+    },
+    {
+      "id": "M5-sync-audit-write-is-not-swallowed",
+      "rule": "A `sync` whose audit row could not be written is not a `sync` that gets to report `ok: true`. cli.zig states the rule above `receiptFatal` and names this exact call as the one that used to break it; `receiptFatal` itself does not fit a verb with no operation row, so the route is `auditFatal` - same rule, same exit 76, no invented request id.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    }, ctx.now) catch |err| Cli.auditFatal(\"sync\", server_name, detail, err);",
+      "replace": "    }, ctx.now) catch {};",
+      "expect_gate": "gate: the audit write is routed, not swallowed"
+    },
+    {
+      "id": "M5-server-cascade-total-is-derived",
+      "rule": "The cascade volume that decides whether `server rm` demands --force is summed from `CascadeCounts`'s own fields. A hand-written sum is the one link of this chain nothing holds: an eighth cascading table moves the schema gate, the declaration, the field and the assignment, and the sum goes on adding seven - so a server whose only rows are in the eighth table totals zero and is deleted with no prompt and no sentence naming it.",
+      "file": "src/core/store/servers.zig",
+      "find": "    inline for (@typeInfo(@TypeOf(counts)).@\"struct\".fields) |f| sum += @field(counts, f.name);",
+      "replace": "    sum = counts.sessions + counts.memories + counts.jobs + counts.facts + counts.history + counts.leases + counts.redaction_rules;",
+      "expect_gate": "gate: the cascade total counts every field"
+    },
+    {
+      "id": "M5-proved-settlement-records-the-result-record-reading",
+      "rule": "Every reading the probe took reaches the receipt, not a placeholder. `not_requested` means `this settlement deliberately did not look`; a settlement that looked and found a foreign or unparseable document at this request's own address must say so, because the verdict can be sound while the anomaly is still a fact about the host.",
+      "file": "src/cli/cli.zig",
+      "find": "        .result_record = resultRecordOf(arena, probe.sidecar),",
+      "replace": "        .result_record = .{ .arena = arena, .reading = .not_requested },",
+      "expect_gate": "gate: the proved settlement records what it read at the result-record address"
+    },
+    {
+      "id": "M5-probe-carry-survives-the-next-probe",
+      "rule": "`parser_carry` holds the bytes a probe held back because a `__TERMINUS_PROGRESS__` marker straddled its read window, and the next probe is the only thing that could ever use them. Written unconditionally it is destroyed on every `job status` and every `job read`, because the one production caller does not set it and binds the struct default null.",
+      "file": "src/core/store/job_attempts.zig",
+      "find": "        \\\\  parser_carry           = COALESCE(?3, parser_carry),",
+      "replace": "        \\\\  parser_carry           = ?3,",
+      "expect_gate": "gate: a second probe does not erase the carry the first one held back"
+    },
+    {
+      "id": "M5-no-attempt-status-word-matches-the-document",
+      "rule": "`job kill` and `job rm` publish one `status` word for `the row names no attempt`, and skill/SKILL.md defines it as `unknown`. The two verbs used to spell it at separate call sites and disagreed - `job rm` said `unchanged`, a word the document listed and never defined - so an agent branching on the documented word missed `job rm` in silence.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    const a = attempt orelse return job_status.unknown;",
+      "replace": "    const a = attempt orelse return \"unchanged\";",
+      "expect_gate": "gate: both destructive verbs answer a row with no attempt with the documented word"
+    },
+    {
+      "id": "M5-proved-settlement-uses-the-shared-receipt-extra",
+      "rule": "`settleProvableBlocker` is the fifth job-settlement path and the only one with no exhaustive switch of its own to break, so a hand-built `TerminalExtra` here drops the sidecar reading with nothing failing to compile. It builds its extra through `provenSettlementExtra`, which takes the whole probe so there is no argument list the reading can be left out of.",
+      "file": "src/cli/cli.zig",
+      "find": "        provenSettlementExtra(ctx.arena, probe),",
+      "replace": "        .{ .stdout = .{ .bytes = @intCast(probe.output.len) }, .source = .reconcile },",
+      "expect_gate": "gate: the fifth settlement path builds its receipt extra through the shared one"
     }
   ]
 }

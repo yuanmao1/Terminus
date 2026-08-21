@@ -13,6 +13,9 @@ const fatal = Cli.fail;
 const Cli = @import("cli.zig");
 const Core = @import("../core/core.zig");
 const Store = Core.Store;
+/// The shared source reader the text-level gates in this tree use. See the gate
+/// at the bottom of this file.
+const Control = @import("../core/control.zig");
 
 const usage =
     \\usage: terminus sync push <server> <local-dir> <remote-dir> [--exclude p1,p2] [--dry-run] [--delete] [--json]
@@ -56,15 +59,24 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const elapsed_ns = started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds;
     const duration_ms: i64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
 
+    // The audit row. Its failure used to be `catch {}` with `.ok = true` two
+    // statements below it, which is the one thing this project's rules forbid
+    // outright — `cli.zig` states it above `receiptFatal` and names this very
+    // call: a ledger write we could not make is not a sync we get to report as
+    // clean. `receiptFatal` itself does not fit, and not for want of trying: its
+    // envelope names a `requestId`, and this verb opens no operation and holds no
+    // scope lease, so there is no id to put there and none may be invented.
+    // `auditFatal` is that rule with the same exit code and no operation in it.
+    const detail = try std.fmt.allocPrint(ctx.arena, "{s} {s} -> {s}{s}", .{
+        verb, src, dst, if (dry_run) " (dry-run)" else "",
+    });
     Store.history.add(&store, resolved.server.id, .{
         .kind = "sync",
-        .detail = try std.fmt.allocPrint(ctx.arena, "{s} {s} -> {s}{s}", .{
-            verb, src, dst, if (dry_run) " (dry-run)" else "",
-        }),
+        .detail = detail,
         .exit_code = 0,
         .transport = "direct",
         .duration_ms = duration_ms,
-    }, ctx.now) catch {};
+    }, ctx.now) catch |err| Cli.auditFatal("sync", server_name, detail, err);
 
     switch (ctx.out.format) {
         .json => try ctx.out.json(.{
@@ -278,4 +290,61 @@ fn pull(
 fn validateRemotePath(path: []const u8) void {
     if (path.len == 0 or std.mem.indexOfAny(u8, path, "'\"\n`$") != null)
         fatal("remote path must not contain quotes, backticks, '$' or newlines", .{});
+}
+
+// The rule `cli.zig` states above `receiptFatal`, applied to the one audit write
+// this verb makes.
+//
+// **Why it is read off the source and not driven.** Reaching the write needs an
+// SSH connection and a remote `tar`, and the failure route ends in
+// `std.process.exit`, so there is no in-process call that can observe the branch.
+// What can be observed is that the branch is there — and that is the whole of the
+// defect: the error was bound to nothing and `.ok = true` followed it. The
+// envelope this routes into is driven by `cli.zig`'s own gate.
+//
+// Three things, because they are the three ways it came back: the write is made
+// exactly once in this body, its failure is bound rather than discarded, and what
+// it is bound to is a path that does not return.
+test "gate: the audit write is routed, not swallowed" {
+    const t = std.testing;
+    const body = try Control.bodyOf(@embedFile("cmd_sync.zig"), "\npub fn run(");
+    // Assembled so this gate's own text is not one of the sites it counts — the
+    // gate lives outside `run`, but the needle must survive being moved into it.
+    const call = "Store.history" ++ ".add(";
+
+    var found: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, body, i, call)) |at| : (i = at + 1) found += 1;
+    if (found != 1) {
+        std.debug.print(
+            \\
+            \\cmd_sync.zig's `run` makes {d} audit writes. It may have exactly one, and this
+            \\gate reads the statement it opens to check that its failure is reported.
+            \\
+        , .{found});
+        return error.AuditWriteNotFound;
+    }
+
+    const at = std.mem.indexOf(u8, body, call).?;
+    const end = std.mem.indexOfScalarPos(u8, body, at, ';') orelse return error.AuditWriteUnterminated;
+    const statement = body[at .. end + 1];
+    if (std.mem.indexOf(u8, statement, "catch |err| Cli.auditFatal(") == null) {
+        std.debug.print(
+            \\
+            \\cmd_sync.zig's audit write no longer routes its failure to `Cli.auditFatal`:
+            \\
+            \\  {s}
+            \\
+            \\`sync` reports `ok: true` two statements below this. A ledger write we could not
+            \\make is not a sync we get to report as clean — cli.zig says so above
+            \\`receiptFatal`, and names this call as the one that used to. If the route
+            \\genuinely moved, point this gate at the new one; deleting it puts the swallow
+            \\back where nothing can see it.
+            \\
+        , .{statement});
+        return error.AuditWriteSwallowed;
+    }
+    // …and the thing it routes to does not come back, so the success document
+    // below is unreachable from a failed write.
+    try t.expect(@typeInfo(@TypeOf(Cli.auditFatal)).@"fn".return_type.? == noreturn);
 }

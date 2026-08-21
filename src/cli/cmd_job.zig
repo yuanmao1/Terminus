@@ -1547,6 +1547,87 @@ test "gate: SKILL.md publishes exactly `job rm`'s action vocabulary" {
     try SkillDoc.expectVocabulary(gpa, what, documented, removal_action);
 }
 
+// `status` has no parenthetical in either key set, because its ordinary values are
+// whatever the ledger holds — an open set neither verb owns. What they *do* own is
+// the word for "there is no ledger word to publish", and until now that word was
+// documented in prose that no gate parsed and spelled at four call sites, two of
+// which disagreed: `job kill` published `unknown` for `attempt == null` and `job
+// rm` published `unchanged` for the identical condition, which the document does
+// not define. An agent branching on the documented word missed the `job rm` case in
+// silence. `session rm` has had exactly this gate for its own no-row word; these
+// two had none, which is why the divergence could sit here.
+//
+// The document is parsed rather than transcribed, so the list cannot be "fixed" by
+// editing the gate, and the code side is a namespace, so a rename moves both.
+test "gate: SKILL.md publishes exactly the word `job kill` and `job rm` use when there is no attempt" {
+    const gpa = std.testing.allocator;
+    const what = "`job kill` and `job rm`'s no-attempt status word";
+    const para = try SkillDoc.paragraphAfter(
+        "\n`status` on these two verbs is ",
+        "the status paragraph",
+    );
+    const documented = try SkillDoc.list(gpa, para, "so it is ", null, what);
+    defer gpa.free(documented);
+    try SkillDoc.expectVocabulary(gpa, what, documented, job_status);
+}
+
+// …and the word itself, at the seam the two verbs share.
+//
+// The vocabulary gate above holds the *list*; this holds which word answers which
+// condition, which is what actually differed. Both halves of the document's
+// definition are driven: a row that names no attempt, and a row that names a
+// request the ledger does not have.
+test "gate: both destructive verbs answer a row with no attempt with the documented word" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_job_status_word");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    var out_buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buffer);
+    var out: Cli.Output = .{ .writer = &writer, .format = .json };
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena_state.allocator(),
+        .environ = undefined,
+        .out = &out,
+        .now = 5000,
+    };
+
+    // The row names no attempt. Both verbs reach this through one function now;
+    // they used to reach it through two literals.
+    try t.expectEqualStrings(job_status.unknown, refusalStatus(&ctx, &store, null));
+
+    // The other half of the same definition: an attempt whose request the ledger
+    // has never heard of.
+    const orphan: Store.job_attempts.Attempt = .{
+        .id = 1,
+        .request_id = "01NOSUCHREQUEST0123456789A",
+        .server_id = 1,
+        .server_name = "prod",
+        .job_name = "deploy",
+        .attempt_no = 1,
+        .sentinel = null,
+        .tmux_session = null,
+        .cwd = null,
+        .interpreter = null,
+        .shell = null,
+        .script_body_redacted = null,
+        .script_sha256 = null,
+        .script_bytes = null,
+        .options_json = null,
+        .env_redacted_json = null,
+        .entry_path = null,
+        .entry_sha256 = null,
+        .created_at = 5000,
+    };
+    try t.expectEqualStrings(job_status.unknown, refusalStatus(&ctx, &store, orphan));
+}
+
 /// `fatalTmux`, plus the one error only a result-record reader can raise.
 ///
 /// `error.ResultUnreadable` means a document is at this attempt's own address
@@ -1981,37 +2062,15 @@ fn removalObserved(
     };
 }
 
-/// The store's vocabulary for what this probe found at the result-record
-/// address, ready to travel into the terminal receipt.
-///
-/// An exhaustive switch and not a cast: `Store.receipts.ResultRecordReading` is
-/// a separate type because nothing under `store/` may import `session/`, so
-/// this is the seam where the two could drift. Adding a reading to
-/// `Tmux.SidecarReading` is a compile error here until it has been named on the
-/// store side too, which is the only thing keeping the receipt's vocabulary and
-/// the probe's the same list.
-///
-/// Every reading is carried, not just the four defective ones. "We looked and
-/// there was nothing" and "we did not look" are different facts about the
-/// settlement, and a receipt that recorded only anomalies could not tell either
-/// of them from a settlement that predates this field.
-fn resultRecordOf(
-    ctx: *Cli.Ctx,
-    reading: Tmux.SidecarReading,
-) Store.receipts.TerminalExtra.ResultRecord {
-    return .{
-        .arena = ctx.arena,
-        .reading = switch (reading) {
-            .not_requested => .not_requested,
-            .absent => .absent,
-            .malformed => .malformed,
-            .unknown_schema => .unknown_schema,
-            .exit_code_out_of_range => .exit_code_out_of_range,
-            .foreign => |claimed| .{ .foreign = claimed },
-            .present => .present,
-        },
-    };
-}
+// The store's vocabulary for what a probe found at the result-record address is
+// `Cli.resultRecordOf`, and this file's seven call sites read it from there.
+//
+// It used to be here, and it moved because there is a fifth job-settlement path
+// and it is in `cli.zig` — `Cli.settleProvableBlocker` — which cannot import this
+// file. The exhaustive switch is the seam between the probe's vocabulary and the
+// receipt's, so a switch only four of the five paths can reach is a seam the fifth
+// is structurally unable to break: it settled with the reading dropped, and
+// nothing failed to compile. See the header on `Cli.resultRecordOf`.
 
 /// Turns an observation into a settlement — or into nothing at all.
 ///
@@ -2058,7 +2117,7 @@ fn applyProbe(
                 .{ clash.result_exit_code, clash.sentinel_exit_code },
             ) catch "the job's result file and its log sentinel report different exit codes",
             .last_observed = if (execution) |e| e.status else .remote_started,
-        } }, .{ .result_record = resultRecordOf(ctx, probe.sidecar) }, .none, null);
+        } }, .{ .result_record = Cli.resultRecordOf(ctx.arena, probe.sidecar) }, .none, null);
         return .{
             // A contradiction is unknown however it was recorded, and the one
             // case where a `no_attempt` reading is still not an answer: two
@@ -2105,7 +2164,7 @@ fn applyProbe(
                 .{ declined.sentinel_exit_code, defect },
             ) catch "this job's result record is present and unusable, so the exit status in its log was not read as its outcome",
             .last_observed = if (execution) |e| e.status else .remote_started,
-        } }, .{ .result_record = resultRecordOf(ctx, probe.sidecar) }, .none, null);
+        } }, .{ .result_record = Cli.resultRecordOf(ctx.arena, probe.sidecar) }, .none, null);
         // What the ledger holds once the settlement above has run, not what
         // this reading established. The two come apart on an attempt that was
         // already terminal before we looked: `attach` returned null, nothing
@@ -2157,7 +2216,7 @@ fn applyProbe(
             // sound — the log sentinel answered — while a document that is not
             // ours, or not readable, sits at this request's own address. The
             // verdict is right and the anomaly is still a fact about the host.
-            .result_record = resultRecordOf(ctx, probe.sidecar),
+            .result_record = Cli.resultRecordOf(ctx.arena, probe.sidecar),
         }, finishSync(job, .exited, code, probe.finished_at orelse ctx.now), null);
         return .{
             // The ledger's verdict, not the probe's reading. Only when there
@@ -2211,7 +2270,7 @@ fn applyProbe(
         const settled = settleObserved(ctx, store, if (execution) |*e| e else null, attempt, .{ .indeterminate = .{
             .reason = "job session disappeared without reporting an exit status",
             .last_observed = if (execution) |e| e.status else .remote_started,
-        } }, .{ .result_record = resultRecordOf(ctx, probe.sidecar) }, finishSync(job, .killed, null, ctx.now), null);
+        } }, .{ .result_record = Cli.resultRecordOf(ctx.arena, probe.sidecar) }, finishSync(job, .killed, null, ctx.now), null);
         return .{
             .status = settled.status orelse .indeterminate,
             // A vanished session with no exit status proves nothing whoever
@@ -2481,9 +2540,45 @@ fn recordedEffective(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) ?Core
 
 /// `recordedEffective` for callers that only need to print it.
 fn recordedStatus(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) []const u8 {
-    const status = recordedEffective(ctx, store, request_id) orelse return "unknown";
+    const status = recordedEffective(ctx, store, request_id) orelse return job_status.unknown;
     return status.text();
 }
+
+/// The `status` word for a refusal on either destructive verb.
+///
+/// **One function for both, and that is the whole point.** `refuseKill` and
+/// `refuseRemoval` are sibling refusals with identical shape, and they answered the
+/// identical `attempt == null` condition with two different words on the same
+/// published key: `job kill` said `unknown`, `job rm` said `unchanged`. The
+/// document defines `unknown` as exactly that condition — "the row names no
+/// attempt, or names a request the ledger does not have" — so an agent branching on
+/// `status == "unknown"` per the document missed `job rm`'s refusal in silence.
+/// Two call sites picking their own word is how that happened; there is one word
+/// now, in one place.
+fn refusalStatus(ctx: *Cli.Ctx, store: *Store, attempt: ?Store.job_attempts.Attempt) []const u8 {
+    const a = attempt orelse return job_status.unknown;
+    return recordedStatus(ctx, store, a.request_id);
+}
+
+/// The one `status` word these verbs publish that is not the ledger's own.
+///
+/// `status`'s ordinary values are whatever the ledger holds — an open set neither
+/// verb owns. What they *do* own is the word for "there is no ledger word to
+/// publish", and it was prose spelled at four call sites, two of which disagreed.
+/// A namespace for the reason `kill_action` and `removal_action` are one: it is
+/// what a gate can hold the document against, and what a rename rewrites on both
+/// sides at once. `session rm` has had this for its own no-row word; these two had
+/// nothing.
+///
+/// **`unchanged` is gone from this key.** `job rm` published it on three branches
+/// and every one of them was the same `attempt == null` this covers, so it was a
+/// second word for one state — while `remoteStatus`, on the receipt-failure
+/// envelope, goes on using it for a different one. One key, one word.
+const job_status = struct {
+    /// There is no attempt to read a word off — the row names none, or names a
+    /// request the ledger does not have. Both verbs.
+    pub const unknown = "unknown";
+};
 
 fn settledText(outcome: Core.Store.receipts.SettleOutcome) []const u8 {
     return switch (outcome) {
@@ -2596,7 +2691,7 @@ fn refuseKill(
             .ok = false,
             .action = kill_action.not_killed,
             .job = job.name,
-            .status = if (attempt) |a| recordedStatus(ctx, store, a.request_id) else "unknown",
+            .status = refusalStatus(ctx, store, attempt),
             // What the probe read, reported because it is a fact about the host
             // and withholding it would make this branch look like a command that
             // never looked. `outcomeProven` is false beside it: nothing was
@@ -2750,7 +2845,7 @@ fn refuseRemoval(
             // publishes for the same moment.
             .errorCode = error_code.authority_lost_before_kill,
             .job = job.name,
-            .status = if (attempt) |a| recordedStatus(ctx, store, a.request_id) else "unchanged",
+            .status = refusalStatus(ctx, store, attempt),
             .outcomeProven = false,
             .rowRemoved = false,
             .evidenceRetained = true,
@@ -2944,7 +3039,7 @@ fn refuseRemovalAtCommit(
     // is settled here rather than left open: an attempt this command reached the
     // host under and then abandoned silently would bar this job's scope with
     // nothing in the ledger saying why.
-    var status_text: []const u8 = "unchanged";
+    var status_text: []const u8 = job_status.unknown;
     var proven = false;
     if (execution) |e| {
         // With the evidence, not with `.{}`. The removal collected a finish time
@@ -2958,12 +3053,14 @@ fn refuseRemovalAtCommit(
         proven = settledStatus(outcome) != .indeterminate;
     } else if (attempt) |a| {
         // Nothing to settle: the ledger already holds this attempt's verdict, or
-        // the row names a request the ledger does not have. Report what is there.
+        // the row names a request the ledger does not have. Report what is there —
+        // and when there is nothing there, the initial value above already says so.
+        // That is the second half of `job_status.unknown`'s definition, and it used
+        // to be a separate assignment of a *different* word from the one this
+        // branch's `attempt == null` sibling published.
         if (recordedEffective(ctx, store, a.request_id)) |status| {
             status_text = status.text();
             proven = status != .indeterminate;
-        } else {
-            status_text = "unknown";
         }
     }
 
@@ -3378,7 +3475,7 @@ fn killJob(
                 .reason = reason,
                 .last_observed = if (execution) |e| e.status else .remote_started,
             } },
-            .{ .result_record = resultRecordOf(ctx, probe.sidecar) },
+            .{ .result_record = Cli.resultRecordOf(ctx.arena, probe.sidecar) },
             finishSync(job, .killed, null, ctx.now),
             claim,
         );
@@ -3712,7 +3809,7 @@ fn killJob(
         // settled*, and this settlement could not find out. Writing the pre-kill
         // reading in would put a stale `absent` into the one document that
         // outlives the command.
-        .{ .result_record = if (final.unreadable) null else resultRecordOf(ctx, reading) },
+        .{ .result_record = if (final.unreadable) null else Cli.resultRecordOf(ctx.arena, reading) },
         finishSync(job, .killed, null, ctx.now),
         claim,
     );
@@ -4622,7 +4719,7 @@ fn removeJob(
         // saying anybody had looked. Null on the two blind branches alone,
         // because there the field's question — what was at the address when
         // this settled — has no answer this command obtained.
-        .result_record = if (final.blind()) null else resultRecordOf(ctx, reading),
+        .result_record = if (final.blind()) null else Cli.resultRecordOf(ctx.arena, reading),
     };
     // The row is deleted only while the scope is ours, and never over a look that
     // came back blind. Forgetting a name this command no longer speaks for — or
@@ -4734,7 +4831,7 @@ fn removeJob(
     const unreconcilable = probe.conflict != null or declined != null;
     const report = removalReport(settled.cache, proven, log_discarded, unreconcilable);
     const removed = report.removed;
-    const settled_status = if (attempt == null) "unchanged" else settled.statusText();
+    const settled_status = if (attempt == null) job_status.unknown else settled.statusText();
     const cache_error = cacheError(ctx, job.name, settled.cache);
 
     const ok = report.ok;

@@ -568,9 +568,9 @@ stderr, under JSON that never mentioned a lease. They now carry it:
 here: the recovery each of these branches recommends is a retry, and a lease this
 command could not hand back refuses exactly that until it lapses (120s).
 
-`status` on these two verbs is the ledger's word for the attempt, and it has two
-values `job status` never prints: `"unknown"` (the row names no attempt, or names
-a request the ledger does not have) and, on `job rm`, `"unchanged"`.
+`status` on these two verbs is the ledger's word for the attempt, plus one value
+`job status` never prints, so it is `unknown` (the row names no attempt, or names
+a request the ledger does not have — both verbs, on every branch).
 `authorityError`, `cacheError`, `leaseReleaseError` and `hint` are prose — do not
 match their text.
 `resultRecordError` is prose too, with the exceptions named above: the tokens
