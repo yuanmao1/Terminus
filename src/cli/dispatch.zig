@@ -18,6 +18,7 @@ pub const TopCommand = enum {
     pull,
     sync,
     doctor,
+    docker,
     history,
     @"export",
     import,
@@ -49,6 +50,7 @@ const usage =
     \\  pull       download a file over SCP
     \\  sync       recursive directory transfer      (push/pull; tar+md5)
     \\  doctor     probe remote environment capabilities
+    \\  docker     container state and health wait     (inspect/wait; typed, no prose)
     \\  history    local record of push/pull/sync    (audit trail: request ls)
     \\  export     dump all servers+memories+facts as JSON
     \\  import     merge an export (dry-run plan, conflict strategies)
@@ -85,6 +87,7 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .pull => try @import("cmd_transfer.zig").run(ctx, .pull, args[1..]),
         .sync => try @import("cmd_sync.zig").run(ctx, args[1..]),
         .doctor => try @import("cmd_doctor.zig").run(ctx, args[1..]),
+        .docker => try @import("cmd_docker.zig").run(ctx, args[1..]),
         .history => try @import("cmd_history.zig").run(ctx, args[1..]),
         .@"export" => try @import("cmd_export_import.zig").exportCmd(ctx, args[1..]),
         .import => try @import("cmd_export_import.zig").importCmd(ctx, args[1..]),
@@ -100,6 +103,7 @@ test {
     // written next to the code it covers silently never runs. That is worse
     // than having no test: the count goes up and nothing is checked.
     _ = @import("cmd_daemon.zig");
+    _ = @import("cmd_docker.zig");
     _ = @import("cmd_doctor.zig");
     _ = @import("cmd_exec.zig");
     _ = @import("cmd_export_import.zig");

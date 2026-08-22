@@ -245,20 +245,23 @@ pub fn sentinelForLocked(
 /// Latest observation of a running attempt. `last_probed_at` travels with
 /// every field so a stale reading is always identifiable as such.
 ///
-/// **Nothing in production reads this row.** `probeState` below has no caller
-/// outside `gates_leases_test.zig`, and `probe_cursor` is written from
-/// `Tmux.probeTail`'s `next_cursor` and never fed back — `probeTail` takes a
-/// `tail_bytes` window, not a cursor. So the whole nine-column table is written and
-/// not read today, and that is the honest description of it: the columns are
-/// correct, and the mechanisms they exist for are not wired up. `parser_carry` in
-/// particular is now preserved across probes rather than destroyed by them, which
-/// is what a reader would need — it does not mean a split
-/// `__TERMINUS_PROGRESS__` line is currently reassembled anywhere.
+/// `probeState` is what `cmd_job.zig`'s `refresh` reads before every probe, and
+/// the row is the probe's memory: `probe_cursor` says where its last forward
+/// read stopped and `parser_carry` holds the bytes that read cut in half. Those
+/// two are what make `Tmux.scanForward` a *forward* reader rather than one that
+/// starts over — see the note there on why the probe's position may not be
+/// `jobs.read_cursor`. The three `latest_*` columns are what lets a settled job
+/// still answer what it reported, after the window that carried it has scrolled
+/// away and after its session is gone.
 pub const ProbeState = struct {
     request_id: []const u8,
     probe_cursor: i64,
     /// Bytes held back because a marker straddled the read window. Without
     /// this a `__TERMINUS_PROGRESS__` line split across two reads is lost.
+    ///
+    /// The empty string is a value and means "nothing is held back"; NULL means
+    /// no probe has ever said either way. They are not the same, and `recordProbe`
+    /// below is why the difference has to be expressible — see `ProbeUpdate`.
     parser_carry: ?[]const u8,
     latest_progress_json: ?[]const u8,
     latest_business_result: ?[]const u8,
@@ -270,6 +273,15 @@ pub const ProbeState = struct {
 
 pub const ProbeUpdate = struct {
     probe_cursor: i64,
+    /// `null` leaves the stored carry alone; the empty string clears it.
+    ///
+    /// The distinction is forced by the `COALESCE` below and it is the right
+    /// way round. A probe whose forward read failed must not erase what the
+    /// last successful one held back, so "I have nothing to say" has to be
+    /// expressible — that is `null`. A probe that did read, and whose window
+    /// ended on a line boundary, has something to say and it is "nothing is
+    /// held back": storing `null` for that would leave a stale fragment
+    /// prefixed to every window from then on.
     parser_carry: ?[]const u8 = null,
     latest_progress_json: ?[]const u8 = null,
     latest_business_result: ?[]const u8 = null,
@@ -283,7 +295,7 @@ pub const ProbeUpdate = struct {
 /// output must not erase what an earlier one established.
 ///
 /// `parser_carry` was the one of the four not behind a `COALESCE`, and its single
-/// production caller (`cmd_job.zig`'s `refresh`) sets neither it nor two of its
+/// production caller (`cmd_job.zig`'s `refresh`) set neither it nor two of its
 /// neighbours: it bound the struct default `null`, so every `job status` and every
 /// `job read` overwrote the column with NULL. What that column holds is the bytes
 /// held back because a marker straddled the read window, which is precisely the

@@ -346,6 +346,23 @@ connection error.
 
 - `exitCode` — the remote exit code, `null` while unknown.
 - `businessResult` — the last `__TERMINUS_RESULT__:<v>` line (see below).
+- `progress` — the last `__TERMINUS_PROGRESS__:<json-object>` line, as the raw
+  JSON text the job printed, or `null`. `phase` is the last
+  `__TERMINUS_PHASE__:<label>` line. Both are **remembered**: they are recorded
+  as the job runs and go on being reported after the job has ended, after its
+  tmux session is gone and after its log has been rotated away. That is what
+  makes them answerable on a finished job, and it means a value here is
+  something the job really printed at some point — not necessarily something it
+  printed recently. `progressError` says when the reading is not current.
+- `progressError` — prose, `null` when nothing was wrong. Two things reach it:
+  the job's most recent `__TERMINUS_PROGRESS__` line was refused (its body is
+  not a JSON object, or it is over 4096 bytes), or the forward read of the log
+  did not happen at all. Either way `progress` beside it is the last value that
+  *was* usable rather than a reading of the log as it stands. A refused line
+  never overwrites a good one — a job that starts printing malformed progress
+  does not lose the last progress it reported.
+  `progress`, `phase` and `progressError` are on `job status` and `job watch`
+  only; `job read` carries none of them.
 - `outcomeProven` / `settlement` — whether the ledger actually backs `status`,
   and which reading it is: `open` (nothing has ended), `settled`, `no_attempt`
   (the row names no attempt, so the host's own record is the whole answer), or
@@ -386,6 +403,8 @@ connection error.
   `cursorAdvanced` and `cursorError` (on a refused cursor advance `to` stays at
   `from` — read `cursorAdvanced`, not `to`, to know whether you may move on);
   `job watch` adds `server`, `stillRunning`, `polls` and `transport`.
+  `job read`'s `from` / `to` are the **reader's** cursor. The state probe keeps
+  its own, which `job read` never moves and which never moves the reader's.
 
 **`job ls` is a different shape and a different clock.** It prints the local
 cache, so its `status` holds the cached row labels
@@ -829,6 +848,23 @@ non-zero would say the opposite and invite a retry into a refusal.
   Use `__TERMINUS_RESULT__:success` / `:failed` / `:<any value>` — the
   last such line wins, so a job can update its verdict as it runs.
 
+- **Report progress and stages the same way.** Two more markers, read the same
+  way (line start, colon, last one wins) and reported as `progress` and `phase`:
+
+  ```bash
+  echo '__TERMINUS_PHASE__:download'
+  echo '__TERMINUS_PROGRESS__:{"pct":42,"files":128}'
+  ```
+
+  `__TERMINUS_PROGRESS__` must carry a **JSON object** and at most 4096 bytes;
+  anything else is refused and reported in `progressError` rather than recorded.
+  `__TERMINUS_PHASE__` carries a plain label, at most 256 bytes. Both are read
+  by a probe that walks the log **forward from its own cursor**, so a marker
+  printed early is still seen on a job that has since printed megabytes, and one
+  split across two reads is reassembled and parsed once. That cursor is not the
+  one `job read --from-cursor` moves: streaming output and probing state are
+  separate positions and neither moves the other.
+
 ### Recovering a wedged daemon
 
 `transport` ("daemon"/"direct") and `daemonError` ride on the responses listed
@@ -1155,3 +1191,136 @@ Peak local memory is fixed at the cap and does not grow with the output, so a
 command that prints ten gigabytes costs the same as one that prints ten
 kilobytes. Note that this cap is on a **command's** output; `terminus pull` and
 `terminus push` stream and are not subject to it.
+
+## What a sync records, and what it does when the answer is unknown
+
+`terminus sync push` replaces a directory on the host: it uploads one archive and
+runs `rm -rf` on the destination (with `--delete`) before unpacking over it. Every
+run now mints an operation, so the thing that happened has a handle.
+
+```bash
+terminus sync push web ./dist /srv/app/dist --json
+```
+
+The `--json` answer carries `requestId` and `status` beside the counts. `status`
+is the operation's own word: `completed`, `failed`, or `indeterminate`.
+
+**Read `status`, not the exit code alone.** A sync that could not establish what
+the host did exits **75** and reports `indeterminate` — the archive was staged and
+the unpack script went out, and the channel then broke or closed without reporting
+a status. Do not retry a `sync push` on 75: the retry runs `rm -rf` on the
+destination a second time, and the first one may already have finished. Establish
+what happened first:
+
+```bash
+terminus request reconcile <requestId>
+```
+
+An ordinary failure is different and safe to act on: exit 1 with `status: failed`
+means the host answered and did not unpack. A digest that did not match is one of
+those — the host checks the archive before it touches the destination, so nothing
+was replaced.
+
+**What a sync contends on.** The attempt claims the **remote directory** it names,
+as a path scope, and paths nest: a sync holding `/srv/app` blocks a sync into
+`/srv/app/dist` and a `terminus push` aimed at `/srv/app/config.json`, in both
+directions. If an earlier attempt on an overlapping path is still unsettled, the
+new one is refused with nothing sent — reconcile it, or pass `--force` to proceed
+and have the override recorded on the trail.
+
+A `sync pull` reads the remote directory rather than writing it, and `--dry-run`
+changes nothing in either direction. Both still get a row you can find, and
+neither holds the barrier, so previewing a push does not refuse the push.
+
+## Docker containers: a typed state, and a wait that cannot lie about it
+
+`terminus docker` reads a container's state and hands it back as keys you branch
+on. It never asks you to parse a sentence out of docker's English, and it never
+answers "not running" for a question it was unable to ask.
+
+```bash
+# One round trip. Exits 0 only when a state was actually read.
+terminus docker inspect web api --json
+
+# Block until the container's own healthcheck says healthy — or give up and say
+# exactly that.
+terminus docker wait web api --for healthy --timeout 120 --interval 5
+
+# ...or just until it is up, which is the right target for an image that
+# declares no HEALTHCHECK.
+terminus docker wait web api --for running --timeout 60
+```
+
+`--for` takes `healthy` (the default) or `running`. `--timeout` is a whole number
+of seconds (default 60), `--interval` is whole seconds between polls (default 2).
+Both verbs are reads: they open no operation row, take no lease and block nobody,
+for the same reason `terminus doctor` does not — nothing they send can change a
+container, and polling one does not make it healthy.
+
+### `reading` says what was established, and absences are not each other
+
+Five ways this can fail to be a state, and they are five different facts about
+your host. Branch on `reading`, never on the prose:
+
+- `docker_absent` — `docker` is not on the PATH a non-interactive SSH command
+  gets. **Nothing was asked about your container.** Run `terminus doctor
+  <server>` to see whether it is installed but on the login shell's PATH only.
+- `daemon_unreachable` — docker is installed and the daemon did not answer it.
+  Again, nothing is known about the container. This is the one a naive "is it
+  up?" check reports as "it is down".
+- `permission_denied` — the daemon did not answer *and* `/var/run/docker.sock`
+  is present and this account may not write to it, i.e. the account is not in
+  the `docker` group. A refusal, not an outage, and it will not fix itself.
+- `container_absent` — the daemon answered and has no container by that name.
+  The daemon's own answer, and the only one of the five that is.
+- `unparseable` — the daemon answered about this container and what came back is
+  not a document terminus can read. Never quietly turned into a state.
+- `unknown_probe_status` — the probe came back with an exit status it does not
+  produce, so it did not run as written and nothing it printed is evidence.
+
+`reading: "state"` is the sixth value, and the only one where `ok` is `true`.
+
+One stated boundary: over a `DOCKER_HOST` that is not the default unix socket, a
+permission refusal reports as `daemon_unreachable` rather than
+`permission_denied`. The socket test looks at `/var/run/docker.sock` and only
+when `DOCKER_HOST` is unset — so it is less specific there, never wrong.
+
+### `status` and `health` are closed lists, and both keep docker's own word
+
+- `status` is `created`, `running`, `paused`, `restarting`, `removing`,
+  `exited`, `dead`, or `unrecognised`. `statusReported` carries the word docker
+  actually printed, always, so an `unrecognised` never also loses it.
+- `health` is `none`, `starting`, `healthy`, `unhealthy`, or `unrecognised`,
+  with `healthReported` beside it the same way. **`none` means the image
+  declares no `HEALTHCHECK`.** It is not "unhealthy" and it is not "not yet".
+
+### A wait that runs out of time is not a wait that succeeded
+
+`outcome` is one of four words, and only the first of them is `ok: true`:
+
+- `reached` — the target became true. Exit 0.
+- `timed_out` — the deadline expired with the target still not true. Exit 1.
+  The last reading travels with it, so `status` and `health` tell you what it
+  was still waiting on. This is **not** the same answer as an unhealthy
+  container: `unhealthy` is a `health` value you can go on waiting through, and
+  it shows up *inside* a `timed_out` result.
+- `cannot_reach` — waiting cannot make the target true from here, so it stopped
+  at once instead of burning the deadline. The common case by far: you waited
+  for `healthy` on a **running** container whose image has no `HEALTHCHECK`, so
+  it has no health status and will never acquire one. Wait for `running`
+  instead. Exit 1.
+- `undetermined` — the host never told us anything about the container at all,
+  i.e. one of the five readings above. Exit 1.
+
+`polls`, `waitedSeconds` and `timeoutSeconds` are numbers, so a deadline that
+expired after one look is distinguishable from one that expired after thirty.
+
+`detail` and `dockerSaid` are the only prose keys in either document —
+terminus's sentence and docker's own message. Nothing you need to act on lives
+only in them.
+
+**What this rests on, so you know when to stop trusting it.** The state comes
+from `docker container inspect` with a JSON format template over `.State`: a
+documented struct, one line of output. If that ever stops being one readable
+line, the answer becomes `unparseable` — a refusal that names itself — and never
+a state with invented fields.

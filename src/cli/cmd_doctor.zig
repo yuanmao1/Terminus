@@ -3,6 +3,24 @@
 //! A single remote script gathers everything an agent needs to decide how
 //! to work: shell, OS, tmux availability (sessions/jobs need it), paths,
 //! disk space, writability. Structured output; one SSH round trip.
+//!
+//! **Why this verb opens no operation.** It makes a remote call and takes no
+//! request id, which looks like the gap `sync` had and is not the same thing.
+//! The ledger exists so a later session can establish whether a *change* was
+//! applied — that is what `operations.zig` records and what
+//! `BeginOptions.mutating` splits on — and this script applies none. It echoes
+//! environment variables, asks `command -v` about eleven tools, and its only two
+//! writes are zero-byte files at fixed terminus-named paths that the same shell
+//! line removes. Every redirection in it goes to `/dev/null`. So there is no fact
+//! about the host that a receipt would let anybody establish and that re-running
+//! `doctor` would not, and no way for a second run to have a different effect
+//! from the first.
+//!
+//! That argument is worth exactly as much as the script it is about, so the gate
+//! at the bottom of this file holds the script to it: a `touch` that stopped being
+//! undone, a redirection that went somewhere real, or any durable-write verb at
+//! all fails the build. If this probe ever needs to change something, it needs an
+//! operation first, and that gate is where the change will stop.
 const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
@@ -143,3 +161,94 @@ const Tool = struct {
     plain: ?[]const u8,
     login: ?[]const u8,
 };
+
+// The claim the file header makes, held against the script it is about.
+//
+// Three readings, because there are three ways this probe could stop being a
+// read: a write that is no longer undone, a redirection that lands on a real
+// path, and a verb that changes something outright. Each is checked over the
+// script text itself, and each is counted so a scan that matched nothing fails
+// rather than passing over an empty region.
+test "gate: doctor's probe changes nothing, which is why it opens no operation" {
+    const t = std.testing;
+
+    // 1. Every write is undone in the line that made it. Per line rather than
+    //    per script: a `touch` on one line and an `rm -f` twenty lines later is
+    //    not the same guarantee, because everything between them can fail.
+    var writes: usize = 0;
+    var lines = std.mem.splitScalar(u8, probe_script, '\n');
+    while (lines.next()) |line| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, line, i, "touch ")) |at| : (i = at + 1) {
+            writes += 1;
+            const rest = line[at + "touch ".len ..];
+            const path = rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len];
+            const undo = try std.fmt.allocPrint(t.allocator, "rm -f {s}", .{path});
+            defer t.allocator.free(undo);
+            if (std.mem.indexOf(u8, line, undo) == null) {
+                std.debug.print(
+                    \\
+                    \\doctor's probe writes {s} and does not remove it on the same line:
+                    \\
+                    \\  {s}
+                    \\
+                    \\The header of this file says this verb needs no operation row because it
+                    \\leaves nothing behind. A write that outlives the command is a change, and a
+                    \\change with no request id is the gap `sync` had.
+                    \\
+                , .{ path, line });
+                return error.ProbeWriteNotUndone;
+            }
+        }
+    }
+    try t.expectEqual(@as(usize, 2), writes);
+    // Both `rm -f`s are the two above, so nothing else in here removes anything.
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, probe_script, "rm -f "));
+
+    // 2. Every redirection goes to /dev/null. This is where a probe stops being
+    //    one most quietly: `2>/dev/null` and `2>/tmp/log` differ by six
+    //    characters and by whether the host is left changed.
+    var redirects: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, probe_script, at, '>')) |found| : (at = found + 1) {
+        redirects += 1;
+        if (!std.mem.startsWith(u8, probe_script[found + 1 ..], "/dev/null")) {
+            std.debug.print(
+                \\
+                \\doctor's probe redirects somewhere other than /dev/null:
+                \\
+                \\  ...{s}...
+                \\
+            , .{probe_script[found -| 40..@min(probe_script.len, found + 20)]});
+            return error.ProbeRedirectsSomewhereReal;
+        }
+    }
+    try t.expectEqual(@as(usize, 10), redirects);
+
+    // 3. No durable-write verb at all. Spelled with their separators where a
+    //    bare name would collide — `scp base64` in the tool list contains "cp".
+    var refused: usize = 0;
+    for ([_][]const u8{
+        "mkdir", " mv ",  " cp ",      " ln ",  "tee ",
+        "chmod", "chown", "systemctl", "kill ", "sed -i",
+        ">>",    " dd ",  "apt-get",   "curl",  "wget",
+    }) |verb| {
+        refused += 1;
+        if (std.mem.indexOf(u8, probe_script, verb) != null) {
+            std.debug.print(
+                \\
+                \\doctor's probe contains `{s}`, so it can change the host. Give it an
+                \\operation row before it does — `cmd_sync.zig` has the shape.
+                \\
+            , .{verb});
+            return error.ProbeChangesTheHost;
+        }
+    }
+    try t.expectEqual(@as(usize, 15), refused);
+
+    // And the probe really is the thing being read: a script trimmed down to
+    // nothing would satisfy all three readings above.
+    try t.expect(std.mem.indexOf(u8, probe_script, "command -v") != null);
+    try t.expect(std.mem.indexOf(u8, probe_script, "tmp_writable=") != null);
+    try t.expect(probe_script.len > 512);
+}

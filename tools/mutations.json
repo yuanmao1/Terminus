@@ -1932,6 +1932,230 @@
       "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
       "replace": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"shell\" };",
       "expect_gate": "gate: every boolean flag exec takes is registered, so none swallows the next argument"
+    },
+    {
+      "id": "M4-probe-carry-dropped",
+      "rule": "A read boundary may not lose the half of a marker line it cut off. Dropping the partial line loses every `__TERMINUS_PROGRESS__` the window happened to split, and the job's most recent report is exactly the one a live window is most likely to be splitting.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "        .carry = if (partial.len == 0)\n            \"\"\n        else if (carryable(partial))\n            try arena.dupe(u8, partial)\n        else\n            carry_elision,",
+      "replace": "        .carry = if (carryable(partial)) \"\" else carry_elision,",
+      "expect_gate": "gate: a marker the read boundary cut in half is parsed once, whole"
+    },
+    {
+      "id": "M4-probe-carry-not-consumed",
+      "rule": "Bytes a read boundary held back must be prepended to the next window, not appended after it. Storing the carry and joining it on the wrong side is the state the column was in before this: preserved, and connected to nothing.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "    const text = try std.mem.concat(arena, u8, &.{ carry, cleaned });",
+      "replace": "    const text = try std.mem.concat(arena, u8, &.{ cleaned, carry });",
+      "expect_gate": "gate: a marker the read boundary cut in half is parsed once, whole"
+    },
+    {
+      "id": "M4-probe-cursor-does-not-advance",
+      "rule": "A forward read must report where it stopped, not where it started. A cursor that never advances turns every probe into a re-read of the log from byte zero, which is unbounded traffic and re-reports markers the job has already been credited with.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "        .next_cursor = chunk.next_cursor,\n        .carry = found.carry,",
+      "replace": "        .next_cursor = 0,\n        .carry = found.carry,",
+      "expect_gate": "gate: the probe reads forward from its own cursor and does not start over"
+    },
+    {
+      "id": "M4-progress-oversized-is-not-absent",
+      "rule": "An oversized `__TERMINUS_PROGRESS__` line is not the absence of one. Reading it as `absent` tells an agent the job reported nothing, which is the one thing that is certainly false.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "    if (trimmed.len > max_progress_bytes) return .{ .too_long = trimmed.len };",
+      "replace": "    if (trimmed.len > max_progress_bytes) return .absent;",
+      "expect_gate": "gate: a progress line is refused three ways and none of them is silence"
+    },
+    {
+      "id": "M4-probe-carry-elision-is-not-nothing",
+      "rule": "A partial line the probe refuses to store must still keep the next window off a line start. Eliding it to nothing puts the continuation of a mid-line at column zero, so `noise__TERMINUS_PROGRESS__:{...}` cut after `noise` comes back as a marker line the job never printed.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "const carry_elision = \" \";",
+      "replace": "const carry_elision = \"\";",
+      "expect_gate": "gate: a partial line we will not store still keeps the next window off a line start"
+    },
+    {
+      "id": "M4-probe-takes-the-readers-cursor",
+      "rule": "The state probe may not read from the cursor that belongs to whoever is streaming output. Sharing it hands the probe whatever window the reader happened to leave behind, and every `job read` then silently changes what the next `job status` can see.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            if (before) |b| b.probe_cursor else 0,\n            probe_forward_bytes,",
+      "replace": "            job.read_cursor,\n            probe_forward_bytes,",
+      "expect_gate": "gate: the reader's cursor and the probe's cursor never move each other"
+    },
+    {
+      "id": "M4-progress-not-recorded",
+      "rule": "What a job reported must be recorded before the window carrying it moves on. A probe that reads progress and does not store it has the value in hand at the only moment it will ever be readable.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .latest_progress_json = seen_progress,",
+      "replace": "            .latest_progress_json = null,",
+      "expect_gate": "gate: a settled job still reports the progress it printed before it ended"
+    },
+    {
+      "id": "M4-probe-carry-write-back-says-nothing",
+      "rule": "A probe that read must say whether it held anything back. `null` means it did not say, and `recordProbe`'s COALESCE leaves the previous fragment in place - so a carry consumed once is prepended to every window from then on.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .parser_carry = switch (forward) {\n                .scanned => |s| s.carry,\n                .not_requested, .failed => null,\n            },",
+      "replace": "            .parser_carry = null,",
+      "expect_gate": "gate: a settled job still reports the progress it printed before it ended"
+    },
+    {
+      "id": "M4-settled-job-forgets-what-it-reported",
+      "rule": "A job that has ended must still be able to say what it reported. Reading only the current window makes `progress` null the moment the log rotates, the session dies or the window moves past the line - which is every finished job.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    state.progress = seen_progress orelse (if (before) |b| b.latest_progress_json else null);",
+      "replace": "    state.progress = seen_progress;",
+      "expect_gate": "gate: progress the probe's window has scrolled past is still what the job reported"
+    },
+    {
+      "id": "M4-refused-progress-is-not-silence",
+      "rule": "A `__TERMINUS_PROGRESS__` line that was refused may not be reported as silence. Without the note beside it, `progress` holds a true but stale value and nothing says the job's most recent statement was one we could not use.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    state.progress_error = progressNote(ctx, forward);",
+      "replace": "    state.progress_error = null;",
+      "expect_gate": "gate: progress the probe's window has scrolled past is still what the job reported"
+    },
+    {
+      "id": "M6-sync-kind-is-not-exec",
+      "rule": "A sync's operation is an `exec`: its remote act is one shell script terminus composed and that script's exit status is the verdict. `cleanup`/`tunnel`/`plan_phase`/`audit` declare `judgement_undeclared` - nothing is known about what one is judged by - so filing a sync as one records a verdict the kind does not claim to have.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "pub const kind: Store.operations.Kind = .exec;",
+      "replace": "pub const kind: Store.operations.Kind = .cleanup;",
+      "expect_gate": "gate: a sync that unpacks cleanly leaves one operation with a terminal and a findable id"
+    },
+    {
+      "id": "M6b-sync-scope-is-not-a-path",
+      "rule": "A sync contends on the remote directory it names, as a `.path` scope, so `scope.Scope.overlaps`'s containment arm makes a sync into /srv/app block one into /srv/app/dist and a `terminus push` aimed at /srv/app/config.json. A `.job` scope only ever matches an identical key and sees no transfer at all.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    return .{ .kind = .path, .key = remote_dir };",
+      "replace": "    return .{ .kind = .job, .key = remote_dir };",
+      "expect_gate": "gate: a submitted sync push holds its remote directory, and a read-only pull does not"
+    },
+    {
+      "id": "M6c-sync-dry-run-holds-the-scope",
+      "rule": "`--dry-run` changes nothing, so its attempt must be `mutating = false` and hold no barrier; a real push must hold one. Dropping the negation inverts both: the preview bars the run it previews, and the run that replaces a directory bars nobody.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    return verb == .push and !dry_run;",
+      "replace": "    return verb == .push and dry_run;",
+      "expect_gate": "gate: --dry-run records a read-only attempt, settles it, and bars nobody"
+    },
+    {
+      "id": "M6d-sync-verdict-ignores-the-status",
+      "rule": "A run settled `indeterminate` is unknown whatever number is sitting beside it. Reading the exit code without first reading the status turns a lost answer into a clean sync.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    if (outcome.status == .indeterminate) return .unknown;",
+      "replace": "    // the status is not consulted",
+      "expect_gate": "gate: verdictOf never turns an outcome nobody reported into an answer"
+    },
+    {
+      "id": "M6e-sync-missing-exit-status-read-as-zero",
+      "rule": "A channel that broke after the script went out, or closed without the supervisor's exit marker, reports no exit status. Defaulting that to zero reports a sync push - which runs `rm -rf` and `tar -xf` - as completed on the strength of a number nobody sent.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    if (outcome.status == .indeterminate) return .unknown;\n    const code = outcome.exit_code orelse return .unknown;",
+      "replace": "    const code = outcome.exit_code orelse 0;",
+      "expect_gate": "gate: a sync whose answer never arrived settles indeterminate, never failed"
+    },
+    {
+      "id": "M6f-sync-dry-run-terminal-claims-a-transport-failure",
+      "rule": "A `push --dry-run` connected and chose not to submit: `local_abandon` (cancelled) is the terminal for that. `never_submitted` records `failed` and claims a transport error that never happened, for a run that did exactly what it was asked.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    _ = execution.settle(.{ .local_abandon = .{ .reason = dry_run_reason } }, .{}) catch |err|",
+      "replace": "    _ = execution.settle(.{ .never_submitted = .{ .transport_error = dry_run_reason } }, .{}) catch |err|",
+      "expect_gate": "gate: --dry-run records a read-only attempt, settles it, and bars nobody"
+    },
+    {
+      "id": "M6g-sync-digest-refusal-read-as-success",
+      "rule": "The host's `exit 43` means it read a digest that did not match and unpacked nothing. Folding that into the success arm reports `ok: true` for a transfer that was refused.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    if (code == 0) return .{ .completed = outcome.stdout };",
+      "replace": "    if (code == 0 or code == corrupt_exit) return .{ .completed = outcome.stdout };",
+      "expect_gate": "gate: a remote extract the host refused settles a failure and is never read as success"
+    },
+    {
+      "id": "M6h-sync-corrupt-exit-is-zero",
+      "rule": "The refusal code the unpack script uses for a digest mismatch must not be zero: the host would print `checksum mismatch` and exit 0, which every reader of an exit status takes for a clean unpack.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "pub const corrupt_exit: i32 = 43;",
+      "replace": "pub const corrupt_exit: i32 = 0;",
+      "expect_gate": "gate: the unpack script proves the digest before it destroys anything"
+    },
+    {
+      "id": "M6i-doctor-probe-leaves-a-file-behind",
+      "rule": "`doctor` opens no operation, and the reason is that its probe changes nothing: every write is a zero-byte file at a fixed terminus-named path removed on the same shell line. A `touch` that outlives the command is a change to the host with no request id.",
+      "file": "src/cli/cmd_doctor.zig",
+      "find": "    \\\\echo \"tmp_writable=$(touch /tmp/.terminus_probe 2>/dev/null && rm -f /tmp/.terminus_probe && echo yes || echo no)\"",
+      "replace": "    \\\\echo \"tmp_writable=$(touch /tmp/.terminus_probe 2>/dev/null && echo yes || echo no)\"",
+      "expect_gate": "gate: doctor's probe changes nothing, which is why it opens no operation"
+    },
+    {
+      "id": "M6j-server-ping-sends-a-command-with-an-effect",
+      "rule": "`server ping` opens no operation, and the reason is that the whole of what it sends is `true` - the POSIX no-op. Any command with an effect there is a remote change nothing in the ledger describes.",
+      "file": "src/cli/cmd_server.zig",
+      "find": "pub const ping_command = \"true\";",
+      "replace": "pub const ping_command = \"touch /tmp/.terminus_ping\";",
+      "expect_gate": "gate: `server ping` sends a command that cannot change the host"
+    },
+    {
+      "id": "M6k-skill-sync-section-drops-the-reconcile-route",
+      "rule": "An agent that meets exit 75 from a `sync push` must be told to reconcile rather than retry: the retry runs `rm -rf` on the destination a second time. The document is the only place that sentence exists.",
+      "file": "skill/SKILL.md",
+      "find": "terminus request reconcile <requestId>",
+      "replace": "terminus request ls",
+      "expect_gate": "gate: the skill document describes the receipt a sync now leaves"
+    },
+    {
+      "id": "M15-docker-argv-concatenated",
+      "rule": "A remote command built from an argv must render every element as exactly one shell word, never join them raw.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "    return Core.shell.render(arena, try inspectArgv(arena, container));",
+      "replace": "    return std.mem.join(arena, \" \", try inspectArgv(arena, container));",
+      "expect_gate": "gate: an argv element with a space, a quote, a $ and braces is one shell word"
+    },
+    {
+      "id": "M15-docker-absence-collapsed",
+      "rule": "A daemon that did not answer may not be reported as a container that does not exist. Five absences, five readings.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "        status.daemon_unreachable => .daemon_unreachable,",
+      "replace": "        status.daemon_unreachable => .container_absent,",
+      "expect_gate": "gate: each distinguishable failure is reported as itself and not as another"
+    },
+    {
+      "id": "M15-docker-wait-deadline",
+      "rule": "A health wait whose deadline expires may never report the target as reached.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "            return finish(.timed_out, probe, polls, waited, null);",
+      "replace": "            return finish(.reached, probe, polls, waited, null);",
+      "expect_gate": "gate: a wait whose deadline expires is timed_out, and timed_out is not success"
+    },
+    {
+      "id": "M15-docker-no-healthcheck",
+      "rule": "A running container whose image declares no HEALTHCHECK can never become healthy, and must be refused rather than waited on.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "            .none => if (state.lifecycle == .running)",
+      "replace": "            .none => if (false)",
+      "expect_gate": "gate: a running container with no HEALTHCHECK cannot reach healthy, and says so"
+    },
+    {
+      "id": "M15-docker-wrong-state-reached",
+      "rule": "Only the target state may satisfy a wait for that target.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "            .created, .restarting, .paused, .exited => .keep_waiting,",
+      "replace": "            .paused => .reached,\n            .created, .restarting, .exited => .keep_waiting,",
+      "expect_gate": "gate: no combination reports the target reached except the target itself"
+    },
+    {
+      "id": "M15-docker-refusal-reported-ok",
+      "rule": "A reading that is not a container state may not be published with ok: true.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "        .ok = probe.reading.isState(),",
+      "replace": "        .ok = true,",
+      "expect_gate": "gate: every vocabulary key takes a word from its own closed list"
+    },
+    {
+      "id": "M15-docker-wait-key-set",
+      "rule": "The published --json key set of `docker wait` is pinned; a key added, renamed or reordered must fail rather than ship.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "    detail: ?[]const u8,\n    dockerSaid: ?[]const u8,\n    transport: []const u8,\n    daemonError: ?[]const u8,\n};\n\n/// The `inspect` document, built where a gate can read it.",
+      "replace": "    dockerSaid: ?[]const u8,\n    detail: ?[]const u8,\n    transport: []const u8,\n    daemonError: ?[]const u8,\n};\n\n/// The `inspect` document, built where a gate can read it.",
+      "expect_gate": "gate: the published key sets are exactly these, and only two of them are prose"
     }
   ]
 }

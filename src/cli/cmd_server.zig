@@ -1,9 +1,28 @@
 //! `terminus server add/ls/show/rm` — server resource management.
+//!
+//! **Why `ping` opens no operation.** It is the one verb here that reaches a
+//! host, and the whole of what it sends is the word below. `true` is the POSIX
+//! no-op: it takes no arguments, reads nothing, writes nothing, and cannot have a
+//! different effect the second time. The operation ledger exists so a later
+//! session can establish whether a *change* was applied (`operations.zig`,
+//! `BeginOptions.mutating`); there is no such fact here for a receipt to carry,
+//! and a row per reachability check would be noise in the one table an operator
+//! reads to find work that may still be in flight. `cmd_sync.zig`'s header has
+//! the other side of that argument, for a verb whose remote call really does
+//! change something.
+//!
+//! The claim is only as strong as the word, so the gate at the bottom of this
+//! file holds both halves of it: the command is exactly `true`, and it is the
+//! only remote call this file makes.
 const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
 const Core = @import("../core/core.zig");
 const Store = Core.Store;
+
+/// Everything `server ping` sends. See the file header for why it may stay that
+/// way without a request id, and the gate at the bottom for what enforces it.
+pub const ping_command = "true";
 
 const usage =
     \\usage: terminus server <verb> [...]
@@ -96,7 +115,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         const started = std.Io.Timestamp.now(ctx.io, .awake);
         var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
         defer conn.deinit();
-        const result = conn.executor().exec(ctx.arena, "true") catch |err|
+        const result = conn.executor().exec(ctx.arena, ping_command) catch |err|
             fatal("reachable but exec failed: {s} ({s})", .{ conn.executor().errorMessage(), @errorName(err) });
         const ms: i64 = @intCast(@divTrunc(
             started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds,
@@ -682,4 +701,43 @@ test "gate: a successful removal names the private key it leaves unreferenced" {
             return error.OrphanedKeyIsNotInTheHumanLine;
         }
     }
+}
+
+// The file header's claim about `ping`, held against the code it is about.
+//
+// Two halves, because dropping either one would let the verb start changing a
+// host with no request id: the word it sends, and the fact that it is the only
+// remote call in here. The second is read over the source rather than asserted
+// from memory — a second `exec` added anywhere in this file fails this gate,
+// which is where the question "does that one need an operation?" gets asked.
+test "gate: `server ping` sends a command that cannot change the host" {
+    const t = std.testing;
+
+    // `true` and nothing else. Not "starts with", not "contains": an argument
+    // appended here would be a command with an effect, and the argument for this
+    // verb having no ledger row is that there is no effect to record.
+    try t.expectEqualStrings("true", ping_command);
+
+    // Assembled so this gate's own text is not one of the sites it counts.
+    const needle = ".exec" ++ "(";
+    const source = @embedFile("cmd_server.zig");
+
+    var calls: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, source, i, needle)) |at| : (i = at + 1) calls += 1;
+    if (calls != 1) {
+        std.debug.print(
+            \\
+            \\cmd_server.zig makes {d} exec calls. It may have exactly one — `ping`'s — and
+            \\the reason this verb has no operation row is that the one it has sends a word
+            \\with no effect. A second one is a remote call nothing in the ledger describes;
+            \\give it an execution (`cmd_sync.zig` has the shape) rather than widening this
+            \\count.
+            \\
+        , .{calls});
+        return error.MoreThanOneRemoteCall;
+    }
+
+    // And the one call is passed the constant, not a literal beside it.
+    try t.expect(std.mem.indexOf(u8, source, needle ++ "ctx.arena, ping_command)") != null);
 }

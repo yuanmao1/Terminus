@@ -228,7 +228,12 @@ pub fn resultReadScript(arena: Allocator, request_id: []const u8) Allocator.Erro
 /// log's byte count, which is not a number, so the probe ends in
 /// `error.RemoteFailed`. No outcome can be established through that path,
 /// which is the property the `tr` was protecting.
-const probe_split_marker = "__TERMINUS_PROBE_SPLIT__";
+///
+/// Public because a gate outside this file has to build a probe reply byte for
+/// byte — `cmd_job.zig`'s `refresh` runs a `probeTail` and a `scanForward`
+/// against one scripted channel, and a transcription of this string there would
+/// go on agreeing with a renamed constant.
+pub const probe_split_marker = "__TERMINUS_PROBE_SPLIT__";
 
 const ProbeHalves = struct {
     /// The sidecar document, or empty if there was none.
@@ -1710,6 +1715,561 @@ fn findBusinessResult(arena: Allocator, data: []const u8) Allocator.Error!?[]con
         search_from = pos + business_marker.len;
     }
     return if (last) |v| try arena.dupe(u8, v) else null;
+}
+
+/// Jobs opt into progress reporting by printing this marker; the JSON object
+/// after the colon is what `latest_progress_json` holds and what `progress`
+/// reports.
+///
+/// A JSON *object* and not a free string, unlike `business_marker` above. The
+/// column is named `latest_progress_json` and a consumer reads keys out of it,
+/// so a document that is not an object is one no reader can use — see
+/// `readProgress`, which refuses rather than storing it.
+pub const progress_marker = "__TERMINUS_PROGRESS__";
+
+/// …and this one names the stage the job believes it is in. A word, not a
+/// document: `latest_phase` is one label, and a job that wants structure has
+/// `progress_marker` for it.
+pub const phase_marker = "__TERMINUS_PHASE__";
+
+/// The most a `__TERMINUS_PROGRESS__` line may carry after its colon.
+///
+/// Same order as `max_result_bytes` and there for the same reason: a progress
+/// line is a status ping, and something larger is a job printing its output
+/// through a marker. The bound is what lets `too_long` be a fact this reports
+/// rather than a buffer it quietly fills.
+pub const max_progress_bytes: usize = 4096;
+
+/// The most a `__TERMINUS_PHASE__` line may carry. A phase is a label.
+pub const max_phase_bytes: usize = 256;
+
+/// What the last `__TERMINUS_PROGRESS__` line in a window turned out to be.
+///
+/// Four readings and not a `?[]const u8`, for the reason `SidecarReading` is
+/// not one either: "the job printed no progress" and "the job printed progress
+/// we refused" are different facts about the host, and a type that cannot hold
+/// them apart turns a defective line into silence. An agent polling `progress`
+/// would then watch a job that is loudly reporting a malformed document look
+/// exactly like a job reporting nothing at all.
+///
+/// A half-written line is deliberately *not* one of these. It is not a defect —
+/// it is a line the read boundary cut in half — so it is held in the carry and
+/// parsed next time, whole. See `scanMarkers`.
+pub const ProgressReading = union(enum) {
+    /// No `__TERMINUS_PROGRESS__` line in this window.
+    absent,
+    /// A JSON object, exactly as the job printed it.
+    present: []const u8,
+    /// A line was there and its body is not a JSON object.
+    malformed,
+    /// A line was there and its body is longer than `max_progress_bytes`.
+    /// Carries the length, because "too long" without a number sends nobody
+    /// anywhere.
+    too_long: usize,
+
+    /// The stable word for this reading — its own tag name, so a renamed
+    /// variant rewrites what is published.
+    pub fn code(r: ProgressReading) []const u8 {
+        return @tagName(r);
+    }
+
+    /// The document, or null for every reading that is not one.
+    pub fn value(r: ProgressReading) ?[]const u8 {
+        return switch (r) {
+            .present => |v| v,
+            .absent, .malformed, .too_long => null,
+        };
+    }
+
+    /// Whether a line was there and could not be used.
+    pub fn anomalous(r: ProgressReading) bool {
+        return switch (r) {
+            .absent, .present => false,
+            .malformed, .too_long => true,
+        };
+    }
+};
+
+/// The body of `line` when it is one of our marker lines, or null.
+///
+/// Line-start only, and the colon is required: `findBusinessResult` has always
+/// worked this way, and the reason is that a job's own output routinely quotes
+/// these strings. `line` carries no newline — the caller has already cut it —
+/// which is what makes a half-delivered line unable to reach here at all.
+fn markerBody(line: []const u8, marker: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, marker)) return null;
+    const after = line[marker.len..];
+    if (after.len < 1 or after[0] != ':') return null;
+    return after[1..];
+}
+
+/// Judges one `__TERMINUS_PROGRESS__` body. Never guesses.
+///
+/// Three refusals rather than one, because they send an operator to three
+/// different places: an empty body is a job that printed the marker and no
+/// document, a body that is not a JSON object is a job printing something else
+/// through this marker, and an oversized one is a job using it as an output
+/// channel. Collapsing them into `absent` would say the job reported nothing,
+/// which is the one thing that is certainly false in all three.
+fn readProgress(arena: Allocator, body: []const u8) Allocator.Error!ProgressReading {
+    const trimmed = std.mem.trim(u8, body, " \t\r");
+    if (trimmed.len == 0) return .malformed;
+    if (trimmed.len > max_progress_bytes) return .{ .too_long = trimmed.len };
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, trimmed, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .malformed,
+    };
+    // An object, not merely valid JSON. `7`, `"done"` and `[1,2]` are all valid
+    // documents and none of them is a progress report; storing one in a column
+    // called `latest_progress_json` hands every reader a value it has to guess
+    // about, which is the guess this exists to refuse.
+    return switch (value) {
+        .object => .{ .present = trimmed },
+        else => .malformed,
+    };
+}
+
+/// The most of a partial line the probe will hold across a read boundary.
+///
+/// A carry exists so a marker the boundary cut in half is parsed once and
+/// whole, so it need only be long enough for the longest line we would accept.
+const max_carry_bytes: usize = max_progress_bytes + 256;
+
+/// What is carried in place of a partial line we will not store: one space.
+///
+/// Not the empty string, and that is the whole point of it. Dropping the
+/// partial line would put the next window's first byte at a line start it does
+/// not occupy, so a log reading `noise__TERMINUS_PROGRESS__:{"a":1}` cut after
+/// `noise` would come back as a marker line the job never printed — a false
+/// reading manufactured by where the read happened to stop. A space is not a
+/// newline, so the continuation stays mid-line, and no marker begins with one.
+const carry_elision = " ";
+
+/// Whether a partial line may be held in `job_probe_state.parser_carry`.
+///
+/// That column is TEXT and the value sits in the local database until the next
+/// probe, so arbitrary log bytes — a NUL, a lone continuation byte from a
+/// truncated UTF-8 sequence — have no business in it. A line we would accept is
+/// printable by construction, so refusing the rest costs nothing: `carry_elision`
+/// keeps the line-start bookkeeping honest without storing the bytes.
+fn carryable(partial: []const u8) bool {
+    if (partial.len > max_carry_bytes) return false;
+    for (partial) |b| if (b != '\t' and (b < 0x20 or b == 0x7f)) return false;
+    return std.unicode.utf8ValidateSlice(partial);
+}
+
+const MarkerScan = struct {
+    progress: ProgressReading,
+    phase: ?[]const u8,
+    business_result: ?[]const u8,
+    /// The trailing partial line, for the next window to be prefixed with.
+    /// Never null: the empty string is how a probe says "nothing held back",
+    /// and `recordProbe`'s `COALESCE` cannot be told that with a NULL.
+    carry: []const u8,
+    /// How many marker lines of each kind this window held. Reported so a scan
+    /// that found nothing can be told from one that was never asked to look.
+    progress_lines: usize,
+    phase_lines: usize,
+    business_lines: usize,
+};
+
+/// Reads only *complete* lines, and hands the rest back as the carry.
+///
+/// This is the whole of why a forward-reading probe can be trusted where a tail
+/// window could not. A read boundary lands wherever the log happened to be, so
+/// a marker line is routinely delivered in two pieces; parsing the trailing
+/// piece as if it were a line reads one marker as two, and neither half is what
+/// the job printed. `findBusinessResult` above does exactly that — its
+/// `line_end` falls back to `data.len` — which is sound for a tail window,
+/// because that window always ends at end-of-file, and wrong for every window
+/// that does not.
+fn scanMarkers(arena: Allocator, text: []const u8) Allocator.Error!MarkerScan {
+    const last_newline = std.mem.lastIndexOfScalar(u8, text, '\n');
+    const complete = if (last_newline) |nl| text[0 .. nl + 1] else "";
+    const partial = if (last_newline) |nl| text[nl + 1 ..] else text;
+
+    var progress: ProgressReading = .absent;
+    var phase: ?[]const u8 = null;
+    var business: ?[]const u8 = null;
+    var progress_lines: usize = 0;
+    var phase_lines: usize = 0;
+    var business_lines: usize = 0;
+
+    var rest = complete;
+    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        const line = rest[0..nl];
+        rest = rest[nl + 1 ..];
+        if (markerBody(line, progress_marker)) |body| {
+            progress_lines += 1;
+            // Last wins, refusals included: the most recent thing the job said
+            // about its progress is the answer, and when that is unusable the
+            // caller is told so rather than handed an older document as if it
+            // were current. What survives a refusal is the *stored* value, which
+            // this never overwrites — see `ProbeUpdate`'s `COALESCE`.
+            progress = try readProgress(arena, body);
+            continue;
+        }
+        if (markerBody(line, phase_marker)) |body| {
+            phase_lines += 1;
+            const label = std.mem.trim(u8, body, " \t\r");
+            // A phase we will not store leaves the previous one standing rather
+            // than blanking it: an empty or oversized label is not a statement
+            // that the job left the stage it named last.
+            if (label.len > 0 and label.len <= max_phase_bytes) phase = label;
+            continue;
+        }
+        if (markerBody(line, business_marker)) |body| {
+            business_lines += 1;
+            business = std.mem.trim(u8, body, " \t\r");
+        }
+    }
+
+    return .{
+        .progress = progress,
+        .phase = phase,
+        .business_result = business,
+        .carry = if (partial.len == 0)
+            ""
+        else if (carryable(partial))
+            try arena.dupe(u8, partial)
+        else
+            carry_elision,
+        .progress_lines = progress_lines,
+        .phase_lines = phase_lines,
+        .business_lines = business_lines,
+    };
+}
+
+/// What one forward read of the log established.
+pub const ForwardScan = struct {
+    /// The last progress line in this window, as a reading.
+    progress: ProgressReading,
+    /// The last phase label in this window, or null when it held none.
+    phase: ?[]const u8,
+    /// The last business-result value in this window, or null.
+    business_result: ?[]const u8,
+    /// Where the probe's own cursor goes next.
+    next_cursor: i64,
+    /// The bytes held back for the next window. See `MarkerScan.carry`.
+    carry: []const u8,
+    /// Bytes this call actually took out of the log. Zero means the probe was
+    /// already caught up, which is the ordinary answer on a quiet job and the
+    /// evidence that it is not re-reading from the start.
+    bytes_read: usize,
+    /// The log's size as the host reported it, so a caller can tell a probe
+    /// that caught up from one that is still behind.
+    log_size: i64,
+
+    /// Whether this read reached the end of the log.
+    pub fn caughtUp(s: ForwardScan) bool {
+        return s.next_cursor >= s.log_size;
+    }
+};
+
+/// The state probe's *other* half: reads the log forward from the probe's own
+/// cursor and reports the markers it finds.
+///
+/// Separate from `probeTail`, and deliberately not folded into it. `probeTail`
+/// re-reads a fixed window at the *end* of the log because a sentinel is the
+/// last thing a well-behaved job writes, and that is the right shape for
+/// establishing an outcome in one round trip however much output came before.
+/// It is the wrong shape for everything else a job says as it runs: a progress
+/// line, a phase label or a business result that scrolled past that window is
+/// never seen again, and one straddling the window's edge is delivered as two
+/// halves and parsed as neither.
+///
+/// So this reads forward instead, from `cursor` — the probe's own position,
+/// which is not `jobs.read_cursor`. Sharing the consumer's cursor would move a
+/// reader's position underneath them and hand the probe whatever window that
+/// reader happened to leave. Two cursors, two consumers, and neither moves the
+/// other.
+///
+/// What forward reading costs is that a probe can fall behind a job that
+/// outruns `limit` between two looks. That is why this reports `log_size` and
+/// `caughtUp` rather than pretending: the next probe resumes where this one
+/// stopped, and the sentinel is `probeTail`'s job either way.
+pub fn scanForward(
+    executor: Executor,
+    arena: Allocator,
+    name: []const u8,
+    cursor: i64,
+    limit: i64,
+    carry: []const u8,
+) Error!ForwardScan {
+    const chunk = try readLog(executor, arena, name, cursor, limit);
+    const cleaned = try stripTerminalNoise(arena, chunk.data);
+    const text = try std.mem.concat(arena, u8, &.{ carry, cleaned });
+    const found = try scanMarkers(arena, text);
+    return .{
+        .progress = found.progress,
+        .phase = found.phase,
+        .business_result = found.business_result,
+        .next_cursor = chunk.next_cursor,
+        .carry = found.carry,
+        .bytes_read = chunk.data.len,
+        .log_size = chunk.log_size,
+    };
+}
+
+test "gate: a marker the read boundary cut in half is parsed once, whole" {
+    const t = std.testing;
+    const Scripted = @import("../exec.zig").Scripted;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+
+    // One progress line, delivered in two pieces. The log is 52 bytes; the
+    // first read stops 14 bytes into the marker itself, which is the case a
+    // tail window cannot express at all and a naive forward reader gets wrong
+    // twice — once by parsing `__TERMINUS_PRO` as a line, and again by starting
+    // the next window at a line boundary that is not one.
+    const line = progress_marker ++ ":{\"pct\":42}\n";
+    try t.expectEqual(@as(usize, 33), line.len);
+    const first_half = line[0..14];
+    const second_half = line[14..];
+
+    var split = Scripted.init(arena, &.{
+        .{ .reply = .{
+            .exit_code = 0,
+            .stdout = try std.fmt.allocPrint(arena, "{d}\n{s}", .{ line.len, first_half }),
+            .stderr = empty,
+        } },
+        .{ .reply = .{
+            .exit_code = 0,
+            .stdout = try std.fmt.allocPrint(arena, "{d}\n{s}", .{ line.len, second_half }),
+            .stderr = empty,
+        } },
+    });
+
+    // Half a marker is not a marker. Nothing is reported, nothing is refused —
+    // the fragment is held, which is the distinction `ProgressReading` refuses
+    // to collapse.
+    const one = try scanForward(split.executor(), arena, "j", 0, 1 << 20, "");
+    try t.expectEqualStrings("absent", one.progress.code());
+    try t.expectEqual(@as(?[]const u8, null), one.progress.value());
+    try t.expectEqualStrings(first_half, one.carry);
+    try t.expectEqual(@as(i64, 14), one.next_cursor);
+    try t.expect(!one.caughtUp());
+
+    // …and the second read completes it. Once: the value is the whole document
+    // and not a second copy of either half.
+    const two = try scanForward(split.executor(), arena, "j", one.next_cursor, 1 << 20, one.carry);
+    try t.expectEqualStrings("{\"pct\":42}", two.progress.value().?);
+    try t.expectEqualStrings("", two.carry);
+    try t.expect(two.caughtUp());
+
+    // The second window asked for the bytes after the first one, not for the
+    // log from the start. Without this the carry would be prepended to a window
+    // that already contains the fragment and the line would be parsed twice.
+    try t.expect(std.mem.indexOf(u8, split.seen.items[1], "tail -c +15 ") != null);
+    try t.expect(std.mem.indexOf(u8, split.seen.items[0], "tail -c +1 ") != null);
+
+    // The control that stops this being satisfied by a reader that carries
+    // everything and parses nothing: a whole line in one window is still read
+    // in that window, and holds nothing back.
+    var whole = Scripted.init(arena, &.{
+        .{ .reply = .{
+            .exit_code = 0,
+            .stdout = try std.fmt.allocPrint(arena, "{d}\n{s}", .{ line.len, line }),
+            .stderr = empty,
+        } },
+    });
+    const at_once = try scanForward(whole.executor(), arena, "j", 0, 1 << 20, "");
+    try t.expectEqualStrings("{\"pct\":42}", at_once.progress.value().?);
+    try t.expectEqualStrings("", at_once.carry);
+}
+
+test "gate: the probe reads forward from its own cursor and does not start over" {
+    const t = std.testing;
+    const Scripted = @import("../exec.zig").Scripted;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+
+    const body = phase_marker ++ ":build\nworking\n";
+    var stream = Scripted.init(arena, &.{
+        .{ .reply = .{
+            .exit_code = 0,
+            .stdout = try std.fmt.allocPrint(arena, "{d}\n{s}", .{ body.len, body }),
+            .stderr = empty,
+        } },
+        // Nothing appended since. The host answers with the same size and no
+        // window at all, because a `tail` starting one past the end is empty.
+        .{ .reply = .{
+            .exit_code = 0,
+            .stdout = try std.fmt.allocPrint(arena, "{d}\n", .{body.len}),
+            .stderr = empty,
+        } },
+    });
+
+    const first = try scanForward(stream.executor(), arena, "j", 0, 1 << 20, "");
+    try t.expectEqual(@as(usize, body.len), first.bytes_read);
+    try t.expectEqualStrings("build", first.phase.?);
+    try t.expectEqual(@as(i64, @intCast(body.len)), first.next_cursor);
+
+    const second = try scanForward(stream.executor(), arena, "j", first.next_cursor, 1 << 20, first.carry);
+    // Strictly less, and it is zero: a probe that re-read from the start would
+    // report `body.len` again here, and would re-report a phase the job had
+    // already been credited with.
+    try t.expect(second.bytes_read < first.bytes_read);
+    try t.expectEqual(@as(usize, 0), second.bytes_read);
+    try t.expectEqual(@as(?[]const u8, null), second.phase);
+    try t.expectEqual(first.next_cursor, second.next_cursor);
+    try t.expect(second.caughtUp());
+
+    // The cursor reaches the shell, so the claim above is about the read that
+    // happened and not only about how its answer was interpreted.
+    try t.expect(std.mem.indexOf(u8, stream.seen.items[0], "tail -c +1 ") != null);
+    try t.expect(std.mem.indexOf(u8, stream.seen.items[1], try std.fmt.allocPrint(
+        arena,
+        "tail -c +{d} ",
+        .{body.len + 1},
+    )) != null);
+}
+
+test "gate: a progress line is refused three ways and none of them is silence" {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const oversized = try arena.alloc(u8, max_progress_bytes + 1);
+    @memset(oversized, 'x');
+
+    const cases = [_]struct {
+        text: []const u8,
+        code: []const u8,
+        value: ?[]const u8,
+        anomalous: bool,
+    }{
+        // Nothing at all. The only one of the four that means the job said
+        // nothing about its progress.
+        .{ .text = "just output\n", .code = "absent", .value = null, .anomalous = false },
+        .{
+            .text = progress_marker ++ ":{\"pct\":7,\"phase\":\"copy\"}\n",
+            .code = "present",
+            .value = "{\"pct\":7,\"phase\":\"copy\"}",
+            .anomalous = false,
+        },
+        // The marker with no document behind it.
+        .{ .text = progress_marker ++ ":\n", .code = "malformed", .value = null, .anomalous = true },
+        // A document that is not JSON.
+        .{ .text = progress_marker ++ ":{oops\n", .code = "malformed", .value = null, .anomalous = true },
+        // Valid JSON that is not an object, which no reader of
+        // `latest_progress_json` can take keys out of.
+        .{ .text = progress_marker ++ ":\"done\"\n", .code = "malformed", .value = null, .anomalous = true },
+        .{ .text = progress_marker ++ ":[1,2]\n", .code = "malformed", .value = null, .anomalous = true },
+        .{
+            .text = try std.fmt.allocPrint(arena, "{s}:{{\"x\":\"{s}\"}}\n", .{ progress_marker, oversized }),
+            .code = "too_long",
+            .value = null,
+            .anomalous = true,
+        },
+    };
+    // A scan that stopped finding cases would otherwise pass over an empty
+    // region and prove nothing.
+    try t.expectEqual(@as(usize, 7), cases.len);
+
+    var refused: usize = 0;
+    for (cases) |case| {
+        const scan = try scanMarkers(arena, case.text);
+        try t.expectEqualStrings(case.code, scan.progress.code());
+        if (case.value) |want| {
+            try t.expectEqualStrings(want, scan.progress.value().?);
+        } else {
+            try t.expectEqual(@as(?[]const u8, null), scan.progress.value());
+        }
+        try t.expectEqual(case.anomalous, scan.progress.anomalous());
+        if (case.anomalous) refused += 1;
+    }
+    try t.expectEqual(@as(usize, 5), refused);
+
+    // The length is carried, not just the verdict: "too long" with no number
+    // tells an operator nothing about what their job printed.
+    const long = try scanMarkers(arena, cases[6].text);
+    try t.expectEqual(
+        cases[6].text.len - progress_marker.len - ":\n".len,
+        long.progress.too_long,
+    );
+
+    // A refusal does not blank the neighbours. The same window's phase and
+    // business result are still read, so one bad line cannot cost a job three
+    // facts.
+    const mixed = try scanMarkers(
+        arena,
+        progress_marker ++ ":not json\n" ++ phase_marker ++ ":deploy\n" ++ business_marker ++ ":rows=12\n",
+    );
+    try t.expectEqualStrings("malformed", mixed.progress.code());
+    try t.expectEqualStrings("deploy", mixed.phase.?);
+    try t.expectEqualStrings("rows=12", mixed.business_result.?);
+    try t.expectEqual(@as(usize, 1), mixed.progress_lines);
+    try t.expectEqual(@as(usize, 1), mixed.phase_lines);
+    try t.expectEqual(@as(usize, 1), mixed.business_lines);
+
+    // Last wins, and the refusal is the last word when it is the last line: the
+    // caller is told the job's most recent statement was unusable rather than
+    // handed an older document as though it were current.
+    const stale = try scanMarkers(
+        arena,
+        progress_marker ++ ":{\"pct\":1}\n" ++ progress_marker ++ ":{\"pct\":2}\n" ++ progress_marker ++ ":nope\n",
+    );
+    try t.expectEqualStrings("malformed", stale.progress.code());
+    try t.expectEqual(@as(usize, 3), stale.progress_lines);
+
+    // Line-start only, exactly as `findBusinessResult` has always been: a job
+    // quoting the marker mid-line has not reported anything.
+    const quoted = try scanMarkers(arena, "echo " ++ progress_marker ++ ":{\"pct\":9}\n");
+    try t.expectEqualStrings("absent", quoted.progress.code());
+    try t.expectEqual(@as(usize, 0), quoted.progress_lines);
+}
+
+test "gate: a partial line we will not store still keeps the next window off a line start" {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A partial line carrying a NUL. It cannot go into a TEXT column, and
+    // dropping it outright would leave the next window's first byte at a line
+    // start it does not occupy.
+    const binary = try std.fmt.allocPrint(arena, "done\nnoise\x00here", .{});
+    const scan = try scanMarkers(arena, binary);
+    try t.expectEqualStrings(carry_elision, scan.carry);
+    try t.expect(!carryable("noise\x00here"));
+
+    // The reading that elision buys: the continuation of that line is not a
+    // marker, because the line it belongs to did not start with one.
+    const next = try scanMarkers(
+        arena,
+        carry_elision ++ progress_marker ++ ":{\"pct\":3}\n",
+    );
+    try t.expectEqualStrings("absent", next.progress.code());
+    try t.expectEqual(@as(usize, 0), next.progress_lines);
+
+    // The control: a genuine line start on the next window is still read, so
+    // elision cannot be satisfied by a scanner that refuses everything after a
+    // carry.
+    const genuine = try scanMarkers(
+        arena,
+        carry_elision ++ "tail of the noisy line\n" ++ progress_marker ++ ":{\"pct\":3}\n",
+    );
+    try t.expectEqualStrings("{\"pct\":3}", genuine.progress.value().?);
+
+    // A partial line longer than any line we would accept is elided too, so the
+    // carry cannot grow without bound on a job that prints megabytes with no
+    // newline.
+    const huge = try arena.alloc(u8, max_carry_bytes + 1);
+    @memset(huge, 'y');
+    try t.expect(!carryable(huge));
+    const overrun = try scanMarkers(arena, huge);
+    try t.expectEqualStrings(carry_elision, overrun.carry);
+
+    // …and an ordinary partial line is held verbatim, which is the case the
+    // whole mechanism exists for.
+    const held = try scanMarkers(arena, "output\n" ++ progress_marker ++ ":{\"pc");
+    try t.expectEqualStrings(progress_marker ++ ":{\"pc", held.carry);
 }
 
 /// Answers "how is this job doing": reads new log output from the caller's

@@ -744,6 +744,21 @@ const State = struct {
     /// look like.
     sidecar: Tmux.SidecarReading = .not_requested,
     business_result: ?[]const u8 = null,
+    /// The last `__TERMINUS_PROGRESS__` document this job printed that we could
+    /// use, from this look or from the row an earlier one wrote.
+    ///
+    /// Filled by `refresh` after `applyProbe` has run, not by `applyProbe`
+    /// itself: what the job reported about its own work says nothing about how
+    /// the operation ended, and a settlement that could read it would be a
+    /// settlement a job can talk its way out of.
+    progress: ?[]const u8 = null,
+    /// The last stage this job named, on the same terms as `progress`.
+    phase: ?[]const u8 = null,
+    /// What went wrong while looking for progress, or null when nothing did.
+    /// Two shapes reach here — a line that was there and unusable, and a
+    /// forward read that never happened — and both mean the value beside them
+    /// is not a reading of the log as it stands.
+    progress_error: ?[]const u8 = null,
     /// The row is still a reservation, so the probe's reading of its tmux
     /// session establishes nothing about it — see `applyProbe`.
     reservation: bool = false,
@@ -1662,13 +1677,46 @@ fn fatalProbe(
 /// paths' lazy settlement, so both windows are the same by construction.
 const probe_tail_bytes = Cli.probe_tail_bytes;
 
-/// One SSH probe of the log's *end*; settles the operation if it establishes
-/// an outcome.
+/// How much of the log a state probe reads *forward*, from its own cursor.
 ///
-/// Deliberately does not use `jobs.read_cursor`. That cursor belongs to
-/// whoever is streaming output, and a probe that shared it would (a) move a
-/// consumer's position underneath them and (b) never reach the sentinel on a
-/// job whose output exceeds one read window.
+/// A constant of its own and deliberately not `probe_tail_bytes`. That one
+/// bounds a window re-read from the end of the log on every call; this one
+/// bounds how far a moving cursor may advance in a single round trip. They
+/// happen to be the same size today and they are not the same budget: raising
+/// one is a decision about repeated traffic, raising the other about how far
+/// behind a probe may fall on a job that outruns it.
+const probe_forward_bytes: i64 = 256 * 1024;
+
+/// What the forward half of a probe came back with.
+///
+/// Three cases and not `?ForwardScan`, because a read that failed is not a read
+/// that found nothing. The failure is reported to the caller and the probe's
+/// cursor is left where it was, so the next look retries the same window rather
+/// than skipping it — and the outcome the tail probe already established is not
+/// thrown away for a side channel that broke.
+const Forward = union(enum) {
+    /// There is no attempt, so there is no probe cursor to read from.
+    not_requested,
+    scanned: Tmux.ForwardScan,
+    failed: anyerror,
+};
+
+/// One SSH probe of the log's *end*, one forward read from the probe's own
+/// cursor; settles the operation if the pair establishes an outcome.
+///
+/// Two reads because they answer two questions that do not have one shape.
+/// `probeTail` asks "did this end", and the end of the log is where a sentinel
+/// is, however much output came before it. `scanForward` asks "what has this
+/// job said", and that is spread across the whole stream — a progress line, a
+/// phase label or a business result that scrolled past the tail window is never
+/// seen by it again, and one lying across that window's edge is delivered as
+/// two halves and read as neither.
+///
+/// Neither read touches `jobs.read_cursor`. That cursor belongs to whoever is
+/// streaming output with `job read --from-cursor`, and a probe that shared it
+/// would (a) move a consumer's position underneath them and (b) be handed
+/// whatever window that consumer happened to leave behind. The probe's position
+/// is `job_probe_state.probe_cursor` and nothing else writes it.
 fn refresh(
     ctx: *Cli.Ctx,
     store: *Store,
@@ -1685,15 +1733,116 @@ fn refresh(
         if (attempt) |a| a.request_id else null,
         probe_tail_bytes,
     ) catch |err| fatalProbe(err, executor, session, job.name, if (attempt) |a| a.request_id else null);
+
+    // What earlier probes established: where this one resumes, what they held
+    // back, and the last progress, phase and business result they could use.
+    const before: ?Store.job_attempts.ProbeState = if (attempt) |a|
+        Store.job_attempts.probeState(store, ctx.arena, a.request_id) catch |err| Cli.storeFatal(store, err)
+    else
+        null;
+
+    const forward: Forward = if (attempt == null) .not_requested else forward: {
+        const scan = Tmux.scanForward(
+            executor,
+            ctx.arena,
+            session,
+            if (before) |b| b.probe_cursor else 0,
+            probe_forward_bytes,
+            if (before) |b| b.parser_carry orelse "" else "",
+        ) catch |err| break :forward .{ .failed = err };
+        break :forward .{ .scanned = scan };
+    };
+
+    // What this look added, if anything. Null means "this window said nothing
+    // about it", which `recordProbe`'s COALESCE reads as "leave the stored
+    // value alone" — the difference between a quiet probe and one that erases
+    // what a louder one established.
+    const seen_progress: ?[]const u8 = switch (forward) {
+        .scanned => |s| s.progress.value(),
+        .not_requested, .failed => null,
+    };
+    const seen_phase: ?[]const u8 = switch (forward) {
+        .scanned => |s| s.phase,
+        .not_requested, .failed => null,
+    };
+    // The tail's answer first. Both windows end inside the same log, but the
+    // tail always ends at end-of-file, so a business marker it can see is the
+    // last one in the file — which the forward window can only match, never
+    // beat. What the forward read adds is every marker the tail is too late to
+    // see at all.
+    const seen_business: ?[]const u8 = probe.business_result orelse switch (forward) {
+        .scanned => |s| s.business_result,
+        .not_requested, .failed => null,
+    };
+
     if (attempt) |a| {
         Store.job_attempts.recordProbe(store, a.request_id, .{
-            .probe_cursor = probe.next_cursor,
-            .latest_business_result = probe.business_result,
+            // Where the forward read stopped. On a read that failed the cursor
+            // stays where it was, so the window it could not take is the window
+            // the next probe asks for.
+            .probe_cursor = switch (forward) {
+                .scanned => |s| s.next_cursor,
+                .not_requested, .failed => if (before) |b| b.probe_cursor else 0,
+            },
+            .parser_carry = switch (forward) {
+                .scanned => |s| s.carry,
+                .not_requested, .failed => null,
+            },
+            .latest_progress_json = seen_progress,
+            .latest_business_result = seen_business,
+            .latest_phase = seen_phase,
             .session_alive = probe.session_alive,
             .now = ctx.now,
         }) catch |err| Cli.storeFatal(store, err);
     }
-    return applyProbe(ctx, store, job, probe, attempt);
+
+    var state = applyProbe(ctx, store, job, probe, attempt);
+    // What the job reported, from this window or from the row an earlier window
+    // wrote. This is the half of the mechanism that lets a job answer after it
+    // has settled: its session is gone, its log may be gone, and the last thing
+    // it said is still on record.
+    state.progress = seen_progress orelse (if (before) |b| b.latest_progress_json else null);
+    state.phase = seen_phase orelse (if (before) |b| b.latest_phase else null);
+    state.business_result = state.business_result orelse
+        (if (before) |b| b.latest_business_result else null);
+    state.progress_error = progressNote(ctx, forward);
+    return state;
+}
+
+/// The sentence a progress reading earns when it is not one of the two ordinary
+/// ones, or null when it is.
+///
+/// Modelled on `resultRecordError` above, and for the same reason: a line that
+/// was there and could not be used is a fact about the host, and an agent
+/// polling `progress` must be able to tell it from a job that is reporting
+/// nothing. Silence would make a job loudly printing malformed documents look
+/// exactly like one printing none.
+///
+/// The failed-read case says so too. A forward read that never happened leaves
+/// `progress` holding whatever the last successful one stored, which is a true
+/// value and a stale one — and the caller is entitled to know which it has.
+fn progressNote(ctx: *Cli.Ctx, forward: Forward) ?[]const u8 {
+    return switch (forward) {
+        .not_requested => null,
+        .failed => |err| std.fmt.allocPrint(
+            ctx.arena,
+            "the forward read of this job's log did not happen ({s}), so any progress and phase above are the last ones recorded and not a reading of the log as it is now; the probe's cursor has not moved and the next look asks for the same window",
+            .{@errorName(err)},
+        ) catch "the forward read of this job's log did not happen, so any progress and phase above are the last ones recorded rather than current",
+        .scanned => |s| switch (s.progress) {
+            .absent, .present => null,
+            .malformed => std.fmt.allocPrint(
+                ctx.arena,
+                "this job's most recent {s} line does not carry a JSON object, so it was not recorded; any progress above is the last line that did",
+                .{Tmux.progress_marker},
+            ) catch "this job's most recent progress line does not carry a JSON object and was not recorded",
+            .too_long => |n| std.fmt.allocPrint(
+                ctx.arena,
+                "this job's most recent {s} line carries {d} bytes, past the {d}-byte limit, so it was not recorded; any progress above is the last line that fitted",
+                .{ Tmux.progress_marker, n, Tmux.max_progress_bytes },
+            ) catch "this job's most recent progress line is past the size limit and was not recorded",
+        },
+    };
 }
 
 /// One sentence per `jobs.Conflict`.
@@ -2391,6 +2540,13 @@ fn reportStatus(
             .settlement = @tagName(state.settlement),
             .exitCode = state.exit_code,
             .businessResult = state.business_result,
+            // The last thing the job said about its own work, as opposed to how
+            // it ended. Both survive the window that carried them and the
+            // session that produced them, which is the point of recording them
+            // at all — see `refresh`.
+            .progress = state.progress,
+            .phase = state.phase,
+            .progressError = state.progress_error,
             .command = job.command,
             .createdAt = job.created_at,
             // Two clocks, never merged. `finishedAt` is the remote's own
@@ -2421,6 +2577,11 @@ fn reportStatus(
                 .{ clash.result_exit_code, clash.sentinel_exit_code },
             );
             if (state.sidecarNote(ctx)) |text| try ctx.out.print("  {s}\n", .{text});
+            // Only when there is one, so the ordinary line is unchanged. A
+            // progress line that was refused, or a window that was never read,
+            // is not something to leave on stderr where `--json` consumers see
+            // it and human ones do not.
+            if (state.progress_error) |text| try ctx.out.print("  {s}\n", .{text});
             if (state.hint(ctx, job.name, attempt)) |text| try ctx.out.print("  {s}\n", .{text});
         },
     }
@@ -2468,6 +2629,9 @@ fn watchJob(
             .settlement = @tagName(state.settlement),
             .exitCode = state.exit_code,
             .businessResult = state.business_result,
+            .progress = state.progress,
+            .phase = state.phase,
+            .progressError = state.progress_error,
             .stillRunning = still_running,
             .conflict = ConflictJson.from(state.conflict),
             .resultRecord = state.sidecar.code(),
@@ -2491,6 +2655,7 @@ fn watchJob(
                 .{ clash.result_exit_code, clash.sentinel_exit_code },
             );
             if (state.sidecarNote(ctx)) |text| try ctx.out.print("  {s}\n", .{text});
+            if (state.progress_error) |text| try ctx.out.print("  {s}\n", .{text});
             if (state.hint(ctx, job.name, attempt)) |text| try ctx.out.print("  {s}\n", .{text});
         },
     }
@@ -7461,4 +7626,405 @@ test "gate: an authority lost once stays lost, even when the scope becomes renew
     // The prose beside the code says the same thing, because that is what
     // `authorityError` carries to the caller.
     try t.expect(authority.note(arena, .{ .job = "deploy" }) != null);
+}
+
+// ---------------------------------------------------------------------------
+// The probe's own cursor, and what a job reported before it settled.
+//
+// Three gates over one mechanism, because goals 7 and 8 are one mechanism.
+// Persisting `progress` without a forward-reading probe would record "the last
+// progress line inside the last tail window", which is wrong exactly when a job
+// has been running long enough for anyone to care; and reading forward without
+// persisting it would lose the value the moment the window moved on.
+// ---------------------------------------------------------------------------
+
+/// A launched job with a recorded attempt, for the three gates below.
+///
+/// One helper rather than three copies: they need identical ledger state — an
+/// operation at `remote_started`, a `running` row and an attempt row — and a
+/// copy that drifted would leave one of them probing a row the other two never
+/// see.
+const LaunchedJob = struct {
+    request_id: []const u8,
+    job: Store.jobs.Job,
+    attempt: ?Store.job_attempts.Attempt,
+
+    fn go(
+        s: *Store,
+        a: std.mem.Allocator,
+        io: std.Io,
+        name: []const u8,
+        sentinel: []const u8,
+    ) !LaunchedJob {
+        var e = switch (try Core.execution.begin(s, a, io, .{
+            .server_id = 1,
+            .server_name = "box",
+            .kind = .job,
+            .scope = jobScope(name),
+            .alias = name,
+            .owner_token = "agent",
+            .now = 1000,
+        })) {
+            .ready => |ready| ready,
+            .blocked => return error.ScopeUnexpectedlyBlocked,
+        };
+        e.settled = true;
+        const request_id = try a.dupe(u8, e.id());
+        try Store.operations.advance(s, request_id, .connecting, 1001);
+        try Store.operations.advance(s, request_id, .submitted, 1002);
+        try Store.operations.advance(s, request_id, .remote_started, 1003);
+        _ = try Store.jobs.create(s, 1, name, "make deploy", sentinel, request_id, 1000);
+        if (!try Store.jobs.markStarted(s, request_id)) return error.RowNotReserved;
+        _ = try Store.job_attempts.create(s, .{
+            .request_id = request_id,
+            .server_id = 1,
+            .server_name = "box",
+            .job_name = name,
+            .attempt_no = 1,
+            .sentinel = sentinel,
+            .tmux_session = name,
+            .now = 1000,
+        });
+        const row = (try Store.jobs.getByName(s, a, 1, name)).?;
+        return .{ .request_id = request_id, .job = row, .attempt = attemptOf(s, a, row) };
+    }
+};
+
+/// The bytes a host sends back for one `Tmux.probeTail`: the result sidecar (or
+/// nothing), the split marker on a line of its own, the log's byte count and
+/// the tail window.
+fn probeReply(
+    a: std.mem.Allocator,
+    sidecar: []const u8,
+    log_size: usize,
+    tail: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}\n{s}\n{d}\n{s}", .{
+        sidecar,
+        Tmux.probe_split_marker,
+        log_size,
+        tail,
+    });
+}
+
+/// The bytes a host sends back for one `Tmux.readLog`: the log's byte count on
+/// a line of its own, then the window.
+fn readReply(a: std.mem.Allocator, log_size: usize, window: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{d}\n{s}", .{ log_size, window });
+}
+
+fn insertBox(store: *Store) !void {
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100)
+    );
+}
+
+test "gate: the reader's cursor and the probe's cursor never move each other" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_two_cursors");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+    const launched = try LaunchedJob.go(&store, arena, scratch.io, "deploy", "__S__");
+    const rid = launched.request_id;
+
+    const log = Tmux.progress_marker ++ ":{\"pct\":5}\nstill working\n";
+    try t.expectEqual(@as(usize, 46), log.len);
+
+    // --- the reader, at its own position -----------------------------------
+    // What `job read --from-cursor --limit 12` does: `probeJob` from
+    // `jobs.read_cursor`, then move that cursor and nothing else.
+    var reader = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log.len, log[0..12]), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // readResult
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // isAlive
+    });
+    const read_one = try Tmux.probeJob(reader.executor(), arena, "deploy", "__S__", rid, 0, 12);
+    try t.expectEqual(@as(i64, 12), read_one.next_cursor);
+    switch (try Store.jobs.setCursor(&store, launched.job.cursorExpectation(), read_one.next_cursor)) {
+        .applied => {},
+        .refused => return error.ReaderCursorRefused,
+    }
+    try t.expectEqual(@as(i64, 12), (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.read_cursor);
+    // Nothing has probed yet, so there is no probe row at all — the reader did
+    // not create one, and did not write into one.
+    try t.expectEqual(
+        @as(?Store.job_attempts.ProbeState, null),
+        try Store.job_attempts.probeState(&store, arena, rid),
+    );
+
+    // --- the probe, at its own position ------------------------------------
+    // The row handed to `refresh` is the current one, exactly as `jobCmd` reads
+    // it: `read_cursor` is 12 here. A probe that took its position from the
+    // reader would start at byte 12 and never see anything before it.
+    const fresh_one = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    var prober = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try probeReply(arena, "", log.len, log), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // isAlive
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log.len, log), .stderr = empty } },
+    });
+    const probed_one = refresh(&ctx, &store, prober.executor(), "deploy", fresh_one, launched.attempt);
+    try t.expectEqualStrings("{\"pct\":5}", probed_one.progress.?);
+    try t.expectEqual(@as(?[]const u8, null), probed_one.progress_error);
+
+    // The forward read asked for the log from the start — the probe's own zero
+    // — while the reader's cursor stood at 12.
+    try t.expect(std.mem.indexOf(u8, prober.seen.items[2], "tail -c +1 ") != null);
+    try t.expect(std.mem.indexOf(u8, prober.seen.items[2], "tail -c +13 ") == null);
+
+    const after_probe = (try Store.job_attempts.probeState(&store, arena, rid)).?;
+    try t.expectEqual(@as(i64, @intCast(log.len)), after_probe.probe_cursor);
+    // …and the reader's position is exactly where the reader left it.
+    try t.expectEqual(@as(i64, 12), (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.read_cursor);
+
+    // --- the reader again, still at its own position ------------------------
+    const fresh_two = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    var reader_two = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log.len, log[12..24]), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+    });
+    const read_two = try Tmux.probeJob(reader_two.executor(), arena, "deploy", "__S__", rid, fresh_two.read_cursor, 12);
+    // The reader resumed at 12, not at the 46 the probe had reached.
+    try t.expect(std.mem.indexOf(u8, reader_two.seen.items[0], "tail -c +13 ") != null);
+    try t.expectEqual(@as(i64, 24), read_two.next_cursor);
+    switch (try Store.jobs.setCursor(&store, fresh_two.cursorExpectation(), read_two.next_cursor)) {
+        .applied => {},
+        .refused => return error.ReaderCursorRefused,
+    }
+    // The reader moved, the probe did not.
+    try t.expectEqual(@as(i64, 24), (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.read_cursor);
+    try t.expectEqual(
+        @as(i64, @intCast(log.len)),
+        (try Store.job_attempts.probeState(&store, arena, rid)).?.probe_cursor,
+    );
+
+    // --- and the probe again ------------------------------------------------
+    const fresh_three = (try Store.jobs.getByName(&store, arena, 1, "deploy")).?;
+    try t.expectEqual(@as(i64, 24), fresh_three.read_cursor);
+    var prober_two = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try probeReply(arena, "", log.len, log), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+        // Nothing appended: a read starting one past the end returns no window.
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log.len, ""), .stderr = empty } },
+    });
+    _ = refresh(&ctx, &store, prober_two.executor(), "deploy", fresh_three, launched.attempt);
+    // 47, which is `log.len + 1`: the probe resumed where *it* stopped, not at
+    // the 25 the reader's position would have asked for.
+    try t.expect(std.mem.indexOf(u8, prober_two.seen.items[2], try std.fmt.allocPrint(
+        arena,
+        "tail -c +{d} ",
+        .{log.len + 1},
+    )) != null);
+    try t.expect(std.mem.indexOf(u8, prober_two.seen.items[2], "tail -c +25 ") == null);
+    try t.expectEqual(@as(i64, 24), (try Store.jobs.getByName(&store, arena, 1, "deploy")).?.read_cursor);
+    try t.expectEqual(
+        @as(i64, @intCast(log.len)),
+        (try Store.job_attempts.probeState(&store, arena, rid)).?.probe_cursor,
+    );
+}
+
+test "gate: a settled job still reports the progress it printed before it ended" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_settled_progress");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+    const launched = try LaunchedJob.go(&store, arena, scratch.io, "migrate", "__S__");
+    const rid = launched.request_id;
+
+    const log = Tmux.progress_marker ++ ":{\"pct\":40}\n" ++
+        Tmux.phase_marker ++ ":migrate\n" ++
+        Tmux.business_marker ++ ":rows=1240\n" ++
+        "working\n";
+
+    // --- while it is running ------------------------------------------------
+    var running = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try probeReply(arena, "", log.len, log), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } }, // isAlive: yes
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log.len, log), .stderr = empty } },
+    });
+    const live = refresh(&ctx, &store, running.executor(), "migrate", launched.job, launched.attempt);
+    try t.expectEqualStrings("{\"pct\":40}", live.progress.?);
+    try t.expectEqualStrings("migrate", live.phase.?);
+    try t.expectEqualStrings("rows=1240", live.business_result.?);
+    try t.expectEqual(@as(?[]const u8, null), live.progress_error);
+
+    const recorded = (try Store.job_attempts.probeState(&store, arena, rid)) orelse
+        return error.ProbeWroteNoRow;
+    try t.expectEqualStrings(
+        "{\"pct\":40}",
+        recorded.latest_progress_json orelse return error.ProgressWasNotRecorded,
+    );
+    try t.expectEqualStrings("migrate", recorded.latest_phase orelse return error.PhaseWasNotRecorded);
+    try t.expectEqualStrings(
+        "rows=1240",
+        recorded.latest_business_result orelse return error.BusinessResultWasNotRecorded,
+    );
+    // The window ended on a line boundary, so nothing is held back — and that
+    // is written as the empty string, not as NULL, which `recordProbe`'s
+    // COALESCE would have read as "leave the old fragment where it is".
+    try t.expectEqualStrings("", recorded.parser_carry orelse return error.CarryWasNotWrittenBack);
+
+    // --- after it has ended, with its log gone -------------------------------
+    // The sidecar answers, the pane is gone and the log has been rotated away.
+    // Everything the job said about itself is now only in the row.
+    const sidecar = try std.fmt.allocPrint(
+        arena,
+        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":0,\"finishedAt\":1750000000}}",
+        .{rid},
+    );
+    const fresh = (try Store.jobs.getByName(&store, arena, 1, "migrate")).?;
+    var ended = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try probeReply(arena, sidecar, 0, ""), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 1, .stdout = empty, .stderr = empty } }, // isAlive: no
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, 0, ""), .stderr = empty } },
+    });
+    const settled = refresh(&ctx, &store, ended.executor(), "migrate", fresh, launched.attempt);
+
+    try t.expectEqual(Core.Store.op_state.Status.completed, settled.status);
+    try t.expectEqual(Settlement.settled, settled.settlement);
+    try t.expectEqual(@as(?i64, 0), settled.exit_code);
+    // Nothing in this look carried any of the three, and all three are still
+    // reported. This is the whole of goal 8: a finished job can say what it
+    // reported.
+    try t.expectEqualStrings("{\"pct\":40}", settled.progress.?);
+    try t.expectEqualStrings("migrate", settled.phase.?);
+    try t.expectEqualStrings("rows=1240", settled.business_result.?);
+    try t.expectEqual(@as(?[]const u8, null), settled.progress_error);
+    // The bytes really were absent from this round trip, so the values above
+    // came from the row and not from a window that happened to still hold them.
+    for (ended.seen.items, 0..) |_, i| {
+        try t.expectEqual(@as(usize, 0), std.mem.count(u8, ended.steps[i].reply.stdout, Tmux.progress_marker));
+        try t.expectEqual(@as(usize, 0), std.mem.count(u8, ended.steps[i].reply.stdout, Tmux.business_marker));
+    }
+    try t.expectEqual(@as(usize, 3), ended.seen.items.len);
+}
+
+test "gate: progress the probe's window has scrolled past is still what the job reported" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_progress_beyond_window");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty = try arena.alloc(u8, 0);
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+    const launched = try LaunchedJob.go(&store, arena, scratch.io, "chatty", "__S__");
+    const rid = launched.request_id;
+
+    // A job that printed its progress early and has been chattering ever since.
+    // `log_size` is far past either window, which is the situation the tail
+    // probe cannot answer at all: its window is the *end* of the log, and the
+    // progress line is nowhere near it in any of the three looks below.
+    const log_size: usize = 4 * 1024 * 1024;
+    const head = Tmux.progress_marker ++ ":{\"pct\":12}\nbuilding\n";
+    const noise = "still chattering\nand chattering\n";
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, head, Tmux.progress_marker));
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, noise, Tmux.progress_marker));
+
+    // --- the window that holds it -------------------------------------------
+    var early = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try probeReply(arena, "", log_size, noise), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log_size, head), .stderr = empty } },
+    });
+    const seen = refresh(&ctx, &store, early.executor(), "chatty", launched.job, launched.attempt);
+    try t.expectEqualStrings("{\"pct\":12}", seen.progress.?);
+    try t.expectEqual(
+        @as(i64, @intCast(head.len)),
+        (try Store.job_attempts.probeState(&store, arena, rid)).?.probe_cursor,
+    );
+
+    // --- every window after it ----------------------------------------------
+    const fresh_two = (try Store.jobs.getByName(&store, arena, 1, "chatty")).?;
+    var later = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try probeReply(arena, "", log_size, noise), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log_size, noise), .stderr = empty } },
+    });
+    const moved_on = refresh(&ctx, &store, later.executor(), "chatty", fresh_two, launched.attempt);
+    // Not one byte of this round trip mentions the marker…
+    var mentions: usize = 0;
+    for (later.steps) |step| mentions += std.mem.count(u8, step.reply.stdout, Tmux.progress_marker);
+    try t.expectEqual(@as(usize, 0), mentions);
+    try t.expectEqual(@as(usize, 3), later.steps.len);
+    // …and the job's progress is still what the job printed.
+    try t.expectEqualStrings("{\"pct\":12}", moved_on.progress.?);
+    try t.expectEqual(@as(?[]const u8, null), moved_on.progress_error);
+
+    // --- and a window carrying a line we refuse ------------------------------
+    // A refusal is not an absence. The stored value stands, the caller keeps
+    // reading it, and it is told in the same breath that the job's most recent
+    // statement about its progress was not one we could use.
+    const fresh_three = (try Store.jobs.getByName(&store, arena, 1, "chatty")).?;
+    const bad = Tmux.progress_marker ++ ":not a document\n";
+    var refused = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = try probeReply(arena, "", log_size, noise), .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = try readReply(arena, log_size, bad), .stderr = empty } },
+    });
+    const complained = refresh(&ctx, &store, refused.executor(), "chatty", fresh_three, launched.attempt);
+    try t.expectEqualStrings("{\"pct\":12}", complained.progress.?);
+    const note = complained.progress_error orelse return error.RefusedProgressWasSilent;
+    try t.expect(std.mem.indexOf(u8, note, Tmux.progress_marker) != null);
+    try t.expect(std.mem.indexOf(u8, note, "JSON object") != null);
+    // The stored value was not overwritten by the line we refused, which is
+    // what keeps a refusal from costing the job the last thing it did say.
+    try t.expectEqualStrings(
+        "{\"pct\":12}",
+        (try Store.job_attempts.probeState(&store, arena, rid)).?.latest_progress_json.?,
+    );
 }
