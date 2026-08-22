@@ -363,6 +363,293 @@ test "gate: a pull stages beside the destination and never opens it" {
     std.Io.Dir.cwd().deleteFile(scratch.io, partial) catch {};
 }
 
+// --- gate: a disk that fills mid-write ---------------------------------------
+//
+// **A real `ENOSPC` cannot be produced in-process on Windows, and this states
+// what is produced instead.** Filling a volume means writing its free space,
+// which is the operator's own disk; and every way of capping one file's growth
+// without doing that needs elevation — NTFS disk quotas, FSRM, a mounted VHD.
+// Neither belongs in `zig build test`.
+//
+// So the first arm produces the *shape* of a full disk from the kernel rather
+// than its cause. A second handle holds an exclusive byte-range lock over the
+// range the transfer is about to reach, so the write that crosses it is refused
+// by Windows — after three slices have really landed on a real disk, through the
+// real `std.Io.File.Writer`, at the real syscall.
+//
+// **What that proves and what it assumes.** Proven: a write to the staging
+// partial that fails part-way is reported rather than counted as a smaller
+// success; the bytes that landed are the right bytes at the right offsets; the
+// destination is byte-for-byte what it was; and the row the interruption leaves
+// names the stage and claims no more of a prefix than the disk took. Assumed:
+// that a full disk arrives by the same route. That assumption is one line wide —
+// `error.NoSpaceLeft` is a member of `std.Io.File`'s write error set,
+// `std.Io.File.Writer` renders every member of that set as `error.WriteFailed`,
+// and `transfer.pullFile` has exactly one arm for it
+// (`catch return error.LocalFileFailed`). There is no branch a lock violation
+// can take that a full disk would not.
+//
+// The remote half needs no such argument, and it is the second arm: a host with
+// no space fails `base64 -d >> <partial>`, the shell exits nonzero, and that is
+// exactly what a scripted non-zero exit is.
+
+/// Takes an exclusive lock on a byte range of an already-open file.
+///
+/// `LockFile` and not `LockFileEx`: the non-`Ex` form takes its offsets as
+/// arguments, and `std.os.windows` declares no `OVERLAPPED` to give the other
+/// one. A write from a *different* handle into a locked range is refused by the
+/// kernel immediately — which is the whole mechanism, and the reason this gate
+/// does not have to mock anything to obtain a failed write.
+extern "kernel32" fn LockFile(
+    hFile: std.os.windows.HANDLE,
+    dwFileOffsetLow: u32,
+    dwFileOffsetHigh: u32,
+    nNumberOfBytesToLockLow: u32,
+    nNumberOfBytesToLockHigh: u32,
+) callconv(.winapi) std.os.windows.BOOL;
+
+test "gate: a local disk that fills mid-transfer keeps the destination and confirms no more than it took" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+    var store_scratch = try StoreScratch.init(t.allocator, "enospc_pull");
+    defer store_scratch.deinit();
+    var store = try Store.open(store_scratch.path);
+    defer store.close();
+
+    const slice = Core.transfer.pull_slice;
+    // Five slices asked for and three the disk will take. Slice-aligned on
+    // purpose: `pullFile` writes through a 64 KiB buffer, so a chunk that is a
+    // whole multiple of it leaves nothing buffered, and "what landed" is then a
+    // fact about the disk rather than about the writer's timing.
+    const total = slice * 5;
+    const room = slice * 3;
+    const body = try arena.alloc(u8, total);
+    for (body, 0..) |*b, i| b.* = @truncate(i * 31 + 7);
+    const body_sha = try hexOf(arena, body);
+    const mtime: i128 = 1712345678 * std.time.ns_per_s;
+
+    // The destination already holds a delivery, and that delivery is the thing
+    // that must survive.
+    const previous = "the delivery that was already there, and must survive a full disk";
+    const dest = try scratch.write("enospc_dest", previous);
+    const partial = try std.fmt.allocPrint(arena, "{s}{s}", .{ dest, cmd_transfer.partial_suffix });
+
+    // The checkpoint, walked the way the driver walks it: the two commitments
+    // before the first byte, then `transferring`.
+    const request_id = try seedTransfer(&store, arena, "enospcpvll");
+    const cp = try transfers.create(&store, .{
+        .request_id = request_id,
+        .direction = .pull,
+        .dest_side = .local,
+        .dest_path = dest,
+        .partial_path = partial,
+        .source = .{ .remote_file = .{ .path = "/srv/app/in.bin" } },
+        .chunk_size = Core.Ssh.chunk_bytes,
+        .total_bytes = total,
+        .now = 100,
+    });
+    try transfers.setState(&store, cp, request_id, .probing, null, 101);
+    try transfers.recordSourceIdentity(&store, cp, request_id, total, mtime, body_sha, 102);
+    try transfers.recordExpectedHash(&store, cp, request_id, body_sha, 103);
+    try Store.operations.advance(&store, request_id, .submitted, 104);
+    try transfers.setState(&store, cp, request_id, .transferring, null, 105);
+
+    // The disk, with `room` bytes left in it. An empty partial exists first so
+    // the lock can be taken before the transfer opens the file; the lock runs
+    // four megabytes past the mark, so nothing the transfer asks for can reach
+    // past the far end of it.
+    {
+        const seed = try std.Io.Dir.cwd().createFile(scratch.io, partial, .{});
+        seed.close(scratch.io);
+    }
+    var locker = try std.Io.Dir.cwd().openFile(scratch.io, partial, .{ .mode = .read_write });
+    var lock_held = true;
+    defer if (lock_held) locker.close(scratch.io);
+    if (!LockFile(locker.handle, @intCast(room), 0, 4 << 20, 0).toBool()) {
+        std.debug.print(
+            "\ncould not hold the byte range this gate needs the kernel to refuse ({s})\n",
+            .{partial},
+        );
+        return error.CouldNotHoldTheRangeTheDiskMustRefuse;
+    }
+
+    var confirmer: Confirmer = .{
+        .store = &store,
+        .checkpoint = cp,
+        .request_id = request_id,
+        .stream = .init(),
+        .confirmed = 0,
+        .every = slice * 2,
+        .arena = arena,
+        .clock = 200,
+    };
+
+    // The host is perfectly healthy: every range it is asked for, it answers.
+    // The only thing wrong here is this end's disk.
+    var steps: std.ArrayList(Core.Scripted.Step) = .empty;
+    for (0..5) |i| try steps.append(arena, try rangeReply(arena, body[i * slice .. (i + 1) * slice]));
+    var script = Core.Scripted.init(arena, try steps.toOwnedSlice(arena));
+
+    var moved: Core.Ssh.Moved = .{};
+    const outcome = Core.transfer.pullFile(
+        script.executor(),
+        arena,
+        scratch.io,
+        "/srv/app/in.bin",
+        partial,
+        0,
+        total,
+        confirmer.observer(),
+        &moved,
+    );
+    // Given back before anything is read, so every assertion below is about the
+    // partial and not about the lock.
+    locker.close(scratch.io);
+    lock_held = false;
+
+    try t.expectError(error.LocalFileFailed, outcome);
+    try t.expectEqual(@as(?anyerror, null), confirmer.failure);
+
+    // Mid-write and not at-open: three slices reached the disk before the kernel
+    // refused the fourth. Without this the gate would pass just as well over a
+    // transfer that never managed to create the file.
+    try t.expectEqual(@as(u64, room), moved.arrived);
+    try t.expectEqual(@as(u64, total), moved.expected);
+
+    // The destination, read back off the disk. This is the requirement: a full
+    // disk leaves what was at the destination exactly as it was, because the only
+    // thing that ever touches the destination is the rename and the rename is
+    // last.
+    try t.expectEqualStrings(previous, try scratch.read(arena, dest));
+
+    // The partial: a correct prefix, and the bytes checked rather than the
+    // length. A writer that had restarted at zero, or filled a gap with zeroes,
+    // would have exactly this length and the wrong contents.
+    const staged = try scratch.read(arena, partial);
+    try t.expectEqual(@as(usize, room), staged.len);
+    try t.expectEqualSlices(u8, body[0..room], staged);
+
+    // What the driver does with it: `abortTransfer`'s own two writes. `paused`
+    // rather than a `failed_*` state, and deliberately — this end cannot
+    // diagnose a full disk from a write error, and `failed_no_space` would be a
+    // reading nobody took.
+    const reason = try std.fmt.allocPrint(
+        arena,
+        "exec transfer stopped after {d} of {d} bytes: LocalFileFailed",
+        .{ moved.arrived, moved.expected },
+    );
+    try transfers.setState(&store, cp, request_id, .paused, reason, 300);
+    _ = try Store.receipts.settle(&store, request_id, .{ .indeterminate = .{
+        .reason = reason,
+        .last_observed = .submitted,
+    } }, .{}, 301);
+
+    const parked = (try transfers.get(&store, arena, cp)).?;
+    try t.expectEqual(transfers.State.paused, parked.state);
+    // The row still stands on the destination, so the next transfer aimed there
+    // is refused rather than walking onto the leftovers.
+    try t.expect(parked.state.holdsDestination());
+    try t.expect(std.mem.indexOf(u8, parked.failure_reason.?, "LocalFileFailed") != null);
+    // Nothing was verified and nothing was published: the stream never returned,
+    // so `verifying` was never entered.
+    try t.expectEqual(@as(?[]const u8, null), parked.verified_sha256);
+
+    // And the ledger claims no more of a prefix than the disk took.
+    // `confirmed_offset` is the byte a later resume splices onto, so a confirm
+    // over bytes the disk refused would put the next attempt's first byte in the
+    // wrong place — and the prefix digest beside it would describe a range
+    // nobody can re-derive.
+    try t.expect(parked.confirmed_offset <= @as(i64, @intCast(staged.len)));
+    try t.expectEqual(@as(i64, slice * 2), parked.confirmed_offset);
+    try t.expectEqualStrings(try hexOf(arena, body[0 .. slice * 2]), parked.partial_sha256.?);
+}
+
+test "gate: a host that runs out of space mid-push never sends a command that names the destination" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch = try Scratch.init(t.allocator);
+    defer scratch.deinit();
+
+    const slice = Core.transfer.push_slice;
+    const body = try arena.alloc(u8, slice * 4);
+    for (body, 0..) |*b, i| b.* = @truncate(i * 17 + 3);
+    const source = try scratch.write("enospc_source", body);
+
+    const dest = "/srv/app/out.bin";
+    const partial = dest ++ cmd_transfer.partial_suffix;
+
+    // The host takes two slices and then has no room for the third — which is
+    // what `base64 -d >> <partial>` does on a full disk: it fails, and the shell
+    // it runs in exits nonzero.
+    var steps = [_]Core.Scripted.Step{
+        replyCode(0, ""), // the init: base64 present, partial created, chmod
+        replyCode(0, ""), // slice 1
+        replyCode(0, ""), // slice 2
+        replyCode(1, ""), // no space
+    };
+    var script = Core.Scripted.init(arena, &steps);
+
+    var moved: Core.Ssh.Moved = .{};
+    try t.expectError(error.RemoteWriteFailed, Core.transfer.pushFile(
+        script.executor(),
+        arena,
+        scratch.io,
+        source,
+        partial,
+        0,
+        0o644,
+        null,
+        &moved,
+    ));
+
+    // Two slices went out and the count is not the answer. How large a slice is
+    // is not asserted: `pushFile` reads through `peekGreedy`, so a chunk is
+    // whatever the reader had, and pinning it here would gate on the reader's
+    // buffering rather than on the host's refusal.
+    try t.expect(moved.arrived > 0);
+    try t.expect(moved.arrived < moved.expected);
+    try t.expectEqual(@as(u64, body.len), moved.expected);
+    // Every byte the host *took* is the right byte at the right offset, read
+    // back out of the traffic — a push's staged partial exists only on the host.
+    // The last command is left out on purpose: its bytes went out and the host
+    // refused them, and how much of a refused append a real host wrote before it
+    // ran out of room is not something either end knows. That unknown is exactly
+    // why the driver parks at `paused` and why a resume re-proves the prefix
+    // before it appends.
+    try t.expectEqualSlices(
+        u8,
+        body[0..@intCast(moved.arrived)],
+        try stagedByPush(arena, script.seen.items[0 .. script.seen.items.len - 1]),
+    );
+
+    // **The destination is untouched structurally rather than by inspection.**
+    // Four commands were sent and not one of them holds the destination as a
+    // word: the publish is the only thing that ever names it, and the publish was
+    // never reached. A `cat partial > dest` publish, or an append that wrote to
+    // the destination directly, would fail here — and would pass a gate that only
+    // read the destination back, because on this side there is no destination to
+    // read.
+    try t.expectEqual(@as(usize, 4), script.seen.items.len);
+    var named_partial: usize = 0;
+    for (script.seen.items) |cmd| {
+        const names_dest = try wordsEqual(arena, cmd, dest);
+        if (names_dest != 0) {
+            std.debug.print("\na command sent before the publish names the destination: {s}\n", .{cmd});
+            return error.CommandNamedTheDestination;
+        }
+        named_partial += try wordsEqual(arena, cmd, partial);
+    }
+    // And the check is not vacuous: those same commands do name the partial, so
+    // the scan is reading real scripts.
+    try t.expect(named_partial >= 4);
+}
+
 // --- gate: no remote digest means completed_unverified, never published ------
 
 test "gate: a host that cannot hash yields no declared digest, and published is then unreachable" {

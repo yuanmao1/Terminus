@@ -542,9 +542,12 @@ test "round trip and strictness" {
     try t.expectError(error.MalformedMessage, protocol.parseMessage(protocol.Request, arena,
         \\{"v":3}
     ));
-    // A payload that ends before the header said it would.
+    // A payload that ends before the header said it would. `FrameIncomplete`
+    // and not `MalformedFrame`: the header was one this build wrote and could
+    // read, so the peer is not speaking another version — the frame simply is
+    // not all there, and `Client.roundTrip` has to tell those two apart.
     var short: std.Io.Reader = .fixed("00000010{\"v\":3}");
-    try t.expectError(error.MalformedFrame, protocol.readFrame(&short, arena));
+    try t.expectError(error.FrameIncomplete, protocol.readFrame(&short, arena));
 }
 
 // --- gate: bounded memory, the daemon's side ---------------------------------

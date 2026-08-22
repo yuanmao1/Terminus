@@ -2476,6 +2476,62 @@
       "find": "    const working_dir = parsed.flag(\"cwd\") orelse resolved.server.cwd;\n    if (working_dir) |dir| {\n        if (Core.shell.cwdRefusal(dir)) |why| fatal(\n            \"the working directory '{s}' cannot be used: {s}. Nothing was sent and no job was created. Pass an absolute path, or one starting '~/'\",\n            .{ dir, why },\n        );\n    }\n",
       "replace": "",
       "expect_gate": "gate: a working directory that lost its expansion is refused before all three side effects"
+    },
+    {
+      "id": "M6-frame-cut-short-reported-as-a-skew",
+      "rule": "A reply that stopped part-way is a broken connection, not a peer speaking another protocol version.",
+      "file": "src/core/daemon/Client.zig",
+      "find": "        error.FrameIncomplete => return .broken,",
+      "replace": "        error.FrameIncomplete => return .{ .skew = null },",
+      "expect_gate": "gate: a CLI that finds no daemon gets a named refusal, never a hang and never a wrong cause"
+    },
+    {
+      "id": "M6-frame-cut-short-is-not-an-unframed-reply",
+      "rule": "A header this build could read, whose frame did not arrive whole, is FrameIncomplete; only bytes that are not a frame header at all are MalformedFrame, and only those are a version skew.",
+      "file": "src/core/daemon/protocol.zig",
+      "find": "        error.OutOfMemory => return error.OutOfMemory,\n        error.EndOfStream => return error.FrameIncomplete,",
+      "replace": "        error.OutOfMemory => return error.OutOfMemory,\n        error.EndOfStream => return error.MalformedFrame,",
+      "expect_gate": "gate: a CLI that finds no daemon gets a named refusal, never a hang and never a wrong cause"
+    },
+    {
+      "id": "M6-local-write-failure-swallowed",
+      "rule": "A write to the staging partial that the disk refuses ends the transfer; it is never counted as a slice that arrived.",
+      "file": "src/core/transfer.zig",
+      "find": "        writer.interface.writeAll(chunk) catch return error.LocalFileFailed;",
+      "replace": "        writer.interface.writeAll(chunk) catch {};",
+      "expect_gate": "gate: a local disk that fills mid-transfer keeps the destination and confirms no more than it took"
+    },
+    {
+      "id": "M6-push-reports-the-whole-file-as-arrived",
+      "rule": "A push's arrived count is what the host took, never the size it was asked for.",
+      "file": "src/core/transfer.zig",
+      "find": "        sent += chunk.len;\n        moved.arrived = sent;",
+      "replace": "        sent += chunk.len;\n        moved.arrived = total;",
+      "expect_gate": "gate: a host that runs out of space mid-push never sends a command that names the destination"
+    },
+    {
+      "id": "M6-published-document-field-gains-a-default",
+      "rule": "No field of a published document carries a default, so a branch that omits a key does not compile.",
+      "file": "src/cli/cmd_memory.zig",
+      "find": "    trusted_by: ?[]const u8,",
+      "replace": "    trusted_by: ?[]const u8 = null,",
+      "expect_gate": "gate: no published document has a field with a default, in any of the six modules"
+    },
+    {
+      "id": "M6-receipt-publishes-a-kind-where-a-status-belongs",
+      "rule": "The receipt document's status keys carry a word from op_state.Status and from nothing else.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .status = op.status.text(),",
+      "replace": "            .status = op.kind,",
+      "expect_gate": "gate: the receipt document's shape is pinned at the depth each key is at"
+    },
+    {
+      "id": "M6-receipt-nulls-a-key-it-has-a-value-for",
+      "rule": "A key the ledger holds a value for is published with that value; a null there reports an absence over a fact.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .alias = op.alias,",
+      "replace": "            .alias = null,",
+      "expect_gate": "gate: the receipt document's shape is pinned at the depth each key is at"
     }
   ]
 }

@@ -225,11 +225,32 @@ pub const ParseError = error{
 };
 
 pub const FrameError = error{
-    /// The header was not eight hex digits, or the stream ended inside the
-    /// payload, or the payload did not end where the header said it would. The
-    /// stream position is no longer trustworthy after this: a framing error
-    /// cannot be resynchronised, so the connection ends.
+    /// **The header was not eight hex digits**, so the bytes on this connection
+    /// are not a frame at all. The stream position is no longer trustworthy
+    /// after this: a framing error cannot be resynchronised, so the connection
+    /// ends.
+    ///
+    /// This is the *only* framing failure a peer speaking some other version of
+    /// this protocol produces, which is why it is its own member — see
+    /// `FrameIncomplete`.
     MalformedFrame,
+    /// The header was a frame header and the frame it announced did not arrive
+    /// whole: the stream ended inside the payload, or ended before the
+    /// terminator, or the byte where the terminator should be is not one.
+    ///
+    /// **Separate from `MalformedFrame` because the two send an operator to
+    /// different places, and telling them apart is arithmetic rather than
+    /// guesswork.** A daemon from an older build answers with a
+    /// newline-delimited line, whose first eight bytes cannot parse as hex — so
+    /// it lands on `MalformedFrame`, always. A daemon that was killed, or
+    /// crashed, between writing its header and writing the rest of its reply
+    /// produced a header this build wrote and can read; the frame simply is not
+    /// all there. `Client.roundTrip` used to answer both with "a daemon from
+    /// another build holds the socket … run `terminus daemon restart --force`",
+    /// which is a false statement about the operator's system on the second
+    /// path, and — because a version skew is not respawned past — it also left
+    /// the CLI on direct SSH where a respawn would have worked.
+    FrameIncomplete,
     /// A frame wider than `max_frame_bytes` — announced by a peer, or about to
     /// be written. Never shortened into one that fits: a truncated reply is a
     /// wrong answer, and this protocol's whole business is not producing those.
@@ -320,6 +341,12 @@ pub fn writeMessage(writer: *std.Io.Writer, value: anytype) FrameError!void {
 /// The payload lands on `arena` at exactly its announced size. A peer that
 /// announces more than `max_frame_bytes` gets `FrameTooLarge` and no allocation
 /// at all, so a lying header cannot be turned into a large allocation.
+///
+/// Two ways a frame can fail to arrive and they are separate members:
+/// `MalformedFrame` for bytes that are not a frame header at all, and
+/// `FrameIncomplete` for a header this build could read whose frame did not
+/// arrive whole. See `FrameError.FrameIncomplete` for why the caller must not
+/// treat them alike.
 pub fn readFrame(reader: *std.Io.Reader, arena: Allocator) FrameError!?[]const u8 {
     // A stream that ends part-way through a header is reported as a clean
     // close, which is the same thing to every caller: the connection is over
@@ -333,16 +360,16 @@ pub fn readFrame(reader: *std.Io.Reader, arena: Allocator) FrameError!?[]const u
 
     const payload = reader.readAlloc(arena, len) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.EndOfStream => return error.MalformedFrame,
+        error.EndOfStream => return error.FrameIncomplete,
         error.ReadFailed => return error.ReadFailed,
     };
     // The terminator both ends the frame and is what an older, line-oriented
     // reader delimits on. Its absence means the header and the payload disagree.
     const terminator = reader.takeByte() catch |err| switch (err) {
-        error.EndOfStream => return error.MalformedFrame,
+        error.EndOfStream => return error.FrameIncomplete,
         error.ReadFailed => return error.ReadFailed,
     };
-    if (terminator != '\n') return error.MalformedFrame;
+    if (terminator != '\n') return error.FrameIncomplete;
     return payload;
 }
 

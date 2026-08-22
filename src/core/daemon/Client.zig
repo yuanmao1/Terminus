@@ -15,6 +15,40 @@
 //! that clears it, and the CLI falls back to direct SSH loudly. It used to
 //! report "mismatch after respawn", which described a respawn that had not
 //! happened and named no way out.
+//!
+//! **Fresh start: every way of finding nothing on the other side is bounded and
+//! named.** The CLI spawns the daemon on demand, so the ordinary first request
+//! of a session arrives at a socket that does not exist yet, or exists and has
+//! nobody behind it, or has a daemon behind it that has not finished starting.
+//! Each of those has to end in a working connection or in a sentence, and none
+//! of them may end in a wait:
+//!
+//!   * **no socket file** — `connectTo` checks for the file before it dials, so
+//!     this is `null` and not a Windows `error.Unexpected` with a stack trace;
+//!   * **a socket file with nothing listening** (the stale file an unclean
+//!     daemon exit leaves) — the connect fails, `null` again, and the daemon
+//!     `Server.run` binds next deletes and rebinds it. On Windows that connect
+//!     fails with a status std does not map — `ConnectionRefused` is not in
+//!     `net.UnixAddress.ConnectError` — so a Debug build prints a trace under
+//!     it on the way past. Noise, not a wrong answer: the branch taken is the
+//!     same one an absent file takes;
+//!   * **accepted, then closed without a reply** — the EOF this whole paragraph
+//!     is about. `protocol.readFrame` reads a clean close between frames as
+//!     `null`, which is `.broken`, which is a named refusal;
+//!   * **a reply that stopped part-way** — `error.FrameIncomplete`, also
+//!     `.broken`. It was `.skew` until this pass, which named the wrong cause
+//!     and skipped the respawn; see `roundTrip`;
+//!   * **nothing came up within the retry budget** — five tries over ~1.6s and
+//!     then a sentence.
+//!
+//! What is *not* bounded is a peer that writes a well-formed header and then
+//! neither writes nor closes: there is no read deadline on this side, and
+//! `206c44b` recorded that as hardening. No fresh-start shape produces it — a
+//! daemon that has not created its socket cannot have written a header — so it
+//! is a wedged *live* daemon's failure and not this one's. The daemon's own
+//! `TERMINUS_DAEMON_REQUEST_MAX_SECS` watchdog is what bounds it today.
+//! Held to by `gate: a CLI that finds no daemon gets a named refusal, never a
+//! hang and never a wrong cause`.
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const Server = @import("Server.zig");
@@ -263,6 +297,14 @@ fn roundTrip(client: *DaemonClient, arena: std.mem.Allocator, request: protocol.
         // An unframed answer is what a daemon from an older build sends. Its
         // version is unreadable from here, so the skew is named without one.
         error.MalformedFrame, error.FrameTooLarge => return .{ .skew = null },
+        // A header this build could read, and a frame that did not arrive whole:
+        // the daemon died, was killed, or had not finished starting. **Not a
+        // skew**, and it used to be reported as one — which named a version that
+        // was not the fault, told the operator to run `daemon restart --force`
+        // for a daemon that had already gone, and, because `acquire` does not
+        // spawn past a skew, left the CLI on direct SSH where a respawn would
+        // have worked. See `protocol.FrameError.FrameIncomplete`.
+        error.FrameIncomplete => return .broken,
         else => return .broken,
     }) orelse return .broken;
 

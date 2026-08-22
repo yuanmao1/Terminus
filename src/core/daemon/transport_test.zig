@@ -24,6 +24,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const DaemonClient = @import("Client.zig");
+const Server = @import("Server.zig");
 const Ssh = @import("../ssh/Client.zig");
 const Core = @import("../core.zig");
 const Store = Core.Store;
@@ -378,6 +379,254 @@ test "gate: over the ceiling the daemon path settles the same way the direct one
     try t.expectEqual(@as(?i64, 0), row.stderr_bytes);
     try t.expectEqual(@as(?bool, false), row.stderr_truncated);
     try t.expectEqualStrings(Ssh.empty_sha256, row.stderr_sha256.?);
+}
+
+// --- gate: the fresh start ---------------------------------------------------
+//
+// **What is driven, and what is not.** The CLI auto-starts the daemon, so the
+// first request of a session is the one that finds nothing on the other side.
+// Every shape of "nothing came back" below is driven over a real `AF_UNIX`
+// connection with the real `DaemonClient`: the socket that is not there, the
+// socket file with nobody behind it, the peer that accepts and closes without
+// writing, the reply that stops part-way, and the unframed answer an older
+// build sends. The success shape is driven too — `acquire` finds a live peer
+// through `Server.socketPath` and returns it without spawning anything.
+//
+// What is **not** driven here is `spawnDaemon` itself. It runs
+// `std.process.executablePath` with `daemon run`, and from a test binary that is
+// this suite re-entering itself as a subprocess. The spawn is driven end to end
+// in `test/blackbox.zig` instead, against the real executable and a scratch
+// home; what is left over from both is the five lines of `spawnDaemon`, which
+// are reviewed.
+//
+// The one thing none of this can prove is the absence of a wait on a peer that
+// writes a header and then neither writes nor closes. No shape below produces
+// it — see the paragraph in `Client.zig`.
+
+/// A listener that answers with **exactly the bytes it is given**, then closes.
+///
+/// Same discipline as `Stub`, and for the same reasons: one accept, one wait on
+/// input, at most one write, then the socket closes. The wait is safe because
+/// `roundTrip` writes and flushes its whole request before it reads a reply, and
+/// nothing here parses that request — so no byte sequence can make this stub
+/// wait for a second piece of input, and the client's own read is bounded by
+/// this stub's close whatever the bytes said.
+const Cut = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    path: []const u8,
+    /// Empty means "accept, read the request, and close without writing" — the
+    /// fresh-start EOF itself.
+    reply: []const u8,
+
+    fn serve(c: *Cut) void {
+        var stream = c.server.accept(c.io) catch return;
+        defer stream.close(c.io);
+        var read_buffer: [1 << 13]u8 = undefined;
+        var reader = stream.reader(c.io, &read_buffer);
+        _ = reader.interface.peekGreedy(protocol.header_len) catch return;
+        if (c.reply.len == 0) return;
+        var write_buffer: [1 << 12]u8 = undefined;
+        var writer = stream.writer(c.io, &write_buffer);
+        writer.interface.writeAll(c.reply) catch return;
+        writer.interface.flush() catch {};
+    }
+
+    /// The knock, then the join. See `Stub.release`.
+    fn release(c: *Cut, thread: std.Thread) void {
+        if (std.Io.net.UnixAddress.init(c.path)) |address| {
+            if (address.connect(c.io)) |stream| {
+                var knock = stream;
+                knock.close(c.io);
+            } else |_| {}
+        } else |_| {}
+        thread.join();
+    }
+
+    fn deinit(c: *Cut) void {
+        c.server.deinit(c.io);
+    }
+};
+
+/// One shape of "nothing came back", and the sentence it has to produce.
+const FreshStart = struct {
+    label: []const u8,
+    reply: []const u8,
+    /// `MalformedFrame` for bytes that are not a frame header, `FrameIncomplete`
+    /// for a header whose frame did not arrive whole, and null when the stream
+    /// simply ended between frames (a clean close, which is not an error).
+    frame_error: ?protocol.FrameError,
+    /// Whether `DaemonClient` must call this a version skew. Exactly one shape
+    /// below may.
+    skew: bool,
+};
+
+test "gate: a CLI that finds no daemon gets a named refusal, never a hang and never a wrong cause" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "daemon_fresh_start");
+    defer h.deinit();
+
+    const started = std.Io.Timestamp.now(h.io, .awake);
+    var proven: usize = 0;
+
+    // (1) No home, so no socket path. `acquire` names it and — this is the part
+    // worth stating — returns before `spawnDaemon`, which from a test binary
+    // would be this suite re-entering itself.
+    {
+        proven += 1;
+        var bare: std.process.Environ.Map = .init(t.allocator);
+        defer bare.deinit();
+        const result = DaemonClient.acquire(h.io, h.arena, &bare, .{
+            .v = protocol.version,
+            .op = .exec,
+        });
+        try t.expectEqualStrings("no home directory for socket path", result.unavailable);
+    }
+
+    // (2) A home with no socket in it: the ordinary state of a machine whose
+    // daemon has never run. `connectTo` checks for the file before it dials, so
+    // this is a stated absence and not a Windows `error.Unexpected` with a
+    // debug stack trace printed under it.
+    //
+    // The *stale* socket file — a plain file where the socket belongs, which an
+    // unclean daemon exit leaves — is driven in `test/blackbox.zig` instead. It
+    // has to be: on Windows a connect to one fails with a status std does not
+    // map (`ConnectionRefused` is not in `UnixAddress.ConnectError`), so it
+    // prints a trace, and out here that trace would land in this suite's own
+    // output on every green run. Over there it lands in the child process's
+    // captured stderr, where the assertion is about what the CLI *did* rather
+    // than about std's noise. See that gate for the finding.
+    {
+        var environ: std.process.Environ.Map = .init(t.allocator);
+        defer environ.deinit();
+        const home = try std.fmt.allocPrint(h.arena, "{s}/fresh_home_{d}", .{ scratch_dir, std.Thread.getCurrentId() });
+        try environ.put("USERPROFILE", home);
+        const sock = try Server.socketPath(h.arena, &environ);
+        std.Io.Dir.cwd().createDirPath(h.io, std.fs.path.dirname(sock).?) catch {};
+        std.Io.Dir.cwd().deleteFile(h.io, sock) catch {};
+
+        proven += 1;
+        try t.expectEqual(@as(?u32, null), DaemonClient.pingDaemon(h.io, h.arena, &environ));
+        try t.expectEqual(false, DaemonClient.stopDaemon(h.io, h.arena, &environ));
+    }
+
+    // (3) The five shapes a peer can produce once the connection is up. The
+    // first is the EOF this gate is named for; the third and fourth are the
+    // ones that used to be reported as a version skew.
+    const header32 = "00000020";
+    const shapes = [_]FreshStart{
+        .{ .label = "accepted, then closed without writing", .reply = "", .frame_error = null, .skew = false },
+        .{ .label = "half a header, then closed", .reply = "0000", .frame_error = null, .skew = false },
+        .{ .label = "a header, then a payload cut short", .reply = header32 ++ "{\"v\":3,", .frame_error = error.FrameIncomplete, .skew = false },
+        .{ .label = "a whole payload with no terminator", .reply = header32 ++ "{\"v\":3,\"ok\":true,\"pid\":9}!!!!!!!", .frame_error = error.FrameIncomplete, .skew = false },
+        .{ .label = "an unframed line, as an older build sends", .reply = "{\"v\":2,\"ok\":false}\n", .frame_error = error.MalformedFrame, .skew = true },
+    };
+
+    for (shapes, 0..) |shape, i| {
+        proven += 1;
+        // The frame layer's own answer first, so the two names are pinned where
+        // they are produced as well as where they are consumed. A shape that
+        // ends between frames is a clean close and yields no error at all.
+        var reader: std.Io.Reader = .fixed(shape.reply);
+        if (shape.frame_error) |want| {
+            try t.expectError(want, protocol.readFrame(&reader, h.arena));
+        } else {
+            try t.expectEqual(@as(?[]const u8, null), try protocol.readFrame(&reader, h.arena));
+        }
+
+        const path = try std.fmt.allocPrint(h.arena, "{s}_{d}", .{ h.sock_path, i });
+        var cut: Cut = .{
+            .io = h.io,
+            .server = try listen(h.io, path),
+            .path = path,
+            .reply = shape.reply,
+        };
+        defer cut.deinit();
+        defer std.Io.Dir.cwd().deleteFile(h.io, path) catch {};
+
+        const message = blk: {
+            const thread = try std.Thread.spawn(.{}, Cut.serve, .{&cut});
+            defer cut.release(thread);
+            var client = try connectClient(h.io, h.arena, path);
+            defer client.deinit();
+            try t.expectError(error.ExecFailed, client.exec(h.arena, "true"));
+            break :blk client.errorMessage();
+        };
+
+        if (shape.skew) {
+            // The one shape that really is another build's protocol, and the one
+            // message allowed to say so — with the command that clears it.
+            t.expect(std.mem.indexOf(u8, message, "another build") != null) catch |err| {
+                std.debug.print("\n{s}: expected a version-skew sentence, got: {s}\n", .{ shape.label, message });
+                return err;
+            };
+            try t.expect(std.mem.indexOf(u8, message, "daemon restart --force") != null);
+        } else {
+            // Nothing came back, and the sentence says that and nothing more.
+            // A reply that stopped part-way used to land on the skew arm above:
+            // it named a protocol version as the fault, sent the operator to
+            // `daemon restart --force` for a daemon that had already gone, and
+            // — because `acquire` does not spawn past a skew — kept the CLI on
+            // direct SSH where a respawn would have worked.
+            t.expectEqualStrings("daemon connection lost mid-request", message) catch |err| {
+                std.debug.print("\n{s}: wrong diagnosis\n", .{shape.label});
+                return err;
+            };
+            try t.expect(std.mem.indexOf(u8, message, "another build") == null);
+        }
+    }
+
+    // (4) And the shape that is not a failure: a live peer at the path
+    // `Server.socketPath` names, found and kept without anything being spawned.
+    // Without this the gate would only prove that `acquire` gives up.
+    {
+        proven += 1;
+        var environ: std.process.Environ.Map = .init(t.allocator);
+        defer environ.deinit();
+        const home = try std.fmt.allocPrint(h.arena, "{s}/live_home_{d}", .{ scratch_dir, std.Thread.getCurrentId() });
+        try environ.put("USERPROFILE", home);
+        const sock = try Server.socketPath(h.arena, &environ);
+        std.Io.Dir.cwd().createDirPath(h.io, std.fs.path.dirname(sock).?) catch {};
+
+        var stub: Stub = .{
+            .io = h.io,
+            .gpa = t.allocator,
+            .server = try listen(h.io, sock),
+            .path = sock,
+            .raw = &.{},
+            .exit_code = 0,
+        };
+        defer stub.deinit();
+        defer std.Io.Dir.cwd().deleteFile(h.io, sock) catch {};
+
+        const thread = try std.Thread.spawn(.{}, Stub.serve, .{&stub});
+        defer stub.release(thread);
+        switch (DaemonClient.acquire(h.io, h.arena, &environ, .{
+            .v = protocol.version,
+            .op = .exec,
+            .host = "10.0.0.1",
+            .username = "ubuntu",
+        })) {
+            .ok => |client| {
+                var open = client;
+                open.deinit();
+            },
+            .unavailable => |reason| {
+                std.debug.print("\nacquire refused a live daemon: {s}\n", .{reason});
+                return error.AcquireRefusedALiveDaemon;
+            },
+        }
+    }
+
+    try t.expectEqual(@as(usize, 8), proven);
+
+    // Bounded, and asserted rather than assumed. Nothing above sleeps and
+    // nothing retries, so this is generous by three orders of magnitude — what
+    // it catches is a change that puts a wait or a retry loop on the read path,
+    // which is the failure this gate is named for and the one an assertion on
+    // messages alone cannot see.
+    const elapsed = started.durationTo(std.Io.Timestamp.now(h.io, .awake)).nanoseconds;
+    try t.expect(elapsed < 5 * std.time.ns_per_s);
 }
 
 fn listen(io: std.Io, path: []const u8) !std.Io.net.Server {

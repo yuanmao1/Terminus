@@ -866,6 +866,39 @@ test "blackbox: an unknown outcome is never reported as a plain failure" {
     try receipt.expectSays("indeterminate");
 }
 
+/// This process's own environment, with the home pointed at a scratch
+/// directory so the binary looks for its daemon socket there.
+///
+/// A full copy rather than a two-entry map. The child is a real process on this
+/// machine, and stripping `SystemRoot`, `PATH` and the rest to isolate one
+/// variable would be gating on an environment nobody has.
+fn scratchHomeEnvironment(allocator: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
+    var map = switch (builtin.os.tag) {
+        .windows => try (std.process.Environ{ .block = .global }).createMap(allocator),
+        // Not quietly degraded to an empty environment. There is no portable
+        // way to read this process's own environment without the
+        // `std.process.Init` a test does not get, and running the binary with
+        // nothing in its environment would gate on a machine that does not
+        // exist. The daemon transport these gates drive is itself Windows-only
+        // until M5.
+        else => {
+            std.debug.print(
+                \\
+                \\this gate points the binary's home at a scratch directory, which needs a
+                \\snapshot of this process's own environment; only the Windows path is
+                \\implemented, and the daemon transport it drives is Windows-only until M5.
+                \\
+                \\
+            , .{});
+            return error.ScratchHomeNeedsWindows;
+        },
+    };
+    errdefer map.deinit();
+    try map.put("USERPROFILE", home);
+    try map.put("HOME", home);
+    return map;
+}
+
 /// A stand-in for the local daemon, so a gate can put a chosen result record in
 /// front of the real binary without a remote host.
 ///
@@ -1054,35 +1087,8 @@ const FakeHost = struct {
 
     /// The child's environment: this process's own, with the home pointed at
     /// the scratch directory so the binary looks for its daemon socket there.
-    ///
-    /// A full copy rather than a two-entry map. The child is a real process on
-    /// this machine, and stripping `SystemRoot`, `PATH` and the rest to isolate
-    /// one variable would be gating on an environment nobody has.
     fn environment(host: *FakeHost) !std.process.Environ.Map {
-        var map = switch (builtin.os.tag) {
-            .windows => try (std.process.Environ{ .block = .global }).createMap(host.allocator),
-            // Not quietly degraded to an empty environment. There is no
-            // portable way to read this process's own environment without the
-            // `std.process.Init` a test does not get, and running the binary
-            // with nothing in its environment would gate on a machine that does
-            // not exist. The daemon transport this stands in for is itself
-            // Windows-only until M5.
-            else => {
-                std.debug.print(
-                    \\
-                    \\this gate points the binary's home at a scratch directory, which needs a
-                    \\snapshot of this process's own environment; only the Windows path is
-                    \\implemented, and the daemon transport it drives is Windows-only until M5.
-                    \\
-                    \\
-                , .{});
-                return error.ScratchHomeNeedsWindows;
-            },
-        };
-        errdefer map.deinit();
-        try map.put("USERPROFILE", host.home);
-        try map.put("HOME", host.home);
-        return map;
+        return scratchHomeEnvironment(host.allocator, host.home);
     }
 
     /// Printed immediately before a traffic assertion's real message.
@@ -6291,4 +6297,491 @@ test "blackbox: a `job kill` whose kill cannot run says what became of the scope
         try t.expectEqual(@as(usize, 1), held.len);
         try t.expectEqualStrings("deploy", held[0].scope_key);
     }
+}
+
+// --- gate: the daemon's own fresh start, against the real executable ---------
+//
+// `FakeHost` stands in for the daemon so the CLI's half of the protocol can be
+// driven. This is the other half: a real `terminus daemon run` in a scratch
+// home, and the real CLI asking it questions across a real socket.
+//
+// It is the only thing in this repo that drives `Server.run` — the bind, the
+// accept loop, the ping and stop dispatch, and the removal of the socket file on
+// the way out — which `src/core/daemon/transport_test.zig` names as reviewed
+// rather than proven.
+//
+// What it does **not** drive is the CLI spawning the daemon on demand. Every
+// path that does goes through `Cli.connect`, which then needs a reachable SSH
+// host, and `DaemonClient.spawnDaemon` run from a test binary is this suite
+// re-entering itself as a subprocess. Those five lines stay reviewed; what
+// happens on either side of them — the CLI finding nothing there, and the CLI
+// finding a real daemon there — is driven, here and in `transport_test.zig`.
+//
+// The daemon started here is stopped by name on the way out and its exit status
+// is read. `TERMINUS_DAEMON_IDLE_SECS=1` is the backstop: a gate that fails
+// part-way cannot leave a process behind for the default five minutes.
+
+test "gate: before the daemon has bound its socket the CLI reports an absence, and after it binds, a pid" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "daemon_lifecycle");
+    defer f.deinit();
+
+    const home = try std.fmt.allocPrint(t.allocator, "{s}/home", .{f.dir});
+    defer t.allocator.free(home);
+    const socket_dir = try std.fmt.allocPrint(t.allocator, "{s}/.terminus", .{home});
+    defer t.allocator.free(socket_dir);
+    try std.Io.Dir.cwd().createDirPath(f.io, socket_dir);
+    const socket = try std.fmt.allocPrint(t.allocator, "{s}/daemon.sock", .{socket_dir});
+    defer t.allocator.free(socket);
+    std.Io.Dir.cwd().deleteFile(f.io, socket) catch {};
+
+    var environ = try scratchHomeEnvironment(t.allocator, home);
+    defer environ.deinit();
+    try environ.put("TERMINUS_DAEMON_IDLE_SECS", "1");
+
+    // (1) Nothing has bound the socket — the state of every machine whose
+    // daemon has not started yet, and the state the CLI is in on the first
+    // command of a session. The answer is a stated absence, not a wait and not
+    // a crash on a socket path that does not exist.
+    {
+        var status = try runWithEnvironment(&f, &.{ "daemon", "status", "--json" }, &environ);
+        defer status.deinit(f.allocator);
+        try status.expectCode(0);
+        try status.expectSays("\"running\": false");
+        try status.expectSays("\"pid\": null");
+    }
+    {
+        var stop = try runWithEnvironment(&f, &.{ "daemon", "stop" }, &environ);
+        defer stop.deinit(f.allocator);
+        try stop.expectCode(0);
+        try stop.expectSays("daemon was not running");
+    }
+
+    // (2) A *stale* socket file: a plain file where the socket belongs, which is
+    // what an unclean daemon exit leaves behind. The CLI still answers with an
+    // absence and still exits 0 — the connect fails and `pingDaemon` reports
+    // null, exactly as for a missing file.
+    //
+    // Driven here rather than in `src/core/daemon/transport_test.zig`, and for a
+    // reason worth recording: on Windows a connect to a stale unix socket fails
+    // with a status std does not map (`ConnectionRefused` is not a member of
+    // `net.UnixAddress.ConnectError`), so a Debug build prints an
+    // `error.Unexpected NTSTATUS=0xc0000236` trace on the way past. That is
+    // noise on a correct path, and it is *the child's* noise: it lands in the
+    // captured stderr below instead of in this suite's own output. In process it
+    // would print on every green run.
+    try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = socket, .data = "not a socket" });
+    {
+        var status = try runWithEnvironment(&f, &.{ "daemon", "status", "--json" }, &environ);
+        defer status.deinit(f.allocator);
+        try status.expectCode(0);
+        try status.expectSays("\"running\": false");
+    }
+
+    // (3) A real daemon, started with the argv and the detached stdio
+    // `DaemonClient.spawnDaemon` uses. It has to get past the stale file above:
+    // `Server.run`'s bind fails with the address in use, nothing answers a
+    // connect to it, so the file is deleted and the address rebound.
+    var child = try std.process.spawn(f.io, .{
+        .argv = &.{ exe_path, "daemon", "run" },
+        .environ_map = &environ,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    });
+    var reaped = false;
+    defer if (!reaped) {
+        child.kill(f.io);
+        _ = child.wait(f.io) catch {};
+    };
+
+    // Asked until it answers, bounded. Every answer before the socket exists is
+    // the fresh-start absence, and each one has to be a clean "not running" —
+    // which is the whole property: the CLI is never left waiting on a daemon
+    // that has not finished starting.
+    var absences: usize = 0;
+    var bound = false;
+    for (0..60) |_| {
+        var status = try runWithEnvironment(&f, &.{ "daemon", "status", "--json" }, &environ);
+        defer status.deinit(f.allocator);
+        try status.expectCode(0);
+        if (std.mem.indexOf(u8, status.stdout, "\"running\": true") != null) {
+            // A pid beside it, and not a null one: `running` is derived from the
+            // pid, so a null here would mean the two disagree.
+            try t.expect(std.mem.indexOf(u8, status.stdout, "\"pid\": null") == null);
+            bound = true;
+            break;
+        }
+        try status.expectSays("\"running\": false");
+        absences += 1;
+        std.Io.sleep(f.io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    if (!bound) {
+        std.debug.print(
+            "\nthe daemon never bound {s} — {d} polls over ~3s all said `running: false`\n",
+            .{ socket, absences },
+        );
+        return error.DaemonNeverBoundItsSocket;
+    }
+
+    // (4) And it goes when it is told to, taking its socket file with it. The
+    // exit status is read rather than assumed: a daemon that "stopped" and is
+    // still running would leave the next `status` answering from a live socket.
+    {
+        var stop = try runWithEnvironment(&f, &.{ "daemon", "stop" }, &environ);
+        defer stop.deinit(f.allocator);
+        try stop.expectCode(0);
+        try stop.expectSays("daemon stopped");
+    }
+    const term = try child.wait(f.io);
+    reaped = true;
+    switch (term) {
+        .exited => |code| try t.expectEqual(@as(u8, 0), code),
+        else => {
+            std.debug.print("\nthe daemon did not exit normally: {any}\n", .{term});
+            return error.DaemonDidNotExitNormally;
+        },
+    }
+    // The socket file is removed on the way out, so the next CLI call takes the
+    // absent branch above rather than dialling a name with nobody behind it.
+    if (std.Io.Dir.cwd().access(f.io, socket, .{})) |_| {
+        return error.StoppedDaemonLeftItsSocketBehind;
+    } else |_| {}
+
+    var after = try runWithEnvironment(&f, &.{ "daemon", "status", "--json" }, &environ);
+    defer after.deinit(f.allocator);
+    try after.expectCode(0);
+    try after.expectSays("\"running\": false");
+}
+
+// --- gate: a document's shape, at the depth it is actually at -----------------
+//
+// **Why this is not a golden file, and what it is instead.**
+//
+// Thirteen `*Json` structs in this tree have their key sets pinned against
+// `@typeInfo`, which fails on a rename, a removal, a reorder and a count change
+// — most of what a golden file is for, checked without a file anybody has to
+// regenerate. Two things a key set cannot see, and a golden file's *value* is
+// entirely in those two:
+//
+//   * **the shape below the top level.** A key set is a flat list of names. It
+//     cannot say that `terminal` is an object rather than a string, that `events`
+//     is an array of objects, or — the sharp one — that `status` occurs at three
+//     different depths in this one document. A gate in this tree passed for
+//     eighteen commits because its assertion matched `status` at the wrong one,
+//     and `cmd_job.zig`'s own key-set gate still checks presence with
+//     `indexOf(document, "\"" ++ name ++ "\":")`, which is that same
+//     depth-blind search.
+//   * **values that are part of the contract.** A closed vocabulary appearing
+//     where it should, rather than merely a string being there.
+//
+// So what is pinned below is a *shape*, not a transcript: every path in the
+// document with the set of JSON kinds found at it, and then the vocabulary at
+// the three paths that publish one. That is aimed at the class a key set is
+// blind to and at nothing else — it deliberately does not re-pin names, because
+// thirteen gates already do.
+//
+// It is an instance, as any golden is: an optional field that is null in this
+// fixture is pinned as `null`, and the fixture is arranged so the interesting
+// ones are not. What that costs is that adding a key to `ReceiptJson` fails here
+// as well as in `cmd_job.zig`; what it buys is that a key changing *shape* — or
+// appearing at a second depth — fails at all.
+
+/// The JSON kinds a path can hold, as a set.
+const JsonKind = enum(u8) {
+    null = 1,
+    bool = 2,
+    number = 4,
+    string = 8,
+    object = 16,
+    array = 32,
+
+    fn of(value: std.json.Value) JsonKind {
+        return switch (value) {
+            .null => .null,
+            .bool => .bool,
+            .integer, .float, .number_string => .number,
+            .string => .string,
+            .object => .object,
+            .array => .array,
+        };
+    }
+};
+
+/// Every path in `value`, each with the set of kinds found at it.
+///
+/// Array elements collapse onto one `[]` step and their kinds are unioned, so a
+/// nullable field inside an array reads as `null|number` rather than as two
+/// entries that depend on which element came first. That union is the point: it
+/// is what a caller may find there, which is the contract, rather than what this
+/// fixture happened to produce in position 0.
+fn jsonShape(
+    arena: std.mem.Allocator,
+    into: *std.StringArrayHashMapUnmanaged(u8),
+    prefix: []const u8,
+    value: std.json.Value,
+) !void {
+    const entry = try into.getOrPut(arena, prefix);
+    if (!entry.found_existing) entry.value_ptr.* = 0;
+    entry.value_ptr.* |= @intFromEnum(JsonKind.of(value));
+
+    switch (value) {
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |kv| {
+                const path = if (prefix.len == 0)
+                    try arena.dupe(u8, kv.key_ptr.*)
+                else
+                    try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, kv.key_ptr.* });
+                try jsonShape(arena, into, path, kv.value_ptr.*);
+            }
+        },
+        .array => |items| {
+            const path = try std.fmt.allocPrint(arena, "{s}[]", .{prefix});
+            for (items.items) |item| try jsonShape(arena, into, path, item);
+        },
+        else => {},
+    }
+}
+
+/// `path:kinds` for a path in the envelope, and the bare path for one inside an
+/// array.
+///
+/// The asymmetry is deliberate. An envelope key's kind *is* the contract —
+/// `terminal` is an object and a string there would be a breaking change — while
+/// a column inside `events[]` is null or not depending on which rows the fixture
+/// produced, and pinning that would make adding an event row to a fixture look
+/// like a contract change. What stays pinned under `events[]` is the path set,
+/// which is what says a key has not appeared at a second depth.
+///
+/// Kinds are rendered in a fixed order, so the text is a function of the set and
+/// not of the walk.
+fn renderShape(arena: std.mem.Allocator, path: []const u8, kinds: u8) ![]const u8 {
+    if (std.mem.indexOf(u8, path, "[]") != null) return path;
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(arena, path);
+    try text.append(arena, ':');
+    var first = true;
+    for ([_]JsonKind{ .null, .bool, .number, .string, .object, .array }) |kind| {
+        if (kinds & @intFromEnum(kind) == 0) continue;
+        if (!first) try text.append(arena, '|');
+        first = false;
+        try text.appendSlice(arena, @tagName(kind));
+    }
+    return text.toOwnedSlice(arena);
+}
+
+/// The value at a dotted path in an object, or null when the path is absent.
+fn jsonAt(value: std.json.Value, path: []const u8) ?std.json.Value {
+    var here = value;
+    var steps = std.mem.splitScalar(u8, path, '.');
+    while (steps.next()) |step| {
+        const obj = switch (here) {
+            .object => |o| o,
+            else => return null,
+        };
+        here = obj.get(step) orelse return null;
+    }
+    return here;
+}
+
+/// Every path `job receipt --json` publishes, with the kinds at it.
+///
+/// Read against `ReceiptJson` (`src/cli/cmd_job.zig`) and
+/// `Store.receipts.Row` — `events[]` is that struct passed through whole, by
+/// contract, which is why its keys are `snake_case` where the envelope's are
+/// `camelCase`. The three `…status` lines below are the whole reason this gate
+/// exists: a substring search for `"status":` matches any of them.
+const receipt_shape = [_][]const u8{
+    ":object",
+    "alias:string",
+    "attempt:number",
+    "blocksScope:bool",
+    "command:null",
+    "commandSha256:null",
+    "createdAt:number",
+    "cwd:null",
+    "effectiveStatus:string",
+    "eventCount:number",
+    "events:array",
+    "events[]",
+    "events[].cancel_method",
+    "events[].connected",
+    "events[].correlation_id",
+    "events[].detail_json",
+    "events[].duration_ms",
+    "events[].error_code",
+    "events[].exit_code",
+    "events[].finished_at",
+    "events[].is_terminal",
+    "events[].kind",
+    "events[].last_observed",
+    "events[].observed_at",
+    "events[].phase",
+    "events[].remote_pgid",
+    "events[].remote_pid",
+    "events[].remote_start_token",
+    "events[].remote_started",
+    "events[].seq",
+    "events[].source",
+    "events[].started_at",
+    "events[].status",
+    "events[].stderr_bytes",
+    "events[].stderr_digest",
+    "events[].stderr_sha256",
+    "events[].stderr_truncated",
+    "events[].stdin_bytes",
+    "events[].stdin_sha256",
+    "events[].stdout_bytes",
+    "events[].stdout_digest",
+    "events[].stdout_sha256",
+    "events[].stdout_truncated",
+    "events[].term_signal",
+    "events[].timed_out",
+    "events[].transport_error",
+    "job:string",
+    "kind:string",
+    "ok:bool",
+    "reconciledAt:null",
+    "requestId:string",
+    "resolutionEvidence:null",
+    "resolvedStatus:null",
+    "settled:bool",
+    "status:string",
+    "terminal.observedAt:number",
+    "terminal.seq:number",
+    "terminal.status:string",
+    "terminal:object",
+    "totalAttempts:number",
+    "updatedAt:number",
+};
+
+/// How many keys one `events[]` element carries — `Store.receipts.Row`'s whole
+/// column set. Checked per element, because the path set above is a *union*
+/// across the array and would not notice one element missing a key.
+const receipt_event_key_count = 34;
+
+test "gate: the receipt document's shape is pinned at the depth each key is at" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "receipt_shape");
+    defer f.deinit();
+    try f.seedServer();
+
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const request_id = "01DDDDDDDD0123456789ABCDEF";
+    try seedInFlightJob(&f, request_id, "deploy");
+    // Settled, so `terminal` is an object rather than the null an unsettled
+    // attempt carries. A shape gate over a document whose nested object is
+    // absent would prove nothing about the nesting.
+    {
+        var store = try f.open();
+        defer store.close();
+        _ = try Store.receipts.settle(&store, request_id, .{ .indeterminate = .{
+            .reason = "connection lost after submission",
+            .last_observed = .submitted,
+        } }, .{}, 1100);
+    }
+
+    var receipt = try run(&f, &.{ "job", "receipt", "box", "deploy", "--json", "--db", f.db });
+    defer receipt.deinit(f.allocator);
+    try receipt.expectCode(0);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, receipt.stdout, .{});
+    var shape: std.StringArrayHashMapUnmanaged(u8) = .empty;
+    try jsonShape(arena, &shape, "", parsed.value);
+
+    var rendered: std.ArrayList([]const u8) = .empty;
+    for (shape.keys(), shape.values()) |path, kinds| {
+        try rendered.append(arena, try renderShape(arena, path, kinds));
+    }
+    std.mem.sort([]const u8, rendered.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+
+    // The count first, so a path added or dropped fails here rather than being
+    // missed by a loop that only walks the ones it knows about.
+    if (rendered.items.len != receipt_shape.len) {
+        std.debug.print("\nthe receipt document's shape has {d} paths, pinned at {d}:\n", .{
+            rendered.items.len, receipt_shape.len,
+        });
+        for (rendered.items) |line| std.debug.print("    \"{s}\",\n", .{line});
+        std.debug.print("\nthe document it came from:\n{s}\n", .{receipt.stdout});
+        return error.ReceiptShapeChanged;
+    }
+    for (rendered.items, receipt_shape) |got, want| {
+        t.expectEqualStrings(want, got) catch |err| {
+            std.debug.print("\nthe receipt document's shape drifted; what it is now:\n", .{});
+            for (rendered.items) |line| std.debug.print("    \"{s}\",\n", .{line});
+            return err;
+        };
+    }
+
+    // --- and the vocabulary, at each of the three depths `status` lives at ----
+    //
+    // Derived from `op_state.Status` rather than transcribed, so renaming a
+    // member rewrites this check along with the code. This is the second thing a
+    // key set cannot see: that the string at a path is a word from a closed list
+    // and not a sentence.
+    const Status = Terminus.Core.Store.op_state.Status;
+    const known = struct {
+        fn isStatus(word: []const u8) bool {
+            return std.meta.stringToEnum(Status, word) != null;
+        }
+    }.isStatus;
+
+    var checked: usize = 0;
+    for ([_][]const u8{ "status", "effectiveStatus", "terminal.status" }) |path| {
+        const at = jsonAt(parsed.value, path) orelse return error.VocabularyPathMissing;
+        const word = switch (at) {
+            .string => |s| s,
+            else => return error.VocabularyPathIsNotAString,
+        };
+        t.expect(known(word)) catch |err| {
+            std.debug.print("\n`{s}` published `{s}`, which is not an op_state.Status\n", .{ path, word });
+            return err;
+        };
+        checked += 1;
+    }
+    // Every event that carries one, too — and the key set of each is checked
+    // element by element, because the path list above is a union across the
+    // array and would not notice one element missing a column.
+    const events = switch (jsonAt(parsed.value, "events").?) {
+        .array => |items| items,
+        else => return error.EventsIsNotAnArray,
+    };
+    try t.expect(events.items.len >= 1);
+    for (events.items) |event| {
+        const obj = switch (event) {
+            .object => |o| o,
+            else => return error.EventIsNotAnObject,
+        };
+        try t.expectEqual(@as(usize, receipt_event_key_count), obj.count());
+        const at = jsonAt(event, "status") orelse return error.EventHasNoStatusKey;
+        switch (at) {
+            .null => {},
+            .string => |word| {
+                try t.expect(known(word));
+                checked += 1;
+            },
+            else => return error.EventStatusIsNotAString,
+        }
+    }
+    // The two top-level words, the terminal's, and at least one event's.
+    try t.expect(checked >= 4);
+
+    // The document really does say `status` more than once, so the paths above
+    // are distinctions and not decoration. A key-set gate sees one key here.
+    var occurrences: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, receipt.stdout, at, "\"status\":")) |found| {
+        occurrences += 1;
+        at = found + 1;
+    }
+    try t.expect(occurrences >= 3);
 }

@@ -35,6 +35,7 @@ const Cli = @import("cli.zig");
 const Core = @import("../core/core.zig");
 const Store = Core.Store;
 const handoff = @import("cmd_handoff.zig");
+const docker = @import("cmd_docker.zig");
 const skill_doc = @import("skill_doc.zig");
 
 const scratch_dir = ".zig-cache/tmp";
@@ -984,13 +985,202 @@ test "gate: the published key set is exactly this, and the section names are the
     inline for (members, section_fields) |m, f| try t.expectEqualStrings(m.name, f.name);
     try t.expectEqual(@as(usize, 6), members.len);
 
-    // No field of the document has a default, so a branch that omits a key does
-    // not compile — the rule `ReceiptFatalJson` states in `cli.zig`.
-    var defaults: usize = 0;
-    inline for (@typeInfo(handoff.HandoffJson).@"struct".fields) |f| {
-        if (f.default_value_ptr != null) defaults += 1;
+    // The no-defaults rule this document follows is held for all thirteen
+    // published documents by `gate: no published document has a field with a
+    // default`, below. It used to be checked here, for this struct alone.
+}
+
+// --- gate: the no-defaults rule, over every published document ---------------
+//
+// Every `*Json` document in this tree is a struct with **no defaults**, so a
+// branch that omits a key does not compile. `ReceiptFatalJson` in `cli.zig`
+// states the rule and twelve other structs cite it, and every key-set gate in
+// this tree rests on it: a key set says which keys exist and says nothing about
+// whether a branch had to supply them. A field that gains a default keeps its
+// name, is still emitted on the branches that fill it, and passes every one of
+// those gates while a branch that omits it starts compiling.
+//
+// It was enforced for exactly one of the thirteen — `HandoffJson`, three lines
+// above this comment — which is what this replaces.
+//
+// **Why a text scan and not `@typeInfo`.** Ten of the thirteen are private to
+// their command's module, and `@typeInfo` cannot reach a decl that is not `pub`.
+// Making six modules' documents public to be testable would widen six surfaces
+// for a rule that is a property of their text. So the source is read — the way
+// `skill_doc` reads `SKILL.md` and `Control.bodyOf` reads a function body — and
+// the three that *are* reachable are then held against the compiler, field name
+// for field name and default for default. That cross-check is what says the
+// scanner sees what `@typeInfo` sees; without it a scan that silently matched
+// nothing would report the rule as kept.
+//
+// It lives in this file because this is where the rule's only enforcement
+// already lived. None of the six files below is this one, so the needle can be
+// spelled whole here — a scanner that lived inside its own subject would find
+// itself.
+
+/// Every source that declares a published document, embedded so the rule can be
+/// held against the text that has to have it.
+const document_sources = [_]struct { name: []const u8, text: []const u8 }{
+    .{ .name = "cli.zig", .text = @embedFile("cli.zig") },
+    .{ .name = "cmd_docker.zig", .text = @embedFile("cmd_docker.zig") },
+    .{ .name = "cmd_handoff.zig", .text = module_source },
+    .{ .name = "cmd_job.zig", .text = @embedFile("cmd_job.zig") },
+    .{ .name = "cmd_memory.zig", .text = @embedFile("cmd_memory.zig") },
+    .{ .name = "cmd_session.zig", .text = @embedFile("cmd_session.zig") },
+};
+
+/// How many document structs those six files declare between them, and how many
+/// fields they carry. Both asserted, because a scan that has stopped covering a
+/// file — a renamed struct, a moved terminator, a body that grew a method above
+/// its fields — walks an empty region and reports success.
+const document_struct_count = 13;
+const document_field_count = 173;
+
+/// One document struct as the text has it.
+const DocumentStruct = struct {
+    file: []const u8,
+    name: []const u8,
+    /// Field lines, trimmed, in declaration order.
+    fields: []const []const u8,
+};
+
+/// The field name a declaration line carries, `@"…"` unwrapped so it is the key
+/// that gets published rather than the Zig spelling of it.
+fn documentFieldName(line: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return line;
+    var name = std.mem.trim(u8, line[0..colon], " \t");
+    if (std.mem.startsWith(u8, name, "@\"") and std.mem.endsWith(u8, name, "\""))
+        name = name[2 .. name.len - 1];
+    return name;
+}
+
+fn scanDocumentStructs(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(DocumentStruct),
+) !void {
+    const opener = "Json = struct {";
+    for (document_sources) |source| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, source.text, from, opener)) |at| {
+            from = at + 1;
+            const line_start = if (std.mem.lastIndexOfScalar(u8, source.text[0..at], '\n')) |nl| nl + 1 else 0;
+            const decl = source.text[line_start .. at + opener.len];
+            // A top-level `const Name = struct {`. A nested or indented one
+            // would close with something other than `};` in column zero, so the
+            // body walk below would be reading the wrong region — refused rather
+            // than guessed at.
+            const keyword = std.mem.indexOf(u8, decl, "const ") orelse {
+                std.debug.print("\n{s}: a document struct is declared as `{s}`, which this scan cannot delimit\n", .{ source.name, decl });
+                return error.DocumentStructIsNotAConstDeclaration;
+            };
+            if (keyword != 0 and !std.mem.startsWith(u8, decl, "pub const ")) {
+                std.debug.print("\n{s}: a document struct is not a top-level declaration: `{s}`\n", .{ source.name, decl });
+                return error.DocumentStructIsNotTopLevel;
+            }
+            const name_start = keyword + "const ".len;
+            const name_end = std.mem.indexOfScalarPos(u8, decl, name_start, ' ') orelse decl.len;
+            const body_start = std.mem.indexOfScalarPos(u8, source.text, at, '\n').? + 1;
+            const body_end = std.mem.indexOfPos(u8, source.text, body_start, "\n};\n") orelse {
+                std.debug.print("\n{s}: `{s}` has no `}};` in column zero to end it\n", .{ source.name, decl });
+                return error.DocumentStructUnterminated;
+            };
+
+            var fields: std.ArrayList([]const u8) = .empty;
+            var lines = std.mem.splitScalar(u8, source.text[body_start..body_end], '\n');
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
+                // The fields come first in all thirteen. The first method or
+                // nested declaration ends the region; the asserted counts above
+                // are what catch a struct that ever stops being written that way.
+                if (std.mem.startsWith(u8, line, "fn ") or
+                    std.mem.startsWith(u8, line, "pub fn ") or
+                    std.mem.startsWith(u8, line, "const ") or
+                    std.mem.startsWith(u8, line, "pub const ") or
+                    // Spelled in halves on purpose. `tools/mutate.py` derives
+                    // every gate name it can resolve by matching `test "…"`
+                    // against the source, so this literal written whole makes
+                    // that regex swallow the opening quote of the next real test
+                    // in this file — and the anchor for the gate below then
+                    // reports UNRESOLVED. It did exactly that once.
+                    std.mem.startsWith(u8, line, "tes" ++ "t ")) break;
+                try fields.append(arena, line);
+            }
+            try out.append(arena, .{
+                .file = source.name,
+                .name = decl[name_start..name_end],
+                .fields = try fields.toOwnedSlice(arena),
+            });
+        }
     }
-    try t.expectEqual(@as(usize, 0), defaults);
+}
+
+test "gate: no published document has a field with a default, in any of the six modules" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var found: std.ArrayList(DocumentStruct) = .empty;
+    try scanDocumentStructs(arena, &found);
+    try t.expectEqual(@as(usize, document_struct_count), found.items.len);
+
+    var fields: usize = 0;
+    for (found.items) |doc| {
+        if (doc.fields.len == 0) {
+            std.debug.print("\n{s}: `{s}` scanned as having no fields at all\n", .{ doc.file, doc.name });
+            return error.DocumentStructHasNoFields;
+        }
+        fields += doc.fields.len;
+        for (doc.fields) |line| {
+            if (std.mem.indexOfScalar(u8, line, '=') == null) continue;
+            std.debug.print(
+                \\
+                \\{s}: `{s}.{s}` carries a default.
+                \\
+                \\  {s}
+                \\
+                \\Every published document in this tree is a struct with no defaults, so that a
+                \\branch which omits a key does not compile — the rule `ReceiptFatalJson` states
+                \\in `cli.zig`. A field with a default keeps its name and is still emitted by the
+                \\branches that fill it, so every key-set gate in this tree goes on passing while
+                \\a branch that says nothing about it starts compiling. What an agent then reads
+                \\is a key whose presence no longer means anybody looked.
+                \\
+                \\If the value really is the same on every branch, it is not a default: state it
+                \\at each site, or compute it in the function that builds the document.
+                \\
+            , .{ doc.file, doc.name, documentFieldName(line), line });
+            return error.PublishedDocumentFieldHasADefault;
+        }
+    }
+    try t.expectEqual(@as(usize, document_field_count), fields);
+
+    // The scanner against the compiler, on the three documents that are `pub`.
+    // Same names, same order, same count — and the compiler's own answer to the
+    // question the scan just answered from text.
+    const reachable = .{
+        .{ "InspectJson", docker.InspectJson },
+        .{ "WaitJson", docker.WaitJson },
+        .{ "HandoffJson", handoff.HandoffJson },
+    };
+    var cross_checked: usize = 0;
+    inline for (reachable) |pair| {
+        const doc = for (found.items) |d| {
+            if (std.mem.eql(u8, d.name, pair[0])) break d;
+        } else {
+            std.debug.print("\n`{s}` is reachable from here and the scan did not find it\n", .{pair[0]});
+            return error.ReachableDocumentWasNotScanned;
+        };
+        const compiled = @typeInfo(pair[1]).@"struct".fields;
+        try t.expectEqual(compiled.len, doc.fields.len);
+        inline for (compiled, 0..) |f, i| {
+            try t.expectEqualStrings(f.name, documentFieldName(doc.fields[i]));
+            try t.expect(f.default_value_ptr == null);
+        }
+        cross_checked += 1;
+    }
+    try t.expectEqual(@as(usize, 3), cross_checked);
 }
 
 // --- gate: resume argv -------------------------------------------------------
