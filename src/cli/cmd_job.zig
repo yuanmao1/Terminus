@@ -42,11 +42,16 @@ const wallClockSeconds = Control.wallClockSeconds;
 
 const run_usage =
     \\usage: terminus run <server> --name <job-name> [--cwd <dir>] [--login]
-    \\                    [--strict] [--interpreter <bin>] [--json] <command input>
+    \\                    [--strict] [--interpreter <bin>] [--shell <name>]
+    \\                    [--json] <command input>
     \\
-    \\command input: --stdin | --cmd-file <path> | --cmd "<command>" | -- <command...>
+    \\command input: --argv-json '["a","b"]' | --stdin | --cmd-file <path>
+    \\               | --cmd "<command>" | -- <command...>
+    \\--argv-json renders every element as exactly one shell word.
     \\Multiline input runs as a staged remote script. --strict = set -euo pipefail.
     \\--login wraps in `bash -ilc` for the full user PATH (nvm/pm2/etc).
+    \\--shell bash|zsh|none declares the interpreter; 'none' adds no shell layer
+    \\of terminus's own. Any other value is refused before anything is sent.
     \\
 ;
 const job_usage =
@@ -133,8 +138,11 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const server_name = parsed.positional(0) orelse fatal("{s}", .{run_usage});
     const job_name = parsed.flag("name") orelse fatal("--name is required\n{s}", .{run_usage});
     validateJobName(job_name);
-    const raw_command = (try Cli.trailingContent(ctx, &parsed, "cmd-file", 1)) orelse
-        fatal("no command given\n{s}", .{run_usage});
+    // The same shaper `exec` uses. `null` for the session, because a job's
+    // tmux session is one this launch is about to create rather than a live
+    // shell the operator named — `--login` has something to do here.
+    const inv = try Cli.shapeInvocation(ctx, &parsed, null, run_usage);
+    const raw_command = inv.text;
 
     var store = try Cli.openStore(ctx, &parsed);
     defer store.close();
@@ -162,7 +170,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
         .argv_sha256 = try sha256Hex(ctx.arena, raw_command),
         .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
-        .shell = if (parsed.boolean("login")) "bash-login" else "bash",
+        .shell = inv.shellWord(),
         .owner_token = owner_token,
         .force = parsed.boolean("force"),
         .now = ctx.now,
@@ -301,26 +309,16 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     );
     Tmux.ensure(executor, ctx.arena, session) catch |err| fatalTmux(err, executor, session);
 
-    var command = raw_command;
     var staged_path: ?[]const u8 = null;
-    if (Core.script.shouldStage(raw_command) or parsed.flag("interpreter") != null) {
-        const staged = Core.script.stage(executor, ctx.arena, raw_command, .{
-            .interpreter = parsed.flag("interpreter") orelse "bash",
-            .strict = parsed.boolean("strict"),
-            .login = parsed.boolean("login"),
-        }, nonce) catch |err| switch (err) {
+    const command = if (inv.stages()) staged: {
+        const staged = Core.script.stage(executor, ctx.arena, inv.text, inv.scriptOptions(), nonce) catch |err| switch (err) {
             error.ScriptTooLarge => fatal("script exceeds {d} KiB; push it as a file and run that instead", .{Core.script.max_inline_script / 1024}),
             error.StagingFailed => fatal("could not stage the script on the remote host", .{}),
             else => fatal("staging failed: {s} ({s})", .{ executor.errorMessage(), @errorName(err) }),
         };
-        command = staged.command;
         staged_path = staged.remote_path;
-    } else if (parsed.boolean("strict")) {
-        command = try std.fmt.allocPrint(ctx.arena, "set -euo pipefail; {s}", .{raw_command});
-        if (parsed.boolean("login")) command = try Cli.loginWrap(ctx.arena, command);
-    } else if (parsed.boolean("login")) {
-        command = try Cli.loginWrap(ctx.arena, command);
-    }
+        break :staged staged.command;
+    } else try inv.inlineCommand(ctx.arena);
 
     const cwd = parsed.flag("cwd") orelse resolved.server.cwd;
     const full = try Tmux.jobLaunchLine(ctx.arena, command, cwd, sentinel, execution.id());
@@ -338,8 +336,8 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         .sentinel = sentinel,
         .tmux_session = session,
         .cwd = cwd,
-        .interpreter = parsed.flag("interpreter") orelse "bash",
-        .shell = if (parsed.boolean("login")) "bash-login" else "bash",
+        .interpreter = inv.interpreterWord(),
+        .shell = inv.shellWord(),
         .script_body_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch
             fatal("cannot redact the script for the audit record; refusing to store it unredacted", .{}),
         .script_sha256 = try sha256Hex(ctx.arena, raw_command),

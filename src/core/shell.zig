@@ -106,6 +106,125 @@ pub fn quotedLen(s: []const u8) usize {
     return n;
 }
 
+// --- An argv, and the shell that runs it -------------------------------------
+
+/// An argv as a command line: every element becomes exactly one shell word.
+///
+/// **What this is not.** `libssh2_channel_process_startup` takes a command
+/// *string*, not an argv array, and the remote sshd hands that string to the
+/// account's shell whatever we do. So nothing here bypasses a shell. What it
+/// does is make the string one the shell splits back into the list it came
+/// from: every element is quoted, so a space, an apostrophe, a `$`, a backtick,
+/// a newline or a `;` inside one is a byte of that word and never a piece of
+/// syntax. `words` is the inverse and the honest way to check it — apply the
+/// splitting rules and see whether the list that comes out is the list that
+/// went in.
+///
+/// Exact sizing and then a fixed writer, the same arrangement as `quote` and
+/// for the same reason: the length and the rendering are one statement, so they
+/// cannot disagree.
+pub fn render(arena: Allocator, argv: []const []const u8) Allocator.Error![]u8 {
+    // An empty argv is not a command. The callers refuse it with a sentence
+    // before they reach here, so this is the assertion that they did.
+    std.debug.assert(argv.len != 0);
+    var total: usize = argv.len - 1; // the separating spaces
+    for (argv) |element| total += quotedLen(element);
+    const buf = try arena.alloc(u8, total);
+    var writer = std.Io.Writer.fixed(buf);
+    for (argv, 0..) |element, i| {
+        if (i != 0) writer.writeByte(' ') catch unreachable;
+        word(element).format(&writer) catch unreachable;
+    }
+    std.debug.assert(writer.end == buf.len);
+    return buf;
+}
+
+/// `<binary> -ilc <command>`, with the command as one shell word.
+///
+/// Both letters are load-bearing. `-l` alone is not enough: distros guard
+/// `~/.bashrc` with an interactive-only early return, and the version managers
+/// people are missing (nvm, bun, pm2) initialise exactly there — so `-i` is
+/// required too. The job-control warnings `-i` emits without a tty are stripped
+/// from stderr by `Cli.stripLoginNoise`.
+///
+/// The one spelling of a login wrap in this tree. There were two: this one and
+/// `bash -ilc '{s}'` in `script.zig`, whose quotes belonged to the format
+/// template and escaped nothing — an `--interpreter` holding an apostrophe
+/// ended that word early and the rest of it became syntax, which is the exact
+/// defect `Word` exists for. A caller now names the binary and hands over the
+/// command; it has no way to spell the quoting itself.
+pub fn loginWrap(arena: Allocator, binary: []const u8, command: []const u8) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(arena, "{s} -ilc {f}", .{ binary, word(command) });
+}
+
+/// The `--shell` vocabulary: which interpreter a command is declared to run
+/// under, and whether terminus adds a shell layer of its own at all.
+///
+/// **Why the vocabulary is closed, and why `powershell` is not in it.**
+/// `supervisor.wrapShell` is what provides the start marker, the pid, the pgid,
+/// the start token and the exit marker that `parseShell` reads, and it is
+/// written in POSIX shell — `$$`, `$?`, `$(…)`, `/proc`, `awk`, `printf`,
+/// `ps -o`, `tr -d`. PowerShell does not run that program. A `--shell
+/// powershell` that was merely passed along would lose the whole supervision
+/// layer: no identity, no exit marker, and `runCommand` would settle every
+/// command `indeterminate` because the marker never arrives. So a value only
+/// enters this enum once a wrapper exists for it, and every other value is
+/// refused by name before anything is sent.
+pub const Kind = enum {
+    bash,
+    zsh,
+    /// No shell layer from terminus. The command is sent as it stands — no
+    /// login wrap, no `set -euo pipefail` prefix, no staged script — and an
+    /// argv is rendered one word per element so nothing in it can become
+    /// syntax. It does not and cannot mean "no shell ran it": the remote sshd
+    /// still hands the string to the account's shell.
+    none,
+
+    /// The binary a login wrap and a staged script use. `none` has none, which
+    /// is the entire content of `none`.
+    pub fn binary(k: Kind) ?[]const u8 {
+        return switch (k) {
+            .bash => "bash",
+            .zsh => "zsh",
+            .none => null,
+        };
+    }
+};
+
+/// The vocabulary as a refusal prints it, derived from the enum so a member the
+/// parser accepts cannot be left out of the message that lists them.
+pub const kind_list = list: {
+    var out: []const u8 = "";
+    for (@typeInfo(Kind).@"enum".fields, 0..) |field, i| {
+        out = out ++ (if (i == 0) "" else "|") ++ field.name;
+    }
+    break :list out;
+};
+
+/// Values that name a real interpreter for which `supervisor.wrapShell` is not
+/// a program. Refused with that reason rather than as an unknown word, because
+/// "powershell is not a value terminus has" invites a second attempt while "the
+/// supervisor is POSIX shell" does not.
+pub const unsupervised_names = [_][]const u8{
+    "powershell", "pwsh", "powershell.exe", "cmd", "cmd.exe", "fish", "csh", "tcsh",
+};
+
+pub const KindError = error{
+    /// A real interpreter, with no supervisor wrapper for it.
+    Unsupervised,
+    /// Not a value this vocabulary has at all.
+    Unknown,
+};
+
+/// `--shell <value>`, or a refusal that says which kind of wrong it is.
+pub fn parseKind(value: []const u8) KindError!Kind {
+    if (std.meta.stringToEnum(Kind, value)) |kind| return kind;
+    for (unsupervised_names) |name| {
+        if (std.mem.eql(u8, value, name)) return error.Unsupervised;
+    }
+    return error.Unknown;
+}
+
 // --- Reading a script back ---------------------------------------------------
 
 /// The shell words a POSIX shell would see in `text`, as it would see them.
@@ -264,6 +383,22 @@ fn codeOf(line: []const u8) []const u8 {
     }
     if (quotes % 2 != 0) return line;
     return before;
+}
+
+/// How many times `needle` appears in `source`, ignoring `//` comments.
+///
+/// `pub` because the gates that forbid a spelling in a *command's* source need
+/// it and `grep -c` does not do it: a count that includes comments makes the
+/// doc comment explaining why a spelling is forbidden into the reason the gate
+/// fails, and a gate that cannot be satisfied gets deleted. Same `codeOf` the
+/// placeholder scan uses, so the two agree about what a comment is.
+pub fn countInCode(source: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw_line| {
+        n += std.mem.count(u8, codeOf(raw_line), needle);
+    }
+    return n;
 }
 
 fn scanLine(line: []const u8, out: *Scan) void {

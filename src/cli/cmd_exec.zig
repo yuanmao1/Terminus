@@ -23,9 +23,13 @@ const Tmux = Core.Tmux;
 /// `--help` prints.
 pub const usage =
     \\usage: terminus exec <server>[:<session>] [--json] [--timeout <sec>] [--login]
-    \\                    [--strict] [--interpreter <bin>] <command input>
+    \\                    [--strict] [--interpreter <bin>] [--shell <name>]
+    \\                    <command input>
     \\
     \\command input, most quote-proof first:
+    \\  --argv-json '["a","b"]'  a JSON array; every element becomes exactly one
+    \\                       shell word, so a space, a quote, a $, a backtick, a
+    \\                       newline or a ; inside one stays data
     \\  --stdin              read the command/script from standard input
     \\  --cmd-file <path>    run a local script file's contents remotely
     \\  --cmd "<command>"    a single flag value (survives PowerShell)
@@ -46,7 +50,13 @@ pub const usage =
     \\                       script and becomes the exit code
     \\  --interpreter <bin>  run with e.g. python3 instead of bash
     \\--login wraps execution in `bash -ilc` for the full user PATH
-    \\(nvm/bun/pm2 live in profile files that plain SSH exec skips).
+    \\(nvm/bun/pm2 live in profile files that plain SSH exec skips). A
+    \\'<server>:<session>' target refuses it: a session is already one.
+    \\
+    \\--shell bash|zsh|none declares the interpreter. 'none' means terminus adds
+    \\no shell layer of its own — no login wrap, no set -euo pipefail, no staged
+    \\script. Any other value is refused before anything is sent: the supervisor
+    \\that reports the pid and the exit status is a POSIX shell program.
     \\
     \\Exit codes: the remote command's own code, or 75 when the outcome could
     \\not be established (never retry blindly on 75 — reconcile first).
@@ -58,8 +68,13 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     if (parsed.boolean("json")) ctx.out.format = .json;
 
     const target = Cli.Target.parse(parsed.positional(0) orelse fatal("{s}", .{usage}));
-    const raw_command = (try Cli.trailingContent(ctx, &parsed, "cmd-file", 1)) orelse
-        fatal("no remote command given\n{s}", .{usage});
+    // One shaper, for both of this command's paths and for `run`: it reads the
+    // command, decides what wraps it, and is the only thing that can name the
+    // shell the ledger records. Refuses `--shell powershell`, a malformed
+    // `--argv-json` and every contradictory combination before a connection
+    // exists.
+    const inv = try Cli.shapeInvocation(ctx, &parsed, target.session, usage);
+    const raw_command = inv.text;
     // Read straight after the command was, because the next call to
     // `trailingContent` anywhere would replace it.
     const line_endings = Cli.commandLineEndings();
@@ -129,7 +144,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             // redaction exists to keep out of an append-only ledger.
             fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
         .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
-        .shell = if (parsed.boolean("login")) "bash-login" else "bash",
+        .shell = inv.shellWord(),
         .owner_token = owner_token,
         .force = parsed.boolean("force"),
         .now = ctx.now,
@@ -190,9 +205,9 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     Cli.settleProvableBlocker(ctx, &store, executor, execution.advisory);
 
     const outcome = if (target.session) |session_name|
-        try runInSession(ctx, &store, &execution, executor, &parsed, session_name, raw_command, timeout_ms)
+        try runInSession(ctx, &store, &execution, executor, inv, session_name, timeout_ms)
     else
-        try runOneShot(ctx, &execution, executor, &parsed, raw_command, resolved.server.cwd, input, &accepted);
+        try runOneShot(ctx, &execution, executor, &parsed, inv, resolved.server.cwd, input, &accepted);
 
     const duration_ms: i64 = @intCast(@divTrunc(
         started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds,
@@ -278,36 +293,25 @@ fn runOneShot(
     execution: *Core.execution.Execution,
     executor: Core.Executor,
     parsed: *const Cli.Args.Parsed,
-    raw_command: []const u8,
+    inv: Cli.Invocation,
     server_cwd: ?[]const u8,
     input: ?*std.Io.Reader,
     accepted: *Core.Ssh.Accepted,
 ) !Outcome {
-    var command = raw_command;
     var staged_path: ?[]const u8 = null;
 
     // Staging happens before submission: it is setup, and a failure there
     // provably never ran the user's command.
-    const wants_script = Core.script.shouldStage(raw_command) or parsed.flag("interpreter") != null;
-    if (wants_script) {
+    const command = if (inv.stages()) staged: {
         const nonce: u64 = @intCast(@mod(std.Io.Timestamp.now(ctx.io, .real).nanoseconds, 1_000_000_000_000));
-        const staged = Core.script.stage(executor, ctx.arena, raw_command, .{
-            .interpreter = parsed.flag("interpreter") orelse "bash",
-            .strict = parsed.boolean("strict"),
-            .login = parsed.boolean("login"),
-        }, nonce) catch |err| switch (err) {
+        const staged = Core.script.stage(executor, ctx.arena, inv.text, inv.scriptOptions(), nonce) catch |err| switch (err) {
             error.ScriptTooLarge => fatal("script exceeds {d} KiB; push it as a file and exec it instead", .{Core.script.max_inline_script / 1024}),
             error.StagingFailed => fatal("could not stage the script on the remote host", .{}),
             else => fatal("staging failed: {s} ({s})", .{ executor.errorMessage(), @errorName(err) }),
         };
-        command = staged.command;
         staged_path = staged.remote_path;
-    } else if (parsed.boolean("strict")) {
-        command = try std.fmt.allocPrint(ctx.arena, "set -euo pipefail; {s}", .{raw_command});
-        if (parsed.boolean("login")) command = try Cli.loginWrap(ctx.arena, command);
-    } else if (parsed.boolean("login")) {
-        command = try Cli.loginWrap(ctx.arena, command);
-    }
+        break :staged staged.command;
+    } else try inv.inlineCommand(ctx.arena);
     defer if (staged_path) |path| Core.script.cleanup(executor, ctx.arena, path);
 
     const effective = if (parsed.flag("cwd") orelse server_cwd) |dir|
@@ -342,7 +346,7 @@ fn runOneShot(
         .status = outcome.status,
         .exit_code = outcome.exit_code,
         .stdout = outcome.stdout,
-        .stderr = if (parsed.boolean("login"))
+        .stderr = if (inv.login)
             try Cli.stripLoginNoise(ctx.arena, outcome.stderr)
         else
             outcome.stderr,
@@ -363,9 +367,8 @@ fn runInSession(
     store: *Store,
     execution: *Core.execution.Execution,
     executor: Core.Executor,
-    parsed: *const Cli.Args.Parsed,
+    inv: Cli.Invocation,
     session_name: []const u8,
-    raw_command: []const u8,
     timeout_ms: i64,
 ) !Outcome {
     const session_id = Store.sessions.ensure(store, execution.server_id.?, session_name, ctx.now) catch |err|
@@ -373,18 +376,16 @@ fn runInSession(
     Tmux.ensure(executor, ctx.arena, session_name) catch |err|
         fatalTmux(err, executor, session_name);
 
-    var command = raw_command;
-    if (Core.script.shouldStage(raw_command) or parsed.flag("interpreter") != null) {
+    // The same two branches, through the same shaper, as the one-shot path.
+    // They were separate copies of one composition rule, and this one had lost
+    // both `--login` arms while the ledger went on recording `bash-login` for
+    // them.
+    const command = if (inv.stages()) staged: {
         const nonce: u64 = @intCast(@mod(std.Io.Timestamp.now(ctx.io, .real).nanoseconds, 1_000_000_000_000));
-        const staged = Core.script.stage(executor, ctx.arena, raw_command, .{
-            .interpreter = parsed.flag("interpreter") orelse "bash",
-            .strict = parsed.boolean("strict"),
-            .login = parsed.boolean("login"),
-        }, nonce) catch fatal("could not stage the script on the remote host", .{});
-        command = staged.command;
-    } else if (parsed.boolean("strict")) {
-        command = try std.fmt.allocPrint(ctx.arena, "set -euo pipefail; {s}", .{raw_command});
-    }
+        const staged = Core.script.stage(executor, ctx.arena, inv.text, inv.scriptOptions(), nonce) catch
+            fatal("could not stage the script on the remote host", .{});
+        break :staged staged.command;
+    } else try inv.inlineCommand(ctx.arena);
 
     const cursor = Store.sessions.cursor(store, session_id) catch |err| Cli.storeFatal(store, err);
 

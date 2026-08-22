@@ -1844,6 +1844,94 @@
       "find": "    if (path.len == 0)\n        fatal(\"remote path must not be empty\", .{});",
       "replace": "    if (path.len == 0 or std.mem.indexOfAny(u8, path, \"'\\\"\\n`$\") != null)\n        fatal(\"remote path must not contain quotes, backticks, '$' or newlines\", .{});",
       "expect_gate": "gate: the CLI no longer refuses the paths this module can now carry"
+    },
+    {
+      "id": "G13-argv-word-separator",
+      "rule": "Argv elements are separated by whitespace. A byte a shell does not split on glues two elements into one word, and `'ls';'-la'` is not one command with an argument - it is one word that a real host would then read as two commands.",
+      "file": "src/core/shell.zig",
+      "find": "        if (i != 0) writer.writeByte(' ') catch unreachable;",
+      "replace": "        if (i != 0) writer.writeByte(';') catch unreachable;",
+      "expect_gate": "gate: every argv element survives as exactly one shell word"
+    },
+    {
+      "id": "G13-trailing-join-separator",
+      "rule": "The `--` channel joins its tokens with the byte a shell splits on, which is what lets `--argv-json` and `-- <cmd>` name the same command. Joined with nothing, three arguments become one word and the two channels stop agreeing.",
+      "file": "src/cli/args.zig",
+      "find": "            return try std.mem.join(arena, \" \", rest);",
+      "replace": "            return try std.mem.join(arena, \"\", rest);",
+      "expect_gate": "gate: --argv-json and -- <cmd> agree for an argv that needs no quoting"
+    },
+    {
+      "id": "G13-argv-json-not-an-array-collapsed",
+      "rule": "Text that is not JSON and JSON that is not an array are two different mistakes. Reported as one, an agent cannot tell a missing bracket from a wrapped object, and the retry it makes is the same argv again.",
+      "file": "src/cli/cli.zig",
+      "find": "        else => return .{ .not_an_array = @tagName(value) },",
+      "replace": "        else => return .{ .not_json = @tagName(value) },",
+      "expect_gate": "gate: a malformed --argv-json is refused by which mistake it was"
+    },
+    {
+      "id": "G13-unsupervised-shell-accepted",
+      "rule": "A `--shell` value for which no supervisor wrapper exists is refused by name before anything is sent. Quietly treated as bash, `--shell powershell` would report a shell that did not run the command; sent to PowerShell it would come back with no exit marker and settle indeterminate every time.",
+      "file": "src/core/shell.zig",
+      "find": "        if (std.mem.eql(u8, value, name)) return error.Unsupervised;",
+      "replace": "        if (std.mem.eql(u8, value, name)) return .bash;",
+      "expect_gate": "gate: a --shell value with no supervisor wrapper is refused by name"
+    },
+    {
+      "id": "G13-shell-none-accepts-strict",
+      "rule": "`--shell none` declares that terminus adds no shell layer of its own, and `--strict` prepends `set -euo pipefail`, which is such a layer. Accepting the pair and dropping one of them is exactly how a ledger comes to describe a wrap that did not happen.",
+      "file": "src/cli/cli.zig",
+      "find": "        if (req.strict) return try std.fmt.allocPrint(arena,",
+      "replace": "        if (false and req.strict) return try std.fmt.allocPrint(arena,",
+      "expect_gate": "gate: --shell none refuses every layer it says terminus does not add"
+    },
+    {
+      "id": "G13-shell-word-always-login",
+      "rule": "The word the ledger records is the wrap that happened. A word naming a login shell for a command nothing login-wrapped is the defect this shaper exists to remove - `exec host:sess --login` filed `bash-login` for a command `runInSession` never wrapped, and no command prints the column.",
+      "file": "src/cli/cli.zig",
+      "find": "            .bash => if (inv.login) \"bash-login\" else \"bash\",",
+      "replace": "            .bash => \"bash-login\",",
+      "expect_gate": "gate: the ledger's shell word is the wrap that happened, session included"
+    },
+    {
+      "id": "G13-exec-recomputes-the-shell-word",
+      "rule": "A caller that did not perform the wrap must not be able to write a word describing one. The shell word has one spelling, in `Invocation.shellWord`; a verb that recomputes it from the flag is the fourth copy of a defect that already shipped three times.",
+      "file": "src/cli/cmd_exec.zig",
+      "find": "        .shell = inv.shellWord(),",
+      "replace": "        .shell = if (parsed.boolean(\"login\")) \"bash-login\" else \"bash\",",
+      "expect_gate": "gate: neither verb can spell a shell word or a wrap of its own"
+    },
+    {
+      "id": "G13-strict-outside-the-login-wrap",
+      "rule": "`--strict` goes inside the login wrap. Outside it, the status reported is the login shell's own `$?` rather than the first failing line's - which is the entire purpose of the flag, and the reason the composition order may not be a property of where an `if` happens to sit.",
+      "file": "src/cli/cli.zig",
+      "find": "        if (inv.login) command = try Core.shell.loginWrap(arena, inv.kind.binary().?, command);",
+      "replace": "        if (inv.login) command = if (inv.strict) try std.fmt.allocPrint(arena, \"set -euo pipefail; {s}\", .{try Core.shell.loginWrap(arena, inv.kind.binary().?, inv.text)}) else try Core.shell.loginWrap(arena, inv.kind.binary().?, command);",
+      "expect_gate": "gate: --strict goes inside the login wrap, on one code path for both verbs"
+    },
+    {
+      "id": "G13-staged-strict-on-the-command-line",
+      "rule": "For a staged script `--strict` is the script's own first line, so the first failing line of the script is the one whose status comes back. Dropped from the file, the flag is accepted and does nothing, and a deploy runs past its first failure reporting the last line's code.",
+      "file": "src/core/script.zig",
+      "find": "        try script.appendSlice(arena, \"set -euo pipefail\\n\");",
+      "replace": "        try script.appendSlice(arena, \"\");",
+      "expect_gate": "gate: a staged script is wrapped by the same rule and stages what it says"
+    },
+    {
+      "id": "G13-document-claims-no-shell-ran-it",
+      "rule": "The document may not tell an agent that `--shell none` means no shell ran the command. SSH exec carries a command string and the remote sshd hands it to the account's shell whatever terminus does; an agent that believed otherwise would stop quoting.",
+      "file": "skill/SKILL.md",
+      "find": "no shell layer of its own",
+      "replace": "no shell at all",
+      "expect_gate": "gate: the skill document describes the argv channel and the shell vocabulary"
+    },
+    {
+      "id": "G13-shell-flag-registered-as-boolean",
+      "rule": "`--shell` takes a value, so it must not be in `bool_flags`. Registered there it stops consuming its argument, the shell's name becomes a positional, and `trailing` sends that name as the command - a run that executes the word `none`.",
+      "file": "src/cli/args.zig",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
+      "replace": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"shell\" };",
+      "expect_gate": "gate: every boolean flag exec takes is registered, so none swallows the next argument"
     }
   ]
 }

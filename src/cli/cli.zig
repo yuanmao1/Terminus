@@ -1851,17 +1851,366 @@ pub fn stripCarriageReturns(arena: std.mem.Allocator, content: []const u8) ![]co
     return out.items;
 }
 
-/// Wraps a command in an interactive login shell so it sees the user's
-/// full PATH. Login alone (-l) is not enough: distros guard ~/.bashrc
-/// with an interactive-only early return, and version managers (nvm,
-/// bun) initialize exactly there — so -i is required too. The known
-/// job-control warnings that -i emits without a tty are stripped from
-/// stderr by `stripLoginNoise`.
-pub fn loginWrap(arena: std.mem.Allocator, command: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "bash -ilc {s}", .{try Core.shell.quote(arena, command)});
+// --- One shaper: how a command becomes the bytes a shell runs -----------------
+
+/// The command a verb is about to send, and the word the ledger records for it.
+///
+/// **Why this exists at all.** The block that turned the raw command plus
+/// `--strict`, `--login` and `--interpreter` into the bytes sent existed three
+/// times — `cmd_exec.runOneShot`, `cmd_job.runCmd` (character-identical to it)
+/// and `cmd_exec.runInSession` (the same block minus both `--login` branches).
+/// The rule those copies had to agree on was expressed only by the physical
+/// arrangement of `if / else if` inside each one, and nothing held them
+/// together: `--strict` goes *inside* the login wrap, so `--strict --login` is
+/// `bash -ilc 'set -euo pipefail; <cmd>'` and not the reverse. That ordering is
+/// the whole point of `--strict` — the first failing line's status becomes the
+/// result — and a `set -euo pipefail` moved outside the wrap reports the login
+/// shell's `$?` instead. One copy changing meant `exec --strict --login` and
+/// `run --strict --login` ran different shells over identical command text
+/// while both recorded `shell: "bash-login"`.
+///
+/// **And the ledger's word comes out of here.** `operations.shell` and
+/// `job_attempts.shell` were computed independently three more times, each as
+/// `if (parsed.boolean("login")) "bash-login" else "bash"`. One of them ran
+/// *before* `exec` forked into its session path, so `exec host:sess --login --
+/// cmd` filed `bash-login` for a command nothing login-wrapped. The column is
+/// stored and no command prints it, which is exactly why nobody noticed.
+/// `shellWord` is now the only spelling of any of those words in the tree, and
+/// a gate in `cmd_exec_test` holds that: a caller that did not shape its
+/// command here has nothing to write a word with.
+pub const Invocation = struct {
+    /// The declared interpreter.
+    kind: Core.shell.Kind,
+    /// Whether the command is wrapped in an interactive login shell.
+    login: bool,
+    /// Whether `set -euo pipefail` is prepended — inside that wrap.
+    strict: bool,
+    /// `--interpreter` as given. Non-null stages even a one-liner, which is
+    /// what it has always meant.
+    interpreter_flag: ?[]const u8,
+    /// The interpreter a staged script runs under. Null when nothing may be
+    /// staged at all: `--shell none` has no interpreter to stage with, and an
+    /// argv is one command rather than a script.
+    interpreter: ?[]const u8,
+    /// The command as an argv, when one was given. Kept past rendering so a
+    /// gate can hold the text against the list it came from.
+    argv: ?[]const []const u8,
+    /// The command text: the script as it was read, or the argv rendered one
+    /// shell word per element.
+    text: []const u8,
+
+    /// The word `operations.shell` and `job_attempts.shell` record.
+    ///
+    /// The single spelling of it. Every other place that needs it asks the
+    /// invocation that performed the wrap.
+    pub fn shellWord(inv: Invocation) []const u8 {
+        return switch (inv.kind) {
+            .bash => if (inv.login) "bash-login" else "bash",
+            .zsh => if (inv.login) "zsh-login" else "zsh",
+            // No layer of ours, so there is no wrap to name.
+            .none => "none",
+        };
+    }
+
+    /// The word `job_attempts.interpreter` records.
+    pub fn interpreterWord(inv: Invocation) []const u8 {
+        return inv.interpreter orelse "none";
+    }
+
+    /// Whether this command travels as a staged remote script.
+    pub fn stages(inv: Invocation) bool {
+        // No shell layer, or an argv: neither has a script to stage.
+        if (inv.interpreter == null) return false;
+        if (inv.argv != null) return false;
+        return Core.script.shouldStage(inv.text) or inv.interpreter_flag != null;
+    }
+
+    pub fn scriptOptions(inv: Invocation) Core.script.Options {
+        // Only reachable once `stages()` has said yes, which is what makes the
+        // interpreter present. Asserted rather than defaulted: an `orelse
+        // "bash"` here would quietly stage a `--shell zsh` script under bash.
+        std.debug.assert(inv.stages());
+        return .{
+            .interpreter = inv.interpreter.?,
+            .strict = inv.strict,
+            .login_shell = if (inv.login) inv.kind.binary() else null,
+        };
+    }
+
+    /// The command line, for the paths that do not stage.
+    ///
+    /// The one composition order in the program.
+    pub fn inlineCommand(inv: Invocation, arena: std.mem.Allocator) ![]const u8 {
+        var command = inv.text;
+        if (inv.strict) command = try std.fmt.allocPrint(arena, "set -euo pipefail; {s}", .{command});
+        // `.?` and not a fallback: `--shell none --login` is refused by
+        // `shapeInvocation`, so a login with no binary cannot get here.
+        if (inv.login) command = try Core.shell.loginWrap(arena, inv.kind.binary().?, command);
+        return command;
+    }
+};
+
+/// `--argv-json`'s text, read as an argv.
+///
+/// Four ways it can be wrong and four answers, because they are four different
+/// mistakes: an agent handed one sentence for all of them has to guess which
+/// one it made, and the guess it makes is usually "retry the same thing".
+pub const ArgvJson = union(enum) {
+    argv: []const []const u8,
+    /// Not JSON at all, with the parser's own word for what stopped it.
+    not_json: []const u8,
+    /// JSON, and not an array. Carries the type it was.
+    not_an_array: []const u8,
+    /// An array holding something that is not a string.
+    not_a_string: struct { at: usize, found: []const u8 },
+    /// An array with nothing in it.
+    empty,
+    /// Something else already named the command. Not produced by the parser —
+    /// this is the reading `shapeInvocation` takes when it finds a second
+    /// source, and it lives here so all five `--argv-json` refusals are one
+    /// function with one gate over them.
+    two_sources: []const u8,
+};
+
+pub fn parseArgvJson(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error!ArgvJson {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .not_json = @errorName(err) },
+    };
+    const items = switch (value) {
+        .array => |array| array.items,
+        else => return .{ .not_an_array = @tagName(value) },
+    };
+    if (items.len == 0) return .empty;
+    const argv = try arena.alloc([]const u8, items.len);
+    for (items, 0..) |item, i| {
+        argv[i] = switch (item) {
+            .string => |s| s,
+            else => return .{ .not_a_string = .{ .at = i, .found = @tagName(item) } },
+        };
+    }
+    return .{ .argv = argv };
+}
+
+/// Why an `--argv-json` was refused, or null when it was not.
+///
+/// A pure function and not a `fail` call, so a gate can read all five sentences
+/// and hold them apart. `fail` exits the process; a refusal reachable only
+/// through it is a refusal no gate can read, which is how five distinct
+/// mistakes end up sharing one message.
+pub fn argvJsonRefusal(arena: std.mem.Allocator, read: ArgvJson) std.mem.Allocator.Error!?[]const u8 {
+    const example = "e.g. --argv-json '[\"ls\",\"-la\",\"/var/log\"]'";
+    return switch (read) {
+        .argv => null,
+        .not_json => |why| try std.fmt.allocPrint(
+            arena,
+            "--argv-json is not valid JSON ({s}); nothing was sent. It takes a JSON array of strings, {s}",
+            .{ why, example },
+        ),
+        .not_an_array => |found| try std.fmt.allocPrint(
+            arena,
+            "--argv-json is valid JSON but it is a {s}, not an array; nothing was sent. An argv is a list, {s}",
+            .{ found, example },
+        ),
+        .not_a_string => |bad| try std.fmt.allocPrint(
+            arena,
+            "--argv-json element {d} is a {s}, not a string; nothing was sent. Every argv element becomes one shell word, so it has to be text already — quote it, {s}",
+            .{ bad.at, bad.found, example },
+        ),
+        .empty => try std.fmt.allocPrint(
+            arena,
+            "--argv-json is an empty array, which names no command; nothing was sent. {s}",
+            .{example},
+        ),
+        .two_sources => |other| try std.fmt.allocPrint(
+            arena,
+            "--argv-json and {s} both name the command; nothing was sent. Two sources for one command is an ambiguity, not a precedence question — pass one of them",
+            .{other},
+        ),
+    };
+}
+
+/// `--shell <value>` read: the kind, or the sentence that refuses it.
+pub const KindReading = union(enum) {
+    kind: Core.shell.Kind,
+    refused: []const u8,
+};
+
+/// `--shell`, or `bash` when it was not given.
+///
+/// Pure, for the reason `argvJsonRefusal` is. The two refusals are different
+/// sentences because they are different situations: a named shell that terminus
+/// cannot supervise is a fact about the supervisor, and an operator told that
+/// should stop, while an unrecognised word is a typo and an operator told that
+/// should look at the list.
+pub fn readKind(arena: std.mem.Allocator, value: ?[]const u8) std.mem.Allocator.Error!KindReading {
+    const given = value orelse return .{ .kind = .bash };
+    return .{ .kind = Core.shell.parseKind(given) catch |err| switch (err) {
+        error.Unsupervised => return .{ .refused = try std.fmt.allocPrint(
+            arena,
+            "--shell {s}: terminus supervises a command with a POSIX shell wrapper — it reports the pid, the pgid, a start token and the exit status, and it is written in $$ / $? / $(…) / awk / ps. {s} does not run that program, so a command sent to it would come back with no identity and no exit marker, and every run would settle indeterminate rather than fail or succeed. Nothing was sent. Accepted: {s}",
+            .{ given, given, Core.shell.kind_list },
+        ) },
+        error.Unknown => return .{ .refused = try std.fmt.allocPrint(
+            arena,
+            "--shell {s} is not a value terminus has; nothing was sent. Accepted: {s} — the vocabulary is closed on purpose, because a shell enters it once a supervisor wrapper exists for it and not before",
+            .{ given, Core.shell.kind_list },
+        ) },
+    } };
+}
+
+/// The flags a shaped invocation is made of, as a value.
+///
+/// A struct rather than seven parameters so `combinationRefusal` is a function
+/// of data: a gate can build the whole matrix and read every sentence, which is
+/// the only way a refusal that exits the process gets tested.
+pub const Request = struct {
+    kind: Core.shell.Kind,
+    login: bool = false,
+    strict: bool = false,
+    /// `--interpreter`, as given.
+    interpreter: ?[]const u8 = null,
+    /// The session an `exec` target named.
+    session: ?[]const u8 = null,
+    /// Whether the command came from `--argv-json`.
+    from_argv: bool = false,
+    /// The command text, after rendering.
+    text: []const u8 = "",
+};
+
+/// Why this combination of flags is refused, or null when it is not.
+///
+/// Every sentence names both flags and says which of them to drop, because a
+/// refusal an agent cannot act on is a refusal it retries.
+pub fn combinationRefusal(arena: std.mem.Allocator, req: Request) std.mem.Allocator.Error!?[]const u8 {
+    // `--shell none` is a statement that terminus adds no shell layer of its
+    // own. Each of these three flags *is* such a layer, so accepting one
+    // alongside it would be answering the operator's declaration with its
+    // opposite — and then recording a shell word for a wrap that did or did not
+    // happen depending on which flag won.
+    if (req.kind == .none) {
+        if (req.login) return try std.fmt.allocPrint(arena,
+            \\--shell none and --login contradict each other: --login *is* a shell layer (bash -ilc), and --shell none says terminus adds none. Nothing was sent. Drop one
+        , .{});
+        if (req.strict) return try std.fmt.allocPrint(arena,
+            \\--shell none and --strict contradict each other: --strict prepends `set -euo pipefail`, which is shell text terminus would be adding. Nothing was sent. Drop one, or set those options inside the command yourself
+        , .{});
+        if (req.interpreter) |interpreter| return try std.fmt.allocPrint(
+            arena,
+            "--shell none and --interpreter {s} contradict each other: an interpreter runs a script terminus stages, and staging is a layer --shell none says it adds none of. Nothing was sent",
+            .{interpreter},
+        );
+        if (!req.from_argv and Core.script.shouldStage(req.text)) return try std.fmt.allocPrint(arena,
+            \\--shell none was given for a multiline command, which travels as a staged remote script and so needs an interpreter to run it; nothing was sent. Send it as one command line — --argv-json keeps every element exactly one shell word, newlines included — or name a shell
+        , .{});
+    }
+
+    // A session shell is already an interactive login shell, which the skill
+    // document has said since 0.1.x. So `--login` there is a flag with nothing
+    // to do, and the old code accepted it, dropped it, and filed `bash-login`
+    // for a command it had not wrapped.
+    if (req.session) |name| {
+        if (req.login) return try std.fmt.allocPrint(
+            arena,
+            "--login has nothing to do in session '{s}': a session is a real interactive shell already, with the login PATH its own startup files built. Nothing was sent — drop --login, or drop the ':{s}' for a one-shot exec that --login can wrap",
+            .{ name, name },
+        );
+    }
+
+    if (req.from_argv) {
+        if (req.interpreter) |interpreter| return try std.fmt.allocPrint(
+            arena,
+            "--argv-json and --interpreter {s} contradict each other: an argv is one command and --interpreter runs a staged script. Nothing was sent. Pass the script through --stdin or --cmd-file instead",
+            .{interpreter},
+        );
+    }
+
+    return null;
+}
+
+/// The one place `--shell`, `--argv-json`, `--strict`, `--login` and
+/// `--interpreter` are read.
+///
+/// Every refusal here happens before a connection exists, which is the only
+/// moment at which a refusal costs nothing: no ledger row, no keys in a shell,
+/// nothing to reconcile. Each of them is produced by one of the three pure
+/// functions above, so the sentence an operator sees is the sentence a gate
+/// read.
+///
+/// `session` is the session an `exec` target named, or null.
+pub fn shapeInvocation(
+    ctx: *Ctx,
+    parsed: *const Args.Parsed,
+    session: ?[]const u8,
+    comptime usage: []const u8,
+) !Invocation {
+    const kind = switch (try readKind(ctx.arena, parsed.flag("shell"))) {
+        .kind => |k| k,
+        .refused => |why| fail("{s}", .{why}),
+    };
+
+    const argv: ?[]const []const u8 = if (parsed.flag("argv-json")) |text| argv: {
+        // A second source is looked for before the JSON is read, so an operator
+        // who supplied two commands hears about that rather than about a comma.
+        const read: ArgvJson = if (otherCommandSource(parsed)) |other|
+            .{ .two_sources = other }
+        else
+            try parseArgvJson(ctx.arena, text);
+        if (try argvJsonRefusal(ctx.arena, read)) |why| fail("{s}", .{why});
+        break :argv read.argv;
+    } else null;
+
+    const text = if (argv) |elements|
+        try Core.shell.render(ctx.arena, elements)
+    else
+        (try trailingContent(ctx, parsed, "cmd-file", 1)) orelse
+            fail("no command given\n{s}", .{usage});
+
+    const req: Request = .{
+        .kind = kind,
+        .login = parsed.boolean("login"),
+        .strict = parsed.boolean("strict"),
+        .interpreter = parsed.flag("interpreter"),
+        .session = session,
+        .from_argv = argv != null,
+        .text = text,
+    };
+    if (try combinationRefusal(ctx.arena, req)) |why| fail("{s}", .{why});
+
+    // Nothing may be staged when there is no shell layer, and nothing needs to
+    // be when the command is an argv.
+    const stageable = kind.binary() != null and argv == null;
+    return .{
+        .kind = kind,
+        .login = req.login,
+        .strict = req.strict,
+        .interpreter_flag = req.interpreter,
+        .interpreter = if (stageable) req.interpreter orelse kind.binary().? else null,
+        .argv = argv,
+        .text = text,
+    };
+}
+
+/// A second source for the command, when `--argv-json` is already one.
+///
+/// Named rather than counted, so the refusal can say which one it found. The
+/// positional threshold is 1 — the server target — and is the same number
+/// `trailingContent` is given, because it is the same question: how many
+/// positionals belong to the verb before the rest of them are the command.
+fn otherCommandSource(parsed: *const Args.Parsed) ?[]const u8 {
+    if (parsed.boolean("stdin")) return "--stdin";
+    if (parsed.flag("cmd-file") != null) return "--cmd-file";
+    if (parsed.flag("cmd") != null) return "--cmd";
+    if (parsed.rest != null) return "--";
+    if (parsed.positionals.len > 1) return "a bare positional";
+    return null;
 }
 
 /// Removes bash's tty-less interactive-mode warnings from stderr.
+///
+/// The warnings `-i` emits without a tty, which are noise rather than the
+/// command's own output. See `Core.shell.loginWrap` for where the `-i` comes
+/// from.
 pub fn stripLoginNoise(arena: std.mem.Allocator, stderr: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, stderr, '\n');

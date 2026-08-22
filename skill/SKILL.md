@@ -24,6 +24,7 @@ PowerShell and some tool-call layers mangle `--`, `;`, `*` in bare
 arguments. Prefer the quote-proof channels, most robust first:
 
 ```bash
+terminus exec <server> --argv-json '["uname","-a"]'  # argv; one word per element
 terminus exec <server> --stdin                      # command from stdin
 terminus exec <server> --cmd-file ./script.sh       # run a local script remotely
 terminus exec <server> --cmd "uname -a"             # single flag value
@@ -34,8 +35,9 @@ terminus memory add <server> --key gotchas --content-file notes.txt
 terminus memory add <server> --key gotchas --content "text with ; and *"
 ```
 
-For agents: **use `--cmd`/`--content` for one-liners and `--stdin` for
-anything with quotes, semicolons, globs, or multiple lines.**
+For agents: **use `--argv-json` when any argument is a value you did not write
+yourself** (a path, a name, anything with a space or a quote in it), `--cmd` for
+one-liners you wrote, and `--stdin` for multiline scripts.
 
 Windows CRLF is **not** rewritten for you. Command text from `--stdin` and
 `--cmd-file` is sent as they were read, byte for byte. If it holds a carriage
@@ -80,8 +82,60 @@ terminus doctor <server> --json    # loginOnlyTools lists exactly these
 terminus exec <server> --login --cmd "pm2 list"   # wraps in bash -ilc
 ```
 
-Sessions (`<server>:<sess>`) don't need `--login` — they are real
-interactive shells already.
+Sessions (`<server>:<sess>`) **refuse** `--login` — they are real interactive
+shells already, so it would do nothing. Earlier versions accepted it, dropped
+it, and recorded `shell: "bash-login"` for a command nothing had wrapped; the
+refusal happens before anything is sent, so dropping the flag is the whole fix.
+
+## Naming a command as an argv, and naming the shell
+
+Two flags for the case where the command is *data* — a path an operator typed,
+a value out of a config file — rather than something you wrote yourself:
+
+```bash
+# Every element becomes exactly one shell word. A space, an apostrophe, a $, a
+# backtick, a newline or a ; inside an element stays a byte of that word.
+terminus exec prod --argv-json '["rm","-f","/data/John'"'"'s files/x.log"]'
+terminus run prod --name tidy --argv-json '["find","/srv","-name","*.tmp","-delete"]'
+
+# Declare the interpreter. bash (the default), zsh, or none.
+terminus exec prod --shell none --argv-json '["/usr/local/bin/report","--to","a b"]'
+```
+
+`--argv-json` takes a JSON **array of strings**. It is one command, never a
+script: it is never staged, so `--interpreter` alongside it is refused, and a
+newline inside an element is part of that word rather than a second line. It is
+also a command *source*, so pairing it with `--stdin`, `--cmd`, `--cmd-file`,
+`--` or a bare positional is refused — two sources for one command is an
+ambiguity, not a precedence question. A malformed value is refused by which
+mistake it was: not JSON, not an array, an element that is not a string (with
+its index), or an empty array.
+
+`--shell` declares the interpreter and takes `bash|zsh|none`:
+
+- `bash` is the default and is what every earlier version did.
+- `zsh` wraps and stages under zsh instead (`zsh -ilc`, `zsh <script>`).
+- `none` means **terminus adds no shell layer of its own** — no `bash -ilc`, no
+  `set -euo pipefail` prefix, no staged script. It does not and cannot mean "no
+  shell ran it": SSH exec takes a command *string*, and the remote sshd hands
+  that string to the account's shell whatever terminus does. So `--login`,
+  `--strict`, `--interpreter` and a multiline command are each refused with
+  `--shell none`, because each of them is a layer it says are absent.
+
+**Any other value is refused before anything is sent**, and `powershell` is the
+one worth stating: terminus supervises a command with a POSIX shell wrapper —
+that wrapper is what reports the pid, the pgid, a start token and the exit
+status. PowerShell does not run it, so a command sent there would come back with
+no exit marker and every run would settle `indeterminate`. A shell enters the
+vocabulary once a wrapper exists for it, not before, which is why `sh` and `dash`
+are refused too.
+
+The shell that ran a command is recorded on its ledger row (`bash`,
+`bash-login`, `zsh`, `zsh-login`, `none`) and is the wrap that actually
+happened — `exec`, `run` and session `exec` all shape their command through one
+code path, so `--strict --login` composes the same way on all of them:
+`bash -ilc 'set -euo pipefail; <cmd>'`, with `--strict` inside the wrap so the
+first failing line's status is the one reported.
 
 ## Golden rule: recall before you act
 

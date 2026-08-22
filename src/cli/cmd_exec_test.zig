@@ -1376,6 +1376,54 @@ test "gate: every boolean flag exec takes is registered, so none swallows the ne
     try t.expectEqualStrings("./payload.bin", with_path.flag("stdin-file").?);
     try t.expect(!with_path.boolean("stdin-file"));
     try t.expectEqual(@as(usize, 1), with_path.positionals.len);
+
+    // The two flags this release adds are both value-taking, so both belong on
+    // that side of the rule. Registering one would be the same bug read
+    // backwards: `--shell` would stop consuming `bash`, `bash` would become a
+    // positional, and `trailing` would send it as the command — a run that
+    // executes the name of a shell.
+    var valued: usize = 0;
+    for ([_]struct { flag: []const u8, value: []const u8 }{
+        .{ .flag = "shell", .value = "none" },
+        .{ .flag = "argv-json", .value = "[\"ls\",\"-la\"]" },
+    }) |pair| {
+        valued += 1;
+        const parsed = try args.parse(arena, &.{
+            "box",
+            try std.fmt.allocPrint(arena, "--{s}", .{pair.flag}),
+            pair.value,
+            "--json",
+        });
+        // Asserted before it is read, so a flag that was registered as a
+        // boolean reports *that* rather than panicking on a null: with
+        // `--shell` in `bool_flags` the value stops being consumed, `none`
+        // becomes a positional, and `trailing` sends the name of a shell as the
+        // command.
+        const got = parsed.flag(pair.flag) orelse {
+            std.debug.print(
+                \\
+                \\--{s} did not take its value: it is registered in `args.bool_flags`,
+                \\so `{s}` became a positional and the trailing-command reader will send
+                \\it as the command.
+                \\
+            , .{ pair.flag, pair.value });
+            return error.ValueFlagRegisteredAsBoolean;
+        };
+        try t.expectEqualStrings(pair.value, got);
+        try t.expect(!parsed.boolean(pair.flag));
+        try t.expect(parsed.boolean("json"));
+        // One positional: the target. The value did not become a second one.
+        try t.expectEqual(@as(usize, 1), parsed.positionals.len);
+        // And `--flag=value` reaches the same place, which is how PowerShell
+        // users pass a JSON array without the shell eating it.
+        const joined = try args.parse(arena, &.{
+            "box",
+            try std.fmt.allocPrint(arena, "--{s}={s}", .{ pair.flag, pair.value }),
+        });
+        try t.expectEqualStrings(pair.value, joined.flag(pair.flag).?);
+        try t.expectEqual(@as(usize, 1), joined.positionals.len);
+    }
+    try t.expectEqual(@as(usize, 2), valued);
 }
 
 // --- gate: the document -------------------------------------------------------
@@ -1487,4 +1535,791 @@ test "gate: the empty-stream digest matches the hash of nothing" {
     try t.expectEqual(@as(u64, 0), taken.bytes);
     try t.expectEqualStrings(Ssh.empty_sha256, taken.sha256[0..]);
     try t.expectEqual(@as(usize, 1), recorder.ends);
+}
+
+// --- gates: one argv element, one shell word ----------------------------------
+//
+// The transport takes a command *string*, not an argv array
+// (`libssh2_channel_process_startup`), and the remote sshd hands that string to
+// the account's shell whatever terminus does. So `--argv-json` cannot bypass a
+// shell and does not claim to. What it claims is narrower and checkable: every
+// element arrives as exactly one shell word, so nothing inside one can become
+// syntax.
+//
+// Checked with `shell.words`, which is the inverse operation — it applies the
+// splitting rules a POSIX shell applies and hands back the words it would see. A
+// gate that eyeballed the quote marks would be asserting that the bytes look
+// right, which is not the question; the question is what the host would split
+// them into.
+
+/// The bytes that are syntax to a shell, one per element, plus the ones that end
+/// a word.
+const nasty_argv = [_][]const u8{
+    "printf",
+    "%s\n",
+    "two words",
+    "John's file",
+    "$HOME/$(whoami)",
+    "`id -u`",
+    "a\nb",
+    "one;rm -rf /",
+    "*",
+    "\t tab \t",
+    "",
+};
+
+test "gate: every argv element survives as exactly one shell word" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const line = try Core.shell.render(arena, &nasty_argv);
+
+    // The inverse. Element for element, and the count first: a reader that
+    // returned one word too many or too few would otherwise pass the loop over
+    // whichever elements happened to line up.
+    const split = try Core.shell.words(arena, line);
+    try t.expectEqual(nasty_argv.len, split.len);
+    var checked: usize = 0;
+    for (nasty_argv, split) |want, got| {
+        checked += 1;
+        try t.expectEqualStrings(want, got);
+    }
+    try t.expectEqual(@as(usize, 11), checked);
+
+    // And each of those bytes really is in the fixture — a gate over an argv
+    // that had been trimmed down to `ls -la` would pass every assertion above
+    // while testing nothing. Counted per byte, so a missing one is named.
+    var present: usize = 0;
+    for ([_][]const u8{ " ", "'", "$", "`", "\n", ";", "*", "\t" }) |syntax| {
+        for (nasty_argv) |element| {
+            if (std.mem.indexOf(u8, element, syntax) != null) {
+                present += 1;
+                break;
+            }
+        }
+    }
+    try t.expectEqual(@as(usize, 8), present);
+
+    // The line is one command's worth of words and nothing else: no element
+    // leaked a separator into the text between two of them.
+    try t.expectEqual(nasty_argv.len - 1, std.mem.count(u8, line, "' '"));
+
+    // The apostrophe on its own, because it is the one byte a quoter that
+    // merely wraps in single quotes gets wrong: it is the terminator, so an
+    // element holding one either closes its word early or is escaped. And the
+    // text an unescaped wrap would have produced is a failure this reader
+    // *reports* rather than silently mis-splits, which is what makes the
+    // element-for-element comparison above an assertion and not an inspection.
+    const one = [_][]const u8{"it's; rm -rf ~"};
+    const alone = try Core.shell.words(arena, try Core.shell.render(arena, &one));
+    try t.expectEqual(@as(usize, 1), alone.len);
+    try t.expectEqualStrings("it's; rm -rf ~", alone[0]);
+    try t.expectError(
+        error.UnbalancedQuote,
+        Core.shell.words(arena, "'it's; rm -rf ~'"),
+    );
+}
+
+test "gate: --argv-json and -- <cmd> agree for an argv that needs no quoting" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The same command through the two channels. `--` joins its tokens with
+    // spaces — the local shell already split them and the boundaries are gone
+    // by the time `Args` sees them — while `--argv-json` renders each element
+    // as a word. The texts therefore differ, and what has to agree is what a
+    // host would make of them, which is the only sense in which two command
+    // channels can be said to produce the same command.
+    const rest = try args.parse(arena, &.{ "box", "--", "systemctl", "restart", "api" });
+    const joined = (try rest.trailing(arena, 1)).?;
+
+    const read = try Cli.parseArgvJson(arena, "[\"systemctl\",\"restart\",\"api\"]");
+    try t.expectEqual(@as(?[]const u8, null), try Cli.argvJsonRefusal(arena, read));
+    const rendered = try Core.shell.render(arena, read.argv);
+
+    try t.expectEqualStrings("systemctl restart api", joined);
+    try t.expectEqualStrings("'systemctl' 'restart' 'api'", rendered);
+
+    const from_rest = try Core.shell.words(arena, joined);
+    const from_argv = try Core.shell.words(arena, rendered);
+    try t.expectEqual(from_rest.len, from_argv.len);
+    try t.expectEqual(@as(usize, 3), from_argv.len);
+    var checked: usize = 0;
+    for (from_rest, from_argv) |a, b| {
+        checked += 1;
+        try t.expectEqualStrings(a, b);
+    }
+    try t.expectEqual(@as(usize, 3), checked);
+}
+
+test "gate: a malformed --argv-json is refused by which mistake it was" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Five mistakes, five readings, five sentences. Collapsing them into one
+    // "invalid --argv-json" is the failure this gate exists for: an agent told
+    // only that its argv was invalid retries the same argv, and the one thing
+    // every message here has to do is say which of them happened.
+    const cases = [_]struct {
+        text: []const u8,
+        tag: std.meta.Tag(Cli.ArgvJson),
+        says: []const u8,
+    }{
+        .{ .text = "[\"ls\", ", .tag = .not_json, .says = "not valid JSON" },
+        .{ .text = "{\"argv\":[\"ls\"]}", .tag = .not_an_array, .says = "not an array" },
+        .{ .text = "\"ls -la\"", .tag = .not_an_array, .says = "not an array" },
+        .{ .text = "[\"kill\",9]", .tag = .not_a_string, .says = "not a string" },
+        .{ .text = "[\"ls\",null]", .tag = .not_a_string, .says = "not a string" },
+        .{ .text = "[]", .tag = .empty, .says = "empty array" },
+    };
+
+    var sentences: std.ArrayList([]const u8) = .empty;
+    var checked: usize = 0;
+    for (cases) |case| {
+        checked += 1;
+        const read = try Cli.parseArgvJson(arena, case.text);
+        try t.expectEqual(case.tag, std.meta.activeTag(read));
+        const why = (try Cli.argvJsonRefusal(arena, read)) orelse {
+            std.debug.print("\n--argv-json {s} was accepted\n", .{case.text});
+            return error.MalformedArgvAccepted;
+        };
+        // The sentence names the mistake, names the flag, and says nothing was
+        // sent — all three, because a refusal an agent cannot act on is a
+        // refusal it retries.
+        try t.expect(std.mem.indexOf(u8, why, case.says) != null);
+        try t.expect(std.mem.indexOf(u8, why, "--argv-json") != null);
+        try t.expect(std.mem.indexOf(u8, why, "nothing was sent") != null);
+        try sentences.append(arena, why);
+    }
+    try t.expectEqual(@as(usize, 6), checked);
+
+    // The element index is in the message: "an element is not a string" is not
+    // actionable for a forty-element argv.
+    const numbered = (try Cli.argvJsonRefusal(arena, try Cli.parseArgvJson(arena, "[\"a\",\"b\",7]"))).?;
+    try t.expect(std.mem.indexOf(u8, numbered, "element 2") != null);
+    try t.expect(std.mem.indexOf(u8, numbered, "integer") != null);
+
+    // A second command source is the fifth reading, and its own sentence too.
+    const two = (try Cli.argvJsonRefusal(arena, .{ .two_sources = "--stdin" })).?;
+    try t.expect(std.mem.indexOf(u8, two, "--stdin") != null);
+    try sentences.append(arena, two);
+
+    // Distinct. Not "each is non-empty": five different mistakes with one
+    // sentence between them passes every assertion above.
+    var pairs: usize = 0;
+    for (sentences.items, 0..) |a, i| {
+        for (sentences.items[i + 1 ..]) |b| {
+            pairs += 1;
+            if (std.mem.eql(u8, a, b)) {
+                std.debug.print("\ntwo --argv-json refusals share a sentence:\n  {s}\n", .{a});
+                return error.RefusalsCollapsed;
+            }
+        }
+    }
+    try t.expectEqual(@as(usize, 21), pairs);
+
+    // And a well-formed argv is not refused.
+    const good = try Cli.parseArgvJson(arena, "[\"echo\",\"hi\"]");
+    try t.expectEqual(@as(?[]const u8, null), try Cli.argvJsonRefusal(arena, good));
+    try t.expectEqual(@as(usize, 2), good.argv.len);
+}
+
+// --- gates: the declared shell ------------------------------------------------
+
+test "gate: a --shell value with no supervisor wrapper is refused by name" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The reason the vocabulary is closed, read off the supervisor itself
+    // rather than asserted from memory: `wrapShell` is the program that
+    // provides the pid, the pgid, the start token and the exit marker
+    // `parseShell` reads, and it is POSIX shell. PowerShell does not run it, so
+    // a command sent to PowerShell would come back with no exit marker at all —
+    // which `runCommand` must settle `indeterminate`, not `failed`. That is
+    // nominal support, and shipping it is what this refusal prevents.
+    const wrapper = try Core.supervisor.wrapShell(arena, "true", 7);
+    var posix: usize = 0;
+    for ([_][]const u8{ "$$", "$?", "$(", "/proc/", "awk", "ps -o", "printf", "tr -d" }) |shellism| {
+        if (std.mem.indexOf(u8, wrapper, shellism) == null) {
+            std.debug.print("\nsupervisor.wrapShell no longer uses {s}\n", .{shellism});
+            return error.SupervisorNotPosix;
+        }
+        posix += 1;
+    }
+    try t.expectEqual(@as(usize, 8), posix);
+
+    // Every accepted value, taken from the enum rather than from a list beside
+    // it, so a member the parser takes cannot be missing here.
+    var accepted: usize = 0;
+    inline for (@typeInfo(Core.shell.Kind).@"enum".fields) |field| {
+        accepted += 1;
+        const reading = try Cli.readKind(arena, field.name);
+        try t.expectEqual(std.meta.stringToEnum(Core.shell.Kind, field.name).?, reading.kind);
+        // And it is in the sentence a refusal prints, so a value the parser
+        // takes cannot be missing from the list an operator is offered.
+        try t.expect(std.mem.indexOf(u8, Core.shell.kind_list, field.name) != null);
+    }
+    try t.expectEqual(@as(usize, 3), accepted);
+
+    // Every named shell with no wrapper, refused with the supervisor's reason.
+    var refused: usize = 0;
+    for (Core.shell.unsupervised_names) |name| {
+        refused += 1;
+        const why = switch (try Cli.readKind(arena, name)) {
+            .kind => {
+                std.debug.print("\n--shell {s} was accepted with no supervisor wrapper\n", .{name});
+                return error.UnsupervisedShellAccepted;
+            },
+            .refused => |sentence| sentence,
+        };
+        try t.expect(std.mem.indexOf(u8, why, name) != null);
+        // Before anything is sent, for a stated reason, and with the
+        // alternatives — all three.
+        try t.expect(std.mem.indexOf(u8, why, "Nothing was sent") != null);
+        try t.expect(std.mem.indexOf(u8, why, "indeterminate") != null);
+        try t.expect(std.mem.indexOf(u8, why, Core.shell.kind_list) != null);
+    }
+    try t.expectEqual(@as(usize, 8), refused);
+
+    // powershell by name, so a list edited down to nothing relevant fails here
+    // rather than passing over an empty region.
+    try t.expectError(error.Unsupervised, Core.shell.parseKind("powershell"));
+    try t.expectError(error.Unsupervised, Core.shell.parseKind("pwsh"));
+
+    // An unrecognised word is a different refusal: a typo, so it points at the
+    // list rather than at the supervisor. `sh` is deliberately in here — it
+    // would run the wrapper perfectly well and it is still not in the
+    // vocabulary, because a value enters that enum once somebody has driven it
+    // and not before.
+    var unknown: usize = 0;
+    for ([_][]const u8{ "sh", "dash", "ksh", "bahs", "", "BASH" }) |name| {
+        unknown += 1;
+        try t.expectError(error.Unknown, Core.shell.parseKind(name));
+        const why = (try Cli.readKind(arena, name)).refused;
+        try t.expect(std.mem.indexOf(u8, why, "not a value terminus has") != null);
+        try t.expect(std.mem.indexOf(u8, why, Core.shell.kind_list) != null);
+    }
+    try t.expectEqual(@as(usize, 6), unknown);
+
+    // No flag at all is bash, which is what every run before this change was.
+    try t.expectEqual(Core.shell.Kind.bash, (try Cli.readKind(arena, null)).kind);
+}
+
+test "gate: --shell none refuses every layer it says terminus does not add" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `--shell none` is a declaration: terminus adds no shell layer of its own.
+    // Accepting a flag that *is* such a layer and quietly dropping it is the
+    // shape of the defect this whole change is about — the old code accepted
+    // `--login` on a session target, dropped it, and recorded `bash-login`.
+    const contradictions = [_]struct {
+        req: Cli.Request,
+        names: []const u8,
+    }{
+        .{ .req = .{ .kind = .none, .login = true, .text = "ls" }, .names = "--login" },
+        .{ .req = .{ .kind = .none, .strict = true, .text = "ls" }, .names = "--strict" },
+        .{ .req = .{ .kind = .none, .interpreter = "python3", .text = "ls" }, .names = "--interpreter" },
+        .{ .req = .{ .kind = .none, .text = "one\ntwo" }, .names = "multiline" },
+        .{ .req = .{ .kind = .bash, .from_argv = true, .interpreter = "python3", .text = "'ls'" }, .names = "--argv-json" },
+        .{ .req = .{ .kind = .bash, .login = true, .session = "work", .text = "ls" }, .names = "--login" },
+    };
+
+    var sentences: std.ArrayList([]const u8) = .empty;
+    var checked: usize = 0;
+    for (contradictions) |case| {
+        checked += 1;
+        const why = (try Cli.combinationRefusal(arena, case.req)) orelse {
+            std.debug.print("\naccepted a contradiction naming {s}\n", .{case.names});
+            return error.ContradictionAccepted;
+        };
+        try t.expect(std.mem.indexOf(u8, why, case.names) != null);
+        try t.expect(std.mem.indexOf(u8, why, "othing was sent") != null);
+        try sentences.append(arena, why);
+    }
+    try t.expectEqual(@as(usize, 6), checked);
+
+    var pairs: usize = 0;
+    for (sentences.items, 0..) |a, i| {
+        for (sentences.items[i + 1 ..]) |b| {
+            pairs += 1;
+            if (std.mem.eql(u8, a, b)) {
+                std.debug.print("\ntwo combination refusals share a sentence:\n  {s}\n", .{a});
+                return error.RefusalsCollapsed;
+            }
+        }
+    }
+    try t.expectEqual(@as(usize, 15), pairs);
+
+    // And the combinations that are fine stay fine, including the one the
+    // composition rule is about. A refusal matrix that refused everything would
+    // pass every assertion above.
+    var allowed: usize = 0;
+    for ([_]Cli.Request{
+        .{ .kind = .none, .from_argv = true, .text = "'ls' '-la'" },
+        // An argv element may hold a newline: it is one word, not a second
+        // line, so the multiline refusal does not reach it.
+        .{ .kind = .none, .from_argv = true, .text = "'printf' 'a\nb'" },
+        .{ .kind = .bash, .login = true, .strict = true, .text = "make deploy" },
+        .{ .kind = .zsh, .login = true, .strict = true, .text = "make deploy" },
+        .{ .kind = .bash, .interpreter = "python3", .text = "print(1)" },
+        // A session target without --login is the ordinary case.
+        .{ .kind = .bash, .session = "work", .strict = true, .text = "make deploy" },
+    }) |req| {
+        allowed += 1;
+        try t.expectEqual(@as(?[]const u8, null), try Cli.combinationRefusal(arena, req));
+    }
+    try t.expectEqual(@as(usize, 6), allowed);
+}
+
+// --- gates: one shaper, and the word that comes out of it ----------------------
+
+test "gate: --strict goes inside the login wrap, on one code path for both verbs" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The composition order, which used to be expressed only by the physical
+    // arrangement of `if / else if` in three copies of one block. `--strict`
+    // belongs *inside* the wrap: its whole purpose is that the first failing
+    // line's status becomes the result, and a `set -euo pipefail` moved outside
+    // the wrap reports the login shell's own `$?` instead.
+    const both: Cli.Invocation = .{
+        .kind = .bash,
+        .login = true,
+        .strict = true,
+        .interpreter_flag = null,
+        .interpreter = "bash",
+        .argv = null,
+        .text = "make deploy",
+    };
+    const line = try both.inlineCommand(arena);
+    try t.expectEqualStrings("bash -ilc 'set -euo pipefail; make deploy'", line);
+
+    // Read back the way a host would: three words, the third being the whole
+    // script including the options. The reverse order — `set -euo pipefail;
+    // bash -ilc 'make deploy'` — splits into five words with `bash` third, so
+    // this is an assertion about the composition and not about the bytes.
+    const split = try Core.shell.words(arena, line);
+    try t.expectEqual(@as(usize, 3), split.len);
+    try t.expectEqualStrings("bash", split[0]);
+    try t.expectEqualStrings("-ilc", split[1]);
+    try t.expectEqualStrings("set -euo pipefail; make deploy", split[2]);
+
+    // All four corners of the same two flags.
+    var corners: usize = 0;
+    for ([_]struct { login: bool, strict: bool, want: []const u8 }{
+        .{ .login = false, .strict = false, .want = "make deploy" },
+        .{ .login = false, .strict = true, .want = "set -euo pipefail; make deploy" },
+        .{ .login = true, .strict = false, .want = "bash -ilc 'make deploy'" },
+        .{ .login = true, .strict = true, .want = "bash -ilc 'set -euo pipefail; make deploy'" },
+    }) |corner| {
+        corners += 1;
+        var inv = both;
+        inv.login = corner.login;
+        inv.strict = corner.strict;
+        try t.expectEqualStrings(corner.want, try inv.inlineCommand(arena));
+    }
+    try t.expectEqual(@as(usize, 4), corners);
+
+    // `--shell zsh` wraps in zsh, and the strict prefix is still inside it.
+    var zsh = both;
+    zsh.kind = .zsh;
+    zsh.interpreter = "zsh";
+    try t.expectEqualStrings("zsh -ilc 'set -euo pipefail; make deploy'", try zsh.inlineCommand(arena));
+
+    // A command holding an apostrophe survives the wrap as one word. This is
+    // the case the old `bash -ilc '{s}'` in `script.zig` got wrong.
+    var quoted = both;
+    quoted.strict = false;
+    quoted.text = "echo it's fine";
+    const back = try Core.shell.words(arena, try quoted.inlineCommand(arena));
+    try t.expectEqual(@as(usize, 3), back.len);
+    try t.expectEqualStrings("echo it's fine", back[2]);
+}
+
+test "gate: neither verb can spell a shell word or a wrap of its own" {
+    const t = std.testing;
+
+    // The fourth copy of the defect, made unwritable rather than merely
+    // corrected. `operations.shell` and `job_attempts.shell` were computed
+    // three times as `if (parsed.boolean("login")) "bash-login" else "bash"` —
+    // one of them before `exec` had even forked into its session path, so
+    // `exec host:sess --login -- cmd` filed `bash-login` for a command nothing
+    // login-wrapped. No command prints the column, which is why it survived.
+    //
+    // Adding `--argv-json` and `--shell` to three copies of the composition
+    // block would have been the fourth instance of that class in this release.
+    // So the spellings are forbidden in both commands' source, and the shaper
+    // use is a floor rather than a ceiling, so a scan over a file that stopped
+    // using it fails instead of reporting that it found nothing wrong.
+    //
+    // Comments are stripped (`shell.countInCode`), because the doc comment that
+    // explains why a spelling is forbidden must not become the reason the gate
+    // fails — a gate that cannot be satisfied gets turned off.
+    const sources = [_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = "cmd_exec.zig", .text = @embedFile("cmd_exec.zig") },
+        .{ .name = "cmd_job.zig", .text = @embedFile("cmd_job.zig") },
+    };
+
+    var scanned: usize = 0;
+    for (sources) |source| {
+        scanned += 1;
+        // The forbidden spellings first, so that when a verb goes back to
+        // computing its own word the diagnostic an engineer reads is the one
+        // that says why it may not, rather than a floor further down noticing
+        // that a call went missing.
+        var forbidden: usize = 0;
+        for ([_][]const u8{
+            // The word itself. Only `Cli.Invocation.shellWord` may say it.
+            "\"bash-login\"",
+            // Reading the flag is how a caller would recompute the word or the
+            // wrap. The shaper reads it once and hands out the answer.
+            "boolean(\"login\")",
+            // The wrap, in the spelling it had here.
+            "loginWrap",
+            // The composition, as the format template it was.
+            "set -euo pipefail; {s}",
+        }) |spelling| {
+            forbidden += 1;
+            const found = Core.shell.countInCode(source.text, spelling);
+            if (found != 0) {
+                std.debug.print(
+                    \\
+                    \\{s} spells `{s}` {d} time(s). The shell a command ran under is
+                    \\decided in `Cli.shapeInvocation` and named by `Invocation.shellWord`;
+                    \\a caller that did not perform the wrap must not be able to write a
+                    \\word describing one, which is how `exec host:sess --login` came to
+                    \\record `bash-login` for a command nothing wrapped.
+                    \\
+                , .{ source.name, spelling, found });
+                return error.ShellWordRecomputed;
+            }
+        }
+        try t.expectEqual(@as(usize, 4), forbidden);
+
+        // A floor, not the exact count: these files are edited for other
+        // reasons and a gate that fails for somebody else's reason is one
+        // people learn to read past. What it catches is a file that went back
+        // to shaping its own command.
+        const shaped = Core.shell.countInCode(source.text, "inv.");
+        if (shaped < 4) {
+            std.debug.print("\n{s} uses the shaper {d} time(s); expected at least 4\n", .{ source.name, shaped });
+            return error.ShaperUnused;
+        }
+        try t.expectEqual(@as(usize, 1), Core.shell.countInCode(source.text, "shapeInvocation"));
+        try t.expect(Core.shell.countInCode(source.text, "inv.shellWord()") >= 1);
+
+        // And the scan is looking at a file that still sends commands, so this
+        // is not a pass over an empty region.
+        try t.expect(Core.shell.countInCode(source.text, "Core.script.stage") >= 1);
+        try t.expect(Core.shell.countInCode(source.text, "inv.inlineCommand") >= 1);
+    }
+    try t.expectEqual(@as(usize, 2), scanned);
+}
+
+test "gate: the ledger's shell word is the wrap that happened, session included" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The property, over the whole cross-product: the word `operations.shell`
+    // and `job_attempts.shell` receive says "login" exactly when the command
+    // that was sent is a login wrap. Not "the word is plausible" — both are
+    // read off the same value and compared.
+    var checked: usize = 0;
+    inline for (@typeInfo(Core.shell.Kind).@"enum".fields) |field| {
+        const kind = std.meta.stringToEnum(Core.shell.Kind, field.name).?;
+        for ([_]bool{ false, true }) |login| {
+            for ([_]bool{ false, true }) |strict| {
+                // `--shell none` never logins or stricts: those combinations
+                // are refused before a shape exists, and the gate above holds
+                // that. Skipped here rather than asserted, because an
+                // invocation that cannot be built has no text to check.
+                if (kind == .none and (login or strict)) continue;
+                checked += 1;
+                const inv: Cli.Invocation = .{
+                    .kind = kind,
+                    .login = login,
+                    .strict = strict,
+                    .interpreter_flag = null,
+                    .interpreter = kind.binary(),
+                    .argv = null,
+                    .text = "make deploy",
+                };
+                const line = try inv.inlineCommand(arena);
+                const word = inv.shellWord();
+                const says_login = std.mem.indexOf(u8, word, "-login") != null;
+                try t.expectEqual(login, says_login);
+                if (says_login) {
+                    const binary = kind.binary().?;
+                    try t.expect(std.mem.startsWith(u8, line, try std.fmt.allocPrint(arena, "{s} -ilc ", .{binary})));
+                    try t.expect(std.mem.startsWith(u8, word, binary));
+                } else {
+                    try t.expect(std.mem.indexOf(u8, line, "-ilc") == null);
+                }
+            }
+        }
+    }
+    try t.expectEqual(@as(usize, 9), checked);
+
+    // The exact vocabulary, pinned, because these words go into an append-only
+    // ledger and renaming one is a migration nobody asked for.
+    var words: usize = 0;
+    for ([_]struct { kind: Core.shell.Kind, login: bool, word: []const u8 }{
+        .{ .kind = .bash, .login = false, .word = "bash" },
+        .{ .kind = .bash, .login = true, .word = "bash-login" },
+        .{ .kind = .zsh, .login = false, .word = "zsh" },
+        .{ .kind = .zsh, .login = true, .word = "zsh-login" },
+        .{ .kind = .none, .login = false, .word = "none" },
+    }) |case| {
+        words += 1;
+        const inv: Cli.Invocation = .{
+            .kind = case.kind,
+            .login = case.login,
+            .strict = false,
+            .interpreter_flag = null,
+            .interpreter = case.kind.binary(),
+            .argv = null,
+            .text = "ls",
+        };
+        try t.expectEqualStrings(case.word, inv.shellWord());
+    }
+    try t.expectEqual(@as(usize, 5), words);
+
+    // **The session target.** This is the row that was wrong: `exec
+    // host:sess --login -- cmd` computed its word before the fork into
+    // `runInSession`, which never login-wrapped a one-liner, so the ledger
+    // claimed a wrap that had not happened. The combination is now refused, so
+    // a session target cannot reach a login word at all — asserted from the
+    // refusal, because "the word would have been right" is not a property a
+    // shape that cannot exist has.
+    try t.expect((try Cli.combinationRefusal(arena, .{
+        .kind = .bash,
+        .login = true,
+        .session = "work",
+        .text = "cmd",
+    })) != null);
+    const in_session: Cli.Invocation = .{
+        .kind = .bash,
+        .login = false,
+        .strict = false,
+        .interpreter_flag = null,
+        .interpreter = "bash",
+        .argv = null,
+        .text = "cmd",
+    };
+    try t.expectEqualStrings("bash", in_session.shellWord());
+    try t.expectEqualStrings("cmd", try in_session.inlineCommand(arena));
+}
+
+test "gate: a staged script is wrapped by the same rule and stages what it says" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The other half of the composition rule. In the staged path `--strict` is
+    // a line *inside* the script file and `--login` wraps the invocation of the
+    // interpreter, so "inside the wrap" is different bytes and the same effect.
+    // Driven through `Core.Scripted`, which is the real `script.stage` loop with
+    // the channel replaced — so the base64 this reads is the base64 a host would
+    // have been handed.
+    const script_body = "git pull\nnpm ci\n";
+    var channel = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = "", .stderr = "" } },
+        .{ .reply = .{ .exit_code = 0, .stdout = "", .stderr = "" } },
+    });
+
+    const inv: Cli.Invocation = .{
+        .kind = .bash,
+        .login = true,
+        .strict = true,
+        .interpreter_flag = null,
+        .interpreter = "bash",
+        .argv = null,
+        .text = script_body,
+    };
+    // Multiline, so it stages — and it stages because the text says so, not
+    // because a flag was passed.
+    try t.expect(inv.stages());
+    const staged = try Core.script.stage(channel.executor(), arena, inv.text, inv.scriptOptions(), 77);
+
+    // The command that runs it is the login wrap of `<interpreter> <path>`, as
+    // three shell words with the whole invocation as the third. The old
+    // spelling was `bash -ilc '{s}'`, a template whose quotes escaped nothing.
+    const split = try Core.shell.words(arena, staged.command);
+    try t.expectEqual(@as(usize, 3), split.len);
+    try t.expectEqualStrings("bash", split[0]);
+    try t.expectEqualStrings("-ilc", split[1]);
+    try t.expectEqualStrings(
+        try std.fmt.allocPrint(arena, "bash {s}", .{staged.remote_path}),
+        split[2],
+    );
+
+    // And `set -euo pipefail` is in the file rather than on the command line:
+    // the script's own first line, so the first failing line of the script is
+    // the one whose status comes back.
+    try t.expect(std.mem.indexOf(u8, staged.command, "pipefail") == null);
+    try t.expectEqual(@as(usize, 2), channel.seen.items.len);
+    const uploaded = try decodeStagedBody(arena, channel.seen.items[1]);
+    try t.expectEqualStrings("set -euo pipefail\n" ++ script_body, uploaded);
+
+    // Without `--login` there is no wrap at all, which is the other half of
+    // `login_shell` being one field: no name, no wrap.
+    var plain = inv;
+    plain.login = false;
+    var second = Core.Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = "", .stderr = "" } },
+        .{ .reply = .{ .exit_code = 0, .stdout = "", .stderr = "" } },
+    });
+    const bare = try Core.script.stage(second.executor(), arena, plain.text, plain.scriptOptions(), 78);
+    try t.expectEqualStrings(
+        try std.fmt.allocPrint(arena, "bash {s}", .{bare.remote_path}),
+        bare.command,
+    );
+
+    // An argv never stages: it is one command rather than a script, and a
+    // newline inside an element is a byte of a word rather than a second line.
+    const argv = [_][]const u8{ "printf", "a\nb" };
+    const from_argv: Cli.Invocation = .{
+        .kind = .bash,
+        .login = false,
+        .strict = false,
+        .interpreter_flag = null,
+        .interpreter = null,
+        .argv = &argv,
+        .text = try Core.shell.render(arena, &argv),
+    };
+    try t.expect(!from_argv.stages());
+    try t.expectEqualStrings(from_argv.text, try from_argv.inlineCommand(arena));
+    try t.expectEqualStrings("none", from_argv.interpreterWord());
+
+    // `--interpreter` stages a one-liner, which is what it has always meant.
+    const explicit: Cli.Invocation = .{
+        .kind = .bash,
+        .login = false,
+        .strict = false,
+        .interpreter_flag = "python3",
+        .interpreter = "python3",
+        .argv = null,
+        .text = "print(1)",
+    };
+    try t.expect(explicit.stages());
+    try t.expectEqualStrings("python3", explicit.interpreterWord());
+
+    // And `--shell zsh` stages under zsh rather than under bash, so the word an
+    // attempt records is the interpreter that ran it.
+    const under_zsh: Cli.Invocation = .{
+        .kind = .zsh,
+        .login = false,
+        .strict = false,
+        .interpreter_flag = null,
+        .interpreter = "zsh",
+        .argv = null,
+        .text = "a\nb",
+    };
+    try t.expect(under_zsh.stages());
+    try t.expectEqualStrings("zsh", under_zsh.scriptOptions().interpreter);
+}
+
+/// The script body out of a `printf '%s' '<b64>' | base64 -d >> <path>` line.
+///
+/// Reads the bytes the channel was handed rather than the bytes that went into
+/// the encoder, so what the gate above checks is what a host would decode.
+fn decodeStagedBody(arena: std.mem.Allocator, command: []const u8) ![]const u8 {
+    const open = (std.mem.indexOf(u8, command, "' '") orelse return error.NotAStagingCommand) + 3;
+    const close = std.mem.indexOfScalarPos(u8, command, open, '\'') orelse return error.NotAStagingCommand;
+    const encoded = command[open..close];
+    const decoder = std.base64.standard.Decoder;
+    const out = try arena.alloc(u8, try decoder.calcSizeForSlice(encoded));
+    try decoder.decode(out, encoded);
+    return out;
+}
+
+// --- gate: the document -------------------------------------------------------
+
+test "gate: the skill document describes the argv channel and the shell vocabulary" {
+    const t = std.testing;
+    const heading = "## Naming a command as an argv, and naming the shell";
+    // Found by name, never by position and never by counting sections: this
+    // document is appended to, so a gate that counted would fail on the next
+    // section somebody adds while a gate that indexed would read a different
+    // one.
+    const at = std.mem.indexOf(u8, skill_doc.text, heading) orelse {
+        std.debug.print(
+            \\
+            \\skill/SKILL.md has no "{s}" section. An agent that cannot read
+            \\about `--argv-json` will keep pasting operator-supplied paths into command
+            \\text, which is the thing this channel replaces.
+            \\
+        , .{heading});
+        return error.SkillArgvSectionMissing;
+    };
+    const rest = skill_doc.text[at + heading.len ..];
+    const section = rest[0 .. std.mem.indexOf(u8, rest, "\n## ") orelse rest.len];
+
+    var claims: usize = 0;
+    for ([_][]const u8{
+        // The two flags.
+        "`--argv-json`",
+        "`--shell`",
+        // The property that makes the argv channel worth having, and the honest
+        // limit on it — an agent told `none` bypasses the shell would draw the
+        // wrong conclusion about quoting.
+        "exactly one shell word",
+        "no shell layer of its own",
+        "the account's shell",
+        // The whole accepted vocabulary, so a value the binary takes cannot be
+        // undocumented.
+        "`bash|zsh|none`",
+        // The refusal that matters most, with its reason.
+        "powershell",
+        "before anything is sent",
+        "indeterminate",
+        // What is refused alongside the argv channel, since each of these is a
+        // command an agent would otherwise expect to work.
+        "`--interpreter` alongside it is refused",
+        "ambiguity",
+        // The ledger word and the composition order, which are the two things
+        // the single shaper exists to make true.
+        "`bash -ilc 'set -euo pipefail; <cmd>'`",
+        "inside the wrap",
+    }) |needle| {
+        if (std.mem.indexOf(u8, section, needle) == null) {
+            std.debug.print(
+                \\
+                \\skill/SKILL.md: the argv/shell section no longer states "{s}".
+                \\
+            , .{needle});
+            return error.SkillArgvClaimMissing;
+        }
+        claims += 1;
+    }
+    // Counted, so a scan over a section that was emptied fails rather than
+    // reporting that it found nothing wrong.
+    try t.expectEqual(@as(usize, 13), claims);
+
+    // Both flags are in the usage each verb prints, so `--help` and the
+    // document cannot drift apart.
+    try t.expect(std.mem.indexOf(u8, cmd_exec.usage, "--argv-json") != null);
+    try t.expect(std.mem.indexOf(u8, cmd_exec.usage, "--shell bash|zsh|none") != null);
+
+    // And the promise the old document made about sessions is gone rather than
+    // merely surrounded by new text: it said they "don't need `--login`", which
+    // read as "harmless", and the flag was accepted, dropped, and recorded.
+    try t.expect(std.mem.indexOf(u8, skill_doc.text, "don't need `--login`") == null);
+    try t.expect(std.mem.indexOf(u8, skill_doc.text, "**refuse** `--login`") != null);
 }

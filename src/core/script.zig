@@ -17,6 +17,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ssh = @import("ssh/Client.zig");
 const Executor = @import("exec.zig").Executor;
+const shell = @import("shell.zig");
 
 const remote_dir = "/tmp/.terminus";
 
@@ -34,8 +35,12 @@ pub const Options = struct {
     /// Prepend `set -euo pipefail` (bash/sh only): any failing line stops
     /// the script and its exit code becomes the result.
     strict: bool = false,
-    /// Wrap execution in `bash -ilc` for the interactive PATH.
-    login: bool = false,
+    /// The shell binary a login wrap uses, or null for no login wrap.
+    ///
+    /// One field rather than a `login: bool` beside a name, so "wrap it" and
+    /// "with what" cannot disagree — the pair had no third state and a bool
+    /// alone had no way to say `zsh`.
+    login_shell: ?[]const u8 = null,
 };
 
 pub const Staged = struct {
@@ -100,8 +105,8 @@ pub fn stage(
     }
 
     const base = try std.fmt.allocPrint(arena, "{s} {s}", .{ options.interpreter, remote_path });
-    const command = if (options.login)
-        try std.fmt.allocPrint(arena, "bash -ilc '{s}'", .{base})
+    const command = if (options.login_shell) |binary|
+        try shell.loginWrap(arena, binary, base)
     else
         base;
     return .{ .command = command, .remote_path = remote_path };
