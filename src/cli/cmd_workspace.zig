@@ -1,8 +1,10 @@
 //! `terminus workspace` — per-server default working directory.
 //!
 //! The workspace is applied automatically by `exec <server>` (plain,
-//! non-session) and `run` — commands execute in it without fragile
-//! `cd X && ...` prefixes. Session targets keep their own live cwd.
+//! non-session) and `run` — through `shell.cdInto`, which renders it as exactly
+//! one shell word. `set` therefore validates with `shell.cwdRefusal`, the same
+//! predicate `exec` uses, rather than a character blacklist of its own.
+//! Session targets keep their own live cwd.
 const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
@@ -32,8 +34,20 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, verb, "set")) {
         const dir = parsed.positional(1) orelse fatal("{s}", .{usage});
-        if (dir.len == 0 or std.mem.indexOfAny(u8, dir, "'\"\n") != null)
-            fatal("workspace path must not contain quotes or newlines", .{});
+        // The same rule `exec` applies to `--cwd`, read from the same place.
+        //
+        // It used to be a blacklist of its own — `'`, `"` and newline — which
+        // admitted `;`, a backtick, `$`, `|` and `&`, and every one of those
+        // reached remote shell text as syntax through `cd {s}`. It is now the
+        // inverse: `shell.cwd` renders any directory as one shell word, so an
+        // apostrophe and a space are ordinary bytes here and no longer refused,
+        // and what is refused is the narrow set that was relying on the remote
+        // shell expanding it. Rejecting it at `set` means the store stops
+        // accumulating values `exec` will later decline.
+        if (Core.shell.cwdRefusal(dir)) |why| fatal(
+            "workspace '{s}' cannot be used as a working directory: {s}. Pass an absolute path, or one starting '~/'",
+            .{ dir, why },
+        );
         Store.servers.setCwd(&store, server.id, dir, ctx.now) catch |err| Cli.storeFatal(&store, err);
         switch (ctx.out.format) {
             .json => try ctx.out.json(.{ .ok = true, .server = server_name, .workspace = dir }),

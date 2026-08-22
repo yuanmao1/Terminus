@@ -120,6 +120,24 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const owner_token = Store.policy.ownerToken(&store, ctx.arena, ctx.io, ctx.now) catch |err|
         Cli.storeFatal(&store, err);
 
+    // The working directory this run composes a `cd` from, resolved once.
+    //
+    // It was resolved twice — here for the ledger row and again inside
+    // `runOneShot` for the command — and validated in neither. It is checked
+    // here, before `begin` and before a connection, because that is the only
+    // point at which a refusal costs nothing: `shell.cwdRefusal` names the
+    // values that used to be expanded by the remote shell and are now one
+    // quoted word, and a `cd` into a directory that expansion would have
+    // produced fails, which would settle an exit code on an attempt whose
+    // command never ran.
+    const working_dir = parsed.flag("cwd") orelse resolved.server.cwd;
+    if (working_dir) |dir| {
+        if (Core.shell.cwdRefusal(dir)) |why| fatal(
+            "the working directory '{s}' cannot be used: {s}. Nothing was sent. Pass an absolute path, or one starting '~/'",
+            .{ dir, why },
+        );
+    }
+
     // An arbitrary shell command is assumed to change things.
     //
     // We cannot inspect `systemctl restart api` and know what it touches, and
@@ -143,7 +161,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             // Falling back to the raw text would write the very secrets the
             // redaction exists to keep out of an append-only ledger.
             fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
-        .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
+        .cwd = working_dir,
         .shell = inv.shellWord(),
         .owner_token = owner_token,
         .force = parsed.boolean("force"),
@@ -207,7 +225,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const outcome = if (target.session) |session_name|
         try runInSession(ctx, &store, &execution, executor, inv, session_name, timeout_ms)
     else
-        try runOneShot(ctx, &execution, executor, &parsed, inv, resolved.server.cwd, input, &accepted);
+        try runOneShot(ctx, &execution, executor, inv, working_dir, input, &accepted);
 
     const duration_ms: i64 = @intCast(@divTrunc(
         started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds,
@@ -292,9 +310,8 @@ fn runOneShot(
     ctx: *Cli.Ctx,
     execution: *Core.execution.Execution,
     executor: Core.Executor,
-    parsed: *const Cli.Args.Parsed,
     inv: Cli.Invocation,
-    server_cwd: ?[]const u8,
+    working_dir: ?[]const u8,
     input: ?*std.Io.Reader,
     accepted: *Core.Ssh.Accepted,
 ) !Outcome {
@@ -314,8 +331,12 @@ fn runOneShot(
     } else try inv.inlineCommand(ctx.arena);
     defer if (staged_path) |path| Core.script.cleanup(executor, ctx.arena, path);
 
-    const effective = if (parsed.flag("cwd") orelse server_cwd) |dir|
-        try std.fmt.allocPrint(ctx.arena, "cd {s} && ({s})", .{ dir, command })
+    // One spelling of "run this somewhere else", shared with
+    // `Tmux.jobLaunchLine`. This used to be a second copy of the same
+    // `"cd {s} && ({s})"` template, splicing `--cwd` in raw — see
+    // `shell.cdInto`. The directory was refused or accepted before `begin`.
+    const effective = if (working_dir) |dir|
+        try Core.shell.cdInto(ctx.arena, dir, command)
     else
         command;
 

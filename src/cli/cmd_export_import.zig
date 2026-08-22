@@ -42,6 +42,14 @@ const import_usage =
 
 // ---- export document shape (versioned) ----
 
+/// Not bumped by the v13 memory fields below, and that is deliberate.
+///
+/// The two additions are optional in both directions: an older binary reads this
+/// document with `ignore_unknown_fields` and simply does not learn when the fact
+/// was observed, and this binary reads an older document and records the
+/// observation as unknown. Bumping the version would instead make every older
+/// binary *refuse* the file outright — `document.v != doc_version` is fatal — for
+/// fields it would otherwise have skipped harmlessly.
 const doc_version = 1;
 
 const KeyDoc = struct {
@@ -52,12 +60,32 @@ const KeyDoc = struct {
     passphrase: ?[]const u8 = null,
 };
 
-const MemoryDoc = struct {
+/// One memory as it travels between machines.
+///
+/// **There is no trust field here, in either direction, and that is the security
+/// boundary.** A `verify_cmd` runs on a host; if a document could say "and this
+/// one is trusted", then handing somebody an export file would be handing them
+/// arbitrary code execution on their hosts. So the wire type has no key for it:
+/// `std.json` parses this struct with `ignore_unknown_fields`, which means a
+/// crafted document claiming `"trusted_at"` or `"trusted_by"` is discarded at the
+/// parse, before any code has to decide about it. The same absence on the export
+/// side is the same rule read the other way — a field no importer may act on is a
+/// field that could only mislead a reader, so it is not written either.
+///
+/// `verify_cmd` does travel. The command text is not the permission; an operator
+/// who can read it is who decides whether to grant it with `memory trust`.
+///
+/// `observed_at` travels verbatim. It is the document's claim about when the fact
+/// was seen — which is the whole reason to move a memory at all — and substituting
+/// the import moment for it would turn every imported note into a fresh one.
+pub const MemoryDoc = struct {
     session: ?[]const u8 = null,
     key: ?[]const u8 = null,
     content: []const u8,
     tags: ?[]const u8 = null,
     updated_at: i64 = 0,
+    observed_at: ?i64 = null,
+    verify_cmd: ?[]const u8 = null,
 };
 
 const FactDoc = struct {
@@ -78,12 +106,43 @@ const ServerDoc = struct {
     facts: []FactDoc = &.{},
 };
 
-const Document = struct {
+/// `pub` so a gate can parse a hostile document with the real type rather than a
+/// transcription of it. The shape a gate has to re-type is a shape it can get
+/// wrong in the direction that passes.
+pub const Document = struct {
     v: u32,
     exportedAt: i64,
     servers: []ServerDoc,
     keys: []KeyDoc = &.{},
 };
+
+/// The one write an import performs for a memory.
+///
+/// Every incoming memory goes through here — new, and conflict-taken-theirs —
+/// so "an imported memory lands untrusted, whatever the document said" is one
+/// call site rather than a rule repeated at two. It cannot do otherwise:
+/// `AddOptions` has no trust field to fill in.
+pub fn importMemory(
+    store: *Store,
+    scope: Store.memories.Scope,
+    m: MemoryDoc,
+    now: i64,
+) Store.Db.Error!Store.memories.AddResult {
+    return Store.memories.add(store, scope, .{
+        .key = m.key,
+        .content = m.content,
+        .tags = m.tags,
+        // The document's claim about *when*, carried as given. A document that
+        // said nothing says nothing here either: `now` would be the import
+        // moment wearing an observation's clothes.
+        .observed = if (m.observed_at) |at| .{ .at = at } else .unknown,
+        // ...and how *this* store came to hold it, which is not the document's to
+        // say. It read a file; `legacy_import` is that, exactly.
+        .observed_source = .legacy_import,
+        .verify_cmd = m.verify_cmd,
+        .now = now,
+    });
+}
 
 pub fn exportCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const parsed = Cli.parseArgs(ctx, raw_args);
@@ -105,6 +164,8 @@ pub fn exportCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
                 .content = m.content,
                 .tags = m.tags,
                 .updated_at = m.updated_at,
+                .observed_at = m.observed_at,
+                .verify_cmd = m.verify_cmd,
             });
         }
         const facts = Store.facts.list(&store, ctx.arena, server.id) catch |err|
@@ -392,22 +453,12 @@ fn planMemory(
     switch (state) {
         .identical => {},
         .new => {
-            _ = Store.memories.add(store, scope, .{
-                .key = m.key,
-                .content = m.content,
-                .tags = m.tags,
-                .now = ctx.now,
-            }) catch |err| Cli.storeFatal(store, err);
+            _ = importMemory(store, scope, m, ctx.now) catch |err| Cli.storeFatal(store, err);
             applied.* += 1;
         },
         .conflict => {
             if (std.mem.eql(u8, strategy, "theirs")) {
-                _ = Store.memories.add(store, scope, .{
-                    .key = m.key,
-                    .content = m.content,
-                    .tags = m.tags,
-                    .now = ctx.now,
-                }) catch |err| Cli.storeFatal(store, err);
+                _ = importMemory(store, scope, m, ctx.now) catch |err| Cli.storeFatal(store, err);
                 applied.* += 1;
             } else skipped.* += 1;
         },

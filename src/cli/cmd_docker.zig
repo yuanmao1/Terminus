@@ -54,6 +54,8 @@ pub const usage =
     \\        the same read, polled until the target holds or the deadline expires
     \\
     \\--for defaults to healthy, --timeout to 60 seconds, --interval to 2.
+    \\--interval is held between 1 second and 1 hour, so a watch can never
+    \\busy-spin or wait past the deadline it was given.
     \\
     \\A wait that runs out of time reports outcome "timed_out" and exits 1. It is
     \\never reported as success; it is a different answer from a container that is
@@ -605,6 +607,11 @@ pub const WaitOptions = struct {
     /// The deadline, in seconds. Checked *after* each poll, so a zero deadline
     /// still reads the container once and reports what it found.
     timeout_secs: u64,
+    /// Seconds between polls. Held inside `interval_bounds` by `intervalFlag`
+    /// before it gets here — a zero would make the sleep below a no-op and turn
+    /// the loop into a busy-spin over the SSH channel. The gates pass zero on
+    /// purpose so they do not sleep, which is exactly why the clamp lives at the
+    /// flag and not here.
     interval_secs: u64,
 };
 
@@ -862,7 +869,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     else
         .healthy;
     const timeout_secs = secondsFlag(&parsed, "timeout", 60);
-    const interval_secs = secondsFlag(&parsed, "interval", 2);
+    const interval_secs = intervalFlag(&parsed, 2);
 
     var store = try Cli.openStore(ctx, &parsed);
     defer store.close();
@@ -924,10 +931,47 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 }
 
+/// The bounds a `--interval` is held to, and why a watch has both.
+///
+/// **The floor.** `waitFor` sleeps `interval_secs` seconds between polls, and a
+/// sleep of zero is not a sleep — so `--interval 0` issued `docker container
+/// inspect` over the SSH channel as fast as the channel could carry it, for the
+/// whole of `--timeout`. `secondsFlag` had no floor and no ceiling, and the
+/// gates cannot see it because they pass `.interval_secs = 0` deliberately so
+/// the tests do not sleep.
+///
+/// **The ceiling.** An interval above the deadline is a watch that polls once
+/// and reports a timeout it never looked past, which reads as a container that
+/// did not come up.
+///
+/// The same bounds, and the same reason, as `cmd_job.parseInterval`: "so a watch
+/// can never busy-spin or hang forever". Clamped at the flag rather than inside
+/// `waitFor`, because `waitFor` is what the gates drive and a clamp there would
+/// make every one of them sleep.
+pub const interval_bounds = struct {
+    pub const min: u64 = 1;
+    pub const max: u64 = 60 * 60;
+};
+
 fn secondsFlag(parsed: *const Cli.Args.Parsed, comptime name: []const u8, default: u64) u64 {
     const text = parsed.flag(name) orelse return default;
     return std.fmt.parseInt(u64, text, 10) catch
         fatal("invalid --" ++ name ++ " '{s}'; it takes a whole number of seconds", .{text});
+}
+
+/// `--interval <sec>`, held inside `interval_bounds`.
+///
+/// A deadline of zero stays zero — `--timeout 0` means "read it once and tell
+/// me", which is a documented reading and not a spin — so only the interval is
+/// clamped, and it is clamped rather than refused: an operator asking for a
+/// tighter poll than the channel can serve wants the tightest one available,
+/// not an error.
+pub fn intervalFlag(parsed: *const Cli.Args.Parsed, default: u64) u64 {
+    return std.math.clamp(
+        secondsFlag(parsed, "interval", default),
+        interval_bounds.min,
+        interval_bounds.max,
+    );
 }
 
 fn printInspect(ctx: *Cli.Ctx, d: InspectJson) !void {

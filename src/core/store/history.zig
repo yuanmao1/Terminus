@@ -38,13 +38,28 @@ pub const Record = struct {
     duration_ms: ?i64 = null,
 };
 
-pub fn add(store: *Store, server_id: i64, record: Record, now: i64) Db.Error!void {
-    // Redact obvious secrets before they ever hit disk. Best-effort: on OOM
-    // we fall back to storing the raw detail (history is an aid, not a
-    // guarantee) rather than dropping the audit entry.
+/// Inserts one row, with the detail redacted before it reaches disk.
+///
+/// **The redaction is not best-effort, and it used to be.** This line was
+/// `redactSecrets(...) catch record.detail` — the only arm in this tree that
+/// writes unredacted text on purpose, justified as "history is an aid, not a
+/// guarantee". Its sharpest form was inside one function: `cmd_sync.run` builds
+/// a detail string, refuses to store it unredacted for the ledger's
+/// `argv_redacted` ("cannot redact the sync description for the audit record;
+/// refusing to store it unredacted", which exits), and then handed the *same
+/// bytes* to this call, which stored them raw when the redaction allocator
+/// failed. Two opposite decisions about identical bytes, five lines apart.
+///
+/// So the failure is returned. `Allocator.Error` joins the error set — `list`
+/// already returns the same union — and both callers already route a failure
+/// here to a process exit that says the audit write did not happen
+/// (`Cli.auditFatal` in `cmd_sync`, `Cli.receiptFatal` in `cmd_transfer`). A
+/// dropped history row is a gap an operator can see; a row holding a live
+/// credential is one nobody can take back out of an append-only table.
+pub fn add(store: *Store, server_id: i64, record: Record, now: i64) (Db.Error || Allocator.Error)!void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
-    const detail = redactSecrets(arena_state.allocator(), record.detail) catch record.detail;
+    const detail = try redactSecrets(arena_state.allocator(), record.detail);
 
     var stmt = try store.db.prepare(
         \\INSERT INTO history (server_id, kind, detail, cwd, exit_code, transport, duration_ms, created_at)
@@ -324,6 +339,65 @@ test redactSecrets {
         "curl -H 'Content-Type: application/json' -H 'Cookie: [REDACTED]'",
         try redactSecrets(a, "curl -H 'Content-Type: application/json' -H 'Cookie: s=1'"),
     );
+}
+
+test "gate: a redaction that could not be performed refuses rather than storing raw" {
+    const t = std.testing;
+
+    // This was the only arm in the tree that wrote unredacted text on purpose:
+    // `redactSecrets(...) catch record.detail`, justified as "history is an aid,
+    // not a guarantee". Its sharpest form was inside one function —
+    // `cmd_sync.run` builds a detail string, refuses to store it unredacted for
+    // the ledger's `argv_redacted`, and then handed the same bytes here.
+    //
+    // Driven off the type rather than off an injected failure, because `add`
+    // builds its own arena from `page_allocator` and there is no seam to fail:
+    // what is checkable, and what actually decides the behaviour, is that the
+    // failure is in the signature at all. An error a caller must handle cannot
+    // be the fallback that writes the secret.
+    const set = @typeInfo(@typeInfo(@TypeOf(add)).@"fn".return_type.?).error_union.error_set;
+    var carries_allocation_failure = false;
+    for (@typeInfo(set).error_set.?) |member| {
+        if (std.mem.eql(u8, member.name, "OutOfMemory")) carries_allocation_failure = true;
+    }
+    if (!carries_allocation_failure) {
+        std.debug.print(
+            \\
+            \\`history.add` cannot report a redaction it could not perform. The only way to
+            \\return from it is then to store `record.detail` as it stands, which is the
+            \\credential the redaction exists to keep out of an append-only table. A dropped
+            \\history row is a gap an operator can see; a row holding a live token is one
+            \\nobody can take back out.
+            \\
+        , .{});
+        return error.RedactionFailureUnreportable;
+    }
+
+    // …and the fallback is gone from the body rather than merely unreachable.
+    const source = @embedFile("history.zig");
+    const at = std.mem.indexOf(u8, source, "\npub fn add(") orelse return error.AddNotFound;
+    const rest = source[at + 1 ..];
+    const body = rest[0 .. std.mem.indexOf(u8, rest, "\n}\n") orelse return error.AddUnterminated];
+    if (std.mem.indexOf(u8, body, "catch record.detail") != null) {
+        std.debug.print(
+            \\
+            \\`history.add` still falls back to the unredacted detail:
+            \\
+            \\{s}
+            \\
+        , .{body});
+        return error.RedactionSwallowed;
+    }
+    try t.expect(std.mem.indexOf(u8, body, "try redactSecrets(") != null);
+
+    // The two callers route the failure to a process exit that says the audit
+    // write did not happen, which is what makes returning it safe. The needle is
+    // assembled so this gate is not itself counted as a third writer by
+    // `cmd_history.zig`'s own scan.
+    const writer_call = "Store.history." ++ "add(";
+    try t.expect(std.mem.indexOf(u8, @embedFile("../../cli/cmd_sync.zig"), "Cli.auditFatal(\"sync\"") != null);
+    try t.expect(std.mem.indexOf(u8, @embedFile("../../cli/cmd_sync.zig"), writer_call) != null);
+    try t.expect(std.mem.indexOf(u8, @embedFile("../../cli/cmd_transfer.zig"), writer_call) != null);
 }
 
 pub fn list(store: *Store, arena: Allocator, server_id: i64, limit: i64) (Db.Error || Allocator.Error)![]Entry {

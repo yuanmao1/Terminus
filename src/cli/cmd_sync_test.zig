@@ -35,6 +35,8 @@ const Core = @import("../core/core.zig");
 const Store = Core.Store;
 const cmd_sync = @import("cmd_sync.zig");
 const skill_doc = @import("skill_doc.zig");
+/// The shared source reader the text-level gates in this tree use.
+const Control = @import("../core/control.zig");
 
 const scratch_dir = ".zig-cache/tmp";
 
@@ -677,4 +679,237 @@ test "gate: the skill document describes the receipt a sync now leaves" {
     // `--help` and the document do not disagree about whether they exist.
     try t.expect(std.mem.indexOf(u8, cmd_sync.usage, "--force") != null);
     try t.expect(std.mem.indexOf(u8, cmd_sync.usage, "--dry-run") != null);
+}
+
+// --- gates: --exclude, which was the unvalidated half of a validated template -
+
+test "gate: every --exclude pattern is one shell word, and the archive script proves it" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Six patterns, and every one of them is a byte `parseExcludes` accepts:
+    // it trims whitespace and keeps the rest. They used to be spliced into
+    // `" --exclude='*{s}*'"` — quotes owned by the template, escaping nothing —
+    // in the same file, on the same `tar` command line, whose *other* argument
+    // has been validated since an earlier audit.
+    const patterns = [_][]const u8{
+        "node_modules",
+        "John's cache",
+        "a b",
+        "x'; rm -rf /tmp/y; '",
+        "$HOME",
+        "`id`",
+    };
+    // What each one has to come back out of the script as: `tar`'s own globbing
+    // stays in the word, because `--exclude` takes a pattern and not a path.
+    var expected: std.ArrayList([]const u8) = .empty;
+    for (patterns) |p| {
+        try expected.append(arena, try std.mem.concat(arena, u8, &.{ "--exclude=*", p, "*" }));
+    }
+
+    var exclude_args: std.ArrayList(u8) = .empty;
+    for (patterns) |p| {
+        try exclude_args.append(arena, ' ');
+        try exclude_args.appendSlice(arena, try cmd_sync.excludeArg(arena, p));
+    }
+
+    const script = try cmd_sync.archiveScript(arena, "/srv/app", exclude_args.items, staged_tar);
+    // Asserted rather than assumed: a fixture that stopped naming `tar` would
+    // make everything below a test of an empty string.
+    try t.expect(std.mem.indexOf(u8, script, "tar -cf") != null);
+
+    // The `tar` line, split the way the host would split it. This is the whole
+    // gate: not "the bytes look quoted" but "the words the shell produces are
+    // the words that went in".
+    const tar_at = std.mem.indexOf(u8, script, "tar -cf") orelse return error.ScriptDoesNotArchive;
+    const stop = std.mem.indexOfScalarPos(u8, script, tar_at, '\n') orelse script.len;
+    const got = try Core.shell.words(arena, script[tar_at..stop]);
+
+    // `tar`, `-cf`, the archive, `-C`, the directory, then one word per
+    // pattern, then `.`. Element for element, so an extra word or a lost one is
+    // a failure either way.
+    try t.expectEqual(@as(usize, 5 + patterns.len + 1), got.len);
+    try t.expectEqualStrings("tar", got[0]);
+    try t.expectEqualStrings("-cf", got[1]);
+    try t.expectEqualStrings(staged_tar, got[2]);
+    try t.expectEqualStrings("-C", got[3]);
+    try t.expectEqualStrings("/srv/app", got[4]);
+    try t.expectEqualStrings(".", got[got.len - 1]);
+
+    var matched: usize = 0;
+    for (expected.items, got[5 .. 5 + patterns.len]) |want, have| {
+        if (!std.mem.eql(u8, want, have)) {
+            std.debug.print(
+                \\
+                \\an --exclude argument did not survive as one word.
+                \\  wanted: {s}
+                \\  got:    {s}
+                \\
+                \\`--exclude='*<pattern>*'` put the operator's pattern inside quotes the
+                \\template owned, so an apostrophe in it ended the word and everything after
+                \\it became syntax in the middle of a `tar` command line on somebody's host.
+                \\
+            , .{ want, have });
+            return error.ExcludePatternNotOneWord;
+        }
+        matched += 1;
+    }
+    try t.expectEqual(@as(usize, 6), matched);
+
+    // And the apostrophe case specifically, because it is the one that used to
+    // end the word: the pattern is intact, and nothing after it became a
+    // separate argument.
+    try t.expect(std.mem.indexOf(u8, got[6], "John's cache") != null);
+
+    // The old spelling, for the contrast. A shell cannot even read it: the
+    // apostrophe inside opens a quote that never closes.
+    const old = try std.fmt.allocPrint(arena, " --exclude='*{s}*'", .{"John's cache"});
+    try t.expectError(error.UnbalancedQuote, Core.shell.words(arena, old));
+
+    // No excludes at all is no words at all — the `tar` line must not grow an
+    // empty argument, which `tar` would read as the current directory.
+    const bare = try cmd_sync.archiveScript(arena, "/srv/app", "", staged_tar);
+    const bare_at = std.mem.indexOf(u8, bare, "tar -cf").?;
+    const bare_stop = std.mem.indexOfScalarPos(u8, bare, bare_at, '\n') orelse bare.len;
+    try t.expectEqual(@as(usize, 6), (try Core.shell.words(arena, bare[bare_at..bare_stop])).len);
+}
+
+test "gate: the remote directory survives every script as one word" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `validateRemotePath` refuses quotes, backticks, `$` and newlines, and
+    // admits everything else — a space, a `;`, a `|`, a `&`. Those were safe
+    // only because of the template's own quotes, which is the arrangement that
+    // has failed in this project seven times. They are safe here because they
+    // are quoted by `shell.word`, which is a property of the renderer and not
+    // of the validator.
+    const dir = "/srv/two words; rm -rf ~ | tee &";
+
+    // Every line of every script that names the directory, split as the host
+    // would. `unpackScript` double-quotes `$actual` for the digest comparison,
+    // which `words` refuses to model — so the lines are taken one at a time and
+    // only the ones carrying the directory are read.
+    const scripts = [_][]const u8{
+        try cmd_sync.unpackScript(arena, staged_tar, staged_md5, dir, true),
+        try cmd_sync.unpackScript(arena, staged_tar, staged_md5, dir, false),
+        try cmd_sync.archiveScript(arena, dir, "", staged_tar),
+        try cmd_sync.probeScript(arena, dir),
+    };
+
+    var found_lines: usize = 0;
+    for (scripts) |script| {
+        var lines = std.mem.splitScalar(u8, script, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "two words") == null) continue;
+            if (std.mem.indexOfScalar(u8, line, '"') != null) continue;
+            found_lines += 1;
+            const got = try Core.shell.words(arena, line);
+            var carried: usize = 0;
+            for (got) |w| {
+                if (std.mem.eql(u8, w, dir)) carried += 1;
+            }
+            if (carried == 0) {
+                std.debug.print(
+                    \\
+                    \\this line does not carry the remote directory as one word:
+                    \\
+                    \\  {s}
+                    \\
+                    \\It is a `rm -rf`, a `mkdir -p`, a `tar -C` or a `cd` on somebody's host.
+                    \\
+                , .{line});
+                return error.RemoteDirectoryNotOneWord;
+            }
+            carried = 0;
+        }
+    }
+    // `rm -rf`, `mkdir -p`, `tar -xf -C` (twice over the two unpack variants,
+    // minus the delete clause the second does not have), `[ -d ]`, `tar -cf -C`,
+    // `[ -d ]` and `cd --`. Counted, so a scan that found nothing fails.
+    try t.expectEqual(@as(usize, 8), found_lines);
+
+    // The `cd` in the dry-run probe carries `--` for the same reason
+    // `shell.cdInto` does: quoting does not stop `cd` reading `-P` as an option.
+    try t.expect(std.mem.indexOf(u8, scripts[3], "cd -- ") != null);
+}
+
+// --- gate: the history row's exit code ---------------------------------------
+
+test "gate: the sync history row reports no exit code when nothing answered" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "sync_history_code");
+    defer h.deinit();
+
+    // The row is written on both of the two paths that reach it, and the only
+    // difference between them is whether the host ever answered. It used to
+    // carry a hardcoded `.exit_code = 0` on both: `push`'s `.unknown` arm
+    // *returns* rather than fatals, so the row was written and only then did the
+    // verb exit 75 — and `terminus history --json` showed `"exit_code": 0` for a
+    // sync that may or may not have run `rm -rf` on the destination.
+    //
+    // The whole status vocabulary, not only the two that occur: `completed` is
+    // the one and only zero, and every other status is the absence of an answer
+    // rather than a number standing in for one.
+    var mapped: usize = 0;
+    for (std.enums.values(Store.op_state.Status)) |status| {
+        mapped += 1;
+        const got = cmd_sync.historyExitCode(status);
+        const want: ?i64 = if (status == .completed) 0 else null;
+        if (!std.meta.eql(got, want)) {
+            std.debug.print(
+                \\
+                \\a `{s}` sync would write exit_code={?d} to its history row, and it must
+                \\write {?d}. A caller told `0` is told the ledger agrees that this worked;
+                \\for anything but `completed` it does not, and for `indeterminate` the
+                \\remote may have replaced a directory.
+                \\
+            , .{ @tagName(status), got, want });
+            return error.HistoryExitCodeDishonest;
+        }
+    }
+    // Nine statuses. Counted, so a status added to `op_state` without a
+    // decision here fails rather than falling into an `else`.
+    try t.expectEqual(@as(usize, 9), mapped);
+
+    // The column can hold the absence, which is why null is available at all.
+    try t.expect(@typeInfo(@FieldType(Store.history.Record, "exit_code")) == .optional);
+
+    // And a run that really was left unanswered maps to null through the same
+    // function, off a status the ledger produced rather than one this gate named.
+    var execution = try h.begin(.push, "/srv/silent", false);
+    defer execution.deinit();
+    try execution.connecting();
+    var scripted = Core.Scripted.init(h.arena, &.{.{ .transport_error = error.ExecFailed }});
+    const script = try cmd_sync.unpackScript(h.arena, staged_tar, staged_md5, "/srv/silent", true);
+    const act = cmd_sync.remoteAct(&execution, scripted.executor(), script);
+    try t.expect(act.ran == .unknown);
+    try t.expectEqualStrings("indeterminate", execution.status.text());
+    try t.expectEqual(@as(?i64, null), cmd_sync.historyExitCode(execution.status));
+
+    // And the command really does read the status rather than hardcoding a zero.
+    // The write is in `run`, so the statement is read from there.
+    const body = try Control.bodyOf(@embedFile("cmd_sync.zig"), "\npub fn run(");
+    const call = "Store.history" ++ ".add(";
+    const at = std.mem.indexOf(u8, body, call) orelse return error.AuditWriteNotFound;
+    const end = std.mem.indexOfScalarPos(u8, body, at, ';') orelse return error.AuditWriteUnterminated;
+    const statement = body[at .. end + 1];
+    if (std.mem.indexOf(u8, statement, ".exit_code = historyExitCode(execution.status),") == null) {
+        std.debug.print(
+            \\
+            \\cmd_sync's history write no longer takes its exit code from the attempt's own
+            \\status:
+            \\
+            \\  {s}
+            \\
+            \\A literal here is a claim about a remote act this process may never have been
+            \\told the outcome of.
+            \\
+        , .{statement});
+        return error.HistoryExitCodeHardcoded;
+    }
 }

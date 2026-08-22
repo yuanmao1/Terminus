@@ -582,6 +582,87 @@ const migrations = [_][:0]const u8{
     \\  ON leases(server_id, scope_kind, scope_key) WHERE released_at IS NULL;
     \\CREATE INDEX idx_leases_owner ON leases(owner_request_id) WHERE released_at IS NULL;
     ,
+    // v13: when a memory's fact was observed, and whether its verify command
+    // may be run.
+    //
+    // Two additions, one version, because they are one row's answer to "how much
+    // is this note worth right now".
+    //
+    // **`observed_at` is not `updated_at`.** The table carried write times and
+    // nothing else, so "the API listens on 8080" written six months ago and the
+    // same sentence written this morning were the same row to every reader.
+    // `cmd_handoff.readMemories` had to say so in prose — it reports the newest
+    // `updated_at` and its header warns that this must not be read as a
+    // verification — because the column that would have made the claim true did
+    // not exist. `observed_at` is when the *fact* was seen, and
+    // `observed_source` says how it came to be known, drawn from
+    // `receipts.Source`'s existing vocabulary rather than a second one invented
+    // beside it. `memories.observed_sources` is the subset a memory row can
+    // carry and a gate holds the CHECK below against it.
+    //
+    // Nullable, because a store that does not know when a fact was observed has
+    // to be able to say so. `updated_at` is NOT NULL and always has been; making
+    // `observed_at` NOT NULL DEFAULT 0 would give every row that nobody has
+    // observed a number, and a number is what a reader believes.
+    //
+    // **The backfill is labelled.** Existing rows get `observed_at =
+    // updated_at`, which is a write time standing in for an observation, and
+    // `observed_source` defaults to `backfill` so the row says that about itself.
+    // The default is also the safe direction for any later writer that forgets
+    // the column: an unlabelled row under-claims instead of claiming a reading it
+    // never took.
+    //
+    // **`verify_cmd` is text, and text is not a permission.** A verify command
+    // is an arbitrary line that runs on a host, and memories arrive by `terminus
+    // import` from documents anybody can hand over. So a command is inert until
+    // somebody grants it, and the grant is three columns because "why did this
+    // run" takes all three: when (`trusted_at`), who (`trusted_by`), and what
+    // was actually authorised (`trusted_cmd_sha256`).
+    //
+    // The third is the load-bearing one. A grant recorded as a flag keeps
+    // applying after the text changes under it: trust `systemctl is-active
+    // nginx`, then `memory add --key svc --verify-cmd 'curl … | sh'`, and the
+    // flag is still set. Binding the grant to the digest of the text it was given
+    // makes that unreachable without any writer having to remember to revoke — a
+    // command that is not the command that was trusted simply has no grant.
+    // `memories.trustState` is that comparison and nothing else decides it.
+    //
+    // `grant_is_whole` is named because half a grant is the shape that reads as
+    // authorised while answering none of the three questions, and because the
+    // drift probe looks for the version by name elsewhere. Every predicate in it
+    // is `IS NULL` / `IS NOT NULL` before it is anything else: a CHECK whose
+    // expression evaluates to NULL *passes*, so a bare `trusted_by <> ''` would
+    // have admitted the all-but-one-column row it exists to refuse. Refused by
+    // the database, where no caller can talk it round — v12's
+    // `owner_request_id <> ''` for the same reason.
+    //
+    // **No trust column is reachable from an insert.** `memories.AddOptions` has
+    // no field for one and `cmd_export_import.MemoryDoc` has no key for one, so
+    // the only way into these three columns is `memories.grantTrust`, which
+    // `memory trust` is the only caller of. That is the security boundary; the
+    // CHECK is the second line behind it.
+    //
+    // ALTER rather than a re-cut, and this is the one table where that is not a
+    // preference. v11 and v12 dropped and recreated tables that were provably
+    // empty in the wild; `memories` is the opposite — it is the table the real
+    // store at v4 has rows in, and those rows are the accumulated knowledge the
+    // product exists to keep. Adding columns cannot lose them, so nothing here
+    // needs a refusal like `checkpoints_would_be_dropped`.
+    \\ALTER TABLE memories ADD COLUMN observed_at INTEGER;
+    \\ALTER TABLE memories ADD COLUMN observed_source TEXT NOT NULL DEFAULT 'backfill'
+    \\  CHECK (observed_source IN ('live','cache','legacy_import','backfill'));
+    \\ALTER TABLE memories ADD COLUMN verify_cmd TEXT;
+    \\ALTER TABLE memories ADD COLUMN trusted_at INTEGER;
+    \\ALTER TABLE memories ADD COLUMN trusted_by TEXT;
+    \\ALTER TABLE memories ADD COLUMN trusted_cmd_sha256 TEXT
+    \\  CONSTRAINT grant_is_whole CHECK (
+    \\    (trusted_at IS NULL AND trusted_by IS NULL AND trusted_cmd_sha256 IS NULL)
+    \\    OR (trusted_at IS NOT NULL
+    \\        AND trusted_by IS NOT NULL AND trusted_by <> ''
+    \\        AND trusted_cmd_sha256 IS NOT NULL AND length(trusted_cmd_sha256) = 64)
+    \\  );
+    \\UPDATE memories SET observed_at = updated_at WHERE observed_at IS NULL;
+    ,
 };
 
 /// Number of schema versions this binary knows about.
@@ -602,6 +683,12 @@ const checkpoints_recut_version = 11;
 /// probes and the refusal to void a live claim both key on it, and it is a
 /// frozen number rather than "the latest".
 const leases_reowned_version = 12;
+
+/// The version at which `memories` gained the observation and trust columns.
+///
+/// Named for the same reason as the two above: the drift probe keys on it, and it
+/// is a frozen number rather than "the latest".
+const memories_observed_version = 13;
 
 /// The verbatim text of one frozen statement, sliced out of its migration.
 ///
@@ -950,6 +1037,41 @@ pub fn checkPreReleaseDrift(db: *Db, refusal: ?*Refusal) (Db.Error || error{PreR
         return drifted(refusal, "idx_leases_active");
     if (!try schemaTextEquals(db, "idx_leases_owner", leases_owner_index_ddl))
         return drifted(refusal, "idx_leases_owner");
+    if (version < memories_observed_version) return;
+    // v13 adds columns to `memories` with `ALTER TABLE`, and that is why this
+    // probe is column presence rather than the whole-statement equality the two
+    // versions above use.
+    //
+    // The equality probes work because sqlite stores a `CREATE` statement exactly
+    // as it was submitted, so the text this binary would write and the text the
+    // database was built from are the same bytes by construction. An `ALTER TABLE
+    // ADD COLUMN` has no such guarantee: sqlite *rewrites* the stored `CREATE
+    // TABLE` by splicing the new column definition in before the closing paren,
+    // and this binary would have to reproduce that splice to compare against it.
+    // Reproducing a transformation somebody else performs is the one shape a
+    // frozen-text probe must not take — the day a library upgrade changed the
+    // splice by one character, every v13 store on the machine would refuse to
+    // open, and the version's own guard would be the thing that bricked it.
+    //
+    // So the realistic pre-release shape is probed instead, which for an
+    // ALTER-only migration is a missing column: an intermediate revision of v13
+    // that added `observed_at` and not `observed_source`, or the two observation
+    // columns and not the grant, reports `user_version` 13 and then fails much
+    // later with a confusing SQL error. One column is named per half of the
+    // version, and each is the *last* column its half adds, so a half applied
+    // partway is caught rather than only a half omitted entirely.
+    //
+    // What this does not see is a v13 whose columns are all present and whose
+    // CHECKs are not. That is defence in depth rather than the boundary:
+    // `memories.trustState` reads the grant digest and compares it in Zig, so a
+    // store missing `grant_is_whole` still cannot make a partial grant
+    // executable — it can only store one. The gate that holds the CHECK text
+    // against `memories.observed_sources` runs against a store this binary built,
+    // which is where that agreement can be asserted honestly.
+    if (!try hasColumn(db, "memories", "observed_source"))
+        return drifted(refusal, "memories.observed_source");
+    if (!try hasColumn(db, "memories", "trusted_cmd_sha256"))
+        return drifted(refusal, "memories.trusted_cmd_sha256");
 }
 
 fn drifted(refusal: ?*Refusal, probe: []const u8) error{PreReleaseSchemaDrift} {

@@ -151,6 +151,29 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     var store = try Cli.openStore(ctx, &parsed);
     defer store.close();
     const resolved = Cli.resolveServer(ctx, &store, server_name);
+
+    // The same check `exec` makes, at the only point in *this* verb where it is
+    // still free.
+    //
+    // `cwd` is read twice here as well — into `begin_opts` below and again for
+    // `jobLaunchLine` — and the second read is 175 lines past `execution.begin`,
+    // `jobs.create` and `Tmux.ensure`. A refusal there would arrive after an
+    // operation row, a job row and a live remote session, so it is made here
+    // instead: before any of the three, where nothing has to be undone.
+    //
+    // What it refuses is a directory whose meaning depended on the remote shell
+    // expanding it. Since `shell.Cwd` now performs the one expansion Terminus
+    // will vouch for and quotes the rest, a `$RELEASE/app` reaching the host
+    // would be a literal path, `cd` would fail, and the attempt would settle an
+    // exit code for a command that never ran.
+    const working_dir = parsed.flag("cwd") orelse resolved.server.cwd;
+    if (working_dir) |dir| {
+        if (Core.shell.cwdRefusal(dir)) |why| fatal(
+            "the working directory '{s}' cannot be used: {s}. Nothing was sent and no job was created. Pass an absolute path, or one starting '~/'",
+            .{ dir, why },
+        );
+    }
+
     const owner_token = Store.policy.ownerToken(&store, ctx.arena, ctx.io, ctx.now) catch |err|
         Cli.storeFatal(&store, err);
 
@@ -6135,6 +6158,77 @@ fn claimHoldingBodies(out: [][]const u8) ![]const []const u8 {
         }
     }
     return found;
+}
+
+test "gate: a working directory that lost its expansion is refused before all three side effects" {
+    const t = std.testing;
+    const source = @embedFile("cmd_job.zig");
+
+    // The sibling of `cmd_exec`'s gate, and it has more to be ahead of.
+    //
+    // `exec` has one side effect to beat — the operation row. `job start` has
+    // three, and they are 130 lines apart: `execution.begin`, `jobs.create` and
+    // `Tmux.ensure`, which starts a real remote session. A refusal after any of
+    // them is not a refusal, it is a cleanup problem: the row has to be settled,
+    // the job row survives `job rm`, and the tmux session outlives this process.
+    //
+    // Held against all three by position rather than one, because "before
+    // `begin`" was true of the old code too — the old check simply ran 175 lines
+    // *after* it, and a gate that only pinned the first of the three would have
+    // passed a check placed between the second and the third.
+    // Every needle below is spelled in halves. This gate lives in the file it
+    // scans, so a needle written whole would be found in *this* body — and it
+    // sits after all three side-effect calls, so deleting the real check would
+    // report "too late" instead of "gone" and point the next reader at the
+    // wrong defect. Verified by driving it: the whole-needle version reported
+    // `CwdRefusedTooLate` for a deletion.
+    const refusal_at = std.mem.indexOf(u8, source, "Core.shell." ++ "cwdRefusal(dir)") orelse {
+        std.debug.print(
+            \\
+            \\cmd_job.zig no longer consults `shell.cwdRefusal`. `--cwd` reaches
+            \\`Tmux.jobLaunchLine` as one quoted word now, so a `$RELEASE/app` that the
+            \\remote shell used to expand becomes a literal path nobody has. The `cd` fails,
+            \\and the attempt settles an exit code for a command that never ran — with a job
+            \\row and a live tmux session already behind it.
+            \\
+        , .{});
+        return error.CwdRefusalGone;
+    };
+
+    // Each name with the reason it is not merely bookkeeping to be ahead of.
+    const effects = [_]struct { needle: []const u8, cost: []const u8 }{
+        .{
+            .needle = "Core.execution." ++ "begin(",
+            .cost = "an operation row exists, and there is no honest terminal for \"we declined to compose the command\"",
+        },
+        .{
+            .needle = "Store.jobs." ++ "create(",
+            .cost = "the job row survives this process and `job rm`, so the name is taken by an attempt that never launched",
+        },
+        .{
+            .needle = "Tmux." ++ "ensure(",
+            .cost = "a remote session is running, and nothing here would ever kill it",
+        },
+    };
+    var checked: usize = 0;
+    for (effects) |effect| {
+        checked += 1;
+        const at = std.mem.indexOf(u8, source, effect.needle) orelse {
+            std.debug.print("\ncmd_job.zig no longer contains `{s}`\n", .{effect.needle});
+            return error.SideEffectNotFound;
+        };
+        if (refusal_at > at) {
+            std.debug.print(
+                \\
+                \\cmd_job.zig checks the working directory at byte {d}, after `{s}` at byte
+                \\{d}. By then {s}.
+                \\
+            , .{ refusal_at, effect.needle, at, effect.cost });
+            return error.CwdRefusedTooLate;
+        }
+    }
+    // A scan that found nothing would have reported nothing.
+    try t.expectEqual(@as(usize, 3), checked);
 }
 
 test "gate: every destructive remote call is renewed on the line above it" {

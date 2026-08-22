@@ -1050,6 +1050,257 @@ fn everyStatus(_: Store.op_state.Status) bool {
     return true;
 }
 
+test "gate: the observation sources Zig can write are the ones the memories column admits" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_observed_source_vocab");
+    defer scratch.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+
+    // v13's third hand-written vocabulary, held the way the other three are. The
+    // column is a CHECK and the Zig side is `memories.observed_sources`, a subset
+    // of `receipts.Source` — so this is equality against the subset and not
+    // against the enum: a member the column accepts that Zig cannot name is a row
+    // `list` refuses to read back with `error.UnknownObservedSource`, and a member
+    // Zig writes that the column rejects is a constraint failure at the first
+    // write of a source nobody tested.
+    const admitted = try schemaInList(
+        t.allocator,
+        &store,
+        "memories",
+        "CHECK (observed_source IN (",
+    );
+    defer t.allocator.free(admitted);
+    try t.expectEqualStrings(Store.memories.observed_sources_sql, admitted);
+    try t.expectEqual(@as(usize, 4), Store.memories.observed_sources.len);
+
+    // And the other direction, which is the one that needs a reason written down:
+    // `receipts.Source` has a member `memories` deliberately does not carry.
+    // Reconciliation adjudicates an operation whose outcome is unknown against
+    // later evidence, and a memory has no ledger row and no outcome to adjudicate
+    // — so `reconcile` is absent by decision. Asserting *which* member is absent,
+    // rather than only how many, is what makes a new `Source` member land here as
+    // a question instead of passing as one more exclusion.
+    const source_fields = @typeInfo(Store.receipts.Source).@"enum".fields;
+    try t.expectEqual(@as(usize, 5), source_fields.len);
+    var excluded: usize = 0;
+    inline for (source_fields) |field| {
+        const source: Store.receipts.Source = @enumFromInt(field.value);
+        var included = false;
+        for (Store.memories.observed_sources) |member| {
+            if (member == source) included = true;
+        }
+        if (!included) {
+            excluded += 1;
+            try t.expectEqual(Store.receipts.Source.reconcile, source);
+        }
+    }
+    try t.expectEqual(@as(usize, 1), excluded);
+
+    // The refusal itself, at the schema level, where no caller can talk it round.
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100);
+        \\INSERT INTO memories (server_id, key, content, created_at, updated_at, observed_at, observed_source)
+        \\VALUES (1, 'ok', 'x', 100, 100, 100, 'cache');
+    );
+    try t.expectError(error.Constraint, store.db.exec(
+        "UPDATE memories SET observed_source = 'reconcile' WHERE key = 'ok'",
+    ));
+    try t.expectError(error.Constraint, store.db.exec(
+        "UPDATE memories SET observed_source = 'verified' WHERE key = 'ok'",
+    ));
+}
+
+test "gate: half a trust grant cannot be stored" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_grant_is_whole");
+    defer scratch.deinit();
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try store.db.exec(
+        \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+        \\VALUES (1, 'box', '10.0.0.1', 22, 'ubuntu', 100, 100);
+        \\INSERT INTO memories
+        \\  (server_id, key, content, created_at, updated_at, observed_at, observed_source, verify_cmd)
+        \\VALUES (1, 'svc', 'nginx on :80', 100, 100, 100, 'cache', 'systemctl is-active nginx');
+    );
+
+    // A grant answers three questions — when, who, and what was authorised — and
+    // a row answering two of them reads as authorised while the audit trail can
+    // say nothing about why the command ran. Every combination is walked, because
+    // a CHECK written with a bare `trusted_by <> ''` instead of an `IS NOT NULL`
+    // would admit exactly the rows where the missing column makes the expression
+    // NULL, and a NULL CHECK expression *passes*.
+    const digest_64 = "a" ** 64;
+    const partials = [_][:0]const u8{
+        "UPDATE memories SET trusted_at = 200",
+        "UPDATE memories SET trusted_by = 'ops'",
+        "UPDATE memories SET trusted_cmd_sha256 = '" ++ digest_64 ++ "'",
+        "UPDATE memories SET trusted_at = 200, trusted_by = 'ops'",
+        "UPDATE memories SET trusted_at = 200, trusted_cmd_sha256 = '" ++ digest_64 ++ "'",
+        "UPDATE memories SET trusted_by = 'ops', trusted_cmd_sha256 = '" ++ digest_64 ++ "'",
+        // Present but naming nobody, which would match every other empty grantee
+        // — v7's `owner_token` defect written in one character.
+        "UPDATE memories SET trusted_at = 200, trusted_by = '', trusted_cmd_sha256 = '" ++ digest_64 ++ "'",
+        // A digest that is not one cannot identify the text it authorised.
+        "UPDATE memories SET trusted_at = 200, trusted_by = 'ops', trusted_cmd_sha256 = 'abc'",
+    };
+    var refused: usize = 0;
+    for (partials) |sql| {
+        store.db.exec(sql) catch |err| {
+            try t.expectEqual(error.Constraint, err);
+            refused += 1;
+            continue;
+        };
+        std.debug.print("the schema accepted a partial grant: {s}\n", .{sql});
+        return error.PartialTrustGrantWasStored;
+    }
+    // Counted, so a rewrite that dropped the loop body would fail here rather
+    // than pass over an empty region.
+    try t.expectEqual(partials.len, refused);
+    try t.expectEqual(@as(usize, 8), refused);
+
+    // And a whole grant is accepted, so the constraint is refusing halves rather
+    // than everything.
+    try store.db.exec(
+        "UPDATE memories SET trusted_at = 200, trusted_by = 'ops', trusted_cmd_sha256 = '" ++
+            digest_64 ++ "'",
+    );
+    var stmt = try store.db.prepare(
+        "SELECT COUNT(*) FROM memories WHERE trusted_cmd_sha256 IS NOT NULL",
+    );
+    defer stmt.deinit();
+    try t.expect(try stmt.step());
+    try t.expectEqual(@as(i64, 1), stmt.columnInt(0));
+}
+
+test "gate: a memory written before v13 is backfilled and the row says it was" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "gate_v13_backfill");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Written through the v4 schema, as 0.1.x would have: a note with a write
+    // time and no notion of an observation. The two timestamps differ so the
+    // backfill cannot be confirmed by coincidence.
+    {
+        var db = try Db.open(scratch.path);
+        defer db.close();
+        try migrate.applyUpTo(&db, 4);
+        try db.exec(
+            \\INSERT INTO servers (id, name, host, port, username, created_at, updated_at)
+            \\VALUES (1, 'legacy', '10.0.0.1', 22, 'ubuntu', 100, 100);
+            \\INSERT INTO memories (server_id, key, content, created_at, updated_at)
+            \\VALUES (1, 'services', 'nginx :80', 100, 4242);
+        );
+    }
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try t.expectEqual(@as(i64, migrate.latest_version), try migrate.userVersion(&store.db));
+
+    const rows = try Store.memories.list(&store, arena, .{ .server_id = 1 }, .{});
+    try t.expectEqual(@as(usize, 1), rows.len);
+    const row = rows[0];
+
+    // The timestamp came from `updated_at` — and the row says that is what it is.
+    // A backfilled observation that read as an observation would be the exact
+    // confusion v13 exists to remove: a write time in an observation's column,
+    // with nothing to tell a reader which it is.
+    try t.expectEqual(@as(?i64, 4242), row.observed_at);
+    try t.expectEqual(@as(i64, 4242), row.updated_at);
+    try t.expectEqual(Store.receipts.Source.backfill, row.observed_source);
+    // And nothing was invented for the trust half: an old row is untrusted,
+    // which is the same state an imported one lands in.
+    try t.expectEqual(@as(?[]const u8, null), row.verify_cmd);
+    try t.expect(row.grant == null);
+    try t.expectEqual(Store.memories.TrustState.no_verify_cmd, Store.memories.trustState(row));
+
+    // Read off the stored column as well, because the assertion above goes
+    // through a Zig default that could in principle be supplying the word.
+    var stmt = try store.db.prepare(
+        "SELECT observed_source, observed_at FROM memories WHERE key = 'services'",
+    );
+    defer stmt.deinit();
+    try t.expect(try stmt.step());
+    try t.expectEqualStrings("backfill", stmt.columnText(0));
+    try t.expectEqual(@as(i64, 4242), stmt.columnInt(1));
+}
+
+test "gate: a pre-release v13 missing a column is named rather than failing later" {
+    const t = std.testing;
+
+    // v13 adds its columns with `ALTER TABLE`, so the drift it can suffer is a
+    // partial one: an intermediate revision that added the observation columns and
+    // not the grant, or `observed_at` and not `observed_source`. Such a store
+    // reports `user_version` 13 and then fails at the first read with a confusing
+    // SQL error far from the cause.
+    //
+    // Both halves are probed and both are checked here, because a probe for one
+    // half would let the other pass — which is how the v11 needle probes came to
+    // open for the shape they were written to catch.
+    //
+    // Each store is built the way an intermediate revision would have built it:
+    // a real v12 store, then *part* of v13's ALTER sequence, then the version
+    // stamp. Not by dropping a column afterwards — sqlite refuses to drop one a
+    // CHECK constraint mentions, and both columns probed here are in one.
+    {
+        var scratch = try Scratch.init(t.allocator, "gate_drift_v13_observed");
+        defer scratch.deinit();
+        {
+            var db = try Db.open(scratch.path);
+            defer db.close();
+            try migrate.applyUpTo(&db, 12);
+            try db.exec(
+                \\ALTER TABLE memories ADD COLUMN observed_at INTEGER;
+                \\PRAGMA user_version = 13;
+            );
+        }
+        var refusal: migrate.Refusal = undefined;
+        try t.expectError(
+            error.PreReleaseSchemaDrift,
+            Store.openDiagnosed(scratch.path, &refusal),
+        );
+        // Which column, not merely that something did not match: the two halves
+        // of v13 send an operator to different places.
+        try t.expectEqualStrings("memories.observed_source", refusal.pre_release_drift.probe);
+    }
+
+    // The trust half, on a store where the observation half is complete. Without
+    // this case the probe above would be the only one that ever fired, and a
+    // build that recorded observations while silently having nowhere to put a
+    // grant would read as a finished v13.
+    {
+        var scratch = try Scratch.init(t.allocator, "gate_drift_v13_grant");
+        defer scratch.deinit();
+        {
+            var db = try Db.open(scratch.path);
+            defer db.close();
+            try migrate.applyUpTo(&db, 12);
+            try db.exec(
+                \\ALTER TABLE memories ADD COLUMN observed_at INTEGER;
+                \\ALTER TABLE memories ADD COLUMN observed_source TEXT NOT NULL DEFAULT 'backfill'
+                \\  CHECK (observed_source IN ('live','cache','legacy_import','backfill'));
+                \\ALTER TABLE memories ADD COLUMN verify_cmd TEXT;
+                \\ALTER TABLE memories ADD COLUMN trusted_at INTEGER;
+                \\ALTER TABLE memories ADD COLUMN trusted_by TEXT;
+                \\PRAGMA user_version = 13;
+            );
+        }
+        var refusal: migrate.Refusal = undefined;
+        try t.expectError(
+            error.PreReleaseSchemaDrift,
+            Store.openDiagnosed(scratch.path, &refusal),
+        );
+        try t.expectEqualStrings("memories.trusted_cmd_sha256", refusal.pre_release_drift.probe);
+    }
+}
+
 /// `ResolvedStatus` has no renderer of its own — it is a four-member subset
 /// with no roles to slice it by — so the gate above builds its list here rather
 /// than typing one out, which would be the seventh copy.

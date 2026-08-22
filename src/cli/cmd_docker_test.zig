@@ -44,6 +44,7 @@
 const std = @import("std");
 const Core = @import("../core/core.zig");
 const docker = @import("cmd_docker.zig");
+const args = @import("args.zig");
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -821,4 +822,67 @@ test "gate: every vocabulary key takes a word from its own closed list" {
         checked += 1;
     }
     try t.expectEqual(readings.len, checked);
+}
+
+// --- gate: the poll interval --------------------------------------------------
+
+test "gate: --interval cannot make a watch busy-spin, and cannot outlast its deadline" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `waitFor` sleeps `interval_secs` seconds between polls, and a sleep of
+    // zero is not a sleep — so `--interval 0` issued `docker container inspect`
+    // over the SSH channel as fast as the channel could carry it, for the whole
+    // of `--timeout`. The flag parser had no floor and no ceiling. The gates
+    // below `waitFor` cannot see this because they pass `.interval_secs = 0`
+    // deliberately so the tests do not sleep, which is exactly why the clamp
+    // lives at the flag and is checked here.
+    const cases = [_]struct { given: []const u8, want: u64, says: []const u8 }{
+        .{ .given = "0", .want = docker.interval_bounds.min, .says = "a zero is a busy-spin, not a fast poll" },
+        .{ .given = "1", .want = 1, .says = "the floor itself is allowed through unchanged" },
+        .{ .given = "2", .want = 2, .says = "an ordinary value is untouched" },
+        .{ .given = "3600", .want = docker.interval_bounds.max, .says = "the ceiling itself is allowed through unchanged" },
+        .{ .given = "86400", .want = docker.interval_bounds.max, .says = "a day between polls is a watch that never looks twice" },
+        .{
+            .given = "18446744073709551615",
+            .want = docker.interval_bounds.max,
+            .says = "the largest u64 there is; the clamp is on the value, not on its digits",
+        },
+    };
+
+    var checked: usize = 0;
+    for (cases) |case| {
+        checked += 1;
+        const parsed = try args.parse(arena, &.{ "box", "web", "--interval", case.given });
+        const got = docker.intervalFlag(&parsed, 2);
+        if (got != case.want) {
+            std.debug.print(
+                \\
+                \\--interval {s} became {d}s and must become {d}s — {s}.
+                \\
+            , .{ case.given, got, case.want, case.says });
+            return error.IntervalNotClamped;
+        }
+        // The property under all of them, stated once so a clamp to the wrong
+        // pair of numbers still fails: a poll never repeats without waiting.
+        try t.expect(got >= 1);
+    }
+    try t.expectEqual(@as(usize, 6), checked);
+
+    // The default, when the flag is absent, is inside the bounds too.
+    const bare = try args.parse(arena, &.{ "box", "web" });
+    try t.expectEqual(@as(u64, 2), docker.intervalFlag(&bare, 2));
+
+    // The bounds themselves, so a clamp to `[0, 0]` is not a passing clamp.
+    try t.expect(docker.interval_bounds.min >= 1);
+    try t.expect(docker.interval_bounds.max == 60 * 60);
+    try t.expect(docker.interval_bounds.min < docker.interval_bounds.max);
+
+    // `--timeout 0` is a documented reading — "read it once and tell me" — and
+    // is *not* clamped, because a deadline of zero still polls once before it
+    // expires. The two flags are not the same kind of number and the usage says
+    // which is which.
+    try t.expect(std.mem.indexOf(u8, docker.usage, "--interval is held between 1 second and 1 hour") != null);
 }

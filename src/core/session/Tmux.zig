@@ -130,6 +130,15 @@ const result_schema_version: i64 = 1;
 
 /// Builds the line typed into the job's shell.
 ///
+/// `cwd` goes through `shell.cdInto`, which is the one spelling of "run this
+/// somewhere else" in this tree — it was `"cd {s} && ({s})"` here and a second
+/// copy of the same template in `cmd_exec.runOneShot`, neither of which quoted
+/// the directory. `cmd_job` cannot refuse a directory that has lost its
+/// expansion (`shell.cwdRefusal` names those) because by the time it composes
+/// this line the job row and the tmux session already exist; the rendering is
+/// total on purpose, so nothing an operator typed can become syntax here even
+/// when nobody upstream looked at it.
+///
 /// Three things happen after the user's command, in this order:
 ///   1. its status is captured into `__t_rc`, before anything else can
 ///      clobber `$?`;
@@ -155,7 +164,7 @@ pub fn jobLaunchLine(
     request_id: []const u8,
 ) Allocator.Error![]u8 {
     const body = if (cwd) |dir|
-        try std.fmt.allocPrint(arena, "cd {s} && ({s})", .{ dir, command })
+        try shell.cdInto(arena, dir, command)
     else
         try std.fmt.allocPrint(arena, "({s})", .{command});
 

@@ -2300,6 +2300,182 @@
       "find": "    const server = (Store.servers.getByName(&store, ctx.arena, server_name) catch |err|\n        Cli.storeFatal(&store, err)) orelse fatal(\"unknown server '{s}'\", .{server_name});",
       "replace": "    const server = Cli.resolveServer(ctx, &store, server_name).server;",
       "expect_gate": "gate: a handoff reaches no host, so an offline one answers every section"
+    },
+    {
+      "id": "G11-untrusted-reads-as-trusted",
+      "rule": "A memory with no grant is untrusted. That is the whole boundary in front of `verify_cmd`: the command text arrives by `terminus import` from documents anybody can hand over, and a row that reads as trusted without a grant makes handing somebody a snapshot equivalent to arbitrary code execution on their hosts.",
+      "file": "src/core/store/memories.zig",
+      "find": "    const grant = m.grant orelse return .untrusted;",
+      "replace": "    const grant = m.grant orelse return .trusted;",
+      "expect_gate": "gate: an untrusted verify command is not run, no connection is opened, and the refusal names the grant"
+    },
+    {
+      "id": "G11-grant-is-not-bound-to-its-command",
+      "rule": "A grant authorises the exact command text it was given. Without the digest comparison a grant is a flag, and a flag keeps applying after the text changes under it - trust `systemctl is-active nginx`, then rewrite --verify-cmd to a pipe-to-shell on the same key and the flag is still set. The digest is what makes that laundering unreachable without any writer having to remember to revoke.",
+      "file": "src/core/store/memories.zig",
+      "find": "    if (!std.mem.eql(u8, digest.hex(command, &buf), grant.cmd_sha256)) return .stale_grant;",
+      "replace": "    if (!std.mem.eql(u8, digest.hex(command, &buf), grant.cmd_sha256)) return .trusted;",
+      "expect_gate": "gate: a grant covers the text it was given and nothing else"
+    },
+    {
+      "id": "G11-refused-verification-dials-the-host",
+      "rule": "An unauthorised verify command is refused with nothing *opened*, not merely with nothing sent. The connection is a `Dial` the driver asks for rather than something it already holds, precisely so the refusal is a claim about what was done and not about what was written to a channel that was already up.",
+      "file": "src/cli/cmd_memory.zig",
+      "find": "    const state = Store.memories.trustState(found);",
+      "replace": "    const early = dial.open(dial.context);\n    _ = early;\n    const state = Store.memories.trustState(found);",
+      "expect_gate": "gate: an untrusted verify command is not run, no connection is opened, and the refusal names the grant"
+    },
+    {
+      "id": "G11-refusal-names-the-wrong-verb",
+      "rule": "A refusal that cannot say what to do next is one an operator can only obey. The refusal renders the exact `memory trust` command line that would authorise this memory's command, by --key or by --id; naming any other verb sends the operator to a read that changes nothing.",
+      "file": "src/cli/cmd_memory.zig",
+      "find": "        return std.fmt.allocPrint(arena, \"terminus memory trust {s} --key {s}\", .{ target, key });",
+      "replace": "        return std.fmt.allocPrint(arena, \"terminus memory show {s} --key {s}\", .{ target, key });",
+      "expect_gate": "gate: an untrusted verify command is not run, no connection is opened, and the refusal names the grant"
+    },
+    {
+      "id": "G11-disagreement-recorded-as-an-observation",
+      "rule": "A verify command that runs and disagrees is not an observation. Recording one would make a contradicted memory read as freshly confirmed, which is worse than reading as stale. An exit code is never negative, so comparing against `< 0` records every disagreement as a live reading.",
+      "file": "src/cli/cmd_memory.zig",
+      "find": "    if (result.exit_code != 0) return .{ .disagreed = .{",
+      "replace": "    if (result.exit_code < 0) return .{ .disagreed = .{",
+      "expect_gate": "gate: a command that disagrees is not recorded as an observation"
+    },
+    {
+      "id": "G11-import-substitutes-the-import-moment",
+      "rule": "An import carries `observed_at` verbatim. The document's claim about when the fact was seen is the whole reason to move a memory between machines; substituting the moment of the import turns every imported note into a fresh one, which is the write-time-as-observation confusion v13 exists to remove.",
+      "file": "src/cli/cmd_export_import.zig",
+      "find": "        .observed = if (m.observed_at) |at| .{ .at = at } else .unknown,",
+      "replace": "        .observed = .now,",
+      "expect_gate": "gate: observed_at survives an export/import round trip unchanged"
+    },
+    {
+      "id": "G11-import-adopts-the-documents-provenance",
+      "rule": "How this store came to hold a fact is not the document's to say. An imported row is `legacy_import` - it was read out of a file - and labelling it `cache` claims somebody here wrote it down after looking at the host.",
+      "file": "src/cli/cmd_export_import.zig",
+      "find": "        .observed_source = .legacy_import,",
+      "replace": "        .observed_source = .cache,",
+      "expect_gate": "gate: observed_at survives an export/import round trip unchanged"
+    },
+    {
+      "id": "G11-trust-field-crosses-the-wire",
+      "rule": "The export document has no field for a trust grant, in either direction. A field it could parse is a field a crafted document could fill, and `ignore_unknown_fields` only discards what the type has no key for. The field counts are asserted so that adding one is a decision somebody has to come and write down.",
+      "file": "src/cli/cmd_export_import.zig",
+      "find": "    observed_at: ?i64 = null,\n    verify_cmd: ?[]const u8 = null,\n};",
+      "replace": "    observed_at: ?i64 = null,\n    verify_cmd: ?[]const u8 = null,\n    trusted_at: ?i64 = null,\n};",
+      "expect_gate": "gate: no wire type or insert option can carry a trust grant"
+    },
+    {
+      "id": "v13-backfill-is-labelled-as-one",
+      "rule": "The backfilled observation says it is one. `observed_at` for a pre-v13 row is `updated_at` - a write time standing in for an observation - and the column default is what labels it. Defaulting to any other member makes every row that nobody has observed claim a reading it never took, which is precisely the confusion the version exists to remove.",
+      "file": "src/core/store/migrate.zig",
+      "find": "    \\\\ALTER TABLE memories ADD COLUMN observed_source TEXT NOT NULL DEFAULT 'backfill'\n",
+      "replace": "    \\\\ALTER TABLE memories ADD COLUMN observed_source TEXT NOT NULL DEFAULT 'cache'\n",
+      "expect_gate": "gate: a memory written before v13 is backfilled and the row says it was"
+    },
+    {
+      "id": "v13-grant-is-whole-admits-a-null",
+      "rule": "Every predicate in `grant_is_whole` is `IS NULL` / `IS NOT NULL` before it is anything else, because a CHECK whose expression evaluates to NULL *passes*. A bare inequality on `trusted_by` is NULL on the row where `trusted_by` is missing, so the constraint admits exactly the half-grant it exists to refuse: a timestamp and a digest with nobody's name against them.",
+      "file": "src/core/store/migrate.zig",
+      "find": "    \\\\        AND trusted_by IS NOT NULL AND trusted_by <> ''\n",
+      "replace": "    \\\\        AND trusted_by <> ''\n",
+      "expect_gate": "gate: half a trust grant cannot be stored"
+    },
+    {
+      "id": "v13-observed-source-vocabulary-drifts",
+      "rule": "The four sources Zig can write are the four the column admits. The schema's copy of a vocabulary and the Zig one are written out twice on purpose and nothing derives one from the other, so a member the column accepts and `memories.observed_sources` cannot name is a row `list` refuses to read back.",
+      "file": "src/core/store/migrate.zig",
+      "find": "    \\\\  CHECK (observed_source IN ('live','cache','legacy_import','backfill'));\n",
+      "replace": "    \\\\  CHECK (observed_source IN ('live','cache','legacy_import','backfill','reconcile'));\n",
+      "expect_gate": "gate: the observation sources Zig can write are the ones the memories column admits"
+    },
+    {
+      "id": "shell-cd-template-returns-to-tmux",
+      "rule": "The `cd` a job is launched with is composed in one place. `Tmux.jobLaunchLine` and `cmd_exec.runOneShot` each held a copy of `\"cd {s} && ({s})\"` taking `--cwd` or the server workspace, and neither quoted it; a directory holding a space rendered `cd /srv/two words`, which a POSIX shell answers `cd: too many arguments`, so the `&&` never fired and the attempt settled `exited` code 1 for a command that was never sent. The per-file exemption on this file covered that placeholder under reasons written about session names and ULIDs.",
+      "file": "src/core/session/Tmux.zig",
+      "find": "        try shell.cdInto(arena, dir, command)\n",
+      "replace": "        try std.fmt.allocPrint(arena, \"cd {s} && ({s})\", .{ dir, command })\n",
+      "expect_gate": "gate: every raw value Tmux.zig sends to a host is exempted by name and reason"
+    },
+    {
+      "id": "sync-exclude-quotes-owned-by-the-template",
+      "rule": "A `--exclude` pattern is one shell word. `pull` built `\" --exclude='*{s}*'\"` from values `parseExcludes` only trims whitespace from, so the quotes belonged to the template and escaped nothing: a pattern holding an apostrophe ended that word early and the rest of it became syntax in the middle of a `tar` command line. The same file has validated the sibling argument of that template since an earlier audit.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "    const value = try std.mem.concat(arena, u8, &.{ \"--exclude=*\", pattern, \"*\" });\n    return std.fmt.allocPrint(arena, \"{f}\", .{Core.shell.word(value)});\n",
+      "replace": "    return std.fmt.allocPrint(arena, \"--exclude='*{s}*'\", .{pattern});\n",
+      "expect_gate": "gate: every --exclude pattern is one shell word, and the archive script proves it"
+    },
+    {
+      "id": "cd-operand-readable-as-an-option",
+      "rule": "`cd` gets `--` before its operand. Quoting does not stop `cd` reading its argument as an option: `cd '-P'` is `cd -P`, which takes no operand and succeeds *in the home directory*, reporting nothing wrong — a working directory silently different from the one asked for.",
+      "file": "src/core/shell.zig",
+      "find": "    return std.fmt.allocPrint(arena, \"cd -- {f} && ({s})\", .{ cwd(dir), command });",
+      "replace": "    return std.fmt.allocPrint(arena, \"cd {f} && ({s})\", .{ cwd(dir), command });",
+      "expect_gate": "cdInto composes one command, and the directory in it is one word"
+    },
+    {
+      "id": "cwd-rendered-without-quoting",
+      "rule": "A working directory is rendered as exactly one shell word. `Cwd.format` recognises the two spellings of the remote home itself and quotes every byte the operator wrote; writing the value out raw is the original defect, and `cd: too many arguments` is a proven failure recorded against a command that never ran.",
+      "file": "src/core/shell.zig",
+      "find": "        const rest = homeRemainder(c.raw) orelse return word(c.raw).format(writer);",
+      "replace": "        const rest = homeRemainder(c.raw) orelse return writer.writeAll(c.raw);",
+      "expect_gate": "gate: a working directory a shell would have refused reaches the host as one word"
+    },
+    {
+      "id": "cwd-refusal-admits-an-expansion-it-cannot-perform",
+      "rule": "A working directory that was relying on the remote shell expanding it is refused rather than quietly turned into a literal path. `Cwd` performs exactly one expansion — a leading `~` or `$HOME` — so `$RELEASE/app` is now a directory nobody has, and a `cd` that fails settles an exit code for a command that never ran.",
+      "file": "src/core/shell.zig",
+      "find": "    if (std.mem.indexOfScalar(u8, rest, '$') != null)\n        return \"it contains `$`, and terminus expands only a leading `~` or `\" ++ home_expansion ++ \"`\";",
+      "replace": "    if (std.mem.indexOfScalar(u8, rest, 0) != null)\n        return \"it contains `$`, and terminus expands only a leading `~` or `\" ++ home_expansion ++ \"`\";",
+      "expect_gate": "gate: a working directory that cannot keep its meaning is refused, not rendered quietly"
+    },
+    {
+      "id": "exec-stops-checking-the-working-directory",
+      "rule": "`exec` refuses an unusable working directory before `execution.begin`, which is the only point at which a refusal costs nothing: once the operation row exists the attempt has to be settled, and there is no honest terminal for declining to compose the command.",
+      "file": "src/cli/cmd_exec.zig",
+      "find": "        if (Core.shell.cwdRefusal(dir)) |why| fatal(",
+      "replace": "        if (@as(?[]const u8, null)) |why| fatal(",
+      "expect_gate": "gate: a working directory that lost its expansion is refused before anything is recorded"
+    },
+    {
+      "id": "sync-history-code-claims-zero-for-an-unknown-outcome",
+      "rule": "The `sync` history row's exit code is the attempt's own status. It was a hardcoded `0` and that was reachable on the indeterminate path: `push`'s `.unknown` arm returns rather than fatals, so the row was written and only then did the verb exit 75 — `terminus history --json` showed `\"exit_code\": 0` for a sync that may or may not have run `rm -rf` on the destination. `history.Record.exit_code` is `?i64 = null`.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "        .completed => 0,\n        .created, .connecting, .submitted, .remote_started, .failed, .timed_out, .cancelled, .indeterminate => null,",
+      "replace": "        .completed, .indeterminate => 0,\n        .created, .connecting, .submitted, .remote_started, .failed, .timed_out, .cancelled => null,",
+      "expect_gate": "gate: the sync history row reports no exit code when nothing answered"
+    },
+    {
+      "id": "docker-interval-unclamped",
+      "rule": "`docker wait --interval` is held inside [1s, 1h]. `waitFor` sleeps `interval_secs` seconds and a sleep of zero is not a sleep, so `--interval 0` issued `docker container inspect` over the SSH channel as fast as the channel could carry it for the whole of `--timeout`. The gates below `waitFor` pass zero deliberately so they do not sleep, which is why the clamp is at the flag. Same bounds and same reason as `cmd_job.parseInterval`.",
+      "file": "src/cli/cmd_docker.zig",
+      "find": "    return std.math.clamp(\n        secondsFlag(parsed, \"interval\", default),\n        interval_bounds.min,\n        interval_bounds.max,\n    );",
+      "replace": "    return secondsFlag(parsed, \"interval\", default);",
+      "expect_gate": "gate: --interval cannot make a watch busy-spin, and cannot outlast its deadline"
+    },
+    {
+      "id": "history-redaction-falls-back-to-raw",
+      "rule": "A redaction that could not be performed is reported, not worked around. This was the only arm in the tree that wrote unredacted text on purpose; its sharpest form was inside one function, where `cmd_sync.run` refuses to store a detail string unredacted for the ledger and then handed the same bytes to a call that stored them raw on allocation failure.",
+      "file": "src/core/store/history.zig",
+      "find": "pub fn add(store: *Store, server_id: i64, record: Record, now: i64) (Db.Error || Allocator.Error)!void {\n    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);\n    defer arena_state.deinit();\n    const detail = try redactSecrets(arena_state.allocator(), record.detail);",
+      "replace": "pub fn add(store: *Store, server_id: i64, record: Record, now: i64) Db.Error!void {\n    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);\n    defer arena_state.deinit();\n    const detail = redactSecrets(arena_state.allocator(), record.detail) catch record.detail;",
+      "expect_gate": "gate: a redaction that could not be performed refuses rather than storing raw"
+    },
+    {
+      "id": "sync-probe-quotes-owned-by-the-template",
+      "rule": "The remote directory is a `shell.Word` in every script `sync` sends, not a value inside quotes the template owns. `validateRemotePath` admits a space, a `;`, a `|` and a `&`, which were harmless only because of those quotes — the arrangement that has failed in this project seven times.",
+      "file": "src/cli/cmd_sync.zig",
+      "find": "        \\\\[ -d {[dir]f} ] || exit {[missing]d}\n        \\\\cd -- {[dir]f} && find . -type f | wc -l && du -sb . | cut -f1\n    , .{ .dir = Core.shell.word(remote_dir), .missing = missing_dir_exit });",
+      "replace": "        \\\\[ -d '{[dir]s}' ] || exit {[missing]d}\n        \\\\cd '{[dir]s}' && find . -type f | wc -l && du -sb . | cut -f1\n    , .{ .dir = remote_dir, .missing = missing_dir_exit });",
+      "expect_gate": "gate: cmd_sync's script builders splice no value raw, and its excludes are words"
+    },
+    {
+      "id": "job-start-checks-the-cwd-after-its-side-effects",
+      "rule": "`job start` refuses an unexpandable --cwd before `execution.begin`, `jobs.create` and `Tmux.ensure` — all three. Removing the check makes a $RELEASE/app a literal path, the `cd` fail, and the attempt settle an exit code for a command that never ran, with a job row and a live tmux session behind it.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    const working_dir = parsed.flag(\"cwd\") orelse resolved.server.cwd;\n    if (working_dir) |dir| {\n        if (Core.shell.cwdRefusal(dir)) |why| fatal(\n            \"the working directory '{s}' cannot be used: {s}. Nothing was sent and no job was created. Pass an absolute path, or one starting '~/'\",\n            .{ dir, why },\n        );\n    }\n",
+      "replace": "",
+      "expect_gate": "gate: a working directory that lost its expansion is refused before all three side effects"
     }
   ]
 }

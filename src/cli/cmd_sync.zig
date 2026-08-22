@@ -186,6 +186,34 @@ pub fn remoteAct(
     };
 }
 
+/// What the history row's `exit_code` says about this attempt.
+///
+/// **It was a hardcoded `0`, and that was reachable on the indeterminate path.**
+/// `push`'s and `pull`'s `.unknown` arms *return* rather than fatal, so the
+/// history row was written and only then did the verb exit 75 — and
+/// `terminus history --json` showed `"exit_code": 0` for a sync that may or may
+/// not have run `rm -rf` on the destination. This verb's only sibling,
+/// `cmd_transfer`, maps an indeterminate outcome away from zero with the
+/// reasoning written out: a caller told `0` is told the ledger agrees that this
+/// worked, and it does not. `history.Record.exit_code` is `?i64 = null`, so the
+/// absence was expressible all along.
+///
+/// Null and not 75. The two records answer different questions: 75 is this
+/// process's exit code, chosen so an unknown outcome cannot be retried as a
+/// plain failure, while this column is "what status did the remote command
+/// report" — and the honest answer to that is that it reported none.
+///
+/// Every other path out of `push` and `pull` ends in `fatal`, so an attempt that
+/// reaches the write is either completed or unknown; the other statuses are
+/// mapped anyway rather than asserted away, because a status that cannot occur
+/// today is not one to guess about tomorrow.
+pub fn historyExitCode(status: Store.op_state.Status) ?i64 {
+    return switch (status) {
+        .completed => 0,
+        .created, .connecting, .submitted, .remote_started, .failed, .timed_out, .cancelled, .indeterminate => null,
+    };
+}
+
 pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     if (raw_args.len == 0) fatal("{s}", .{usage});
     const verb = std.meta.stringToEnum(Verb, raw_args[0]) orelse
@@ -262,6 +290,9 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const elapsed_ns = started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds;
     const duration_ms: i64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
 
+    // Whether the one remote act this row describes was ever answered for.
+    const unknown = execution.status == .indeterminate;
+
     // The history row, which is a different record from the receipt above it and
     // is kept for the same reason it always was: `terminus history` is the
     // per-server narrative an operator reads, and the ledger is the per-attempt
@@ -271,15 +302,18 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // that rule with the same exit code: this attempt now *has* a request id, but
     // what failed here is not the operation receipt, so `receiptFatal`'s envelope
     // would name the wrong thing as incomplete.
+    //
+    // **The exit code is the status's own, and never a hardcoded zero.** See
+    // `historyExitCode`: it was `0` on both paths that reach here, including the
+    // one where nothing ever answered.
     Store.history.add(&store, resolved.server.id, .{
         .kind = "sync",
         .detail = detail,
-        .exit_code = 0,
+        .exit_code = historyExitCode(execution.status),
         .transport = "direct",
         .duration_ms = duration_ms,
     }, ctx.now) catch |err| Cli.auditFatal("sync", server_name, detail, err);
 
-    const unknown = execution.status == .indeterminate;
     switch (ctx.out.format) {
         .json => try ctx.out.json(.{
             .ok = !unknown,
@@ -351,8 +385,35 @@ fn excluded(path: []const u8, excludes: []const []const u8) bool {
 /// Derived from the request id rather than from the clock, so a temp file left
 /// behind by an attempt that died names the attempt that left it. Ids are
 /// Crockford base32 (`store/ids.zig`), so nothing here can become shell syntax.
+///
+/// The `{s}` builds a *value*. Every script below renders that value through
+/// `shell.word`, so the path is one shell word wherever it lands and this
+/// placeholder is not a splice into shell text.
 pub fn stagingPath(arena: std.mem.Allocator, request_id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "/tmp/.terminus_sync_{s}.tar", .{request_id});
+}
+
+/// One `--exclude` argument for the remote `tar`, as exactly one shell word.
+///
+/// **The bug this replaces.** `pull` built `" --exclude='*<pattern>*'"` straight
+/// from `parseExcludes`, which only trims whitespace — quotes owned by the
+/// template and no escaping of the value, which is the exact shape `shell.zig`'s
+/// scan forbids in `transfer.zig` and the exact shape that was still here. A
+/// pattern holding an apostrophe ended that word early and whatever followed it
+/// became syntax in the middle of a `tar` command line. The same file validated
+/// the *other* argument of the same template — `validateRemotePath` on
+/// `remote_dir`, added after an earlier audit — and left this one alone.
+///
+/// The `*`s stay inside the word on purpose: they are `tar`'s own globbing, not
+/// the shell's, so they have to reach `tar` literally. That is why the quotes
+/// were there, and it is why the answer is one *word* rather than no quotes at
+/// all — `--exclude=*a b*` would split into two arguments.
+///
+/// Built with `concat` and not a format template, so the pattern goes into a
+/// value and never into text: there is no placeholder here to get wrong.
+pub fn excludeArg(arena: std.mem.Allocator, pattern: []const u8) ![]const u8 {
+    const value = try std.mem.concat(arena, u8, &.{ "--exclude=*", pattern, "*" });
+    return std.fmt.allocPrint(arena, "{f}", .{Core.shell.word(value)});
 }
 
 /// The script the host runs to unpack a staged archive.
@@ -369,23 +430,29 @@ pub fn unpackScript(
     delete: bool,
 ) ![]const u8 {
     const delete_clause = if (delete)
-        try std.fmt.allocPrint(arena, "rm -rf '{s}' && ", .{remote_dir})
+        try std.fmt.allocPrint(arena, "rm -rf {f} && ", .{Core.shell.word(remote_dir)})
     else
         "";
     return std.fmt.allocPrint(arena,
         \\set -e
-        \\actual=$(md5sum {s} | cut -d' ' -f1)
-        \\[ "$actual" = "{s}" ] || {{ echo "checksum mismatch: $actual"; rm -f {s}; exit {d}; }}
-        \\{s}mkdir -p '{s}'
-        \\tar -xf {s} -C '{s}'
-        \\rm -f {s}
+        \\actual=$(md5sum {[tmp]f} | cut -d' ' -f1)
+        \\[ "$actual" = {[md5]f} ] || {{ echo "checksum mismatch: $actual"; rm -f {[tmp]f}; exit {[corrupt]d}; }}
+        \\{[delete]s}mkdir -p {[dir]f}
+        \\tar -xf {[tmp]f} -C {[dir]f}
+        \\rm -f {[tmp]f}
     , .{
-        remote_tmp, md5_hex,    remote_tmp, corrupt_exit, delete_clause,
-        remote_dir, remote_tmp, remote_dir, remote_tmp,
+        .tmp = Core.shell.word(remote_tmp),
+        .md5 = Core.shell.word(md5_hex),
+        .corrupt = corrupt_exit,
+        .delete = delete_clause,
+        .dir = Core.shell.word(remote_dir),
     });
 }
 
 /// The script the host runs to tar a directory up for a pull.
+///
+/// `exclude_args` is already-rendered shell text — one quoted word per pattern,
+/// from `excludeArg` — which is why it is the one raw splice here.
 pub fn archiveScript(
     arena: std.mem.Allocator,
     remote_dir: []const u8,
@@ -394,18 +461,23 @@ pub fn archiveScript(
 ) ![]const u8 {
     return std.fmt.allocPrint(arena,
         \\set -e
-        \\[ -d '{s}' ] || exit {d}
-        \\tar -cf {s} -C '{s}'{s} .
-        \\md5sum {s} | cut -d' ' -f1
-    , .{ remote_dir, missing_dir_exit, remote_tmp, remote_dir, exclude_args, remote_tmp });
+        \\[ -d {[dir]f} ] || exit {[missing]d}
+        \\tar -cf {[tmp]f} -C {[dir]f}{[excludes]s} .
+        \\md5sum {[tmp]f} | cut -d' ' -f1
+    , .{
+        .dir = Core.shell.word(remote_dir),
+        .missing = missing_dir_exit,
+        .tmp = Core.shell.word(remote_tmp),
+        .excludes = exclude_args,
+    });
 }
 
 /// The script a `pull --dry-run` runs: a count and a size, and no write anywhere.
 pub fn probeScript(arena: std.mem.Allocator, remote_dir: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena,
-        \\[ -d '{s}' ] || exit {d}
-        \\cd '{s}' && find . -type f | wc -l && du -sb . | cut -f1
-    , .{ remote_dir, missing_dir_exit, remote_dir });
+        \\[ -d {[dir]f} ] || exit {[missing]d}
+        \\cd -- {[dir]f} && find . -type f | wc -l && du -sb . | cut -f1
+    , .{ .dir = Core.shell.word(remote_dir), .missing = missing_dir_exit });
 }
 
 /// Local tree → tar in memory → SCP → remote `tar -x` → md5 verify.
@@ -543,7 +615,8 @@ fn pull(
 
     var exclude_args: std.ArrayList(u8) = .empty;
     for (excludes) |pattern| {
-        try exclude_args.appendSlice(ctx.arena, try std.fmt.allocPrint(ctx.arena, " --exclude='*{s}*'", .{pattern}));
+        try exclude_args.append(ctx.arena, ' ');
+        try exclude_args.appendSlice(ctx.arena, try excludeArg(ctx.arena, pattern));
     }
 
     // Remote: tar to a temp file (SCP needs a real file), report its md5.
@@ -571,7 +644,7 @@ fn pull(
     // has to happen in between, and it is not the act the row is about — but a
     // failure is reported rather than dropped, because what it leaves is a file
     // on somebody's host with this request id in its name.
-    _ = executor.exec(ctx.arena, try std.fmt.allocPrint(ctx.arena, "rm -f {s}", .{remote_tmp})) catch |err|
+    _ = executor.exec(ctx.arena, try std.fmt.allocPrint(ctx.arena, "rm -f {f}", .{Core.shell.word(remote_tmp)})) catch |err|
         std.debug.print(
             "terminus: could not remove the staged archive {s} on the remote host: {s}; delete it by hand\n",
             .{ remote_tmp, @errorName(err) },
@@ -642,7 +715,21 @@ fn reportBlocked(blocker: Core.execution.Blocker) noreturn {
     }
 }
 
-/// Remote paths land inside single-quoted shell strings.
+/// A first refusal for the remote directory, before an operation row exists.
+///
+/// **No longer the thing that makes the scripts safe.** It said "remote paths
+/// land inside single-quoted shell strings", and it was right: they were spliced
+/// into `'{s}'`, so this blacklist was the only reason a `$` or a backtick in a
+/// path was not command substitution — and it admitted a space, a `;`, a `|` and
+/// a `&`, which were harmless only because of the quotes the template happened
+/// to own. Every one of those paths now goes through `shell.word`, so safety is
+/// a property of the renderer and this is defence in depth over the value that
+/// is also this attempt's scope key.
+///
+/// Kept rather than widened: the character set it admits is unchanged, so no
+/// path that worked stops working and no path that was refused starts being
+/// accepted. `~` stays literal here as it always did — `[ -d '~/app' ]` never
+/// expanded, and `shell.word` does not change that.
 fn validateRemotePath(path: []const u8) void {
     if (path.len == 0 or std.mem.indexOfAny(u8, path, "'\"\n`$") != null)
         fatal("remote path must not contain quotes, backticks, '$' or newlines", .{});

@@ -29,8 +29,13 @@
 //!
 //! What that does *not* cover is somebody adding a template argument of a
 //! different type, and `Word` cannot make that a compile error from here. That
-//! half is held by the scan at the bottom of this file, which reads
-//! `transfer.zig`'s own source and refuses both shapes the defect can take.
+//! half is held by the scan at the bottom of this file, which reads the source
+//! of every module that splices into remote shell text and refuses both shapes
+//! the defect can take. The exemptions to it are per *function*, each stating
+//! how many raw values it splices and why — see `Exemption`, and
+//! `shell_test.zig` for the registry itself. A per-file exemption is what let
+//! `cd {s}` through: the three reasons written on it were reasons about three
+//! other arguments.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -155,6 +160,122 @@ pub fn render(arena: Allocator, argv: []const []const u8) Allocator.Error![]u8 {
 /// command; it has no way to spell the quoting itself.
 pub fn loginWrap(arena: Allocator, binary: []const u8, command: []const u8) Allocator.Error![]u8 {
     return std.fmt.allocPrint(arena, "{s} -ilc {f}", .{ binary, word(command) });
+}
+
+// --- A working directory, the one value a shell still has to expand ---------
+
+/// The one expansion a `Cwd` performs, and the only text it emits unquoted.
+pub const home_expansion = "$HOME";
+
+/// A working directory, rendered as exactly one shell word.
+///
+/// **Why this is not simply a `Word`.** Every other value in this file is data
+/// and nothing else, so `Word` is the whole answer: quote it and no byte of it
+/// can be syntax. A working directory is the one argument in this project where
+/// that is not the whole answer, because `cd '~/app'` is not a slower `cd
+/// ~/app` — it is a different command, and it fails. The tilde is expanded by
+/// the shell before `cd` ever sees it, so a value that is quoted has lost the
+/// expansion it was written for, and `~/app` and `$HOME/app` are what operators
+/// actually put in `terminus workspace set`.
+///
+/// **A value cannot be both expandable and safe, so the expansion is ours.** An
+/// expansion performed by the remote shell is by definition the shell reading
+/// the value as syntax — that is what expansion *is* — and there is no quoting
+/// that admits one expansion and refuses the rest. So this type does not ask
+/// the shell to expand anything the operator typed. It recognises the two
+/// spellings of the remote home itself, emits `$HOME` as text of its own, and
+/// quotes every byte the operator wrote after it:
+///
+///   * `~`            → `$HOME`
+///   * `~/app dir`    → `$HOME/'app dir'`
+///   * `$HOME/app`    → `$HOME/'app'`
+///   * `/srv/two words` → `'/srv/two words'`
+///   * `/tmp; rm -rf ~` → `'/tmp; rm -rf ~'`, which is a path and not a command
+///
+/// The `$HOME` it writes is its own literal, not the operator's — so the only
+/// expansion that survives is one this file spelled, and the remainder is one
+/// quoted word whatever is in it.
+///
+/// **What that leaves, and why it is refused rather than rendered.** A value
+/// like `$RELEASE/app` was expanded before this type existed and is a literal
+/// path now, so it would silently become a directory nobody has. That is not
+/// rendered quietly: `cwdRefusal` names it, and the callers that can still
+/// refuse — before a connection and before a ledger row — do. See its doc
+/// comment for which those are.
+pub const Cwd = struct {
+    raw: []const u8,
+
+    pub fn format(c: Cwd, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const rest = homeRemainder(c.raw) orelse return word(c.raw).format(writer);
+        try writer.writeAll(home_expansion);
+        if (rest.len == 0) return;
+        try writer.writeByte('/');
+        try word(rest).format(writer);
+    }
+};
+
+/// `dir` as one shell word, for a template argument.
+pub fn cwd(dir: []const u8) Cwd {
+    return .{ .raw = dir };
+}
+
+/// What follows a leading `~/` or `$HOME/`; `""` for a bare `~` or `$HOME`, and
+/// null when `dir` does not name the remote home at all.
+fn homeRemainder(dir: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, dir, "~") or std.mem.eql(u8, dir, home_expansion)) return "";
+    if (std.mem.startsWith(u8, dir, "~/")) return dir[2..];
+    if (std.mem.startsWith(u8, dir, home_expansion ++ "/")) return dir[home_expansion.len + 1 ..];
+    return null;
+}
+
+/// Why `dir` cannot be carried as one shell word without changing what it
+/// meant, or null when it can.
+///
+/// This is the honest half of `Cwd`. `Cwd` is total — it always renders one
+/// word, so nothing an operator types can become syntax — but a value that was
+/// relying on an expansion beyond `~` and `$HOME` is now a literal path, and
+/// turning it into one quietly would trade an injection for a directory that is
+/// not there. The values named here are refused *before* a connection exists,
+/// which is the one disposition that cannot leave a ledger row: a refusal has
+/// no exit code, and a `cd` that fails does.
+///
+/// Called by `cmd_exec` (before `begin`) and by `cmd_workspace set` (so the
+/// store stops accepting one). `Tmux.jobLaunchLine` renders without refusing:
+/// by the time `cmd_job` composes that line it has already created the job row
+/// and the tmux session, so a refusal there would be later than the side
+/// effects it is refusing on behalf of.
+pub fn cwdRefusal(dir: []const u8) ?[]const u8 {
+    if (dir.len == 0) return "it is empty, and an empty operand makes `cd` change to the home directory instead";
+    const rest = homeRemainder(dir) orelse blk: {
+        if (dir[0] == '~') return "it starts with `~` and a user name, and terminus expands only `~` and `~/`";
+        break :blk dir;
+    };
+    if (std.mem.indexOfScalar(u8, rest, '$') != null)
+        return "it contains `$`, and terminus expands only a leading `~` or `" ++ home_expansion ++ "`";
+    if (std.mem.indexOfScalar(u8, rest, '`') != null)
+        return "it contains a backtick, which is command substitution and not part of a path";
+    return null;
+}
+
+/// `cd -- <dir> && (<command>)` — the one spelling of "run this somewhere else".
+///
+/// **Why it is a function and not a template each caller writes.** It was a
+/// template each caller wrote: `cmd_exec.runOneShot` and `Tmux.jobLaunchLine`
+/// held one `"cd {s} && ({s})"` each, both taking `--cwd` or the server's
+/// workspace, and neither validated or quoted it. A `--cwd` holding a space
+/// therefore produced `cd /srv/two words`, which a POSIX shell answers with
+/// `cd: too many arguments` — so the `&&` never fired, the operator's command
+/// was never sent, and `exec` settled the attempt `exited` with code 1. The
+/// ledger recorded a proven failure of a command that had not run. One
+/// spelling, in one place, is what stops the third caller writing a third copy.
+///
+/// `--` is load-bearing and not decoration. Quoting does not stop `cd` reading
+/// its operand as an option: `cd '-P'` is `cd -P`, which takes no operand and
+/// succeeds *in the home directory* — a working directory silently different
+/// from the one that was asked for, which is the same class of defect as the
+/// injection and quieter. `cd -- '-P'` reports that there is no such directory.
+pub fn cdInto(arena: Allocator, dir: []const u8, command: []const u8) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(arena, "cd -- {f} && ({s})", .{ cwd(dir), command });
 }
 
 /// The `--shell` vocabulary: which interpreter a command is declared to run
@@ -356,7 +477,12 @@ pub fn scan(source: []const u8) Scan {
         .word_placeholders = 0,
     };
     var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |raw_line| scanLine(codeOf(raw_line), &out);
+    while (lines.next()) |raw_line| {
+        const line = scanLine(codeOf(raw_line));
+        out.quoted_placeholders += line.quoted_placeholders;
+        out.string_placeholders += line.string_placeholders;
+        out.word_placeholders += line.word_placeholders;
+    }
     return out;
 }
 
@@ -401,7 +527,12 @@ pub fn countInCode(source: []const u8, needle: []const u8) usize {
     return n;
 }
 
-fn scanLine(line: []const u8, out: *Scan) void {
+fn scanLine(line: []const u8) Scan {
+    var out: Scan = .{
+        .quoted_placeholders = 0,
+        .string_placeholders = 0,
+        .word_placeholders = 0,
+    };
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
         switch (line[i]) {
@@ -433,6 +564,225 @@ fn scanLine(line: []const u8, out: *Scan) void {
             else => {},
         }
     }
+    return out;
+}
+
+// --- The exemption, which has to say what it exempts ------------------------
+
+/// One script-building function, the raw values it splices, and why each one
+/// must stay raw.
+///
+/// **Why the unit is a function and not a file.** It was a file. `Tmux.zig` held
+/// a blanket exemption from the `{s}` clause — one `expect(found.string_placeholders
+/// >= 10)` justified in prose by three arguments that really are safe: session
+/// names validated to `[a-zA-Z0-9._-]`, ULIDs this program minted, and
+/// `$HOME/...` directories that have to stay unquoted to expand at all. Every
+/// one of those justifications is *about an argument*. The exemption was about a
+/// file, and so it covered all 77 placeholders in it — including `cd {s}`, whose
+/// argument is `--cwd`, which nothing validated and nobody had reasoned about.
+/// A new `{s}` anywhere in the file was silently covered by somebody else's
+/// argument for a different value.
+///
+/// So an exemption now names a function and states how many raw values that
+/// function splices. Four things then fail rather than pass:
+///
+///   * a `{s}` in a function nobody registered — it is unaccounted for;
+///   * a *new* `{s}` in a registered function — the count no longer matches, and
+///     the message prints the body so the reader sees which value appeared;
+///   * a registered function that lost its placeholders, was renamed or was
+///     emptied — the count no longer matches in the other direction, so a scan
+///     cannot pass by finding nothing;
+///   * a reason too short to be one.
+///
+/// What it does not do is discover a script-building function that nobody
+/// registered in a file nobody registered. `expectAccounted` closes the first
+/// half of that — a registered file's non-test placeholders must all be inside
+/// registered functions or a declared prose count — and a wholly new module is
+/// the part a human still has to add. It is one list, in one place, which is the
+/// most that can be said for it.
+pub const Exemption = struct {
+    /// The function header, as `bodyOf` takes it: `"\npub fn ensure("`.
+    header: []const u8,
+    /// Exactly how many `{s}` placeholders its body carries.
+    placeholders: usize,
+    /// Exactly how many placeholders sit inside a quote the template owns —
+    /// the `'{` shape. Almost always zero, and the default is zero so an entry
+    /// has to say otherwise out loud. `script.stage` is the one place in this
+    /// tree where it is not, and `why` carries the argument for it.
+    quoted: usize = 0,
+    /// Why none of them can be a `Word`. Not optional and not a word: this is
+    /// the thing the per-file exemption did not have.
+    why: []const u8,
+};
+
+/// The shortest a reason may be. A `why` of "ok" is a blanket exemption with
+/// extra steps.
+pub const min_reason_len: usize = 24;
+
+pub const ExemptionError = error{
+    /// A registered function does not splice what it says it splices.
+    ExemptionMiscounted,
+    /// A reason too short to be one.
+    ExemptionUnreasoned,
+    /// Two entries name the same function.
+    ExemptionDuplicated,
+    /// A registered script builder owns the quotes around a placeholder, which
+    /// is the shape no reason can justify.
+    QuotedPlaceholderInScript,
+    /// A registered file has `{s}` outside every registered function and
+    /// outside its declared prose count.
+    RawValueUnaccounted,
+};
+
+/// Checks one file's exemptions against its own source, and returns how many
+/// raw values they accounted for.
+///
+/// `bodies` are the function bodies, already extracted by the caller — `bodyOf`
+/// lives in `control.zig` and this file does not import it. Parallel to
+/// `exemptions`, and asserted so.
+pub fn expectExempted(
+    file: []const u8,
+    exemptions: []const Exemption,
+    bodies: []const []const u8,
+) ExemptionError!usize {
+    std.debug.assert(exemptions.len == bodies.len);
+    var accounted: usize = 0;
+    for (exemptions, bodies, 0..) |exemption, body, i| {
+        if (exemption.why.len < min_reason_len) {
+            std.debug.print(
+                \\
+                \\{s}: the exemption for `{s}` gives no reason for the {d} raw value(s) it
+                \\splices ("{s}"). An exemption that does not say what it exempts and why is
+                \\the per-file exemption this mechanism replaced.
+                \\
+            , .{ file, exemption.header, exemption.placeholders, exemption.why });
+            return error.ExemptionUnreasoned;
+        }
+        for (exemptions, 0..) |other, j| {
+            if (j == i) continue;
+            if (std.mem.eql(u8, other.header, exemption.header)) {
+                std.debug.print(
+                    \\
+                    \\{s}: `{s}` is registered twice, so the two reasons cover each other and
+                    \\neither count means anything.
+                    \\
+                , .{ file, exemption.header });
+                return error.ExemptionDuplicated;
+            }
+        }
+        const found = scan(body);
+        // The clause that is almost never exempted, counted here rather than
+        // over the whole file: a CLI module quotes paths in its *English* —
+        // `fatal("cannot open '{s}'")` — and reads as six violations file-wide
+        // while being none. A nonzero declaration is an argument its `why` has
+        // to carry, and the default of zero is what makes it an argument
+        // somebody had to make.
+        if (found.quoted_placeholders != exemption.quoted) {
+            std.debug.print(
+                \\
+                \\{s}: `{s}` puts {d} placeholder(s) inside a quote the template owns, and its
+                \\exemption declares {d}. The quotes escape nothing, so the first apostrophe in
+                \\the value ends the word and the rest of it becomes syntax — this is the shape
+                \\thirty sites in `transfer.zig` had. Render the value with `shell.word` and drop
+                \\the quotes; `{{f}}` writes its own. If the value provably cannot hold an
+                \\apostrophe, raise `quoted` and say why in the same breath as the rest.
+                \\
+                \\The declared reason is:
+                \\  {s}
+                \\
+                \\{s}
+                \\
+            , .{ file, exemption.header, found.quoted_placeholders, exemption.quoted, exemption.why, body });
+            return error.QuotedPlaceholderInScript;
+        }
+        if (found.string_placeholders != exemption.placeholders) {
+            std.debug.print(
+                \\
+                \\{s}: `{s}` splices {d} raw value(s) into shell text, and its exemption
+                \\declares {d}.
+                \\
+                \\The declared reason is:
+                \\  {s}
+                \\
+                \\If a value was added, that reason was written for the other ones — say what
+                \\the new value is and why a shell must read it as syntax rather than as one
+                \\word, or render it through `shell.word`/`shell.cwd` and drop the count. If a
+                \\value was removed, lower the count so the next reader is not told this
+                \\function still splices something it does not.
+                \\
+                \\The body this gate read:
+                \\{s}
+                \\
+            , .{ file, exemption.header, found.string_placeholders, exemption.placeholders, exemption.why, body });
+            return error.ExemptionMiscounted;
+        }
+        accounted += found.string_placeholders;
+    }
+    return accounted;
+}
+
+/// Checks that a registered file has no raw value outside its registered
+/// functions, beyond a declared count of placeholders that are not shell text
+/// at all.
+///
+/// The half that catches a *new* script-building function. `accounted` is what
+/// `expectExempted` returned; `prose` is the file's declared number of `{s}`
+/// that reach no host — an error sentence, a JSON document, a diagnostic. Its
+/// reason is stated at the call site next to the number.
+///
+/// Test bodies are excluded from the denominator, and only they: a `{s}` inside
+/// a `test` block builds a fixture for a stand-in executor and cannot reach a
+/// host, while a `{s}` anywhere else in the file might. Counting them would tie
+/// this gate to every fixture edit, which is how a gate stops being read.
+pub fn expectAccounted(
+    file: []const u8,
+    source: []const u8,
+    accounted: usize,
+    prose: usize,
+) ExemptionError!void {
+    const outside = nonTestScan(source).string_placeholders;
+    if (outside != accounted + prose) {
+        std.debug.print(
+            \\
+            \\{s}: {d} raw value(s) outside its `test` blocks, and its registry accounts for
+            \\{d} in registered functions plus {d} declared as prose.
+            \\
+            \\A `{{s}}` appeared, or moved, somewhere this registry does not describe. Decide
+            \\which it is: if it splices into remote shell text, register the function that
+            \\builds it and say why each value must stay raw; if it is an error sentence or a
+            \\document that reaches no host, raise the prose count and say so there. Adding
+            \\the file to a scan list is what this mechanism replaced — the next unscanned
+            \\thing is a function, not a file.
+            \\
+        , .{ file, outside, accounted, prose });
+        return error.RawValueUnaccounted;
+    }
+}
+
+/// `scan`, over the lines that are not inside a top-level `test` block.
+///
+/// The block rule is the one `zig fmt` guarantees: a top-level declaration
+/// starts in column zero, so a `test` there runs to the next `}` in column
+/// zero. Nothing in this tree nests a top-level declaration.
+pub fn nonTestScan(source: []const u8) Scan {
+    var out: Scan = .{
+        .quoted_placeholders = 0,
+        .string_placeholders = 0,
+        .word_placeholders = 0,
+    };
+    var in_test = false;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw_line| {
+        if (!in_test and std.mem.startsWith(u8, raw_line, "test ")) in_test = true;
+        if (!in_test) {
+            const line = scanLine(codeOf(raw_line));
+            out.quoted_placeholders += line.quoted_placeholders;
+            out.string_placeholders += line.string_placeholders;
+            out.word_placeholders += line.word_placeholders;
+        }
+        if (in_test and std.mem.eql(u8, raw_line, "}")) in_test = false;
+    }
+    return out;
 }
 
 test "a shell word is every byte literal, and the apostrophe is the only one rewritten" {
@@ -552,54 +902,163 @@ test "gate: the scan sees both shapes of the defect and counts what it looked at
     try t.expectEqual(@as(usize, 1), scan("    x(\"'{[path]s}'\"); // fine").quoted_placeholders);
 }
 
-test "gate: transfer.zig has no spelling for a raw value in a remote script" {
+test "a working directory is one word, and the only expansion in it is ours" {
     const t = std.testing;
-    const found = scan(@embedFile("transfer.zig"));
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // **Zero single-quoted placeholders.** The shape all thirty sites had:
-    // quotes owned by the template and no escaping of the value, so the first
-    // apostrophe in an operator's path ended the word and the rest of the path
-    // became syntax.
-    try t.expectEqual(@as(usize, 0), found.quoted_placeholders);
+    // Every case is a directory somebody could reasonably have in
+    // `terminus workspace set`, and the assertion is on the words a shell would
+    // split the rendering into — not on the quote marks.
+    const cases = [_]struct {
+        dir: []const u8,
+        rendered: []const u8,
+        /// The single word the host sees, before it expands `$HOME`.
+        word: []const u8,
+    }{
+        .{ .dir = "/srv/app", .rendered = "'/srv/app'", .word = "/srv/app" },
+        // The case that made a command silently not run: `cd /srv/two words`
+        // is `cd` with two operands, which a POSIX shell refuses outright.
+        .{ .dir = "/srv/two words", .rendered = "'/srv/two words'", .word = "/srv/two words" },
+        .{ .dir = "/data/John's app", .rendered = "'/data/John'\\''s app'", .word = "/data/John's app" },
+        // Not a command. Each of these was syntax before `Cwd` existed.
+        .{ .dir = "/tmp; rm -rf ~", .rendered = "'/tmp; rm -rf ~'", .word = "/tmp; rm -rf ~" },
+        .{ .dir = "/tmp/`whoami`", .rendered = "'/tmp/`whoami`'", .word = "/tmp/`whoami`" },
+        .{ .dir = "/tmp/a\nb", .rendered = "'/tmp/a\nb'", .word = "/tmp/a\nb" },
+        .{ .dir = "/tmp/a|b&&c", .rendered = "'/tmp/a|b&&c'", .word = "/tmp/a|b&&c" },
+        // A directory named like an option. `cd '-P'` is `cd -P`, which lands
+        // in the home directory and reports success; `cdInto` puts `--` in
+        // front, and this is the word that has to arrive for that to matter.
+        .{ .dir = "-P", .rendered = "'-P'", .word = "-P" },
+        // The two spellings of the remote home, which have to keep expanding.
+        .{ .dir = "~", .rendered = "$HOME", .word = "$HOME" },
+        .{ .dir = "$HOME", .rendered = "$HOME", .word = "$HOME" },
+        .{ .dir = "~/app", .rendered = "$HOME/'app'", .word = "$HOME/app" },
+        .{ .dir = "$HOME/app", .rendered = "$HOME/'app'", .word = "$HOME/app" },
+        // …and the remainder after the prefix is still just data.
+        .{ .dir = "~/two words", .rendered = "$HOME/'two words'", .word = "$HOME/two words" },
+        .{ .dir = "~/a;b", .rendered = "$HOME/'a;b'", .word = "$HOME/a;b" },
+    };
 
-    // **Zero `{s}` placeholders of any spelling.** Every string this module
-    // splices into a command is a shell word, so a `{s}` is a raw slice standing
-    // where a `shell.Word` belongs — and dropping the quotes is not the safer
-    // half of the fix: `rm -f {[path]s}` word-splits on the first space. This is
-    // the clause that stops the thirty-first site rather than repairing it:
-    // `'{[path]s}'` with a `[]const u8` argument compiles perfectly well, and
-    // nothing else in this tree would have a word to say about it.
-    try t.expectEqual(@as(usize, 0), found.string_placeholders);
-
-    // **And the file still has templates in it.** A count, so a scan over a
-    // module that was emptied, renamed, or had its script text moved somewhere
-    // else fails here instead of reporting that it found nothing wrong.
-    //
-    // A floor with room in it, not the exact count. The conversion produced
-    // thirty; pinning thirty makes this gate fail for any edit that consolidates
-    // a line of shell — two of the no-clobber mutations do exactly that, and
-    // both already have a gate of their own that says what is wrong. A gate that
-    // fails for somebody else's reason is a gate people learn to read past.
-    try t.expect(found.word_placeholders >= 20);
+    var checked: usize = 0;
+    for (cases) |case| {
+        checked += 1;
+        const rendered = try std.fmt.allocPrint(arena, "{f}", .{cwd(case.dir)});
+        try t.expectEqualStrings(case.rendered, rendered);
+        // One word, and it is the one expected. `words` is the inverse of the
+        // quoter, so this is what the *host* would split the text into.
+        const got = try words(arena, rendered);
+        try t.expectEqual(@as(usize, 1), got.len);
+        try t.expectEqualStrings(case.word, got[0]);
+        // The only unquoted text a `Cwd` ever emits is its own `$HOME`.
+        if (!std.mem.startsWith(u8, rendered, home_expansion))
+            try t.expect(rendered[0] == '\'');
+    }
+    try t.expectEqual(@as(usize, 14), checked);
 }
 
-test "gate: Tmux.zig puts no placeholder inside a shell quote either" {
+test "cdInto composes one command, and the directory in it is one word" {
     const t = std.testing;
-    const found = scan(@embedFile("session/Tmux.zig"));
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // The same first clause, on the other module that writes remote shell text.
-    // It already passes — `Tmux` reaches for `shell.quote` where it interpolates
-    // a value the operator wrote, and the one `'{` in the file is `printf '{{`,
-    // an escaped literal brace in a JSON format string.
-    try t.expectEqual(@as(usize, 0), found.quoted_placeholders);
+    // The exact case the audit measured against a real `sh`: a `--cwd` with a
+    // space used to render `cd /srv/two words`, which answers `cd: too many
+    // arguments` — so the `&&` never fired and the command was never sent.
+    const line = try cdInto(arena, "/srv/two words", "true");
+    try t.expectEqualStrings("cd -- '/srv/two words' && (true)", line);
 
-    // Not the `{s}` clause. `Tmux` interpolates session names and request ids
-    // bare and on purpose: a session name is validated to `[a-zA-Z0-9._-]`
-    // before it reaches here (`cmd_session.validateName`), a request id is a
-    // ULID this program minted, and the log and result directories are
-    // `$HOME/...` — which have to stay unquoted to expand at all. Demanding
-    // `Word` here would be demanding `cd '~/app'`, which is a directory almost
-    // nobody has. Counted, so this exemption is a statement about a file that
-    // still has script text in it.
-    try t.expect(found.string_placeholders >= 10);
+    const got = try words(arena, line);
+    // `cd`, `--`, the directory, `&&`, and the parenthesised command. `words`
+    // does not model operators, so `&&` and `(true)` come back as words — what
+    // matters is that the directory is exactly one of them and is intact.
+    try t.expectEqual(@as(usize, 5), got.len);
+    try t.expectEqualStrings("cd", got[0]);
+    try t.expectEqualStrings("--", got[1]);
+    try t.expectEqualStrings("/srv/two words", got[2]);
+    try t.expectEqualStrings("&&", got[3]);
+    try t.expectEqualStrings("(true)", got[4]);
+
+    // Every byte a shell reads as syntax, inside a directory, still one word —
+    // and the command after it still exactly the operator's own text.
+    const nasty = try cdInto(arena, "/srv/John's app; rm -rf ~", "make test");
+    const nasty_words = try words(arena, nasty);
+    try t.expectEqual(@as(usize, 6), nasty_words.len);
+    try t.expectEqualStrings("/srv/John's app; rm -rf ~", nasty_words[2]);
+
+    // `--` before the operand, always: without it a directory named `-P` is an
+    // option and `cd` succeeds in the home directory instead.
+    try t.expect(std.mem.startsWith(u8, try cdInto(arena, "-P", "true"), "cd -- '-P'"));
+
+    // A home-relative directory keeps expanding, and the command after it is
+    // untouched — it is the operator's own program text and quoting it would
+    // run it as a filename.
+    try t.expectEqualStrings(
+        "cd -- $HOME/'app' && (make -j4 && ./run)",
+        try cdInto(arena, "~/app", "make -j4 && ./run"),
+    );
+}
+
+test "gate: a working directory that cannot keep its meaning is refused, not rendered quietly" {
+    const t = std.testing;
+
+    // Refused, with the reason named. Each of these expanded before `Cwd`
+    // existed, so rendering it as a literal path would trade an injection for a
+    // directory nobody has — and a `cd` that fails is an exit code on an
+    // attempt whose command never ran.
+    const refused = [_][]const u8{
+        "", // not a directory at all
+        "$RELEASE/app", // a variable that is not $HOME
+        "$HOME/$RELEASE", // …including after the prefix
+        "/srv/`date +%F`", // command substitution
+        "~deploy/app", // another account's home
+    };
+    var named: usize = 0;
+    for (refused) |dir| {
+        const why = cwdRefusal(dir) orelse {
+            std.debug.print(
+                \\
+                \\`{s}` is accepted as a working directory. It relied on an expansion `Cwd`
+                \\does not perform, so it is now a literal path — which `cd` will not find,
+                \\which makes the `&&` not fire, which settles an exit code for a command
+                \\that never ran. That is the failure this whole change exists to remove,
+                \\arriving from the other side.
+                \\
+            , .{dir});
+            return error.UnexpandableCwdAccepted;
+        };
+        try t.expect(why.len >= min_reason_len);
+        named += 1;
+    }
+    try t.expectEqual(@as(usize, 5), named);
+
+    // Accepted, because `Cwd` renders each of these as exactly what it means.
+    // The apostrophe and the semicolon are the point: they are refused by
+    // nothing and dangerous in nothing, because they are quoted.
+    const accepted = [_][]const u8{
+        "/srv/app",
+        "/srv/two words",
+        "/data/John's app",
+        "/tmp; rm -rf ~",
+        "~",
+        "~/app",
+        "$HOME",
+        "$HOME/app",
+        "-P",
+    };
+    var passed: usize = 0;
+    for (accepted) |dir| {
+        if (cwdRefusal(dir)) |why| {
+            std.debug.print("\n`{s}` was refused: {s}\n", .{ dir, why });
+            return error.SafeCwdRefused;
+        }
+        passed += 1;
+    }
+    try t.expectEqual(@as(usize, 9), passed);
+}
+
+test {
+    _ = @import("shell_test.zig");
 }

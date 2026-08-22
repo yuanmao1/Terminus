@@ -186,6 +186,81 @@ Same `--key` **replaces** the entry (the JSON response includes `previous`
 so nothing vanishes silently); use `--append` to add a line instead. Keep
 each entry short and factual — it's an index card, not a log.
 
+## How old is a memory, really
+
+A memory carries two different times and they are **not** the same fact:
+
+- `updated_at` — when the row was written.
+- `observed_at` — when the thing it says was *seen*, with `observed_source`
+  saying how it was known.
+
+"The API listens on 8080" seen six months ago is a different claim from the same
+sentence seen this morning, so read `observed_source` before you trust
+`observed_at`:
+
+- `live` — the memory's own `--verify-cmd` ran on the host and agreed. The only
+  value that means anything was checked.
+- `cache` — somebody wrote it down. Nothing was asked of the host.
+- `legacy_import` — it arrived by `terminus import`. The timestamp is the
+  exporting machine's claim about when the fact was seen; this machine has not
+  checked it.
+- `backfill` — the timestamp **is** the write time, standing in for an
+  observation because the row predates the column. Treat it as unknown.
+
+`observed_at: null` means nobody knows, which is the honest answer for a memory
+imported from a document that recorded no observation.
+
+Record an older observation explicitly when you are writing down something you
+learned a while ago:
+
+```bash
+terminus memory add prod --key services --observed-at 1700000000 -- "api :3000"
+```
+
+## Re-checking a memory: verify_cmd is untrusted by default
+
+A memory can carry the command that would re-observe its fact:
+
+```bash
+terminus memory add prod --key services \
+  --verify-cmd "systemctl is-active nginx" -- "nginx :80 (systemd)"
+```
+
+Storing that command **authorises nothing**. `memory verify` refuses to run it
+until somebody has granted it by name, and the refusal tells you what to run:
+
+```bash
+terminus memory verify prod --key services --json
+#   {"ok":false,"errorCode":"VERIFY_CMD_UNTRUSTED","trust":"untrusted",
+#    "verifyCmd":"systemctl is-active nginx",
+#    "grant":"terminus memory trust prod --key services"}
+
+terminus memory trust prod --key services            # read the command first
+terminus memory verify prod --key services --json    # now it runs
+#   {"ok":true,"action":"observed","observedSource":"live",...}
+```
+
+Four rules, and none of them has an override:
+
+- **An imported memory is always untrusted.** The export document has no field
+  for a grant, in either direction — a snapshot that could say "and this command
+  is trusted" would be arbitrary code execution by handing you a file. `terminus
+  import` therefore cannot make anything runnable, and neither can
+  `--strategy theirs`.
+- **A grant covers the exact command text it was given.** Rewriting
+  `--verify-cmd` revokes it: the memory goes to `trust: "stale_grant"` and
+  refuses again. Writing the authorised text back restores it.
+- **The grant records who and when** (`trusted_by`, `trusted_at`), so an audit
+  of a command that ran can say why it was allowed to. `--by <name>` signs it
+  yourself; without it, this machine's audit identity is recorded.
+- **A refused verification contacts no host at all.** Not "sent nothing" — no
+  connection is opened.
+
+`trust` in `memory ls --json` / `memory show --json` is one of `no_verify_cmd`,
+`untrusted`, `stale_grant`, `trusted`. Only `trusted` can run. A verify command
+that runs and *disagrees* (non-zero exit) leaves `observed_at` alone — a
+contradicted memory must not read as freshly confirmed.
+
 ## Quick reference
 
 ```bash
@@ -1174,6 +1249,16 @@ For conflicts you want to resolve individually: read both values from the
 dry-run plan, then write the merged truth with `memory add --key ...`
 (it upserts). Re-import is idempotent — identical items are skipped.
 
+What an import carries and what it refuses to carry:
+
+- `observed_at` comes across **verbatim**. An imported memory keeps the moment
+  the other machine says the fact was seen; the import moment is never
+  substituted for it. `observed_source` becomes `legacy_import` — this store read
+  a file, which is not the same as having checked anything.
+- `verify_cmd` comes across as text, and lands **untrusted**. Read it, then
+  `memory trust` it if you want it runnable. No document and no `--strategy` can
+  do that for you.
+
 ## Feeding a command its own standard input
 
 `--stdin-file <path>` streams a local file into the remote command's standard
@@ -1438,6 +1523,11 @@ are not equally fresh. Read both before you believe anything:
   run of this command.
 - `source: null` — the section could not be read at all. There is no timestamp
   and no rows, and the reason is in `errors[]`.
+
+The `memories` section's `observedAt` is still the newest **write** time, not the
+newest observation: it predates the `observed_at` column and has not been moved
+onto it. For the truer per-memory answer read `memory ls <server> --json`, where
+each row carries its own `observed_at` and `observed_source`.
 
 ### `complete` is the only thing you should gate on
 

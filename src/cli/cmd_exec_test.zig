@@ -2323,3 +2323,144 @@ test "gate: the skill document describes the argv channel and the shell vocabula
     try t.expect(std.mem.indexOf(u8, skill_doc.text, "don't need `--login`") == null);
     try t.expect(std.mem.indexOf(u8, skill_doc.text, "**refuse** `--login`") != null);
 }
+
+// --- the working directory ----------------------------------------------------
+
+test "gate: a working directory a shell would have refused reaches the host as one word" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "exec_cwd_one_word");
+    defer h.deinit();
+
+    // Each of these is a directory somebody could have put in `--cwd` or in
+    // `terminus workspace set`. Before `shell.cdInto` every one of them was
+    // spliced into `"cd {s} && ({s})"` raw, so the shell read it as syntax: the
+    // first was two operands (`cd: too many arguments`), the second ended the
+    // word early, and the third ran `rm -rf` before the command did.
+    //
+    // `word` is what the host is expected to see as one argument, which is not
+    // always the input: `~/...` and `$HOME/...` are the two spellings of the
+    // remote home that terminus still honours, and it honours them by writing
+    // its own `$HOME` and quoting everything the operator wrote after it.
+    const cases = [_]struct { dir: []const u8, word: []const u8 }{
+        .{ .dir = "/srv/two words", .word = "/srv/two words" },
+        .{ .dir = "/data/John's app", .word = "/data/John's app" },
+        .{ .dir = "/tmp; rm -rf ~", .word = "/tmp; rm -rf ~" },
+        .{ .dir = "/srv/$(whoami)/x", .word = "/srv/$(whoami)/x" },
+        .{ .dir = "/srv/`id`/x", .word = "/srv/`id`/x" },
+        .{ .dir = "-P", .word = "-P" },
+        .{ .dir = "~/app dir", .word = "$HOME/app dir" },
+        .{ .dir = "$HOME/app dir", .word = "$HOME/app dir" },
+    };
+
+    var checked: usize = 0;
+    for (cases) |case| {
+        checked += 1;
+        var execution = try h.begin();
+        defer execution.deinit();
+        try execution.connecting();
+        const request_id = try h.arena.dupe(u8, execution.id());
+
+        const effective = try Core.shell.cdInto(h.arena, case.dir, "make release");
+
+        var scripted = Core.Scripted.init(h.arena, &.{.{ .reply = .{
+            .exit_code = 0,
+            .stdout = try completeOutput(h.arena, execution.nonce, "", 0),
+            .stderr = @constCast(@as([]const u8, "")),
+        } }});
+
+        const result = try Core.execution.runCommand(&execution, scripted.executor(), effective, null);
+        try t.expect(result == .ran);
+
+        // What actually went down the channel, split the way the host would
+        // split it: `cd`, `--`, the directory, `&&`, `(make`, `release)`.
+        try t.expectEqual(@as(usize, 1), scripted.seen.items.len);
+        const sent = scripted.seen.items[0];
+        const at = std.mem.indexOf(u8, sent, "cd -- ") orelse return error.NoCdInSentCommand;
+        const stop = std.mem.indexOfScalarPos(u8, sent, at, '\n') orelse sent.len;
+        const got = try Core.shell.words(h.arena, sent[at..stop]);
+
+        if (got.len != 6 or !std.mem.eql(u8, got[2], case.word)) {
+            std.debug.print(
+                \\
+                \\the directory `{s}` did not arrive as the single word `{s}`. What the host
+                \\would see:
+                \\
+                \\  {s}
+                \\
+                \\A `cd` whose operand splits is `cd: too many arguments`, so the `&&` never
+                \\fires and the command is never sent — and the attempt then settles `exited`
+                \\with the status of a `cd`, which is a proven failure of a command that did
+                \\not run.
+                \\
+            , .{ case.dir, case.word, sent[at..stop] });
+            return error.WorkingDirectoryNotOneWord;
+        }
+        try t.expectEqualStrings("cd", got[0]);
+        // `--`, so a directory named like an option is an operand. `cd '-P'`
+        // succeeds *in the home directory* and reports nothing wrong, which is
+        // the same defect one notch quieter.
+        try t.expectEqualStrings("--", got[1]);
+        try t.expectEqualStrings("&&", got[3]);
+        try t.expectEqualStrings("(make", got[4]);
+        try t.expectEqualStrings("release)", got[5]);
+
+        // And the ledger's answer is the host's own status, never a `cd`'s.
+        const terminal = try h.terminalRow(request_id);
+        try t.expectEqualStrings("completed", terminal.status.?);
+        try t.expectEqual(@as(?i64, 0), terminal.exit_code);
+    }
+    try t.expectEqual(@as(usize, 8), checked);
+
+    // The contrast, so this gate is a statement about a defect that was real:
+    // the template it replaced splits the very same directory in two, which is
+    // two operands to `cd` and the reason the command never ran.
+    const old = try std.fmt.allocPrint(h.arena, "cd {s} && ({s})", .{ "/srv/two words", "make release" });
+    const old_words = try Core.shell.words(h.arena, old);
+    try t.expectEqualStrings("/srv/two", old_words[1]);
+    try t.expectEqualStrings("words", old_words[2]);
+}
+
+test "gate: a working directory that lost its expansion is refused before anything is recorded" {
+    const t = std.testing;
+    const source = @embedFile("cmd_exec.zig");
+
+    // `shell.cwdRefusal` names the directories the remote shell used to expand
+    // and that are one quoted word now. What matters for the ledger is *where*
+    // it is consulted: before `execution.begin`, so a refusal leaves no
+    // operation row and therefore no exit code. A refusal after the row exists
+    // is the same false entry wearing a different hat.
+    const refusal_at = std.mem.indexOf(u8, source, "Core.shell.cwdRefusal(dir)") orelse {
+        std.debug.print(
+            \\
+            \\cmd_exec.zig no longer consults `shell.cwdRefusal`. A `--cwd` of `$RELEASE/app`
+            \\was expanded before `shell.cwd` existed and is a literal path now, so without
+            \\this check it silently becomes a directory nobody has — and the `cd` that fails
+            \\settles an exit code for a command that never ran.
+            \\
+        , .{});
+        return error.CwdRefusalGone;
+    };
+    const begin_at = std.mem.indexOf(u8, source, "Core.execution.begin(") orelse
+        return error.BeginNotFound;
+    if (refusal_at > begin_at) {
+        std.debug.print(
+            \\
+            \\cmd_exec.zig checks the working directory at byte {d}, after it opens an
+            \\operation at byte {d}. The refusal has to come first: once the row exists the
+            \\attempt has to be settled, and there is no honest terminal for "we declined to
+            \\compose the command".
+            \\
+        , .{ refusal_at, begin_at });
+        return error.CwdRefusedTooLate;
+    }
+
+    // One resolution of the directory, not two. It was read twice — once for
+    // the ledger row and once inside `runOneShot` — and validated in neither,
+    // which is how a check could be added to one and not reach the other.
+    try t.expectEqual(@as(usize, 1), Core.shell.countInCode(source, "parsed.flag(\"cwd\")"));
+
+    // And the refusal does not return.
+    const window = source[refusal_at..@min(source.len, refusal_at + 400)];
+    try t.expect(std.mem.indexOf(u8, window, "fatal(") != null);
+    try t.expect(std.mem.indexOf(u8, window, "Nothing was sent") != null);
+}
