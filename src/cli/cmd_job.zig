@@ -66,6 +66,10 @@ const job_usage =
     \\                                           else terminate and verify
     \\  job rm      <server> <name> [--force]     forget the job (kills if running)
     \\  job inspect <server> <name> [--json]     what was launched, byte for byte
+    \\  job receipt <server> <name> [--attempt N] [--json]
+    \\                                           what the ledger recorded about it:
+    \\                                           the event trail, the terminal, and
+    \\                                           the resolution if one happened
     \\
     \\'kill' and 'rm' hold a lease on the job for as long as they are working on
     \\it, so a second session is refused rather than racing them. --force takes
@@ -508,6 +512,7 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const job_name = parsed.positional(1) orelse fatal("{s}", .{job_usage});
 
     if (std.mem.eql(u8, verb, "inspect")) return inspectJob(ctx, &store, resolved.server.id, job_name, &parsed);
+    if (std.mem.eql(u8, verb, "receipt")) return jobReceipt(ctx, &store, resolved.server.id, job_name, &parsed);
 
     const job = (Store.jobs.getByName(&store, ctx.arena, resolved.server.id, job_name) catch |err|
         Cli.storeFatal(&store, err)) orelse fatal("unknown job '{s}' on '{s}'", .{ job_name, server_name });
@@ -538,6 +543,26 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         }
     else
         null;
+
+    // The ledger entry these two verbs never had, opened before the dial for the
+    // reason `session rm` opens its own there: a refusal that happens before
+    // anything is sent still has to be a refusal *of something*. See the header
+    // above `beginControl` for the scope, the terminal and the identity argument.
+    //
+    // Registered, so the seventeen indirect exits out of `killJob` / `removeJob`
+    // settle it through `Cli.fail` without knowing they do. Cleared on the way
+    // out, so nothing later in the process settles a row it is not about.
+    var control: ?Core.execution.Execution = if (mutation) |claim|
+        beginControl(ctx, &store, resolved.server, claim, verb)
+    else
+        null;
+    defer Cli.clearExecution();
+    if (control) |*c| {
+        Cli.registerExecution(c);
+        // Before `Cli.connect`, because that is what this step records. A failure
+        // here is a store failure with nothing sent, which `storeFatal` reports.
+        c.connecting() catch |err| Cli.storeFatal(&store, err);
+    }
 
     // Everything below the claim runs with the scope held, `Cli.connect`
     // included — so for the two mutating verbs the connect is the one that
@@ -661,9 +686,9 @@ pub fn jobCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     } else if (std.mem.eql(u8, verb, "watch")) {
         try watchJob(ctx, &store, executor, session, job, attempt, &parsed, server_name, conn);
     } else if (std.mem.eql(u8, verb, "kill")) {
-        try killJob(ctx, &store, executor, session, job, attempt, mutation.?);
+        try killJob(ctx, &store, executor, session, job, attempt, mutation.?, &control.?);
     } else if (std.mem.eql(u8, verb, "rm")) {
-        try removeJob(ctx, &store, executor, session, job, attempt, mutation.?, &parsed);
+        try removeJob(ctx, &store, executor, session, job, attempt, mutation.?, &control.?, &parsed);
     } else {
         fatal("unknown verb 'job {s}'\n{s}", .{ verb, job_usage });
     }
@@ -1093,6 +1118,18 @@ const KillJson = struct {
     resultRecord: []const u8,
     resultRecordError: ?[]const u8,
     requestId: ?[]const u8,
+    /// This command's *own* operation — the `control` row that records the kill
+    /// as an act rather than recording the job it was aimed at.
+    ///
+    /// Never null, and never `requestId`: that key names the target attempt,
+    /// somebody else's work, and this one names ours. `terminus request show` /
+    /// `request receipt` take this id; the two rows can and do settle
+    /// differently, which is the whole reason there are two — a kill that
+    /// verified a session gone over a job whose process tree it cannot speak
+    /// for is exactly that case.
+    controlRequestId: []const u8,
+    /// What the ledger holds for that row, as a word.
+    controlStatus: []const u8,
     cacheError: ?[]const u8,
     /// Whether this command still held the scope lease it took before it
     /// reached the host: `held`, `lapsed`, or `unreadable`.
@@ -1220,6 +1257,13 @@ const RemovalJson = struct {
     /// Prose about the reading above, for a human. Nothing branches on it.
     resultRecordError: ?[]const u8,
     requestId: ?[]const u8,
+    /// This command's own `control` operation, and what the ledger holds for it.
+    /// The same two keys `KillJson` publishes and the same distinction from
+    /// `requestId` — see there. On this verb they matter one degree more: `job rm`
+    /// destroys the local row, so after it runs the control row is the only thing
+    /// left that says anybody removed this job.
+    controlRequestId: []const u8,
+    controlStatus: []const u8,
     cacheError: ?[]const u8,
     authority: []const u8,
     authorityError: ?[]const u8,
@@ -2843,8 +2887,15 @@ fn refuseKill(
     attempt: ?Store.job_attempts.Attempt,
     authority: Authority,
     probe: Tmux.JobProbe,
+    control: *Core.execution.Execution,
 ) noreturn {
     const hint = refusalHint(ctx, authority, job.name, "");
+    // The control operation, before anything else: this exit ends at
+    // `Cli.exitNow`, which settles nothing, so a row left here is a row left
+    // unsettled for good. `abandonControl` records `never_submitted` from the
+    // three sites that reach here before `submitControl` and `indeterminate` from
+    // the one that reaches it after.
+    abandonControl(control, controlWithheld(ctx, authority, job.name));
     // Before the document, and that ordering is the rule on every branch of both
     // verbs: the answer this publishes is what the release actually did, not a
     // prediction of what it is about to do.
@@ -2870,6 +2921,8 @@ fn refuseKill(
             .resultRecord = probe.sidecar.code(),
             .resultRecordError = resultRecordError(ctx, probe.sidecar),
             .requestId = if (attempt) |a| a.request_id else null,
+            .controlRequestId = control.id(),
+            .controlStatus = control.status.text(),
             .cacheError = null,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -2925,7 +2978,13 @@ fn refuseKillAfterSettlement(
     authority: Authority,
     probe: Tmux.JobProbe,
     settled: Observed,
+    control: *Core.execution.Execution,
 ) noreturn {
+    // This is the one site reached *after* `submitControl`, so the row is at
+    // `submitted` and `abandonControl` records `indeterminate` — which overstates
+    // a kill that never left this machine, and is the whole of the cost
+    // `submitControl` documents for sitting above the renewal.
+    abandonControl(control, controlWithheld(ctx, authority, job.name));
     const proven = settled.settlement.proves();
     const hint = std.fmt.allocPrint(
         ctx.arena,
@@ -2964,6 +3023,8 @@ fn refuseKillAfterSettlement(
             .resultRecord = probe.sidecar.code(),
             .resultRecordError = resultRecordError(ctx, probe.sidecar),
             .requestId = if (attempt) |a| a.request_id else null,
+            .controlRequestId = control.id(),
+            .controlStatus = control.status.text(),
             .cacheError = cacheError(ctx, job.name, settled.cache),
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -2991,7 +3052,9 @@ fn refuseRemoval(
     attempt: ?Store.job_attempts.Attempt,
     authority: Authority,
     probe: Tmux.JobProbe,
+    control: *Core.execution.Execution,
 ) noreturn {
+    abandonControl(control, controlWithheld(ctx, authority, job.name));
     const hint = refusalHint(
         ctx,
         authority,
@@ -3017,6 +3080,8 @@ fn refuseRemoval(
             .resultRecord = probe.sidecar.code(),
             .resultRecordError = resultRecordError(ctx, probe.sidecar),
             .requestId = if (attempt) |a| a.request_id else null,
+            .controlRequestId = control.id(),
+            .controlStatus = control.status.text(),
             .cacheError = null,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -3165,7 +3230,15 @@ fn refuseRemovalAtCommit(
     /// see below.
     terminal: Core.Store.op_state.Terminal,
     refusal: Core.execution.Refusal,
+    control: *Core.execution.Execution,
 ) noreturn {
+    // The control row is already settled on this path — `settleControl` runs on
+    // the line after the `kill-session` that got us here — so this is a no-op,
+    // and it is written anyway for the reason the gate below states: every
+    // reporter that can end the process either records the control act or
+    // abandons it, and a body that is exempt because somebody traced its callers
+    // is a body that stops being exempt when a caller moves.
+    abandonControl(control, controlWithheld(ctx, authority, job.name));
     // What this removal actually did before it was stopped, stated in full. An
     // operator told only "not removed" does not know which of the three
     // destructive steps happened.
@@ -3256,6 +3329,8 @@ fn refuseRemovalAtCommit(
             .resultRecord = record_keys.record,
             .resultRecordError = record_keys.note,
             .requestId = if (attempt) |a| a.request_id else null,
+            .controlRequestId = control.id(),
+            .controlStatus = control.status.text(),
             .cacheError = refusalCacheNote(refusal, ctx, job.name),
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -3491,6 +3566,10 @@ fn killJob(
     job: Store.jobs.Job,
     attempt: ?Store.job_attempts.Attempt,
     claim: Claim,
+    /// This command's own `control` operation, opened by `jobCmd` before the dial.
+    /// Distinct from every `Execution` below it, all of which are the *target*
+    /// attempt reopened by `attach` — see the header above `beginControl`.
+    control: *Core.execution.Execution,
 ) !void {
     // The scope was taken in `jobCmd`, before the connection was opened, and
     // is held from here through the kill to the settlement below. Every step
@@ -3530,7 +3609,7 @@ fn killJob(
         // It is *not* the renewal the kill runs under. The transaction below
         // sits between the two, and this answer is stale by all of it — see the
         // renewal immediately above the `kill-session`.
-        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe, control);
         const settled = settleObserved(
             ctx,
             store,
@@ -3558,9 +3637,14 @@ fn killJob(
         // kill some interval after the renewal answered, and only a session
         // identity the host itself can check would close it — but it is the
         // narrowest this side can make the window.
-        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
+        //
+        // `submitControl` sits above the renewal rather than below it, so that
+        // nothing but the renewal separates the question from the act. See there.
+        submitControl(store, control);
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled, control);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
+        settleControl(control, session_gone, ctx.now);
         // The kill is on the far side of the settlement on this branch, so the
         // scope is given back after it rather than at the settle: releasing in
         // between would open the job to a peer mid-`kill-session`.
@@ -3586,6 +3670,8 @@ fn killJob(
                 .resultRecord = probe.sidecar.code(),
                 .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
+                .controlRequestId = control.id(),
+                .controlStatus = control.status.text(),
                 .cacheError = cacheError(ctx, job.name, settled.cache),
                 .authority = authority.code(),
                 .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -3628,7 +3714,7 @@ fn killJob(
             null;
         // The settlement's renewal. The kill has its own, below: the
         // transaction between them is long enough for the scope to move.
-        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe, control);
         const settled = settleObserved(
             ctx,
             store,
@@ -3646,9 +3732,11 @@ fn killJob(
         // Adjacent to the kill for the same reason as the branch above: this is
         // the last moment at which a `kill-session` aimed by name at a session a
         // peer may now own can still be withheld.
-        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
+        submitControl(store, control);
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled, control);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
+        settleControl(control, session_gone, ctx.now);
         const lease = Cli.releaseClaimReporting();
 
         switch (ctx.out.format) {
@@ -3672,6 +3760,8 @@ fn killJob(
                 .resultRecord = probe.sidecar.code(),
                 .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
+                .controlRequestId = control.id(),
+                .controlStatus = control.status.text(),
                 .cacheError = cacheError(ctx, job.name, settled.cache),
                 .authority = authority.code(),
                 .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -3715,7 +3805,7 @@ fn killJob(
         else
             null;
         // The settlement's renewal. The kill's is below, after the transaction.
-        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe, control);
         const settled = settleObserved(
             ctx,
             store,
@@ -3737,9 +3827,14 @@ fn killJob(
         // request id and a lease says nothing about whether it is true — but the
         // cleanup is a remote mutation like any other, and a session this
         // command no longer has the scope for is not one it may stop.
-        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);
+        submitControl(store, control);
+        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled, control);
         const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
             fatalTmux(err, executor, session);
+        // What the *control* act established, which on this branch is the whole of
+        // what it established: the job had already ended, so the cleanup is the
+        // only thing this command did to the host.
+        settleControl(control, session_gone, ctx.now);
         // The remote work is behind us, so the scope goes back here — and what
         // came of that is published below rather than left on stderr. This is the
         // branch where it matters most: a proven outcome and a cleaned-up session
@@ -3786,6 +3881,8 @@ fn killJob(
                 .resultRecord = probe.sidecar.code(),
                 .resultRecordError = resultRecordError(ctx, probe.sidecar),
                 .requestId = if (attempt) |a| a.request_id else null,
+                .controlRequestId = control.id(),
+                .controlStatus = control.status.text(),
                 .cacheError = cacheError(ctx, job.name, settled.cache),
                 .authority = authority.code(),
                 .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -3855,15 +3952,23 @@ fn killJob(
     // at all. This is the branch where a stale claim costs the most: `job kill`
     // with no outcome in hand is about to stop a pane, and if the scope now
     // belongs to somebody else that pane may be theirs.
-    if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);
+    submitControl(store, control);
+    if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe, control);
     const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);
+    // Settled here rather than at the end of the branch, and that is the whole of
+    // Decision 2 applied: the control act's subject is the *session*, `killSession`
+    // has just carried the host's own answer about it, and nothing downstream —
+    // not `finalProbe`, not the terminal this command picks for the job, not a
+    // lease lost afterwards — is evidence about that session. The target's verdict
+    // is decided 100 lines below from all of those; this row's was decided here.
+    settleControl(control, session_gone, ctx.now);
 
     const final: FinalLook = if (session_gone)
         finalProbe(ctx.arena, executor, session, job.name, job.sentinel, if (attempt) |a| a.request_id else null)
     else
         .{};
-    if (final.upgrade) |after| return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone, claim, authority);
+    if (final.upgrade) |after| return reportFinishedDuringKill(ctx, store, job, attempt, after, session_gone, claim, authority, control);
 
     // The reading this command ends on. The second look happened later and, on
     // the path that matters here, is the only one that saw the document at all
@@ -4019,6 +4124,8 @@ fn killJob(
             .resultRecord = record_keys.record,
             .resultRecordError = record_keys.note,
             .requestId = if (attempt) |a| a.request_id else null,
+            .controlRequestId = control.id(),
+            .controlStatus = control.status.text(),
             .cacheError = cache_error,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -4497,8 +4604,19 @@ fn reportFinishedDuringKill(
     session_gone: bool,
     claim: Claim,
     held: Authority,
+    /// Already settled by `killJob` on the line after its `kill-session`, so this
+    /// body only publishes it. Carried in rather than looked up: the two keys are
+    /// part of this verb's fixed set and this is one of the ten branches that has
+    /// to emit them.
+    control: *Core.execution.Execution,
 ) !void {
     const code = probe.exit_code.?;
+    // Already settled by `killJob` on the line after its `kill-session`, so this
+    // is a no-op — and written anyway, for the reason `refuseRemovalAtCommit`
+    // states: every reporter that can end the process either records the control
+    // act or abandons it, and a body exempt because somebody traced its callers
+    // stops being exempt when a caller moves.
+    abandonControl(control, controlWithheld(ctx, held, job.name));
     var execution = if (attempt) |a|
         Core.execution.attach(store, ctx.arena, ctx.io, a.request_id) catch |err|
             Cli.storeFatal(store, err)
@@ -4576,6 +4694,8 @@ fn reportFinishedDuringKill(
             .resultRecord = probe.sidecar.code(),
             .resultRecordError = resultRecordError(ctx, probe.sidecar),
             .requestId = if (attempt) |a| a.request_id else null,
+            .controlRequestId = control.id(),
+            .controlStatus = control.status.text(),
             .cacheError = cache_error,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -4639,6 +4759,9 @@ fn removeJob(
     job: Store.jobs.Job,
     attempt: ?Store.job_attempts.Attempt,
     claim: Claim,
+    /// This command's own `control` operation. See the header above `beginControl`;
+    /// it is not the target attempt and it is not the lease owner either.
+    control: *Core.execution.Execution,
     parsed: *const Cli.Args.Parsed,
 ) !void {
     // The scope was taken in `jobCmd`, before the connection was opened, and
@@ -4666,9 +4789,15 @@ fn removeJob(
     // Renewed immediately before it, and refused if the scope has moved: this
     // is the first command on this path that changes anything, and everything
     // after it is a deletion.
-    if (!stillOurs(claim, ctx.io, &authority)) refuseRemoval(ctx, store, job, attempt, authority, probe);
+    submitControl(store, control);
+    if (!stillOurs(claim, ctx.io, &authority)) refuseRemoval(ctx, store, job, attempt, authority, probe, control);
     const cleared = Tmux.killSession(executor, ctx.arena, session) catch |err|
         fatalTmux(err, executor, session);
+    // The control act's own verdict, from the host's own answer, and before the
+    // `fatal` below reads the same boolean: on the `!cleared` path this row
+    // records `proven_failure` — the session is still there — rather than being
+    // left for `Cli.fail` to abandon as an unknown.
+    settleControl(control, cleared, ctx.now);
     if (!cleared) fatal(
         "job '{s}' session is still present after cleanup; refusing to forget a job that may still be running. Nothing was deleted — no log, no result record, no local row. Inspect it with 'tmux attach -t {s}' on the host",
         .{ job.name, try Tmux.targetName(ctx.arena, session) },
@@ -4962,6 +5091,7 @@ fn removeJob(
                 result_discarded,
                 terminal,
                 why,
+                control,
             ),
         };
     } else settleObserved(
@@ -5100,6 +5230,8 @@ fn removeJob(
             .resultRecord = record_keys.record,
             .resultRecordError = record_keys.note,
             .requestId = if (attempt) |a| a.request_id else null,
+            .controlRequestId = control.id(),
+            .controlStatus = control.status.text(),
             .cacheError = cache_error,
             .authority = authority.code(),
             .authorityError = authority.note(ctx.arena, .{ .job = job.name }),
@@ -5282,6 +5414,218 @@ fn inspectJob(
     }
 }
 
+// --- `job receipt`: what the ledger recorded about an attempt ----------------
+//
+// `job inspect` answers *what this attempt was* — the script, its digest, the
+// interpreter, the entry path — out of `job_attempts`, the immutable launch
+// record. This answers goal 9's other half: *what the ledger recorded about it*.
+// Two questions over two tables, and neither is derivable from the other, which
+// is why this is a second verb and not a flag on the first.
+//
+// Three properties it is built around, and each is what a naive shape gets wrong.
+//
+// **An unsettled attempt has no terminal, and the absence is a fact.**
+// `receipts.terminalOf` answers null for one, and rendering that as an empty
+// `status` would be indistinguishable from a terminal whose column happened to be
+// blank. So `settled` is a boolean of its own, `terminal` is null beside it, and
+// the human form prints the words rather than a gap.
+//
+// **A resolved attempt shows both readings.** `receipts.resolve` writes
+// `resolved_status` and leaves `status` exactly where it was, deliberately, so
+// that "we recorded X and somebody later proved Y" survives instead of being
+// overwritten. The receipt is where that has to show, so this publishes `status`,
+// `resolvedStatus`, `effectiveStatus`, `reconciledAt` and `resolutionEvidence`
+// side by side and collapses none of them. A document that printed only
+// `effectiveStatus` would erase the very history the column pair exists to keep.
+//
+// **Nothing here may carry a secret, and the surface is narrow on purpose.** This
+// verb reads `operations` and `operation_events` and takes *nothing* from
+// `job_attempts` but the number of the attempt it is about. The launch record
+// holds `script_body_redacted` and `job inspect --show-script` is the verb that
+// prints it; printing it here as well would double the surface for no part of this
+// question. What it does publish from `operations` is `argv_redacted` — the form
+// `Store.history.redactSecrets` produced *before* the row was inserted, which is
+// the only form of the command this database has, `run` and `exec` being the
+// column's only writers — and `argv_sha256`, which is a digest. The gate below
+// drives a launch whose command carries four shapes of credential and asserts that
+// none of the four appears anywhere in this document.
+
+/// The terminal a receipt reports, when there is one.
+///
+/// A struct rather than three nullable keys beside `settled`, so that "there is a
+/// terminal and here it is" cannot be half-expressed.
+const TerminalJson = struct {
+    status: []const u8,
+    seq: i64,
+    observedAt: i64,
+};
+
+/// `job receipt --json`'s fixed key set.
+///
+/// No defaults, so a branch that omits a key does not compile — the rule
+/// `KillJson` and `RemovalJson` follow. Deliberately *not* published as a
+/// `skill/SKILL.md` key-set paragraph: `SkillDoc.key_set_count` is a compile-time
+/// three and lives in a module this change does not own, so a fourth paragraph of
+/// that shape would break the census it cannot then fix. The key set is pinned by
+/// the gate at the bottom of this file instead, held against this struct.
+const ReceiptJson = struct {
+    ok: bool,
+    job: []const u8,
+    /// Which attempt, and how many there are — `job inspect`'s two keys under the
+    /// same names, so the two documents read side by side.
+    attempt: i64,
+    totalAttempts: usize,
+    requestId: []const u8,
+    /// `job` for an ordinary launch. Published because a request id addresses a
+    /// row of any kind and a reader has to know which one it got.
+    kind: []const u8,
+    /// What was observed at the time, and never overwritten by a later proof.
+    status: []const u8,
+    /// Whether a terminal was ever recorded. False with `terminal: null` beside it
+    /// is the report of an absence rather than a blank.
+    settled: bool,
+    /// `resolvedStatus` when a reconcile proved one, `status` otherwise. Derived
+    /// and published so a caller does not re-derive the precedence and get it
+    /// wrong.
+    effectiveStatus: []const u8,
+    /// Whether this attempt still bars its scope.
+    blocksScope: bool,
+    /// How many rows the trail has. Stated rather than left to be counted, for the
+    /// reason every count in this file is stated: an empty trail is a fact a caller
+    /// should be able to read without walking an array.
+    eventCount: usize,
+    createdAt: i64,
+    updatedAt: i64,
+    terminal: ?TerminalJson,
+    /// The redacted command and the digest of the raw text. Never the raw text:
+    /// the column holds what the redactor produced and the original was never
+    /// stored anywhere.
+    command: ?[]const u8,
+    commandSha256: ?[]const u8,
+    cwd: ?[]const u8,
+    alias: ?[]const u8,
+    /// What a later reconcile proved, when, and on what evidence. All three null
+    /// on an attempt nobody reconciled — the ordinary case, and the reason
+    /// `status` is published beside them rather than replaced by them.
+    resolvedStatus: ?[]const u8,
+    reconciledAt: ?i64,
+    resolutionEvidence: ?[]const u8,
+    /// The `operation_events` trail, oldest first, as `Core.Store.receipts.Row`.
+    ///
+    /// Passed through rather than projected onto a shape of this file's own. That
+    /// struct "mirrors every stored column" by contract, and a projection here
+    /// would be a second list to keep in step with it — evidence that reaches the
+    /// database and not the report is evidence a caller cannot act on.
+    /// `request receipt` publishes the same rows under the same names.
+    events: []const Core.Store.receipts.Row,
+};
+
+fn jobReceipt(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    server_id: i64,
+    job_name: []const u8,
+    parsed: *const Cli.Args.Parsed,
+) !void {
+    const history = Store.job_attempts.history(store, ctx.arena, server_id, job_name) catch |err|
+        Cli.storeFatal(store, err);
+    if (history.len == 0) fatal("no recorded attempts for job '{s}'", .{job_name});
+
+    // `--attempt N` addresses an attempt by its *number*, not by its position in
+    // this newest-first list. An operator reads `attempt 3 of 5` off
+    // `job inspect`, so 3 has to mean that attempt.
+    const chosen = if (parsed.flag("attempt")) |raw| found: {
+        const no = std.fmt.parseInt(i64, raw, 10) catch
+            fatal("invalid --attempt '{s}': expected an attempt number", .{raw});
+        for (history) |a| {
+            if (a.attempt_no == no) break :found a;
+        }
+        fatal(
+            "job '{s}' has no attempt {d}; it has {d}, the most recent being attempt {d}",
+            .{ job_name, no, history.len, history[0].attempt_no },
+        );
+    } else history[0];
+
+    // The launch record and the ledger disagreeing is a real state and is reported
+    // as one rather than defaulted past: `job_attempts` rows survive `job rm`, and
+    // `operations.server_id` is set to NULL by a `server rm`, so an attempt whose
+    // operation cannot be found is a fact about this database and not a missing
+    // field. There is no receipt to print for it.
+    const op = (Store.operations.get(store, ctx.arena, chosen.request_id) catch |err|
+        Cli.storeFatal(store, err)) orelse fatal(
+        "job '{s}' attempt {d} names request {s} and the ledger holds no such operation, so there is no receipt to read",
+        .{ job_name, chosen.attempt_no, chosen.request_id },
+    );
+    // The terminal *event*, not the status column: this verb reports what the
+    // trail holds, and "no terminal was ever written" is the answer the column
+    // cannot give.
+    const recorded = Store.receipts.terminalOf(store, chosen.request_id) catch |err|
+        Cli.storeFatal(store, err);
+    const rows = Store.receipts.list(store, ctx.arena, chosen.request_id) catch |err|
+        Cli.storeFatal(store, err);
+
+    switch (ctx.out.format) {
+        .json => try ctx.out.json(ReceiptJson{
+            .ok = true,
+            .job = job_name,
+            .attempt = chosen.attempt_no,
+            .totalAttempts = history.len,
+            .requestId = op.request_id,
+            .kind = op.kind,
+            .status = op.status.text(),
+            .settled = recorded != null,
+            .effectiveStatus = op.effectiveStatus().text(),
+            .blocksScope = op.effectiveStatus().blocksScope(),
+            .eventCount = rows.len,
+            .createdAt = op.created_at,
+            .updatedAt = op.updated_at,
+            .terminal = if (recorded) |r| .{
+                .status = r.status.text(),
+                .seq = r.seq,
+                .observedAt = r.observed_at,
+            } else null,
+            .command = op.argv_redacted,
+            .commandSha256 = op.argv_sha256,
+            .cwd = op.cwd,
+            .alias = op.alias,
+            .resolvedStatus = if (op.resolved_status) |r| r.text() else null,
+            .reconciledAt = op.reconciled_at,
+            .resolutionEvidence = op.resolution_evidence,
+            .events = rows,
+        }),
+        .human => {
+            try ctx.out.print("job '{s}' attempt {d} of {d}\n", .{ job_name, chosen.attempt_no, history.len });
+            try ctx.out.print("  request  : {s} ({s})\n", .{ op.request_id, op.kind });
+            try ctx.out.print("  recorded : {s}\n", .{op.status.text()});
+            // The absence, in words. A blank line here is what this verb exists
+            // not to print.
+            if (recorded) |r| {
+                try ctx.out.print("  terminal : {s} at {d} (event {d})\n", .{ r.status.text(), r.observed_at, r.seq });
+            } else {
+                try ctx.out.print("  terminal : none — this attempt was never settled\n", .{});
+            }
+            // Both readings, on two lines, whenever there are two. One line
+            // showing only the later one would be the overwrite this database
+            // refuses to perform.
+            if (op.resolved_status) |r| {
+                try ctx.out.print("  proved   : {s} at {?d}\n", .{ r.text(), op.reconciled_at });
+                try ctx.out.print("  evidence : {s}\n", .{op.resolution_evidence orelse "(not recorded)"});
+            }
+            try ctx.out.print("  blocks   : {s}\n", .{if (op.effectiveStatus().blocksScope()) "yes" else "no"});
+            try ctx.out.print("  command  : {s}\n", .{op.argv_redacted orelse "(not recorded)"});
+            try ctx.out.print("  events   : {d}\n", .{rows.len});
+            for (rows) |row| {
+                try ctx.out.print("  {d:>3} {s:<13} {s:<14} {s}\n", .{
+                    row.seq,
+                    row.kind,
+                    row.status orelse "",
+                    row.transport_error orelse row.error_code orelse "",
+                });
+            }
+        },
+    }
+}
+
 /// Takes the job scope, before anything is sent to the host.
 ///
 /// The `Claim` it produces is `Control.Claim`, the one every destructive verb
@@ -5388,6 +5732,298 @@ fn reportClaimBlocked(lease: Store.leases.Lease) noreturn {
         "refused: request {s} (on {s}) holds a lease on an overlapping scope until {d}; nothing was sent to the host. Wait, or pass --force to take it over",
         .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
     );
+}
+
+// --- The operation these two verbs record *themselves* as --------------------
+//
+// `job kill` and `job rm` reached the host, stopped a session, deleted evidence
+// and dropped local rows while writing nothing to `operations` about themselves.
+// Everything they wrote went onto the *target* — the job attempt somebody else
+// launched — so a kill or a removal left no row for a later `request show`,
+// `request receipt` or `request ls` to find, and no receipt to reconcile.
+// `session rm` had the identical hole and closed it with a `.control` operation;
+// these two verbs are the second and third producers of `operations.Kind.control`.
+//
+// **A copy of `session rm` does not work here, and the type system says why.**
+// For `session rm` the control id, the lease owner and the operation being
+// settled are one string, which is what `Identity.coincident` is for. Here they
+// are three:
+//
+//   * `claim.owner_request_id` — the lease owner, minted per invocation by
+//     `claimJobScope`, backing no operation row at all;
+//   * `control.id()` — this control operation, the row this section creates;
+//   * `attempt.request_id` — the target job attempt, somebody else's unsettled
+//     work, and what `Execution.id()` names in every `settleObserved` and
+//     `settleAndForgetJob` call in this file.
+//
+// See `Core.execution.AuthorityOwner`. Nothing below is ever handed to a lease
+// read, and no row below settles two subjects.
+//
+// --- Decision 1: the scope, and why it is not the job's ---------------------
+//
+// `session rm`'s `contentionScope` maps session `job-deploy` onto `.job:"deploy"`
+// *so that a running job blocks it*: that verb must not stop a job's shell, and
+// being refused by the job's own unsettled attempt is the right answer for it.
+// `job kill` is the verb whose entire purpose is to act on that attempt, so the
+// same answer inverts, in three places:
+//
+//   * `execution.begin` keys its guard on `Identity.coincident(&request_id)` — a
+//     brand-new id that exempts nothing — so the target's unsettled attempt *is*
+//     a blocker. A mutating control op on `.job:"deploy"` would be refused before
+//     it dialled, by the very job it was about to kill.
+//   * `settleAndForgetJob` runs `authorityLocked` with
+//     `identity = { authority: claim.owner, target: attempt }`, which exempts the
+//     lease owner and the target and nothing else. A submitted control op on
+//     `.job:"deploy"` is neither, so `job rm` would read *its own* control row as
+//     the peer blocking its removal.
+//   * and permanently: `control`'s admissible terminals include `indeterminate`,
+//     which `Status.blocksScope` counts, and an operation row has no TTL. A
+//     `job kill` that lost its lease settles exactly that (`lostTerminal`), so the
+//     one verb that recovers a stuck job would bar the job's scope for good after
+//     every lost lease — a trap with the recovery verb shut inside it.
+//
+// The two cheap ways past the first bullet are worse than the bullet.
+// `mutating = false` makes the guard advisory (`holds_scope_predicate` is
+// `… AND mutating = 1`), but the column is persisted precisely so the guard can
+// still tell which role an attempt claimed, and filing a kill as read-only is a
+// false statement in the ledger. `force = true` writes a `forced_past_blocker`
+// audit on every kill, claiming an override nobody asked for, and does nothing
+// about the second or third bullet.
+//
+// So the control operation contends on a scope of its own, keyed on the lease
+// owner the act runs under: `.job:"<claim.owner_request_id>"`. It names the
+// authority rather than an arbitrary string, and because `claimJobScope` mints
+// that id per invocation it is unique per invocation. Therefore:
+//
+//   * `begin` and `submitted` find nothing to be blocked by, and raise no
+//     advisory either — our own lease is on `jobScope(name)`, which does not
+//     overlap this;
+//   * the row never overlaps `jobScope(name)`, so it cannot bar the target and
+//     cannot bar the next kill, *whatever it settles as*. That is the answer to
+//     the third bullet and it holds by construction rather than by discipline;
+//   * two concurrent kills are still mutually exclusive, because that exclusion
+//     is the lease's and always was: `claimJobScope` runs before the dial and
+//     `reportClaimBlocked` refuses the loser with nothing sent.
+//
+// What is given up is that the scope guard does no work for this row — stated
+// rather than hidden. It cannot: the barrier this act needs is the one it already
+// holds, and duplicating it in a mechanism with no expiry is the trap above. The
+// scope vocabulary has three kinds (`server`, `job`, `path`) and none of them is
+// "a control act about a job"; a fourth is the v13 scope-vocabulary change
+// `contentionScope` also defers to, and not this slice. A job literally *named*
+// the 26 characters of a request id would collide with this key — a false block,
+// the safe direction, and the same direction `contentionScope` already accepts.
+
+/// The scope a control act *about* a job contends on. See the header above.
+fn controlScope(owner_request_id: []const u8) Core.execution.Scope {
+    return .{ .kind = .job, .key = owner_request_id };
+}
+
+/// The `error_code` on the receipt of a kill the host answered and refused.
+///
+/// Its own constant rather than a member of `error_code`: that namespace is
+/// `job rm --json`'s published `errorCode` vocabulary, held against `SKILL.md`
+/// word for word, and this is a *receipt* column on a different row. Putting it
+/// there would publish a word no branch of that document can emit.
+const session_survived_kill = "SESSION_SURVIVED_KILL";
+
+/// `job kill` / `job rm`, as the ledger records the act itself.
+///
+/// Created before the connection is opened — like `session rm`'s — so the row
+/// exists on every path a refusal can take, including the ones that refuse
+/// before anything is sent. That is what makes "a kill that lost its lease
+/// settles its control operation" a statement about something that exists.
+///
+/// `Cli.registerExecution` covers the indirect exits (`Cli.storeFatal`,
+/// `fatalTmux`, `fatalProbe`, the bare `fatal`), which settle through
+/// `Cli.fail`. It does **not** cover the named `noreturn` reporters in this file:
+/// they end at `Cli.exitNow` or `Cli.failIndeterminateAfterOutput`, neither of
+/// which settles anything, so each of those calls `abandonControl` itself and the
+/// gate below holds every one of them to it.
+fn beginControl(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    server: Store.servers.Server,
+    claim: Claim,
+    /// `kill` or `rm`, as `jobCmd` dispatched it.
+    verb: []const u8,
+) Core.execution.Execution {
+    const owner_token = Store.policy.ownerToken(store, ctx.arena, ctx.io, ctx.now) catch |err|
+        Cli.storeFatal(store, err);
+    const start = Core.execution.begin(store, ctx.arena, ctx.io, .{
+        .server_id = server.id,
+        .server_name = server.name,
+        .kind = .control,
+        .scope = controlScope(claim.owner_request_id),
+        // The job this act is about, in the column `session rm` already puts a
+        // session name in. Dedicated target columns are v13.
+        .alias = claim.subject.name(),
+        // The class of act, and nothing else. There is no operator text in it to
+        // redact — the host is in `server_name`, the job in `alias` — so this
+        // says which of the two verbs ran and stops. Recorded because `kind` is
+        // `control` for both and a receipt that cannot tell a kill from a removal
+        // is a receipt that cannot answer what happened.
+        .argv_redacted = if (std.mem.eql(u8, verb, "kill")) "job kill" else "job rm",
+        // Left at its default `true`, and worth saying out loud: this stops a
+        // remote shell, and on `job rm` it also deletes a log, a result record
+        // and the local row.
+        .owner_token = owner_token,
+        .now = ctx.now,
+    }) catch |err| Cli.storeFatal(store, err);
+    return switch (start) {
+        .ready => |e| e,
+        .blocked => |blocker| controlScopeTaken(blocker),
+    };
+}
+
+/// Nothing can claim a control scope keyed on a per-invocation lease owner, so
+/// `beginControl` and `submitControl` reach this only if something has.
+///
+/// Reported with the claimant named rather than asserted away: a caller that gets
+/// here has been handed a real blocker, and `unreachable` over a `Blocker` that
+/// arrived anyway would turn a store fact into a crash. `fatal` also settles this
+/// command's control row on the way out, through `Cli.fail`.
+fn controlScopeTaken(blocker: Core.execution.Blocker) noreturn {
+    switch (blocker) {
+        .unsettled => |op| fatal(
+            "internal: this command's own control scope is claimed by request {s} ({s}); nothing was sent to the host",
+            .{ op.request_id, op.status.text() },
+        ),
+        .lease => |lease| fatal(
+            "internal: this command's own control scope is leased by request {s} (on {s}) until {d}; nothing was sent to the host",
+            .{ lease.owner_request_id, lease.profile_token, lease.expires_at },
+        ),
+    }
+}
+
+/// Moves the control operation to `submitted`, just before the act it records
+/// goes to the host.
+///
+/// Required, not bookkeeping: `op_state.canSettle` admits
+/// `remote_cancel_confirmed` and `proven_failure` only from `submitted` or
+/// `remote_started`, so a control row that never submits can never record what the
+/// host answered about the session.
+///
+/// Placed *above* the renewal that gates the kill rather than between it and the
+/// `kill-session`, for the reason `cmd_session.removeSession` places it there:
+/// nothing but the renewal may sit between the question "is the scope still ours"
+/// and the act, and `submitted()` is a `BEGIN IMMEDIATE` of its own. The cost is
+/// one statement wide and is the one that verb documents — a loss caught by that
+/// renewal leaves this row at `submitted`, where `canSettle` no longer admits
+/// `never_submitted`, so `abandonControl` records `indeterminate` for a kill that
+/// never left this machine.
+fn submitControl(store: *Store, control: *Core.execution.Execution) void {
+    switch (control.submitted() catch |err| Cli.storeFatal(store, err)) {
+        .submitted => {},
+        .refused => |blocker| controlScopeTaken(blocker),
+    }
+}
+
+/// What the control operation settles, from the host's own answer about the
+/// session this act named — and from nothing else.
+///
+/// --- Decision 2: the terminal ----------------------------------------------
+///
+/// `Kind.control` declares `supervises_another_subject` and nothing else, so
+/// `receipts.terminalDescribes` refuses `exited`, `remote_deadline`,
+/// `input_accepted` and `input_refused` for it. That had to be checked before the
+/// shape was committed to, because a refused *settlement* is not recoverable:
+/// `settle` is the sole terminal writer, there is no operator variant, and a kind
+/// whose only route to an outcome is refused holds its scope forever. Its whole
+/// business vocabulary is the two below, and each is earned here:
+///
+///  * `Tmux.killSession` sends `kill-session` and then asks `has-session`, so
+///    `true` is the host's own answer that the session is gone. That is
+///    `remote_cancel_confirmed` — `cancelled` — the identical terminal
+///    `session rm` settles from the identical pair of tmux calls.
+///  * `false` is the host answering that the session is still there after the
+///    kill. `op_state.Terminal.proven_failure` exists for a failure proven
+///    *after* submission and its own doc names "a `session rm` whose kill was
+///    sent and whose host reports the session still present" as one of the three
+///    sites that wanted it. `indeterminate` here would bar a scope over a
+///    question the host already answered.
+///
+/// **This is where the control row and the target part company, which is the
+/// point of there being two rows.** A job's kill may not claim a verified
+/// cancellation — `cancellationProvable` refuses it, because a job's subject is
+/// the command in the pane and a disowned child outlives it — so the target
+/// settles `indeterminate`. The control act's subject is the *session*, and the
+/// session is proven gone. `operations.Kind.capabilities` argues that cell out at
+/// length: "The gap that forces a job to `indeterminate` — pane gone, work
+/// possibly alive — is not a gap in this claim, because this claim never reached
+/// for the work."
+///
+/// `term_sent = true, kill_sent = false`: `tmux kill-session` hangs the pane up on
+/// our behalf and nothing here sends SIGKILL. `pid = null`: the process in that
+/// pane belongs to whoever started the job, and recording its pid would be a
+/// reading about one thing offered as a verdict on another — the mistake
+/// `.job`'s `records_process_identity = false` exists for.
+///
+/// **The lease is not an input here.** A renewal that fails *before* the kill
+/// decides whether the act happens at all, and that path settles through
+/// `abandonControl`. A renewal that fails *after* it cannot unmake the host's
+/// answer: `absence_verified_at` dates the reading, and `Kind.control` is explicit
+/// that a control operation "settles from **its own** evidence — lease held or
+/// lost, kill sent or withheld, the host's answer — and never from the target's".
+/// The target's `lostTerminal` outranks every reading for a reason that does not
+/// transfer: it must not release *the job's* scope barrier over a name a peer may
+/// have relaunched into. This row's scope is its own and releases nothing.
+fn controlTerminal(session_gone: bool, at: i64) Core.Store.op_state.Terminal {
+    if (session_gone) return .{ .remote_cancel_confirmed = .{
+        .pid = null,
+        .term_sent = true,
+        .kill_sent = false,
+        .absence_verified_at = at,
+        .verification_method = "tmux kill-session, then tmux has-session reported the job's session absent",
+    } };
+    return .{ .proven_failure = .{
+        .observation = "tmux has-session reported the job's session still present after kill-session",
+        .error_code = session_survived_kill,
+    } };
+}
+
+/// Records what this command's kill established about the job's session.
+///
+/// Called on the line after the `kill-session` it reports, on every branch of both
+/// verbs, and the gate below counts them: a kill with no control settlement beside
+/// it is the hole this section closes.
+fn settleControl(control: *Core.execution.Execution, session_gone: bool, at: i64) void {
+    _ = control.settle(controlTerminal(session_gone, at), .{}) catch |err|
+        Cli.receiptFatalReportingClaim(control.id(), err, "recording what a job control act did");
+}
+
+/// Settles the control operation for an act this command did not take.
+///
+/// `Execution.abandon` classifies it by how far the row got, through
+/// `op_state.terminalForTransportLoss`: a refusal before `submitControl` records
+/// `never_submitted` — "the command the caller asked for did not run", which is
+/// exactly a withheld kill — and one inside the single statement after it records
+/// `indeterminate`. `never_submitted` carries the reason in a field named
+/// `transport_error` and a lost lease is not a transport failure; that cell is
+/// `cmd_session.refuseBeforeKill`'s too, and following it is cheaper than a second
+/// classifier that would then be the thing that drifts.
+///
+/// Safe to call unconditionally: `abandon` does nothing once settled, which is
+/// what lets the reporters that run *after* a kill call it as well, rather than
+/// each of them deciding whether it is needed.
+///
+/// A write that fails is printed rather than raised. Every caller is a `noreturn`
+/// reporter with a document still to publish, and losing that document to report a
+/// lost receipt would cost the operator both.
+fn abandonControl(control: *Core.execution.Execution, reason: []const u8) void {
+    control.abandon(reason) catch |err| std.debug.print(
+        "terminus: RECEIPT_PERSIST_FAILED for {s}: {s} (this job control act recorded no verdict)\n",
+        .{ control.id(), @errorName(err) },
+    );
+}
+
+/// The sentence a withheld or abandoned control act records.
+fn controlWithheld(ctx: *Cli.Ctx, authority: Authority, job_name: []const u8) []const u8 {
+    return std.fmt.allocPrint(
+        ctx.arena,
+        "this supervisory act on job '{s}' was not completed: the scope lease it runs under is {s}, so no further step was taken",
+        .{ job_name, authority.code() },
+    ) catch "this supervisory act on a job was not completed: the scope lease it runs under is no longer held";
 }
 
 /// The terminal a step taken without authority may settle, and the only one it
@@ -8027,4 +8663,780 @@ test "gate: progress the probe's window has scrolled past is still what the job 
         "{\"pct\":12}",
         (try Store.job_attempts.probeState(&store, arena, rid)).?.latest_progress_json.?,
     );
+}
+
+// --- Gates: the operation `job kill` / `job rm` record themselves as ---------
+//
+// The three decisions are argued in the header above `beginControl` and in the
+// doc comment on `controlTerminal`. These hold them.
+//
+// **What is driven and what is not.** There is no live server, and the test host's
+// key exists only inside a database these tests may not touch, so every gate below
+// stops at the `Core.Executor` boundary and feeds `Core.Scripted` the bytes a host
+// would return. The store is a real sqlite file under `.zig-cache/tmp`.
+//
+// Exactly one path through `killJob` runs end to end and *returns*: the
+// `already_finished` branch, whose exit is `.ok`. Every other branch of both verbs
+// ends at `Cli.failIndeterminateAfterOutput` or `Cli.exitNow`, which call
+// `std.process.exit` — a gate that drove one would take the test process down with
+// it and every gate after it would stop running. So the refusal side is held two
+// ways instead: the settlement helpers are driven directly against the store, and a
+// text gate holds every reporter that can end the process to calling one of them.
+// Stated plainly, because it is the line between proven and reviewed.
+
+/// A job launched as far as `remote_started`, with its cache row, its attempt and
+/// its unsettled operation — the state both verbs are entered in.
+///
+/// `command` goes through the real redactor on its way to `argv_redacted`, which is
+/// what lets the secrets gate below be a statement about the shipped path rather
+/// than about a fixture.
+fn launchForControl(
+    store: *Store,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+    command: []const u8,
+) !struct {
+    request_id: []const u8,
+    job: Store.jobs.Job,
+    attempt: ?Store.job_attempts.Attempt,
+} {
+    var e = switch (try Core.execution.begin(store, arena, io, .{
+        .server_id = 1,
+        .server_name = "box",
+        .kind = .job,
+        .scope = jobScope(name),
+        .alias = name,
+        .argv_redacted = try Store.history.redactSecrets(arena, command),
+        .argv_sha256 = try sha256Hex(arena, command),
+        .owner_token = "agent",
+        .now = 1000,
+    })) {
+        .ready => |ready| ready,
+        .blocked => return error.ScopeUnexpectedlyBlocked,
+    };
+    e.settled = true;
+    const request_id = try arena.dupe(u8, e.id());
+    // Through the boundary's own steps rather than `operations.advance`, so the
+    // attempt has the `operation_events` trail a receipt is *about*. A fixture that
+    // advanced the status column alone would leave `job receipt` reading an empty
+    // trail and the gate below asserting that an empty trail is fine.
+    try e.connecting();
+    switch (try e.submitted()) {
+        .submitted => {},
+        .refused => return error.ScopeUnexpectedlyBlocked,
+    }
+    try e.remoteStarted(.{ .pid = 4242, .pgid = 4242, .start_token = "start-token" });
+    _ = try Store.jobs.create(store, 1, name, command, "__S__", request_id, 1000);
+    if (!try Store.jobs.markStarted(store, request_id)) return error.RowNotReserved;
+    _ = try Store.job_attempts.create(store, .{
+        .request_id = request_id,
+        .server_id = 1,
+        .server_name = "box",
+        .job_name = name,
+        .attempt_no = 1,
+        .sentinel = "__S__",
+        .tmux_session = name,
+        .now = 1000,
+    });
+    const row = (try Store.jobs.getByName(store, arena, 1, name)).?;
+    return .{ .request_id = request_id, .job = row, .attempt = attemptOf(store, arena, row) };
+}
+
+/// A held claim on a job's scope, acquired with an explicit stamp 60 seconds in
+/// the past.
+///
+/// `claimJobScope` dates its acquisition from `Control.wallClockSeconds` while
+/// `Cli.releaseClaimReporting` dates the release from the *store's* clock, and the
+/// two are not the same reader — so a claim taken and released inside one test can
+/// be refused for reading an earlier clock than its own acquisition. That
+/// behaviour is `claimJobScope`'s and is gated where it belongs; what these gates
+/// need is a claim that is unambiguously live and releasable.
+fn heldClaim(
+    store: *Store,
+    arena: std.mem.Allocator,
+    name: []const u8,
+    owner: []const u8,
+) !Claim {
+    const at = (try Store.leases.clockSeconds(store)) - 60;
+    switch (try Store.leases.acquire(store, arena, .{
+        .server_id = 1,
+        .scope = jobScope(name),
+        .owner_request_id = owner,
+        .profile_token = "gate",
+        .owner_label = name,
+        .ttl_secs = Claim.ttl_secs,
+        .now = at,
+    })) {
+        .acquired => {},
+        .renewed, .conflict => return error.ClaimDidNotTake,
+    }
+    return .{
+        .store = store,
+        .server_id = 1,
+        .scope = jobScope(name),
+        .owner_request_id = owner,
+        .subject = .{ .job = name },
+    };
+}
+
+test "gate: a job control act contends on a scope of its own, never the job's" {
+    const t = std.testing;
+    const owner = "01CONTROLOWNER0123456789AB";
+    const control = controlScope(owner);
+    const target = jobScope("deploy");
+
+    // The fixture first: a `jobScope` that had stopped being `.job:"deploy"` would
+    // make every claim below vacuous.
+    try t.expect(target.kind == .job);
+    try t.expectEqualStrings("deploy", target.key);
+    try t.expect(control.kind == .job);
+    try t.expectEqualStrings(owner, control.key);
+
+    // Disjoint in both directions, which is the whole of Decision 1. Overlapping,
+    // `execution.begin` would be refused by the very attempt the kill is aimed at,
+    // `settleAndForgetJob` would read this row as the peer blocking its own
+    // removal, and an `indeterminate` control row would bar the job for good.
+    try t.expect(!control.overlaps(target));
+    try t.expect(!target.overlaps(control));
+
+    // …and it does not overlap `session rm`'s reading of the same job either, which
+    // is the third scope in play on this name.
+    try t.expect(!control.overlaps(.{ .kind = .job, .key = "deploy" }));
+
+    // Unique per invocation, because the key is the id `claimJobScope` mints per
+    // invocation. Two control acts on one job do not contend, and must not: their
+    // exclusion is the lease's, and duplicating it in a mechanism with no TTL is
+    // the trap Decision 1 exists to avoid.
+    try t.expect(!control.overlaps(controlScope("01CONTROLOWNER0123456789XY")));
+
+    // The one collision this key can have, asserted as the safe direction rather
+    // than denied: a job literally named the 26 characters of the owner id.
+    try t.expect(control.overlaps(jobScope(owner)));
+}
+
+test "gate: a control act's terminal is the host's answer, and both answers are admissible" {
+    const t = std.testing;
+    const receipts = Core.Store.receipts;
+    const op_state = Core.Store.op_state;
+
+    const gone = controlTerminal(true, 4242);
+    const survived = controlTerminal(false, 4242);
+
+    // Two answers, two statuses. A shape that reported a surviving session as a
+    // cancellation would publish `cancelled` over a shell that is still running.
+    try t.expectEqual(op_state.Status.cancelled, gone.status());
+    try t.expectEqual(op_state.Status.failed, survived.status());
+    // Neither bars a scope, which is what makes the ordinary outcome of these two
+    // verbs leave nothing behind at all.
+    try t.expect(!gone.status().blocksScope());
+    try t.expect(!survived.status().blocksScope());
+
+    // Admissible *for this kind*. Checked because a refused settlement is not
+    // recoverable: `settle` is the only terminal writer, there is no operator
+    // variant, and a kind whose terminals `terminalDescribesKind` all refuse can
+    // never be settled at all.
+    try t.expect(receipts.terminalDescribesKind(gone, .control));
+    try t.expect(receipts.terminalDescribesKind(survived, .control));
+
+    // …and reachable from where `submitControl` leaves the row, and *only* from
+    // there. That second half is why `submitControl` is not bookkeeping: without
+    // it neither of these two can ever be written.
+    try t.expect(op_state.canSettle(.submitted, gone));
+    try t.expect(op_state.canSettle(.submitted, survived));
+    try t.expect(!op_state.canSettle(.connecting, gone));
+    try t.expect(!op_state.canSettle(.connecting, survived));
+
+    // The four the kind refuses, named so that a widening of `.control`'s
+    // capabilities has to come past this list. `exited` is the one that matters:
+    // `job kill` runs three tmux invocations, and settling the control act with one
+    // of their exit statuses would write `exit_code = 0` into the column an auditor
+    // reads first, for an operation in which no command of the caller's was judged.
+    const refused = [_]op_state.Terminal{
+        .{ .exited = .{ .exit_code = 0 } },
+        .{ .remote_deadline = .{ .after_ms = 1 } },
+        .{ .input_accepted = .{ .bytes = 1, .sha256 = "00" } },
+        .{ .input_refused = .{ .reason = "no such session" } },
+    };
+    var seen: usize = 0;
+    for (refused) |terminal| {
+        try t.expect(!receipts.terminalDescribesKind(terminal, .control));
+        seen += 1;
+    }
+    try t.expectEqual(refused.len, seen);
+
+    // The evidence is carried rather than claimed. `absence_verified_at` dates the
+    // reading and both strings name the tmux call behind them, which is what stops
+    // either of these from being a conclusion with nothing under it.
+    switch (gone) {
+        .remote_cancel_confirmed => |c| {
+            try t.expectEqual(@as(i64, 4242), c.absence_verified_at);
+            try t.expect(c.term_sent);
+            try t.expect(!c.kill_sent);
+            try t.expectEqual(@as(?i64, null), c.pid);
+            try t.expect(std.mem.indexOf(u8, c.verification_method, "has-session") != null);
+        },
+        else => return error.ProvenKillWasNotACancellation,
+    }
+    switch (survived) {
+        .proven_failure => |p| {
+            try t.expectEqualStrings(session_survived_kill, p.error_code);
+            try t.expect(std.mem.indexOf(u8, p.observation, "has-session") != null);
+            // `canSettle` refuses an empty observation or an empty code, and this
+            // is the site that has to satisfy it.
+            try t.expect(p.observation.len > 0 and p.error_code.len > 0);
+        },
+        else => return error.SurvivingSessionWasNotAProvenFailure,
+    }
+}
+
+test "gate: a job control act records itself, settles, and never bars the job it is about" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_control_records");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+    const server = (try Store.servers.getByName(&store, arena, "box")).?;
+    const launched = try launchForControl(&store, arena, scratch.io, "deploy", "make deploy");
+
+    const claim = try heldClaim(&store, arena, "deploy", "01CONTROLOWNER0123456789AB");
+
+    // The row `job kill` never had. It exists *before* the dial, which is what
+    // makes a refusal a refusal of something.
+    var control = beginControl(&ctx, &store, server, claim, "kill");
+    try control.connecting();
+
+    // The three ids, and they are three. Not asserted for its own sake: keyed the
+    // target's way round a lease read answers `never_taken` about a live claim, and
+    // keyed the authority's way round the operation half reports the target attempt
+    // as a peer blocking its own removal. The type system stops a literal crossing
+    // over; this says the values really do differ at run time.
+    try t.expect(!std.mem.eql(u8, control.id(), claim.owner_request_id));
+    try t.expect(!std.mem.eql(u8, control.id(), launched.request_id));
+    try t.expect(!std.mem.eql(u8, claim.owner_request_id, launched.request_id));
+    // And that the lease is held under the owner id rather than under either of the
+    // other two, which is the half a name comparison cannot see.
+    {
+        const live = try Store.leases.active(&store, arena, 1, ctx.now);
+        try t.expectEqual(@as(usize, 1), live.len);
+        try t.expectEqualStrings(claim.owner_request_id, live[0].owner_request_id);
+    }
+
+    // `begin` was not blocked, and — the sharper half — raised no advisory either.
+    // The target attempt is unsettled on `.job:"deploy"` right now, which is
+    // exactly the state that would have refused a control op on the job's scope.
+    try t.expectEqual(@as(?Core.execution.Blocker, null), control.advisory);
+    try t.expect((try Store.operations.unsettledInScope(&store, arena, 1, jobScope("deploy"))).len == 1);
+
+    submitControl(&store, &control);
+    try t.expectEqual(Core.Store.op_state.Status.submitted, control.status);
+
+    // The submitted control row does not join the job's barrier. This is the
+    // property `settleAndForgetJob` depends on: `authorityLocked` exempts the lease
+    // owner and the target and nothing else, so a control row inside the job's
+    // scope would be read as the peer blocking `job rm`'s own removal.
+    {
+        const barring = try Store.operations.unsettledInScope(&store, arena, 1, jobScope("deploy"));
+        try t.expectEqual(@as(usize, 1), barring.len);
+        try t.expectEqualStrings(launched.request_id, barring[0].request_id);
+    }
+
+    settleControl(&control, true, ctx.now);
+
+    // Exactly one control operation, settled, findable by request id, and carrying
+    // the terminal the host's answer earned.
+    const op = (try Store.operations.get(&store, arena, control.id())).?;
+    try t.expectEqualStrings("control", op.kind);
+    try t.expectEqualStrings("deploy", op.alias.?);
+    try t.expectEqualStrings("job kill", op.argv_redacted.?);
+    try t.expectEqual(Core.Store.op_state.Status.cancelled, op.status);
+    try t.expect(!op.effectiveStatus().blocksScope());
+    const recorded = (try Core.Store.receipts.terminalOf(&store, control.id())).?;
+    try t.expectEqual(Core.Store.op_state.Status.cancelled, recorded.status);
+    {
+        var stmt = try store.db.prepare("SELECT COUNT(*) FROM operations WHERE kind = 'control'");
+        defer stmt.deinit();
+        try t.expect(try stmt.step());
+        try t.expectEqual(@as(i64, 1), stmt.columnInt(0));
+    }
+
+    // And the target is still killable: a fresh mutating attempt on the job's own
+    // scope is refused by the job's unsettled attempt and by nothing else. Proved
+    // by settling that attempt and watching the scope come free — if the control
+    // row were in it, this would still be blocked.
+    _ = try Core.Store.receipts.settle(&store, launched.request_id, .{ .indeterminate = .{
+        .reason = "the kill established nothing about the work",
+        .last_observed = .remote_started,
+    } }, .{}, ctx.now);
+    try t.expect((try Store.operations.unsettledInScope(&store, arena, 1, jobScope("deploy"))).len == 1);
+    _ = try Core.Store.receipts.resolve(&store, arena, launched.request_id, .cancelled, .{
+        .operator_override = .{ .reason = "operator settled it by hand", .by = "gate" },
+    }, ctx.now);
+    try t.expectEqual(
+        @as(usize, 0),
+        (try Store.operations.unsettledInScope(&store, arena, 1, jobScope("deploy"))).len,
+    );
+}
+
+test "gate: a control act this command withheld is settled, not left open" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_control_withheld");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var out: Cli.Output = .{ .writer = &discard.writer };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+    const server = (try Store.servers.getByName(&store, arena, "box")).?;
+    const launched = try launchForControl(&store, arena, scratch.io, "deploy", "make deploy");
+
+    const claim = try heldClaim(&store, arena, "deploy", "01CONTROLOWNER0123456789AB");
+
+    // --- the lease lost before the kill: nothing was handed over --------------
+    var early = beginControl(&ctx, &store, server, claim, "kill");
+    try early.connecting();
+    const lapsed: Authority = .lapsed;
+    abandonControl(&early, controlWithheld(&ctx, lapsed, "deploy"));
+
+    const early_op = (try Store.operations.get(&store, arena, early.id())).?;
+    // `never_submitted` — the command the caller asked for did not run — and
+    // `failed`, which does not bar a scope. A withheld kill leaves nothing behind.
+    try t.expectEqual(Core.Store.op_state.Status.failed, early_op.status);
+    try t.expect(!early_op.effectiveStatus().blocksScope());
+    try t.expect((try Core.Store.receipts.terminalOf(&store, early.id())) != null);
+    // The reason travels: a receipt saying only "abandoned" sends nobody anywhere.
+    {
+        const rows = try Core.Store.receipts.list(&store, arena, early.id());
+        var reason: ?[]const u8 = null;
+        for (rows) |row| if (row.is_terminal) {
+            reason = row.transport_error;
+        };
+        try t.expect(std.mem.indexOf(u8, reason.?, "deploy") != null);
+        try t.expect(std.mem.indexOf(u8, reason.?, "lapsed") != null);
+    }
+    // Idempotent, which is what lets the reporters that run *after* a kill call it
+    // without each deciding whether it is needed.
+    abandonControl(&early, "a second call must not write a second verdict");
+    try t.expectEqual(@as(i64, early_op.updated_at), (try Store.operations.get(&store, arena, early.id())).?.updated_at);
+
+    // --- the lease lost in the one statement after `submitControl` ------------
+    var late = beginControl(&ctx, &store, server, claim, "rm");
+    try late.connecting();
+    submitControl(&store, &late);
+    abandonControl(&late, controlWithheld(&ctx, lapsed, "deploy"));
+
+    const late_op = (try Store.operations.get(&store, arena, late.id())).?;
+    // `indeterminate`, which overstates a kill that never left this machine — the
+    // documented cost of `submitControl` sitting above the renewal, and the reason
+    // Decision 1 matters: this row *does* bar a scope, and the scope it bars is its
+    // own and nobody else's.
+    try t.expectEqual(Core.Store.op_state.Status.indeterminate, late_op.status);
+    try t.expect(late_op.effectiveStatus().blocksScope());
+    // …and the job's scope is barred by the job's own attempt and by nothing else.
+    // One row, and it is the target's: an `indeterminate` control row inside the
+    // job's scope is precisely the trap Decision 1 exists to avoid, and this is
+    // where it would show.
+    {
+        const barring = try Store.operations.unsettledInScope(&store, arena, 1, jobScope("deploy"));
+        try t.expectEqual(@as(usize, 1), barring.len);
+        try t.expectEqualStrings(launched.request_id, barring[0].request_id);
+    }
+    // …and it bars nothing a later invocation will ever ask for, because the next
+    // one mints a new owner id and therefore a new scope.
+    try t.expectEqual(
+        @as(usize, 1),
+        (try Store.operations.unsettledInScope(&store, arena, 1, controlScope(claim.owner_request_id))).len,
+    );
+    try t.expectEqual(
+        @as(usize, 0),
+        (try Store.operations.unsettledInScope(&store, arena, 1, controlScope("01ANOTHEROWNER0123456789AB"))).len,
+    );
+}
+
+/// Terminal writes for the *control* operation, spelled as they are written.
+///
+/// `Control.bare_terminal_writes` cannot carry these: that vocabulary is shared by
+/// every claim-holding verb in the tree and lives in `src/core/control.zig`, and a
+/// spelling private to this file does not belong in it. So the rule is stated here,
+/// over the same bodies `claim_reporting_bodies` already names.
+const control_settlements = [_][]const u8{ "settleControl(", "abandonControl(" };
+
+/// How many of them those bodies write between them.
+///
+/// Four kills in `killJob` and one in `removeJob` record the host's answer; the
+/// four refusal reporters and `reportFinishedDuringKill` abandon. Asserted for the
+/// reason every count in these gates is asserted: a scan that matched nothing
+/// reports nothing, which is worse than no gate.
+const control_settlement_count = 10;
+
+test "gate: every reporter that can end the process records or abandons the control act" {
+    const t = std.testing;
+    const source = @embedFile("cmd_job.zig");
+    var total: usize = 0;
+    for (claim_reporting_bodies) |header| {
+        const body = try Control.bodyOf(source, header);
+        var here: usize = 0;
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            // Prose that spells a call is not a call — the paragraphs explaining
+            // each site are full of both names.
+            if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
+            for (control_settlements) |call| {
+                if (std.mem.indexOf(u8, line, call) != null) here += 1;
+            }
+        }
+        if (here == 0) {
+            std.debug.print(
+                \\
+                \\{s}… publishes a document and can end the process, and does not settle this
+                \\command's control operation.
+                \\
+                \\Every one of these bodies ends at `Cli.exitNow` or
+                \\`Cli.failIndeterminateAfterOutput`, and neither settles anything — the
+                \\`Cli.registerExecution` hook only covers the routes through `Cli.fail`. So a
+                \\body here that writes neither `settleControl(` nor `abandonControl(` leaves a
+                \\`control` row unsettled for good. Call `abandonControl(` even where the row is
+                \\already settled: it does nothing once settled, and a body exempt because
+                \\somebody traced its callers stops being exempt when a caller moves.
+                \\
+            , .{header[1..]});
+            return error.ControlActLeftUnsettled;
+        }
+        total += here;
+    }
+    try t.expectEqual(@as(usize, control_settlement_count), total);
+}
+
+test "gate: a kill of a finished job leaves one settled control operation beside the job's own" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_control_e2e");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out_buffer: [1 << 15]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buffer);
+    var out: Cli.Output = .{ .writer = &writer, .format = .json };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+    const server = (try Store.servers.getByName(&store, arena, "box")).?;
+    const launched = try launchForControl(&store, arena, scratch.io, "deploy", "make deploy");
+
+    const claim = try heldClaim(&store, arena, "deploy", "01CONTROLOWNER0123456789AB");
+    // Registered, because `killJob` hands the scope back through
+    // `Cli.releaseClaimReporting` and publishes what that did.
+    registerClaim(claim);
+    var control = beginControl(&ctx, &store, server, claim, "kill");
+    try control.connecting();
+    const control_id = try arena.dupe(u8, control.id());
+
+    // `probeTail`'s wire shape, with the sidecar addressed to *this* attempt's own
+    // request id — the address is what makes the document evidence about it.
+    const empty = try arena.alloc(u8, 0);
+    const tail = try std.fmt.allocPrint(
+        arena,
+        "{{\"v\":1,\"requestId\":\"{s}\",\"exitCode\":7,\"finishedAt\":1750}}\n" ++
+            "__TERMINUS_PROBE_SPLIT__\n12\nbuilding...\n",
+        .{launched.request_id},
+    );
+    var scripted = Core.Scripted.init(arena, &.{
+        // the tail, then `isAlive` (0 = still there), then `kill-session`
+        // (0 = killed and verified absent).
+        .{ .reply = .{ .exit_code = 0, .stdout = tail, .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+        .{ .reply = .{ .exit_code = 0, .stdout = empty, .stderr = empty } },
+    });
+
+    try killJob(
+        &ctx,
+        &store,
+        scripted.executor(),
+        "job-deploy",
+        launched.job,
+        launched.attempt,
+        claim,
+        &control,
+    );
+
+    // Every scripted step was consumed: a kill that never reached `kill-session`
+    // would leave one behind and every assertion below would be about a control act
+    // that recorded nothing.
+    try t.expectEqual(@as(usize, 3), scripted.index);
+
+    // One control row, settled, and it is *this* command's.
+    {
+        var stmt = try store.db.prepare("SELECT COUNT(*) FROM operations WHERE kind = 'control'");
+        defer stmt.deinit();
+        try t.expect(try stmt.step());
+        try t.expectEqual(@as(i64, 1), stmt.columnInt(0));
+    }
+    const op = (try Store.operations.get(&store, arena, control_id)).?;
+    try t.expectEqual(Core.Store.op_state.Status.cancelled, op.status);
+    try t.expect((try Core.Store.receipts.terminalOf(&store, control_id)) != null);
+
+    // The target settled from its own evidence, and the two verdicts differ. That
+    // difference is the reason there are two rows: the job ended with exit 7, and
+    // the control act stopped a session and verified it gone.
+    const target = (try Store.operations.get(&store, arena, launched.request_id)).?;
+    try t.expectEqual(Core.Store.op_state.Status.failed, target.status);
+
+    // Both ids are published, and they are not the same key or the same value.
+    const document = writer.buffered();
+    try t.expect(std.mem.indexOf(u8, document, "\"controlRequestId\": \"") != null);
+    try t.expect(std.mem.indexOf(u8, document, control_id) != null);
+    try t.expect(std.mem.indexOf(u8, document, launched.request_id) != null);
+    try t.expect(std.mem.indexOf(u8, document, "\"controlStatus\": \"cancelled\"") != null);
+    // The lease owner is the third id, and it is deliberately *not* in the
+    // document: it names no operation row, so publishing it as a request id would
+    // hand a caller a string `request show` cannot resolve.
+    try t.expect(std.mem.indexOf(u8, document, claim.owner_request_id) == null);
+}
+
+// --- Gates: `job receipt` ----------------------------------------------------
+
+/// A credential of each shape the redactor recognises, so the secrets gate is a
+/// statement about the shipped redaction path and not about one lucky pattern.
+const receipt_secrets = [_][]const u8{
+    "hunter2trustno1",
+    "sk-ant-000111222333",
+    "Bearer abcdefzz9988",
+    "sess=deadbeefcafe",
+};
+
+test "gate: job receipt reports an unsettled attempt as unsettled, and a resolved one as both" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_receipt_states");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out_buffer: [1 << 15]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buffer);
+    var out: Cli.Output = .{ .writer = &writer, .format = .json };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+    const launched = try launchForControl(&store, arena, scratch.io, "deploy", "make deploy");
+    const args = Cli.parseArgs(&ctx, &.{ "box", "deploy" });
+
+    // --- never settled: the absence is the report ----------------------------
+    //
+    // Every key below is matched at its **top-level** indentation. `Output.json`
+    // renders `.indent_2`, so a top-level key sits under two spaces and a key
+    // inside `terminal` under four — and `status` exists at both depths. Matching
+    // the bare `"status":` found the nested one, which meant the assertion that
+    // this verb does not overwrite the observation was satisfied by the very
+    // object it was distinguishing itself from. A mutation collapsing `status`
+    // onto `effectiveStatus` survived under it.
+    const top = "\n  ";
+    try jobReceipt(&ctx, &store, 1, "deploy", &args);
+    const open = writer.buffered();
+    try t.expect(std.mem.indexOf(u8, open, top ++ "\"settled\": false") != null);
+    try t.expect(std.mem.indexOf(u8, open, top ++ "\"terminal\": null") != null);
+    // …and the observed status is still published beside it, so "unsettled" is not
+    // the same word as "we have no idea where this got to".
+    try t.expect(std.mem.indexOf(u8, open, top ++ "\"status\": \"remote_started\"") != null);
+    try t.expect(std.mem.indexOf(u8, open, top ++ "\"blocksScope\": true") != null);
+    try t.expect(std.mem.indexOf(u8, open, top ++ "\"resolvedStatus\": null") != null);
+    // The trail is not empty and says so twice — a count and the rows.
+    try t.expect(std.mem.indexOf(u8, open, top ++ "\"eventCount\": 0") == null);
+
+    // --- settled `indeterminate`, then resolved: both readings survive -------
+    _ = try Core.Store.receipts.settle(&store, launched.request_id, .{ .indeterminate = .{
+        .reason = "the launcher detached and nobody looked again",
+        .last_observed = .remote_started,
+    } }, .{}, 3000);
+    _ = try Core.Store.receipts.resolve(&store, arena, launched.request_id, .completed, .{
+        .job_sentinel = .{ .sentinel = "__S__", .exit_code = 0 },
+    }, 4000);
+
+    writer.end = 0;
+    try jobReceipt(&ctx, &store, 1, "deploy", &args);
+    const both = writer.buffered();
+    // "We recorded X." Still there, not overwritten — this is the whole reason the
+    // tree kept `status` and added `resolved_status` beside it. Top-level, so the
+    // `terminal` object's own `status` cannot answer for it.
+    try t.expect(std.mem.indexOf(u8, both, top ++ "\"status\": \"indeterminate\"") != null);
+    try t.expect(std.mem.indexOf(u8, both, top ++ "\"status\": \"completed\"") == null);
+    // "…and somebody later proved Y."
+    try t.expect(std.mem.indexOf(u8, both, top ++ "\"resolvedStatus\": \"completed\"") != null);
+    try t.expect(std.mem.indexOf(u8, both, top ++ "\"effectiveStatus\": \"completed\"") != null);
+    try t.expect(std.mem.indexOf(u8, both, top ++ "\"reconciledAt\": 4000") != null);
+    // …on what evidence, which is the half that makes the pair auditable rather
+    // than merely contradictory.
+    try t.expect(std.mem.indexOf(u8, both, "job_sentinel") != null);
+    try t.expect(std.mem.indexOf(u8, both, top ++ "\"settled\": true") != null);
+    try t.expect(std.mem.indexOf(u8, both, top ++ "\"blocksScope\": false") != null);
+    // The terminal is the one that was written, not the one that was proved. A
+    // receipt that showed `completed` here would have lost the disagreement.
+    const terminal_at = std.mem.indexOf(u8, both, top ++ "\"terminal\": {") orelse
+        return error.ResolvedReceiptCarriedNoTerminal;
+    try t.expect(std.mem.indexOf(u8, both[terminal_at..], "\n    \"status\": \"indeterminate\"") != null);
+}
+
+test "gate: job receipt carries no secret, and its --json key set is pinned" {
+    const t = std.testing;
+    var scratch = try Scratch.init(t.allocator, "cmd_job_receipt_secrets");
+    defer scratch.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out_buffer: [1 << 15]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buffer);
+    var out: Cli.Output = .{ .writer = &writer, .format = .json };
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    var ctx: Cli.Ctx = .{
+        .io = scratch.io,
+        .arena = arena,
+        .environ = &environ,
+        .out = &out,
+        .now = 5000,
+    };
+
+    var store = try Store.open(scratch.path);
+    defer store.close();
+    try insertBox(&store);
+
+    // A launch whose command carries one credential of each shape the redactor
+    // knows. `launchForControl` puts it through `Store.history.redactSecrets` on
+    // the way to `argv_redacted`, which is the shipped path.
+    const command = try std.fmt.allocPrint(
+        arena,
+        "DB_PASSWORD={s} deploy --key {s} -H 'Authorization: {s}' -H 'Cookie: {s}'",
+        .{ receipt_secrets[0], receipt_secrets[1], receipt_secrets[2], receipt_secrets[3] },
+    );
+    // The fixture is asserted: a command that had lost its credentials would make
+    // every claim below vacuous.
+    for (receipt_secrets) |secret|
+        try t.expect(std.mem.indexOf(u8, command, secret) != null);
+    _ = try launchForControl(&store, arena, scratch.io, "deploy", command);
+
+    const args = Cli.parseArgs(&ctx, &.{ "box", "deploy" });
+    try jobReceipt(&ctx, &store, 1, "deploy", &args);
+    const document = writer.buffered();
+
+    // Not one of the four appears anywhere in the document — not in `command`, not
+    // in an event's `detail_json`, not in a `transport_error`.
+    var leaked: usize = 0;
+    for (receipt_secrets) |secret| {
+        if (std.mem.indexOf(u8, document, secret) != null) {
+            std.debug.print("\njob receipt published the secret `{s}`\n", .{secret});
+            leaked += 1;
+        }
+    }
+    try t.expectEqual(@as(usize, 0), leaked);
+    // …and the redacted form *is* published, so the absence above is redaction and
+    // not an empty document.
+    try t.expect(std.mem.indexOf(u8, document, "DB_PASSWORD=[REDACTED]") != null);
+    try t.expect(std.mem.indexOf(u8, document, "\"commandSha256\": \"") != null);
+
+    // The launch record's own script body is never on this surface. `job inspect
+    // --show-script` is the verb for it, and printing it here would double the
+    // surface for no part of this question.
+    try t.expect(std.mem.indexOf(u8, document, "script") == null);
+
+    // --- the key set, pinned -------------------------------------------------
+    //
+    // Not a `skill/SKILL.md` key-set paragraph: `SkillDoc.key_set_count` is a
+    // compile-time three in a module this change does not own, so a fourth
+    // paragraph of that shape would break a census it could not then fix. Held
+    // against the struct here instead, in both directions and with a count, so a
+    // key added, renamed or made nullable fails rather than passing quietly.
+    const never_null = [_][]const u8{
+        "ok",              "job",         "attempt",    "totalAttempts",
+        "requestId",       "kind",        "status",     "settled",
+        "effectiveStatus", "blocksScope", "eventCount", "createdAt",
+        "updatedAt",       "events",
+    };
+    const nullable = [_][]const u8{
+        "terminal", "command",        "commandSha256", "cwd",
+        "alias",    "resolvedStatus", "reconciledAt",  "resolutionEvidence",
+    };
+    const fields = @typeInfo(ReceiptJson).@"struct".fields;
+    try t.expectEqual(never_null.len + nullable.len, fields.len);
+    var matched: usize = 0;
+    inline for (fields) |f| {
+        const optional = @typeInfo(f.type) == .optional;
+        const wanted: []const []const u8 = if (optional) &nullable else &never_null;
+        for (wanted) |name| {
+            if (std.mem.eql(u8, name, f.name)) {
+                matched += 1;
+                break;
+            }
+        } else {
+            std.debug.print(
+                "\n`{s}` is {s} in ReceiptJson and is not in the pinned {s} list\n",
+                .{ f.name, if (optional) "nullable" else "never null", if (optional) "nullable" else "never-null" },
+            );
+            return error.ReceiptKeySetDrifted;
+        }
+    }
+    try t.expectEqual(fields.len, matched);
+    // And every key really is in the document, which a `@typeInfo` walk alone
+    // cannot say: the struct could be right and the emitter could be somewhere
+    // else entirely.
+    inline for (fields) |f| {
+        const needle = "\"" ++ f.name ++ "\":";
+        std.testing.expect(std.mem.indexOf(u8, document, needle) != null) catch |err| {
+            std.debug.print("\n`{s}` is in ReceiptJson and not in the document\n", .{f.name});
+            return err;
+        };
+    }
 }

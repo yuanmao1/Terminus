@@ -19,6 +19,7 @@ pub const TopCommand = enum {
     sync,
     doctor,
     docker,
+    handoff,
     history,
     @"export",
     import,
@@ -51,6 +52,7 @@ const usage =
     \\  sync       recursive directory transfer      (push/pull; tar+md5)
     \\  doctor     probe remote environment capabilities
     \\  docker     container state and health wait     (inspect/wait; typed, no prose)
+    \\  handoff    everything in flight on a host     (offline; per-section source/observedAt)
     \\  history    local record of push/pull/sync    (audit trail: request ls)
     \\  export     dump all servers+memories+facts as JSON
     \\  import     merge an export (dry-run plan, conflict strategies)
@@ -88,6 +90,7 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .sync => try @import("cmd_sync.zig").run(ctx, args[1..]),
         .doctor => try @import("cmd_doctor.zig").run(ctx, args[1..]),
         .docker => try @import("cmd_docker.zig").run(ctx, args[1..]),
+        .handoff => try @import("cmd_handoff.zig").run(ctx, args[1..]),
         .history => try @import("cmd_history.zig").run(ctx, args[1..]),
         .@"export" => try @import("cmd_export_import.zig").exportCmd(ctx, args[1..]),
         .import => try @import("cmd_export_import.zig").importCmd(ctx, args[1..]),
@@ -108,6 +111,7 @@ test {
     _ = @import("cmd_exec.zig");
     _ = @import("cmd_export_import.zig");
     _ = @import("cmd_fact.zig");
+    _ = @import("cmd_handoff.zig");
     _ = @import("cmd_history.zig");
     _ = @import("cmd_job.zig");
     _ = @import("cmd_key.zig");

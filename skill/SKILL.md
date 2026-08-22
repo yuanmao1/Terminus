@@ -557,12 +557,13 @@ every key of its set — the emitter structs have no defaults, so a missing key 
 a compile error rather than a shape you discover at runtime. Absent is never a
 signal; `null` means "there is no such reading", never "we did not look".
 
-`job kill` — 21 keys. Never null: `ok`,
+`job kill` — 23 keys. Never null: `ok`,
 `action` (`killed` | `already_finished` | `finished_during_kill` | `not_killed`),
 `job`, `status`, `outcomeProven`, `observedAt`, `sessionGone`,
 `sessionCleanedUp` (the
 same boolean under the older name, published everywhere so it means one thing),
 `cancellationProven`, `resultRecord`,
+`controlRequestId`, `controlStatus`,
 `authority` (`held` | `lapsed` | `unreadable`),
 `leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
 Nullable: `exitCode` (null when no record answered, and deliberately null on the
@@ -571,9 +572,10 @@ outcome), `finishedAt`, `conflict`, `requestId` (null when the row names no
 attempt), `resultRecordError`, `cacheError`, `authorityError`,
 `leaseReleaseError`, `hint`.
 
-`job rm` — 19 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
+`job rm` — 21 keys. Never null: `ok`, `action` (`removed` | `not_removed`),
 `errorCode`, `job`, `status`, `outcomeProven`, `rowRemoved`, `evidenceRetained`,
 `attemptRetained`, `resultRecord`,
+`controlRequestId`, `controlStatus`,
 `authority` (`held` | `lapsed` | `unreadable`),
 `leaseRelease` (`not_taken` | `released` | `not_ours` | `left_held`).
 Nullable: `conflict`, `requestId`, `resultRecordError`, `cacheError`,
@@ -652,6 +654,85 @@ same word in `resultRecord`. Presence alone is meaningful only for `cacheError`,
 where non-null is the one signal that the local row was not updated; the others
 mirror `resultRecord`, `authority` and `leaseRelease`, which you can branch on
 directly.
+
+### What a kill or a removal records about itself
+
+`job kill` and `job rm` write **two** ledger rows, not one, and they can disagree
+on purpose.
+
+- The **target** row is the job's own attempt — somebody else's work, reopened and
+  settled from the evidence on the host. Its id is `requestId`.
+- The **control** row is this command's own act: "stop this job's session". Its id
+  is `controlRequestId` and its status is `controlStatus`. Both keys are on every
+  branch of both verbs.
+
+Read them with `terminus request show <id>` / `terminus request receipt <id>`.
+
+The control row's subject is the **session**, so it settles from what
+`tmux has-session` answered after the kill and from nothing else:
+
+- session verified gone → `cancelled`, on a `remote_cancel_confirmed` terminal
+  whose `absence_verified_at` dates the reading;
+- session still present → `failed`, on a `proven_failure` terminal carrying
+  `error_code: "SESSION_SURVIVED_KILL"`;
+- the act withheld because the lease was lost before it → `failed`
+  (`never_submitted`), and nothing was sent.
+
+**This is why the two rows can differ, and the difference is the useful part.**
+The target row is usually `indeterminate`: a job's subject is the command in its
+pane, and a disowned or `setsid` child outlives the pane, so nothing here can
+claim the *work* stopped. The control row can still say `cancelled`, because the
+*session* was proven gone. "The shell was stopped and verified, and what it was
+running is unknown" needs two rows to say; one row cannot.
+
+**A control row never blocks the job.** It contends on a scope of its own, keyed
+on the lease this invocation took, so it does not overlap the job's scope in
+either direction. That matters because an operation row has no TTL: a kill that
+loses its lease settles `indeterminate`, which *does* bar a scope — and the scope
+it bars is its own and nobody else's. A later `job kill`, `job rm`, `run --name`
+or `session rm` on that job is never refused by the wreckage of an earlier kill.
+Two concurrent kills are still mutually exclusive; that has always been the
+lease's job, and the loser is refused before it dials.
+
+`controlRequestId` is not `requestId` and neither is the lease owner. The lease
+owner backs no operation row, so it is deliberately absent from both documents —
+`request show` could not resolve it.
+
+### `job receipt`: what the ledger recorded, as against what was launched
+
+`terminus job receipt <server> <name> [--attempt N] [--json]`.
+
+`job inspect` answers *what this attempt was* — the script, its digest, the
+interpreter, the entry path. `job receipt` answers *what the ledger recorded about
+it* — the `operation_events` trail, the terminal, and the resolution if one
+happened. Two tables, two questions; neither is derivable from the other.
+`--attempt N` addresses an attempt by the number `job inspect` prints, not by
+position.
+
+Three things it will not do:
+
+- **It will not print an empty terminal for an unsettled attempt.** `settled` is a
+  boolean of its own and `terminal` is `null` beside it. An attempt nobody ever
+  settled is a fact, not a blank; `status` is still published, so "unsettled" does
+  not read as "we have no idea where this got to".
+- **It will not collapse the two readings of a reconciled attempt.** `status` is
+  what was observed and is never overwritten; `resolvedStatus`, `reconciledAt` and
+  `resolutionEvidence` are what a later reconcile proved; `effectiveStatus` is the
+  one to act on. `terminal` stays the terminal that was *written*, so "we recorded
+  X, somebody later proved Y" survives in full. All three resolution keys are
+  `null` on an attempt nobody reconciled.
+- **It will not carry a secret.** It reads `operations` and `operation_events` and
+  takes nothing from the launch record but the attempt number. `command` is
+  `argv_redacted` — the form the redactor produced before the row was inserted;
+  the raw text was never stored anywhere — and `commandSha256` is a digest. The
+  script body is `job inspect --show-script`'s and stays there.
+
+`--json` keys, all on every run. Never null: `ok`, `job`, `attempt`,
+`totalAttempts`, `requestId`, `kind`, `status`, `settled`, `effectiveStatus`,
+`blocksScope`, `eventCount`, `createdAt`, `updatedAt`, `events`. Nullable:
+`terminal`, `command`, `commandSha256`, `cwd`, `alias`, `resolvedStatus`,
+`reconciledAt`, `resolutionEvidence`. `events` mirrors every stored
+`operation_events` column, under the same names `request receipt` publishes.
 
 ### Removing a session
 
@@ -1324,3 +1405,72 @@ from `docker container inspect` with a JSON format template over `.State`: a
 documented struct, one line of output. If that ever stops being one readable
 line, the answer becomes `unparseable` — a refusal that names itself — and never
 a state with invented fields.
+
+## Picking up somebody else's work: `terminus handoff`
+
+```bash
+terminus handoff web-01 --json
+```
+
+Run this **first** on any host you did not start work on yourself. It answers
+one question: what is already in flight here, and how much of it do I actually
+know? Six sections — `ledger`, `jobs`, `transfers`, `leases`, `memories` and
+`errors` — plus a `resume` list of command lines you can run.
+
+**It contacts no host.** Every section is read out of the local store, so a
+handoff works `offline`: the server can be down, the session that was working on
+it long gone, and you still get the whole picture. That is what it is for.
+
+### Nothing in it is a fact about right now
+
+`source` and `observedAt` are **per section**, not one timestamp for the
+document, because a memory written last week and a lease renewed a second ago
+are not equally fresh. Read both before you believe anything:
+
+- `source: "cache"` — a stored reading. This is what all five host-describing
+  sections say, always. A job whose `status` is `running` and whose
+  `lastProbedAt` is three days old is **not** a running job; it is what we saw
+  three days ago. Run `terminus job status <server> <name>` to find out what is
+  true now.
+- `source: "reconcile"` — that section's freshest fact was *proven* against the
+  host by a `terminus request reconcile`. Stronger than `cache`.
+- `source: "live"` — only ever the `errors` section, whose facts are about this
+  run of this command.
+- `source: null` — the section could not be read at all. There is no timestamp
+  and no rows, and the reason is in `errors[]`.
+
+### `complete` is the only thing you should gate on
+
+`complete: false` means at least one section failed, and every failure is in
+`errors[]` with its `section`, an error `code` and a `detail` saying what you
+lose. The other sections are still there and still usable. An incomplete handoff
+`exits 1`, so a script notices. A handoff never drops a section and still claims
+to be complete.
+
+`schemaVersion` is this document's own version — not the database's. A reader
+that understood one version can read a later one that only *added* keys; a bump
+means a key was renamed or changed meaning.
+
+### The `resume` list
+
+Each entry is `{section, subject, argv, why}`. When `argv` is present it is a
+command line you can run as written. When `argv` is `null`, no honest command
+exists yet and `why` says what a human has to decide first. The two cases:
+
+- a settled transfer failure still holding its destination — releasing it means
+  `--restart`, which discards the partial beside the destination;
+- a lease somebody else holds — taking it means `--force` or a takeover, and a
+  handoff will not tell you to override a peer's live claim on the strength of a
+  cached row.
+
+No `argv` in this list ever carries `--force` or `--restart`.
+
+### What it will not tell you
+
+Memory *freshness* in the goal-11 sense is not here: the `memories` table
+records when a note was written and nothing about when anybody last checked it
+against the host. `observedAt` for that section is the write time, and it must
+not be read as a verification. Secrets are masked wherever they are recognisable
+(`NAME=…` credentials, `Bearer` and `sk-` tokens, `Cookie`-style headers), and
+the raw command text of a job is not published at all — you get the redacted
+script body and its SHA-256.

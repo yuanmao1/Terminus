@@ -201,7 +201,7 @@
       "id": "M4-pre-kill-renewal",
       "rule": "`job kill` renews the scope lease immediately before it stops a session.",
       "file": "src/cli/cmd_job.zig",
-      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);\n    const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|\n",
+      "find": "    if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe, control);\n    const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|\n",
       "replace": "    const session_gone = Tmux.killSession(executor, ctx.arena, session) catch |err|\n",
       "expect_gate": "blackbox: `job kill` sends nothing to the host once the scope has moved"
     },
@@ -337,39 +337,39 @@
       "id": "M8-renew-conflict-branch",
       "rule": "The conflict branch's kill is renewed on the line above it, not before its settlement.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        // narrowest this side can make the window.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);\n",
-      "replace": "        // narrowest this side can make the window.\n",
+      "find": "        // nothing but the renewal separates the question from the act. See there.\n        submitControl(store, control);\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled, control);\n",
+      "replace": "        // nothing but the renewal separates the question from the act. See there.\n        submitControl(store, control);\n",
       "expect_gate": "gate: every destructive remote call is renewed on the line above it"
     },
     {
       "id": "M8-renew-declined-branch",
       "rule": "The unusable-record branch's kill is renewed on the line above it.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        // peer may now own can still be withheld.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);\n",
-      "replace": "        // peer may now own can still be withheld.\n",
+      "find": "        // peer may now own can still be withheld.\n        submitControl(store, control);\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled, control);\n",
+      "replace": "        // peer may now own can still be withheld.\n        submitControl(store, control);\n",
       "expect_gate": "gate: every destructive remote call is renewed on the line above it"
     },
     {
       "id": "M8-renew-exit-code-branch",
       "rule": "The already-finished branch's kill is renewed on the line above it.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        // command no longer has the scope for is not one it may stop.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled);\n",
-      "replace": "        // command no longer has the scope for is not one it may stop.\n",
+      "find": "        // command no longer has the scope for is not one it may stop.\n        submitControl(store, control);\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement(ctx, job, attempt, authority, probe, settled, control);\n",
+      "replace": "        // command no longer has the scope for is not one it may stop.\n        submitControl(store, control);\n",
       "expect_gate": "gate: every destructive remote call is renewed on the line above it"
     },
     {
       "id": "M8-renew-refuses-always",
       "rule": "Discriminating control: a renewal that refuses its own command is caught end to end, in the three kill branches that have one and in the adjacency scan.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        // command no longer has the scope for is not one it may stop.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement",
-      "replace": "        // command no longer has the scope for is not one it may stop.\n        if (true) refuseKillAfterSettlement",
+      "find": "        // command no longer has the scope for is not one it may stop.\n        submitControl(store, control);\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKillAfterSettlement",
+      "replace": "        // command no longer has the scope for is not one it may stop.\n        submitControl(store, control);\n        if (true) refuseKillAfterSettlement",
       "expect_gate": "blackbox: a kill on a job that already finished settles, then needs the scope to clean up"
     },
     {
       "id": "M8-settlement-renewal",
       "rule": "A settlement is a claim under this command's name, so it too is gated on a renewal.",
       "file": "src/cli/cmd_job.zig",
-      "find": "        // The settlement's renewal. The kill's is below, after the transaction.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe);\n",
+      "find": "        // The settlement's renewal. The kill's is below, after the transaction.\n        if (!stillOurs(claim, ctx.io, &authority)) refuseKill(ctx, store, job, attempt, authority, probe, control);\n",
       "replace": "        // The settlement's renewal. The kill's is below, after the transaction.\n",
       "expect_gate": "blackbox: a kill on a job that already finished settles, then needs the scope to clean up"
     },
@@ -793,8 +793,8 @@
       "id": "S2b-skill-authority-vocabulary",
       "rule": "skill/SKILL.md's published `authority` values are `Control.Authority.code()`'s own words, in every paragraph that publishes them, not prose nobody checks.",
       "file": "skill/SKILL.md",
-      "find": "`cancellationProven`, `resultRecord`,\n`authority` (`held` | `lapsed` | `unreadable`),\n",
-      "replace": "`cancellationProven`, `resultRecord`,\n`authority` (`held` | `lapsed` | `unreadable` | `swept`),\n",
+      "find": "`cancellationProven`, `resultRecord`,\n`controlRequestId`, `controlStatus`,\n`authority` (`held` | `lapsed` | `unreadable`),\n",
+      "replace": "`cancellationProven`, `resultRecord`,\n`controlRequestId`, `controlStatus`,\n`authority` (`held` | `lapsed` | `unreadable` | `swept`),\n",
       "expect_gate": "gate: SKILL.md publishes exactly the authority vocabulary, everywhere it publishes it"
     },
     {
@@ -2156,6 +2156,150 @@
       "find": "    detail: ?[]const u8,\n    dockerSaid: ?[]const u8,\n    transport: []const u8,\n    daemonError: ?[]const u8,\n};\n\n/// The `inspect` document, built where a gate can read it.",
       "replace": "    dockerSaid: ?[]const u8,\n    detail: ?[]const u8,\n    transport: []const u8,\n    daemonError: ?[]const u8,\n};\n\n/// The `inspect` document, built where a gate can read it.",
       "expect_gate": "gate: the published key sets are exactly these, and only two of them are prose"
+    },
+    {
+      "id": "M16-control-scope-is-not-the-jobs",
+      "rule": "A job control act contends on a scope of its own. On the job's own scope, `execution.begin` is refused by the very attempt the kill is aimed at, `settleAndForgetJob` reads the control row as the peer blocking its own removal, and an `indeterminate` control row bars the job for good.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "fn controlScope(owner_request_id: []const u8) Core.execution.Scope {\n    return .{ .kind = .job, .key = owner_request_id };\n}",
+      "replace": "fn controlScope(owner_request_id: []const u8) Core.execution.Scope {\n    _ = owner_request_id;\n    return .{ .kind = .server };\n}",
+      "expect_gate": "gate: a job control act contends on a scope of its own, never the job's"
+    },
+    {
+      "id": "M16-survived-kill-is-not-a-cancellation",
+      "rule": "A session the host reports still present after `kill-session` settles the control act `proven_failure`, never a cancellation: `cancelled` there publishes a stopped shell over one that is still running.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    return .{ .proven_failure = .{\n        .observation = \"tmux has-session reported the job's session still present after kill-session\",\n        .error_code = session_survived_kill,\n    } };",
+      "replace": "    return .{ .remote_cancel_confirmed = .{\n        .pid = null,\n        .term_sent = true,\n        .kill_sent = false,\n        .absence_verified_at = at,\n        .verification_method = \"tmux kill-session was sent\",\n    } };",
+      "expect_gate": "gate: a control act's terminal is the host's answer, and both answers are admissible"
+    },
+    {
+      "id": "M16-control-act-records-the-kill",
+      "rule": "Every branch that sends `kill-session` records what the host answered onto this command's own control operation, on the line after the kill.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "        // What the *control* act established, which on this branch is the whole of\n        // what it established: the job had already ended, so the cleanup is the\n        // only thing this command did to the host.\n        settleControl(control, session_gone, ctx.now);\n",
+      "replace": "",
+      "expect_gate": "gate: a kill of a finished job leaves one settled control operation beside the job's own"
+    },
+    {
+      "id": "M16-refused-kill-settles-its-control-act",
+      "rule": "A reporter that ends the process settles this command's control operation itself. `Cli.exitNow` and `Cli.failIndeterminateAfterOutput` settle nothing, so a control row left there is unsettled for good.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    abandonControl(control, controlWithheld(ctx, authority, job.name));\n    // Before the document, and that ordering is the rule on every branch of both\n",
+      "replace": "    // Before the document, and that ordering is the rule on every branch of both\n",
+      "expect_gate": "gate: every reporter that can end the process records or abandons the control act"
+    },
+    {
+      "id": "M16-receipt-keeps-the-observation",
+      "rule": "`job receipt` publishes what was observed *and* what a later reconcile proved. Collapsing `status` onto `effectiveStatus` erases the disagreement the `status` / `resolved_status` pair exists to keep.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .status = op.status.text(),\n            .settled = recorded != null,",
+      "replace": "            .status = op.effectiveStatus().text(),\n            .settled = recorded != null,",
+      "expect_gate": "gate: job receipt reports an unsettled attempt as unsettled, and a resolved one as both"
+    },
+    {
+      "id": "M16-receipt-publishes-the-redacted-command",
+      "rule": "`job receipt` publishes the redacted command rather than nothing. The gate beside this one asserts that no credential reaches the document; on its own that would also pass over an empty document, so the redacted form has to be there for the absence to mean redaction.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "            .command = op.argv_redacted,",
+      "replace": "            .command = null,",
+      "expect_gate": "gate: job receipt carries no secret, and its --json key set is pinned"
+    },
+    {
+      "id": "M16-receipt-key-set-is-pinned",
+      "rule": "`job receipt --json`'s key set is pinned in both directions with a count, including which keys are nullable. A never-null key that quietly becomes nullable changes what every caller must handle, and no compiler catches it: the initialiser coerces.",
+      "file": "src/cli/cmd_job.zig",
+      "find": "    eventCount: usize,",
+      "replace": "    eventCount: ?usize,",
+      "expect_gate": "gate: job receipt carries no secret, and its --json key set is pinned"
+    },
+    {
+      "id": "M12-handoff-complete-over-a-failed-section",
+      "rule": "A handoff whose section failed is never `complete`. Dropping a section and still claiming completeness is the pseudo-success class this verb exists to refuse.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "            if (!@field(p.sections, f.name).answered) return false;",
+      "replace": "            if (@field(p.sections, f.name).count == std.math.maxInt(usize)) return false;",
+      "expect_gate": "gate: a section this build refuses to read leaves complete false and names itself"
+    },
+    {
+      "id": "M12-handoff-unread-section-invents-a-source",
+      "rule": "A section nobody could read has no provenance. Naming one would let an empty section pass for a read one.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "const unread: Reading = .{ .answered = false, .source = null, .observedAt = null, .count = 0 };",
+      "replace": "const unread: Reading = .{ .answered = false, .source = \"cache\", .observedAt = null, .count = 0 };",
+      "expect_gate": "gate: a section this build refuses to read leaves complete false and names itself"
+    },
+    {
+      "id": "M12-handoff-section-claims-a-live-reading",
+      "rule": "No section that describes the host may report `live`: a handoff asks the host nothing, so every host-describing section is a dated cache.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "        fresh.see(cp.updated_at, .cache);",
+      "replace": "        fresh.see(cp.updated_at, .live);",
+      "expect_gate": "gate: every section is answered with its own observedAt, and only errors is live"
+    },
+    {
+      "id": "M12-handoff-job-dated-by-its-launch",
+      "rule": "A job's freshness is when the host was last probed, never when the row was written. The schema puts `last_probed_at` there for this reader so a stale reading cannot pass for a live one.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "        fresh.see(probed orelse job.finished_at orelse job.created_at, .cache);",
+      "replace": "        fresh.see(job.created_at, .cache);",
+      "expect_gate": "gate: every section is answered with its own observedAt, and only errors is live"
+    },
+    {
+      "id": "M12-handoff-memory-content-unredacted",
+      "rule": "Every string entering a handoff goes through the sole redactor. A memory is authored free text and the likeliest place a credential is written down.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "            .content = try scrub(arena, m.content),",
+      "replace": "            .content = m.content,",
+      "expect_gate": "gate: a secret in every reachable column reaches no field of the document"
+    },
+    {
+      "id": "M12-handoff-trusts-argv-redacted",
+      "rule": "`operations.argv_redacted` is redacted again at the document boundary. The column has many writers and a handoff is a release blocker, so its contract is not taken on trust.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "            .argvRedacted = try scrubOpt(arena, op.argv_redacted),",
+      "replace": "            .argvRedacted = op.argv_redacted,",
+      "expect_gate": "gate: a secret in every reachable column reaches no field of the document"
+    },
+    {
+      "id": "M12-handoff-lease-gets-an-override-argv",
+      "rule": "A handoff never emits an argv that overrides a peer's live claim. A lease it read out of a cache is not grounds for telling a reader to force it.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "            .subject = lease.scopeKey,\n            .argv = null,",
+      "replace": "            .subject = lease.scopeKey,\n            .argv = try argv(arena, &.{ \"terminus\", \"job\", \"kill\", server, lease.scopeKey, \"--force\" }),",
+      "expect_gate": "gate: every resume argv runs as written, and the dishonest ones carry none"
+    },
+    {
+      "id": "M12-handoff-unjudged-publish-called-resumable",
+      "rule": "Only an adoptable checkpoint is resumable. A parked publish still holds its destination and may already have landed, so offering to send the bytes again would overwrite a result nobody has judged.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "            .resumable = cp.state.isAdoptable(),",
+      "replace": "            .resumable = cp.state.holdsDestination(),",
+      "expect_gate": "gate: an unjudged publish is reconciled, never sent again"
+    },
+    {
+      "id": "M12-handoff-transfers-silently-empty",
+      "rule": "A section that could not be enumerated says so. Reporting zero checkpoints for a ledger that could not be read would hide a destination-holding transfer behind a plausible empty list.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "        try note(&errors, arena, .transfers, error.LedgerWindowUnavailable);",
+      "replace": "        sections.transfers = .{ .answered = true, .source = @tagName(Source.cache), .observedAt = null, .count = 0 };",
+      "expect_gate": "gate: a ledger that cannot be read takes transfers with it, under its own name"
+    },
+    {
+      "id": "M12-handoff-key-set",
+      "rule": "The published --json key set of `handoff` is pinned; a key added, renamed or reordered must fail rather than ship.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "    errors: []const ErrorEntry,\n    @\"resume\": []const ResumeEntry,\n};",
+      "replace": "    @\"resume\": []const ResumeEntry,\n    errors: []const ErrorEntry,\n};",
+      "expect_gate": "gate: the published key set is exactly this, and the section names are the vocabulary"
+    },
+    {
+      "id": "M12-handoff-resolves-the-server-with-its-key",
+      "rule": "A handoff reads the server row directly and never resolves auth: `Cli.resolveServer` loads private key material, and a verb that dials stops working in the one situation this one exists for.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "    const server = (Store.servers.getByName(&store, ctx.arena, server_name) catch |err|\n        Cli.storeFatal(&store, err)) orelse fatal(\"unknown server '{s}'\", .{server_name});",
+      "replace": "    const server = Cli.resolveServer(ctx, &store, server_name).server;",
+      "expect_gate": "gate: a handoff reaches no host, so an offline one answers every section"
     }
   ]
 }
