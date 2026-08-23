@@ -64,6 +64,348 @@ pub const shell_capability: Capability = .{
     .audit_isolation = false,
 };
 
+/// The helper's wire protocol, host side.
+///
+/// This lived in `test/blackbox.zig` — the nine gates that drive
+/// `src/helper/main.zig` on a real Linux kernel had their own encoder and their
+/// own frame loop. So those gates, and the nine mutation anchors pointing at
+/// them, were proving that the *helper binary* is correct against a codec no
+/// production path uses. Two implementations of one protocol, and the tested one
+/// was the copy. Moving it here does not change what the helper does; it changes
+/// which code the existing evidence covers.
+///
+/// Every constant below mirrors one in `src/helper/main.zig`, and a gate holds
+/// the two in step rather than a comment asking the next reader to.
+pub const wire = struct {
+    /// A request larger than this is refused rather than truncated: a truncated
+    /// argv is a different command. The helper refuses the same bound from the
+    /// other side, so a request that gets past here cannot be rejected there for
+    /// being too big.
+    pub const max_frame = 1 << 20;
+    pub const max_argv = 256;
+    /// Room for argv strings plus their null terminators.
+    pub const argv_bytes = 1 << 19;
+    /// How much of a stream the helper carries in one frame.
+    pub const pump_bytes = 32 * 1024;
+
+    pub const Kind = struct {
+        // host -> helper
+        pub const run: u8 = 0x01;
+        // helper -> host
+        pub const started: u8 = 0x81;
+        pub const stdout: u8 = 0x82;
+        pub const stderr: u8 = 0x83;
+        pub const exited: u8 = 0x84;
+        pub const failed: u8 = 0x85;
+    };
+
+    /// How a command ended, as the helper measured it.
+    ///
+    /// The two timeout arms are distinct on the wire because they are distinct
+    /// outcomes: `timed_out_killed` means the helper signalled and then confirmed
+    /// the group was gone, and `timed_out_unconfirmed` means it signalled and the
+    /// window closed with the group still there. The first is `timed_out`; the
+    /// second is `indeterminate`. Collapsing them is exactly how a supervisor
+    /// comes to report a command it could not account for as one it stopped.
+    ///
+    /// Non-exhaustive: a helper newer than this build must not be read as one of
+    /// these by accident.
+    pub const How = enum(u8) {
+        exited = 0,
+        signalled = 1,
+        timed_out_killed = 2,
+        timed_out_unconfirmed = 3,
+        _,
+    };
+
+    pub const Started = struct { pid: i64, pgid: i64, token: u64 };
+    pub const Ended = struct { how: How, status: i32 };
+
+    pub const EncodeError = error{ TooManyArguments, ArgumentsTooLarge } || Allocator.Error;
+
+    /// Encodes one `run` request.
+    ///
+    /// Refuses rather than truncating, and refuses *here* rather than letting the
+    /// helper do it: a request that left this machine and was then rejected for
+    /// its size is a submitted attempt with no result, which is `indeterminate`
+    /// for a fault we could have named before sending a byte.
+    pub fn encodeRun(
+        arena: Allocator,
+        argv: []const []const u8,
+        deadline_ms: u64,
+        grace_ms: u64,
+    ) EncodeError![]u8 {
+        if (argv.len > max_argv) return error.TooManyArguments;
+        var total: usize = 0;
+        for (argv) |a| total += a.len + 1;
+        if (total > argv_bytes) return error.ArgumentsTooLarge;
+
+        var body: std.ArrayList(u8) = .empty;
+        var head: [8]u8 = undefined;
+        std.mem.writeInt(u64, &head, deadline_ms, .little);
+        try body.appendSlice(arena, &head);
+        std.mem.writeInt(u64, &head, grace_ms, .little);
+        try body.appendSlice(arena, &head);
+        std.mem.writeInt(u32, head[0..4], @intCast(argv.len), .little);
+        try body.appendSlice(arena, head[0..4]);
+        for (argv) |a| {
+            std.mem.writeInt(u32, head[0..4], @intCast(a.len), .little);
+            try body.appendSlice(arena, head[0..4]);
+            try body.appendSlice(arena, a);
+        }
+
+        if (body.items.len + 1 > max_frame) return error.ArgumentsTooLarge;
+        var frame: std.ArrayList(u8) = .empty;
+        std.mem.writeInt(u32, head[0..4], @intCast(body.items.len + 1), .little);
+        try frame.appendSlice(arena, head[0..4]);
+        try frame.append(arena, Kind.run);
+        try frame.appendSlice(arena, body.items);
+        return frame.items;
+    }
+
+    /// Everything one reply stream said.
+    ///
+    /// `started` and `ended` are lists rather than options so a caller driving
+    /// several runs through one invocation can assert about each, and so a helper
+    /// that emitted two terminal frames is a fact the caller can see rather than
+    /// one silently overwritten by the last.
+    pub const Reply = struct {
+        started: []const Started,
+        ended: []const Ended,
+        stdout: []const u8,
+        stderr: []const u8,
+        /// The `failed` frame's message, if the helper could not start the work.
+        failed: ?[]const u8,
+        /// Bytes after the last complete frame. Non-zero means the stream ended
+        /// mid-frame — a helper that died while writing — which is not the same
+        /// as a helper that reported nothing, and the caller must be able to tell
+        /// them apart.
+        trailing: usize,
+    };
+
+    pub const DecodeError = error{
+        StartedFrameWrongSize,
+        EndedFrameWrongSize,
+        UnknownFrameKind,
+        FrameTooLarge,
+    } || Allocator.Error;
+
+    /// Reads a reply stream.
+    ///
+    /// Sizes are checked rather than assumed: a frame whose declared length is
+    /// wrong by one byte would otherwise slice out of bounds and panic, and a
+    /// panicking decoder names the wrong defect — this is the layer that is
+    /// supposed to notice.
+    pub fn decode(arena: Allocator, bytes: []const u8) DecodeError!Reply {
+        var started: std.ArrayList(Started) = .empty;
+        var ended: std.ArrayList(Ended) = .empty;
+        var out: std.ArrayList(u8) = .empty;
+        var err_out: std.ArrayList(u8) = .empty;
+        var failed: ?[]const u8 = null;
+
+        var at: usize = 0;
+        while (at + 4 <= bytes.len) {
+            const n = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            if (n == 0) break;
+            if (n > max_frame) return error.FrameTooLarge;
+            if (at + 4 + n > bytes.len) break;
+            const kind = bytes[at + 4];
+            const payload = bytes[at + 5 ..][0 .. n - 1];
+            at += 4 + n;
+            switch (kind) {
+                Kind.started => {
+                    if (payload.len != 24) return error.StartedFrameWrongSize;
+                    try started.append(arena, .{
+                        .pid = std.mem.readInt(i64, payload[0..8], .little),
+                        .pgid = std.mem.readInt(i64, payload[8..16], .little),
+                        .token = std.mem.readInt(u64, payload[16..24], .little),
+                    });
+                },
+                Kind.exited => {
+                    if (payload.len != 5) return error.EndedFrameWrongSize;
+                    try ended.append(arena, .{
+                        .how = @enumFromInt(payload[0]),
+                        .status = std.mem.readInt(i32, payload[1..5], .little),
+                    });
+                },
+                Kind.stdout => try out.appendSlice(arena, payload),
+                Kind.stderr => try err_out.appendSlice(arena, payload),
+                Kind.failed => failed = payload,
+                else => return error.UnknownFrameKind,
+            }
+        }
+
+        return .{
+            .started = started.items,
+            .ended = ended.items,
+            .stdout = out.items,
+            .stderr = err_out.items,
+            .failed = failed,
+            .trailing = bytes.len - at,
+        };
+    }
+};
+
+/// What the helper can vouch for, and the one thing it cannot.
+///
+/// `audit_isolation` is **false**, and that is the helper's own statement rather
+/// than a placeholder: `src/helper/main.zig` implements no allowlist and claims
+/// none. Setting it true because a helper is present is how `audited_execution`
+/// would come to run against a boundary that does not exist — the precise thing
+/// the release rules forbid.
+pub const helper_capability: Capability = .{
+    .supervisor = .helper,
+    .pid_proof = .strong,
+    .binary_framing = true,
+    .remote_deadline = true,
+    .audit_isolation = false,
+};
+
+test "gate: the host's wire constants are the helper's own" {
+    const t = std.testing;
+    // The helper is a separate compilation unit for a different target, so its
+    // constants cannot be imported — they are read out of its source. A comment
+    // asking the next reader to keep two numbers in step is not a mechanism, and
+    // a request the far side refuses for a bound this side thought was larger is
+    // a submitted attempt with no result.
+    //
+    // Scoped per block rather than by indented text: `const exited: u8 =` occurs
+    // in both `Kind` (0x84) and `How` (0), so a flat table cannot say which one
+    // it is asserting about, and the first version of this gate did not.
+    const source = @embedFile("../helper/main.zig");
+
+    const Block = struct {
+        fn of(src: []const u8, header: []const u8) ![]const u8 {
+            const at = std.mem.indexOf(u8, src, header) orelse return error.HelperBlockGone;
+            const rest = src[at + header.len ..];
+            const close = std.mem.indexOf(u8, rest, "\n};") orelse return error.HelperBlockUnterminated;
+            return rest[0..close];
+        }
+
+        fn value(block: []const u8, decl: []const u8) ![]const u8 {
+            const at = std.mem.indexOf(u8, block, decl) orelse return error.HelperDeclarationGone;
+            if (std.mem.indexOfPos(u8, block, at + decl.len, decl) != null)
+                return error.HelperDeclarationRepeated;
+            const rest = block[at + decl.len ..];
+            const semi = std.mem.indexOfScalar(u8, rest, ';') orelse
+                return error.HelperDeclarationUnterminated;
+            return rest[0..semi];
+        }
+    };
+
+    var checked: usize = 0;
+    const kind = try Block.of(source, "const Kind = struct {");
+    const how = try Block.of(source, "const How = struct {");
+
+    const cases = [_]struct { block: []const u8, decl: []const u8, want: []const u8 }{
+        .{ .block = source, .decl = "\nconst max_frame = ", .want = "1 << 20" },
+        .{ .block = source, .decl = "\nconst max_argv = ", .want = "256" },
+        .{ .block = source, .decl = "\nconst argv_bytes = ", .want = "1 << 19" },
+        .{ .block = source, .decl = "\nconst pump_bytes = ", .want = "32 * 1024" },
+        .{ .block = kind, .decl = "const run: u8 = ", .want = "0x01" },
+        .{ .block = kind, .decl = "const started: u8 = ", .want = "0x81" },
+        .{ .block = kind, .decl = "const stdout: u8 = ", .want = "0x82" },
+        .{ .block = kind, .decl = "const stderr: u8 = ", .want = "0x83" },
+        .{ .block = kind, .decl = "const exited: u8 = ", .want = "0x84" },
+        .{ .block = kind, .decl = "const failed: u8 = ", .want = "0x85" },
+        .{ .block = how, .decl = "const exited: u8 = ", .want = "0" },
+        .{ .block = how, .decl = "const signalled: u8 = ", .want = "1" },
+        .{ .block = how, .decl = "const timed_out_killed: u8 = ", .want = "2" },
+        .{ .block = how, .decl = "const timed_out_unconfirmed: u8 = ", .want = "3" },
+    };
+    for (cases) |c| {
+        const got = Block.value(c.block, c.decl) catch |err| {
+            std.debug.print(
+                "src/helper/main.zig and its host codec disagree about `{s}`: {s}\n",
+                .{ c.decl, @errorName(err) },
+            );
+            return err;
+        };
+        t.expectEqualStrings(c.want, got) catch |err| {
+            std.debug.print("`{s}` disagrees between the helper and its host codec\n", .{c.decl});
+            return err;
+        };
+        checked += 1;
+    }
+    // Asserted so that deleting a row above — the way a rule stops being checked
+    // without anything failing — is itself a failure.
+    try t.expectEqual(@as(usize, 14), checked);
+
+    // And the values the host actually uses, against the same numbers.
+    try t.expectEqual(@as(usize, 1 << 20), wire.max_frame);
+    try t.expectEqual(@as(usize, 256), wire.max_argv);
+    try t.expectEqual(@as(usize, 1 << 19), wire.argv_bytes);
+    try t.expectEqual(@as(usize, 32 * 1024), wire.pump_bytes);
+    try t.expectEqual(@as(u8, 0x01), wire.Kind.run);
+    try t.expectEqual(@as(u8, 0x85), wire.Kind.failed);
+    try t.expectEqual(@as(u8, 2), @intFromEnum(wire.How.timed_out_killed));
+    try t.expectEqual(@as(u8, 3), @intFromEnum(wire.How.timed_out_unconfirmed));
+}
+
+test "gate: a request too large for the helper is refused before it is sent" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Refused here, not there. A request the far side rejects for its size is a
+    // submitted attempt with no result — `indeterminate` for a fault nameable
+    // before a byte left.
+    const many = try arena.alloc([]const u8, wire.max_argv + 1);
+    for (many) |*a| a.* = "x";
+    try t.expectError(error.TooManyArguments, wire.encodeRun(arena, many, 0, 0));
+
+    const big = try arena.alloc(u8, wire.argv_bytes);
+    @memset(big, 'x');
+    try t.expectError(error.ArgumentsTooLarge, wire.encodeRun(arena, &.{big}, 0, 0));
+
+    // And the boundary is not off by one in the permissive direction: exactly
+    // `max_argv` arguments encode.
+    const exact = try arena.alloc([]const u8, wire.max_argv);
+    for (exact) |*a| a.* = "x";
+    const frame = try wire.encodeRun(arena, exact, 0, 0);
+    try t.expectEqual(wire.Kind.run, frame[4]);
+}
+
+test "gate: a reply that ends mid-frame is not a reply that said nothing" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A helper killed while writing its terminal frame, and a helper that
+    // reported nothing at all, are different outcomes. If `trailing` were not
+    // reported the caller would see an empty `ended` list for both and could
+    // only guess.
+    var stream: std.ArrayList(u8) = .empty;
+    var head: [4]u8 = undefined;
+    std.mem.writeInt(u32, &head, 25, .little);
+    try stream.appendSlice(arena, &head);
+    try stream.append(arena, wire.Kind.started);
+    try stream.appendSlice(arena, &[_]u8{0} ** 24);
+    // Then a header promising five bytes, with two arriving.
+    std.mem.writeInt(u32, &head, 6, .little);
+    try stream.appendSlice(arena, &head);
+    try stream.append(arena, wire.Kind.exited);
+    try stream.appendSlice(arena, &[_]u8{ 0, 0 });
+
+    const reply = try wire.decode(arena, stream.items);
+    try t.expectEqual(@as(usize, 1), reply.started.len);
+    try t.expectEqual(@as(usize, 0), reply.ended.len);
+    try t.expectEqual(@as(usize, 7), reply.trailing);
+
+    // A complete stream leaves nothing over, so the field cannot be read as
+    // "always non-zero".
+    var whole: std.ArrayList(u8) = .empty;
+    std.mem.writeInt(u32, &head, 6, .little);
+    try whole.appendSlice(arena, &head);
+    try whole.append(arena, wire.Kind.exited);
+    try whole.appendSlice(arena, &[_]u8{ 2, 0, 0, 0, 0 });
+    const clean = try wire.decode(arena, whole.items);
+    try t.expectEqual(@as(usize, 0), clean.trailing);
+    try t.expectEqual(wire.How.timed_out_killed, clean.ended[0].how);
+}
+
 /// Features that must refuse rather than pretend under a weak supervisor.
 pub const Requirement = enum {
     /// Killing a process tree and proving it is gone.

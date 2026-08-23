@@ -2804,6 +2804,22 @@
       "replace": "    if (false) {",
       "rule": "The refresh refuses in both directions, and this is the outbound one: a binary that cannot honour the document it ships must not install it. This survived once - the guard read the pair the checkout happens to hold, which always satisfies, so `if (false)` changed nothing observable. The decision is parameterised now for the same reason `mayInstall` and `refreshUserSkills` already were.",
       "expect_gate": "gate: a startup that cannot honour the document it ships installs nothing"
+    },
+    {
+      "id": "G5h-decode-merges-the-two-streams",
+      "rule": "stdout and stderr are separate frame kinds because they are separate streams. Appending stderr into stdout makes a command's diagnostics indistinguishable from its output, and it is the host decoder that has to keep them apart - the helper already labelled them. This also establishes that the real-kernel gates run through the production decoder: before it moved here they drove a copy in test/blackbox.zig, so a defect on this line would have gone unnoticed by all nine of them.",
+      "file": "src/core/supervisor.zig",
+      "find": "                Kind.stderr => try err_out.appendSlice(arena, payload),",
+      "replace": "                Kind.stderr => try out.appendSlice(arena, payload),",
+      "expect_gate": "blackbox: the helper's streams carry a NUL and a forged exit marker unchanged"
+    },
+    {
+      "id": "G5h-encode-frame-length-omits-the-kind-byte",
+      "rule": "The host mirror of G5-frame-length-omits-the-kind-byte. The declared length covers the kind byte plus the body; dropping the byte hands the helper a frame one short, so the last argv element is truncated - a truncated argv is a different command. Killing this from the host side is what shows the encoder on the production path is the one the nine real-kernel gates exercise.",
+      "file": "src/core/supervisor.zig",
+      "find": "        std.mem.writeInt(u32, head[0..4], @intCast(body.items.len + 1), .little);",
+      "replace": "        std.mem.writeInt(u32, head[0..4], @intCast(body.items.len), .little);",
+      "expect_gate": "blackbox: the helper reassembles output larger than its own read buffer, in order"
     }
   ]
 }

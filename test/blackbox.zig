@@ -6841,25 +6841,16 @@ test "gate: the receipt document's shape is pinned at the depth each key is at" 
 const helper_exe = build_options.helper_exe;
 const linux_runner = build_options.linux_runner;
 
-const HelperKind = struct {
-    const run: u8 = 0x01;
-    const started: u8 = 0x81;
-    const stdout: u8 = 0x82;
-    const stderr: u8 = 0x83;
-    const exited: u8 = 0x84;
-    const failed: u8 = 0x85;
-};
-
-const HelperHow = enum(u8) {
-    exited = 0,
-    signalled = 1,
-    timed_out_killed = 2,
-    timed_out_unconfirmed = 3,
-    _,
-};
-
-const HelperStarted = struct { pid: i64, pgid: i64, token: u64 };
-const HelperExit = struct { how: HelperHow, status: i32 };
+// The production codec, aliased so the gate bodies below read unchanged.
+//
+// These were four local declarations and an encoder of their own, which meant the
+// nine gates that drive `src/helper/main.zig` on a real Linux kernel — and the
+// nine mutation anchors pointing at them — were proving the helper agrees with a
+// copy nothing ships. The helper is unchanged; the coverage moved.
+const HelperKind = Terminus.Core.supervisor.wire.Kind;
+const HelperHow = Terminus.Core.supervisor.wire.How;
+const HelperStarted = Terminus.Core.supervisor.wire.Started;
+const HelperExit = Terminus.Core.supervisor.wire.Ended;
 
 const HelperRun = struct {
     /// One entry per `started` frame, so a gate driving several runs through a
@@ -6982,34 +6973,6 @@ fn escapeHead(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
 }
 
 /// Encodes one `run` request frame.
-fn helperRequest(
-    arena: std.mem.Allocator,
-    argv: []const []const u8,
-    deadline_ms: u64,
-    grace_ms: u64,
-) ![]u8 {
-    var body: std.ArrayList(u8) = .empty;
-    var head: [8]u8 = undefined;
-    std.mem.writeInt(u64, &head, deadline_ms, .little);
-    try body.appendSlice(arena, &head);
-    std.mem.writeInt(u64, &head, grace_ms, .little);
-    try body.appendSlice(arena, &head);
-    std.mem.writeInt(u32, head[0..4], @intCast(argv.len), .little);
-    try body.appendSlice(arena, head[0..4]);
-    for (argv) |a| {
-        std.mem.writeInt(u32, head[0..4], @intCast(a.len), .little);
-        try body.appendSlice(arena, head[0..4]);
-        try body.appendSlice(arena, a);
-    }
-
-    var frame: std.ArrayList(u8) = .empty;
-    std.mem.writeInt(u32, head[0..4], @intCast(body.items.len + 1), .little);
-    try frame.appendSlice(arena, head[0..4]);
-    try frame.append(arena, HelperKind.run);
-    try frame.appendSlice(arena, body.items);
-    return frame.items;
-}
-
 /// The runner's argv for a script file holding the commands to run.
 ///
 /// Three layers, and each one is there for a stated reason.
@@ -7086,7 +7049,7 @@ fn runHelper(
     argv: []const []const u8,
     opts: struct { deadline_ms: u64 = 0, grace_ms: u64 = 200, repeat: usize = 1, delay_request_ms: u64 = 0 },
 ) !HelperRun {
-    const request = try helperRequest(arena, argv, opts.deadline_ms, opts.grace_ms);
+    const request = try Terminus.Core.supervisor.wire.encodeRun(arena, argv, opts.deadline_ms, opts.grace_ms);
 
     const req_name = try std.fmt.allocPrint(arena, "{s}/helper_req.bin", .{f.dir});
     try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = req_name, .data = request });
@@ -7160,55 +7123,28 @@ fn runHelper(
         else => return err,
     };
 
-    var started: std.ArrayList(HelperStarted) = .empty;
-    var exits: std.ArrayList(HelperExit) = .empty;
-    var out: std.ArrayList(u8) = .empty;
-    var err_out: std.ArrayList(u8) = .empty;
-    var failed: ?[]const u8 = null;
+    // The production decoder. The harness used to carry its own copy of this
+    // loop, which is why the nine gates below were proving the helper agrees with
+    // something nothing ships.
+    const reply = try Terminus.Core.supervisor.wire.decode(arena, result.stdout);
 
-    var at: usize = 0;
+    // Frame kinds, for the diagnosis when nothing parsed. Rendered from what came
+    // back rather than accumulated during the parse, so the decoder stays the
+    // only thing that reads the wire.
     var kinds: std.ArrayList(u8) = .empty;
-    while (at + 4 <= result.stdout.len) {
-        const n = std.mem.readInt(u32, result.stdout[at..][0..4], .little);
-        at += 4;
-        if (n == 0 or at + n > result.stdout.len) break;
-        const kind = result.stdout[at];
-        const payload = result.stdout[at + 1 ..][0 .. n - 1];
-        at += n;
-        try kinds.print(arena, "{x} ", .{kind});
-        switch (kind) {
-            // Sizes are checked rather than assumed. A frame whose declared
-            // length is wrong by one byte would otherwise slice out of bounds
-            // and panic, and a panicking harness names the wrong defect — the
-            // reader is supposed to be the thing that notices.
-            HelperKind.started => {
-                if (payload.len != 24) return error.StartedFrameWrongSize;
-                try started.append(arena, .{
-                    .pid = std.mem.readInt(i64, payload[0..8], .little),
-                    .pgid = std.mem.readInt(i64, payload[8..16], .little),
-                    .token = std.mem.readInt(u64, payload[16..24], .little),
-                });
-            },
-            HelperKind.exited => {
-                if (payload.len != 5) return error.ExitedFrameWrongSize;
-                try exits.append(arena, .{
-                    .how = @enumFromInt(payload[0]),
-                    .status = std.mem.readInt(i32, payload[1..5], .little),
-                });
-            },
-            HelperKind.stdout => try out.appendSlice(arena, payload),
-            HelperKind.stderr => try err_out.appendSlice(arena, payload),
-            HelperKind.failed => failed = payload,
-            else => return error.UnknownHelperFrameKind,
-        }
-    }
+    for (reply.started) |_| try kinds.appendSlice(arena, "81 ");
+    if (reply.stdout.len != 0) try kinds.appendSlice(arena, "82 ");
+    if (reply.stderr.len != 0) try kinds.appendSlice(arena, "83 ");
+    for (reply.ended) |_| try kinds.appendSlice(arena, "84 ");
+    if (reply.failed != null) try kinds.appendSlice(arena, "85 ");
+    if (reply.trailing != 0) try kinds.print(arena, "+{d} trailing", .{reply.trailing});
 
     const outcome: HelperRun = .{
-        .started = started.items,
-        .exits = exits.items,
-        .stdout = out.items,
-        .stderr = err_out.items,
-        .failed = failed,
+        .started = reply.started,
+        .exits = reply.ended,
+        .stdout = reply.stdout,
+        .stderr = reply.stderr,
+        .failed = reply.failed,
         .diagnosis = .{
             .command = line.items,
             .argv = try std.mem.join(arena, " ", try linuxArgv(arena, f.dir, "<script>")),
