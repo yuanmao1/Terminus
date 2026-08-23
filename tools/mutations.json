@@ -2793,8 +2793,8 @@
       "id": "Gv-overwrite-ignores-the-stated-minimum",
       "file": "src/cli/cmd_setup.zig",
       "find": "    return .{ .allowed = binary.atLeast(floor), .requires = stated };",
-      "replace": "    return .{ .allowed = true, .requires = stated };",
-      "rule": "The mirror of mayInstall: this asks whether the document being destroyed was written by a newer terminus. Ignoring what it states is how an old local build silently downgrades what an npm upgrade installed.",
+      "replace": "    return .{ .allowed = floor.major >= 0, .requires = stated };",
+      "rule": "The mirror of mayInstall: this asks whether the document being destroyed was written by a newer terminus. Ignoring what it states is how an old local build silently downgrades what an npm upgrade installed. The replace keeps `floor` used: dropping it entirely left an unused local, so the compiler caught the mutation and it proved nothing about the gate.",
       "expect_gate": "gate: nothing overwrites a document a newer terminus installed"
     },
     {

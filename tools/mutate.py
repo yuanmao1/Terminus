@@ -173,6 +173,22 @@ def failing_gate_names(output: str) -> list[str]:
     return names
 
 
+def occurrences(mut: Mutation) -> tuple[int, str]:
+    """How many times the `find` text appears, and the file's digest.
+
+    Both are reported when a mutation is NOT_APPLIED, because the runner used to
+    report that outcome as a bare sentence about the code having moved — with no
+    count and no digest — and a run that reported it for three entries whose
+    `find` text was measurably present exactly once, before and after, left
+    nothing on record to say what the files had held at the time. The same
+    reasoning as `Result.detail` for BUILD_ERROR: an unexplained failure is not
+    evidence, and "your anchor drifted" is the wrong thing to tell somebody whose
+    anchor did not.
+    """
+    raw = mut.path().read_bytes()
+    return raw.decode("utf-8").count(mut.find), hashlib.sha256(raw).hexdigest()[:12]
+
+
 def apply(mut: Mutation) -> bytes | None:
     """Rewrites the file in place; returns the original bytes, or None if the
     pattern was not found exactly once (a drifted manifest, not a passing
@@ -398,8 +414,12 @@ def evaluate(mut: Mutation, zig: str) -> Result:
         return Result(
             mut.id, mut.rule, mut.file, mut.expect_gate, "NOT_APPLIED", [],
             time.time() - started,
-            "the manifest's `find` text does not appear exactly once in the file; "
-            "the code moved and this mutation no longer tests what it claims to",
+            "the manifest's `find` text appears {0} time(s) in {1} (sha256 {2}), not "
+            "exactly once, so nothing was tested. If it reads 1 here, the file held "
+            "something else when this ran - check for a stranded mutation from an "
+            "interrupted run, or a peer writing to the tree.".format(
+                *((lambda c, h: (c, mut.file, h))(*occurrences(mut)))
+            ),
         )
     try:
         code, output = run_gates(zig)
