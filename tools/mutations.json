@@ -2806,11 +2806,11 @@
       "expect_gate": "gate: a startup that cannot honour the document it ships installs nothing"
     },
     {
-      "id": "G5h-decode-merges-the-two-streams",
-      "rule": "stdout and stderr are separate frame kinds because they are separate streams. Appending stderr into stdout makes a command's diagnostics indistinguishable from its output, and it is the host decoder that has to keep them apart - the helper already labelled them. This also establishes that the real-kernel gates run through the production decoder: before it moved here they drove a copy in test/blackbox.zig, so a defect on this line would have gone unnoticed by all nine of them.",
+      "id": "G5h-decode-swaps-the-two-streams",
+      "rule": "stdout and stderr are separate frame kinds because they are separate streams, and it is the host decoder that has to keep them apart - the helper already labelled them. Crossing them makes a command diagnostics indistinguishable from its output. Merging the two arms was the first attempt and the compiler caught it: `err_out` was then never mutated and Zig refuses a read-only `var`. Swapping them keeps both mutated. This also establishes that the real-kernel gates run through the production decoder - before it moved out of test/blackbox.zig a defect on these lines was invisible to all nine of them.",
       "file": "src/core/supervisor.zig",
-      "find": "                Kind.stderr => try err_out.appendSlice(arena, payload),",
-      "replace": "                Kind.stderr => try out.appendSlice(arena, payload),",
+      "find": "                Kind.stdout => try out.appendSlice(arena, payload),\n                Kind.stderr => try err_out.appendSlice(arena, payload),",
+      "replace": "                Kind.stdout => try err_out.appendSlice(arena, payload),\n                Kind.stderr => try out.appendSlice(arena, payload),",
       "expect_gate": "blackbox: the helper's streams carry a NUL and a forged exit marker unchanged"
     },
     {
