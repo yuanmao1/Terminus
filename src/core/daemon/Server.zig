@@ -19,6 +19,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const Ssh = @import("../ssh/Client.zig");
+const currentPid = @import("../proc.zig").currentPid;
 
 const default_idle_exit_ns: i96 = 5 * std.time.ns_per_min;
 /// Backstop for a truly wedged request (transport hang the key-format
@@ -460,13 +461,6 @@ fn respondTooLarge(writer: *std.Io.Writer, response: protocol.Response) !void {
         .{ size, protocol.max_frame_bytes },
     ) catch "reply exceeds the daemon protocol frame; rerun with --no-daemon";
     try respondError(writer, message);
-}
-
-fn currentPid() u32 {
-    return switch (@import("builtin").os.tag) {
-        .windows => std.os.windows.GetCurrentProcessId(),
-        else => @intCast(std.c.getpid()),
-    };
 }
 
 // --- The daemon's borrowed authority -----------------------------------------

@@ -103,8 +103,8 @@ const Fixture = struct {
         const n = counter.fetchAdd(1, .monotonic);
         const dir = try std.fmt.allocPrint(
             allocator,
-            ".zig-cache/tmp/bb_{s}_{d}_{d}",
-            .{ name, std.Thread.getCurrentId(), n },
+            ".zig-cache/tmp/bb_{s}_{d}_{d}_{d}",
+            .{ name, Terminus.Core.proc.currentPid(), std.Thread.getCurrentId(), n },
         );
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         const db = try std.fmt.allocPrintSentinel(allocator, "{s}/terminus.db", .{dir}, 0);
@@ -7486,6 +7486,79 @@ test "blackbox: a grandchild holding the pipe open does not stall the helper" {
         std.debug.print(
             "the helper took {d} ms to answer a command that exited immediately\n",
             .{elapsed},
+        );
+        return err;
+    };
+}
+
+test "blackbox: no scratch path is named without this process's id" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "scratch_pid");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A thread id is unique inside one process and recycled across them, so a
+    // fixture named after one lets a live run and a killed run's orphans name
+    // the same path. That is not theoretical: it froze a `test.exe` for two
+    // hours with its CPU time stopped, and `digest.zig`'s own comment already
+    // described the shape ("deletes the other's file mid-read and the failure
+    // looks like a digest bug") while defending against it with a timestamp.
+    //
+    // This scans the tree rather than a registry of files, deliberately. A
+    // registry catches a new *function* in a file it already knows and is blind
+    // to a new file — the limitation `shell.zig`'s `expectAccounted` carries and
+    // states. `grep -r` has no such blind spot, and the whole point of this rule
+    // is that the next fixture somebody writes obeys it.
+    //
+    // The needle is assembled at run time from two halves. Spelled whole it
+    // would appear in this file's own source, and this file is inside the
+    // scanned tree — the fourth time in this repository that a scanner has been
+    // found by its own needle.
+    const needle = "std.Thread." ++ "getCurrentId()";
+    const script = try std.fmt.allocPrint(arena,
+        \\total=$(grep -rn '{s}' --include=*.zig src test | wc -l)
+        \\bad=$(grep -rn '{s}' --include=*.zig src test | grep -v 'currentPid()' | wc -l)
+        \\printf 'total=%s bad=%s\n' "$total" "$bad"
+        \\grep -rn '{s}' --include=*.zig src test | grep -v 'currentPid()' | head -20
+        \\exit 0
+        \\
+    , .{ needle, needle, needle });
+
+    const script_path = try std.fmt.allocPrint(arena, "{s}/scratch_pid.sh", .{f.dir});
+    try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = script_path, .data = script });
+    const result = try runPosixShell(arena, f.io, script_path, .inherit);
+
+    var total: usize = 0;
+    var bad: usize = 1;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (!std.mem.startsWith(u8, trimmed, "total=")) continue;
+        var fields = std.mem.tokenizeScalar(u8, trimmed, ' ');
+        const total_field = fields.next() orelse continue;
+        const bad_field = fields.next() orelse continue;
+        total = std.fmt.parseInt(usize, total_field["total=".len..], 10) catch continue;
+        bad = std.fmt.parseInt(usize, bad_field["bad=".len..], 10) catch continue;
+    }
+
+    // A floor and not an exact count. The exact number changes whenever a
+    // fixture is added, which is churn for no property; the floor is here for
+    // the other failure mode this tree hunts — a scan that matched nothing and
+    // reported success. Fifteen is well below the twenty-one that exist and well
+    // above zero.
+    std.testing.expect(total >= 15) catch |err| {
+        std.debug.print(
+            "the scan found only {d} scratch-path sites, so it is probably not scanning\n",
+            .{total},
+        );
+        return err;
+    };
+    std.testing.expectEqual(@as(usize, 0), bad) catch |err| {
+        std.debug.print(
+            "{d} scratch path(s) are named without the process id:\n{s}\n",
+            .{ bad, result.stdout },
         );
         return err;
     };

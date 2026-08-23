@@ -15,6 +15,7 @@ const std = @import("std");
 const Store = @import("Store.zig");
 const ids = @import("ids.zig");
 const execution = @import("../execution.zig");
+const Proc = @import("../proc.zig");
 
 /// Scratch database under .zig-cache so a crashed test leaves nothing in the
 /// source tree. Returns a NUL-terminated path for sqlite.
@@ -33,7 +34,7 @@ pub const Scratch = struct {
 
     fn uniqueName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
         const n = counter.fetchAdd(1, .monotonic);
-        return std.fmt.allocPrint(allocator, "{s}_{d}_{d}", .{ name, std.Thread.getCurrentId(), n });
+        return std.fmt.allocPrint(allocator, "{s}_{d}_{d}_{d}", .{ name, Proc.currentPid(), std.Thread.getCurrentId(), n });
     }
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8) !Scratch {

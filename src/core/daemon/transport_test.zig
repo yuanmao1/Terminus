@@ -27,6 +27,7 @@ const DaemonClient = @import("Client.zig");
 const Server = @import("Server.zig");
 const Ssh = @import("../ssh/Client.zig");
 const Core = @import("../core.zig");
+const Proc = @import("../proc.zig");
 const Store = Core.Store;
 const wireOutput = @import("protocol_test.zig").wireOutput;
 
@@ -181,11 +182,11 @@ const Harness = struct {
         const cwd = std.Io.Dir.cwd();
         cwd.createDirPath(io, scratch_dir) catch {};
         const n = counter.fetchAdd(1, .monotonic);
-        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}.db", .{
-            scratch_dir, name, std.Thread.getCurrentId(), n,
+        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}_{d}.db", .{
+            scratch_dir, name, Proc.currentPid(), std.Thread.getCurrentId(), n,
         }, 0);
-        const sock_path = try std.fmt.allocPrint(allocator, "{s}/{s}_{d}_{d}.sock", .{
-            scratch_dir, name, std.Thread.getCurrentId(), n,
+        const sock_path = try std.fmt.allocPrint(allocator, "{s}/{s}_{d}_{d}_{d}.sock", .{
+            scratch_dir, name, Proc.currentPid(), std.Thread.getCurrentId(), n,
         });
 
         cwd.deleteFile(io, db_path) catch {};
@@ -499,7 +500,7 @@ test "gate: a CLI that finds no daemon gets a named refusal, never a hang and ne
     {
         var environ: std.process.Environ.Map = .init(t.allocator);
         defer environ.deinit();
-        const home = try std.fmt.allocPrint(h.arena, "{s}/fresh_home_{d}", .{ scratch_dir, std.Thread.getCurrentId() });
+        const home = try std.fmt.allocPrint(h.arena, "{s}/fresh_home_{d}_{d}", .{ scratch_dir, Proc.currentPid(), std.Thread.getCurrentId() });
         try environ.put("USERPROFILE", home);
         const sock = try Server.socketPath(h.arena, &environ);
         std.Io.Dir.cwd().createDirPath(h.io, std.fs.path.dirname(sock).?) catch {};
@@ -583,7 +584,7 @@ test "gate: a CLI that finds no daemon gets a named refusal, never a hang and ne
         proven += 1;
         var environ: std.process.Environ.Map = .init(t.allocator);
         defer environ.deinit();
-        const home = try std.fmt.allocPrint(h.arena, "{s}/live_home_{d}", .{ scratch_dir, std.Thread.getCurrentId() });
+        const home = try std.fmt.allocPrint(h.arena, "{s}/live_home_{d}_{d}", .{ scratch_dir, Proc.currentPid(), std.Thread.getCurrentId() });
         try environ.put("USERPROFILE", home);
         const sock = try Server.socketPath(h.arena, &environ);
         std.Io.Dir.cwd().createDirPath(h.io, std.fs.path.dirname(sock).?) catch {};

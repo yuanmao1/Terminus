@@ -20,6 +20,7 @@ const Core = @import("../core/core.zig");
 /// gates in this tree hold text-level rules with. See `cmd_job.zig`, which uses
 /// the same one for the renewal-adjacency and release-ordering rules.
 const Control = @import("../core/control.zig");
+const Proc = @import("../core/proc.zig");
 const Store = Core.Store;
 const Ssh = Core.Ssh;
 const DaemonClient = Core.DaemonClient;
@@ -2539,7 +2540,7 @@ const Scratch = struct {
         threaded.* = .init(allocator, .{});
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-        const unique = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ name, std.Thread.getCurrentId() });
+        const unique = try std.fmt.allocPrint(allocator, "{s}_{d}_{d}", .{ name, Proc.currentPid(), std.Thread.getCurrentId() });
         defer allocator.free(unique);
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.db", .{ dir, unique }, 0);
         var s: Scratch = .{ .io = io, .threaded = threaded, .path = path, .allocator = allocator };

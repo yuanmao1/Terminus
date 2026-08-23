@@ -30,6 +30,7 @@ const Core = @import("../core/core.zig");
 const Store = Core.Store;
 const memory_cmd = @import("cmd_memory.zig");
 const export_import = @import("cmd_export_import.zig");
+const Proc = @import("../core/proc.zig");
 
 const scratch_dir = ".zig-cache/tmp";
 
@@ -54,8 +55,8 @@ const Harness = struct {
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, scratch_dir) catch {};
         const n = counter.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}.db", .{
-            scratch_dir, name, std.Thread.getCurrentId(), n,
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}_{d}.db", .{
+            scratch_dir, name, Proc.currentPid(), std.Thread.getCurrentId(), n,
         }, 0);
 
         const cwd = std.Io.Dir.cwd();

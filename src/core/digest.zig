@@ -19,6 +19,7 @@
 //! and a line of operator input, both of which are already in memory and neither
 //! of which is in this change's path.
 const std = @import("std");
+const Proc = @import("proc.zig");
 
 /// Length of a hex SHA-256, which is what the ledger stores and compares.
 pub const hex_len = 64;
@@ -209,8 +210,8 @@ test "readFile hashes a file larger than its own buffer in bounded memory" {
     // binaries this file is compiled into, and they run at the same time: one
     // deletes the other's file mid-read and the failure looks like a digest
     // bug.
-    const path = try std.fmt.allocPrint(t.allocator, "{s}/digest_readfile_{d}_{d}.bin", .{
-        dir, std.Thread.getCurrentId(), std.Io.Timestamp.now(io, .real).nanoseconds,
+    const path = try std.fmt.allocPrint(t.allocator, "{s}/digest_readfile_{d}_{d}_{d}.bin", .{
+        dir, Proc.currentPid(), std.Thread.getCurrentId(), std.Io.Timestamp.now(io, .real).nanoseconds,
     });
     defer t.allocator.free(path);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};

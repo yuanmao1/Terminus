@@ -28,6 +28,7 @@ const std = @import("std");
 const Cli = @import("cli.zig");
 const Dispatch = @import("dispatch.zig");
 const Setup = @import("cmd_setup.zig");
+const Proc = @import("../core/proc.zig");
 const Version = Dispatch.Version;
 
 const dispatch_source = @embedFile("dispatch.zig");
@@ -415,8 +416,8 @@ const Home = struct {
         const io = threaded.io();
         const path = try std.fmt.allocPrint(
             allocator,
-            ".zig-cache/tmp/home_{s}_{d}",
-            .{ name, std.Thread.getCurrentId() },
+            ".zig-cache/tmp/home_{s}_{d}_{d}",
+            .{ name, Proc.currentPid(), std.Thread.getCurrentId() },
         );
         const skill_dir = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/terminus", .{path});
         try std.Io.Dir.cwd().createDirPath(io, skill_dir);
@@ -537,4 +538,45 @@ test "gate: the refresh replaces an older installed document and refuses a newer
         try home.refresh(arena, binary, shipped);
         try t.expectEqualStrings(shipped, try home.read(arena));
     }
+}
+
+test "gate: main.zig declares no tests, which is the whole reason the exe step is compiled and not run" {
+    const t = std.testing;
+
+    // `build.zig` depends on `exe_tests.step` — the compile — rather than on a
+    // run artifact. The justification written there is that `src/main.zig`
+    // declares zero tests, so running the binary executes a test runner with
+    // nothing in it, and the only thing such a run can contribute is a start-up
+    // timeout (it has produced `test runner failed to respond` four times under
+    // machine load). That justification is a claim about this count, so the
+    // count is asserted rather than assumed.
+    //
+    // The compile is kept because `zig build test` does not depend on the install
+    // step: without it nothing in the test step would compile the executable's
+    // root at all.
+    const main_src = @embedFile("../main.zig");
+    var declared: usize = 0;
+    var lines = std.mem.splitScalar(u8, main_src, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimStart(u8, raw, " \t");
+        if (std.mem.startsWith(u8, line, "test ") or std.mem.startsWith(u8, line, "test{")) declared += 1;
+    }
+    std.testing.expectEqual(@as(usize, 0), declared) catch |err| {
+        std.debug.print(
+            "src/main.zig now declares {d} test(s); build.zig must go back to running the exe step\n",
+            .{declared},
+        );
+        return err;
+    };
+
+    // And the other half of the decision, so the two cannot drift apart: the
+    // step is wired to the compile and the run artifact is gone. Needles in
+    // halves, because a whole one would match this gate's own text if this file
+    // were ever the one being scanned.
+    const build_src = @embedFile("build_zig_source");
+    try t.expect(std.mem.indexOf(u8, build_src, "test_step.dependOn(&exe" ++ "_tests.step)") != null);
+    std.testing.expect(std.mem.indexOf(u8, build_src, "run_exe" ++ "_tests") == null) catch |err| {
+        std.debug.print("build.zig runs the exe test binary again; see the count above\n", .{});
+        return err;
+    };
 }

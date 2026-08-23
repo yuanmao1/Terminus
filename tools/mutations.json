@@ -2732,6 +2732,78 @@
       "replace": "            .pins => .{ .pins = .{ .context = self, .recorded = recorded, .trust_on_first_use = true } },",
       "rule": "First-use trust means recording the key that answered, and this process has no store to record it in. A daemon that accepted an unpinned host would accept it silently and permanently, since nothing would ever write the pin that a later connection could be checked against.",
       "expect_gate": "gate: trust-on-first-use is turned on in exactly one place"
+    },
+    {
+      "id": "Gp-scratch-path-drops-the-pid",
+      "file": "test/blackbox.zig",
+      "find": "            .{ name, Terminus.Core.proc.currentPid(), std.Thread.getCurrentId(), n },",
+      "replace": "            .{ name, 0, std.Thread.getCurrentId(), n },",
+      "rule": "A thread id is unique inside one process and recycled across them, so a fixture named after one lets a live run and a killed run's orphans name the same path - including the daemon socket under a scratch HOME. Zero compiles and keeps the format string honest, which is what makes this drive the gate rather than the compiler.",
+      "expect_gate": "blackbox: no scratch path is named without this process's id"
+    },
+    {
+      "id": "Gp-scratch-scan-matches-nothing",
+      "file": "test/blackbox.zig",
+      "find": "    const needle = \"std.Thread.\" ++ \"getCurrentId()\";",
+      "replace": "    const needle = \"std.Thread.\" ++ \"getCurrentIdAbsent()\";",
+      "rule": "The floor on the match count is not decoration: a scan that matches nothing reports zero violations and passes. This drives that arm, which is the failure mode this tree hunts for in its own gates.",
+      "expect_gate": "blackbox: no scratch path is named without this process's id"
+    },
+    {
+      "id": "Gb-exe-step-runs-an-empty-binary",
+      "file": "build.zig",
+      "find": "    test_step.dependOn(&exe_tests.step);",
+      "replace": "    test_step.dependOn(&b.addRunArtifact(exe_tests).step);",
+      "rule": "src/main.zig declares no tests, so running that binary can only contribute a start-up timeout - it produced `test runner failed to respond` four times under load. The step is kept for the compile, because `zig build test` does not depend on the install step and nothing else in it builds the executable's root.",
+      "expect_gate": "gate: main.zig declares no tests, which is the whole reason the exe step is compiled and not run"
+    },
+    {
+      "id": "Gv-version-not-from-the-manifest",
+      "file": "src/cli/dispatch.zig",
+      "find": "pub const version_string = packageVersion(package_json);",
+      "replace": "pub const version_string = \"9.9.9\";",
+      "rule": "npm/package.json is the single origin, because `npm publish` reads that file and cannot read a Zig constant. A literal here is the second hand-written copy the gate exists to hunt - and the one that would ship a binary reporting a version the registry does not have.",
+      "expect_gate": "gate: the version has one origin, and a second hand-written copy fails"
+    },
+    {
+      "id": "Gv-version-components-lose-their-base",
+      "file": "src/cli/dispatch.zig",
+      "find": "            n = std.math.mul(u32, n, 10) catch return error.VersionComponentTooLarge;",
+      "replace": "            n = std.math.mul(u32, n, 1) catch return error.VersionComponentTooLarge;",
+      "rule": "0.1.10 must order above 0.1.9. Reading \"10\" as 1 puts it below, which is exactly the byte ordering this parser exists to replace - and the mistake that produced a reported claim that 0.1.10 had never been tagged.",
+      "expect_gate": "gate: versions order numerically — 0.1.10 is above 0.1.9, which bytes get wrong"
+    },
+    {
+      "id": "Gv-unreadable-minimum-assumed-satisfied",
+      "file": "src/cli/cmd_setup.zig",
+      "find": "    const floor = requiredBy(doc) catch return false;",
+      "replace": "    const floor = requiredBy(doc) catch return true;",
+      "rule": "\"Cannot tell what this document requires\" is not \"this binary satisfies it\". Assuming satisfaction installs a document promising flags the binary rejects, and an unregistered flag consumes the argument after it rather than failing.",
+      "expect_gate": "gate: a version that cannot be read is refused, not assumed to satisfy"
+    },
+    {
+      "id": "Gv-overwrite-treats-unreadable-as-replaceable",
+      "file": "src/cli/cmd_setup.zig",
+      "find": "        else => return .{ .allowed = false, .requires = Overwrite.unreadable },",
+      "replace": "        else => return .{ .allowed = true, .requires = Overwrite.unreadable },",
+      "rule": "A document stating a minimum nothing can read is left alone: \"unreadable\" is not \"older\". Overwriting it hands an agent instructions older than the binary on its PATH, which is the one harm this whole policy exists to prevent.",
+      "expect_gate": "gate: nothing overwrites a document a newer terminus installed"
+    },
+    {
+      "id": "Gv-overwrite-ignores-the-stated-minimum",
+      "file": "src/cli/cmd_setup.zig",
+      "find": "    return .{ .allowed = binary.atLeast(floor), .requires = stated };",
+      "replace": "    return .{ .allowed = true, .requires = stated };",
+      "rule": "The mirror of mayInstall: this asks whether the document being destroyed was written by a newer terminus. Ignoring what it states is how an old local build silently downgrades what an npm upgrade installed.",
+      "expect_gate": "gate: nothing overwrites a document a newer terminus installed"
+    },
+    {
+      "id": "Gv-refresh-installs-what-it-cannot-honour",
+      "file": "src/cli/cmd_setup.zig",
+      "find": "    if (!embeddedSatisfied()) {",
+      "replace": "    if (false) {",
+      "rule": "The refresh refuses in both directions, and this is the outbound one: a binary that cannot honour the document it ships must not install it. `embeddedSatisfied` is a function rather than a const for the same reason - a const would leave these refusals uncompiled on any build that happened to satisfy its own document.",
+      "expect_gate": "gate: a document requiring more than the binary provides is not installed"
     }
   ]
 }

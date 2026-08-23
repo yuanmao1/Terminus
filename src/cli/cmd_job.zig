@@ -1316,6 +1316,7 @@ const RemovalJson = struct {
 // which namespaces the document is describing, and which literals to look for.
 
 const SkillDoc = @import("skill_doc.zig");
+const Proc = @import("../core/proc.zig");
 
 test "gate: SKILL.md's --json key sets are the ones these structs emit" {
     const gpa = std.testing.allocator;
@@ -6478,7 +6479,7 @@ const Scratch = struct {
         threaded.* = .init(allocator, .{});
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-        const unique = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ name, std.Thread.getCurrentId() });
+        const unique = try std.fmt.allocPrint(allocator, "{s}_{d}_{d}", .{ name, Proc.currentPid(), std.Thread.getCurrentId() });
         defer allocator.free(unique);
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.db", .{ dir, unique }, 0);
         var s: Scratch = .{ .io = io, .threaded = threaded, .path = path, .allocator = allocator };

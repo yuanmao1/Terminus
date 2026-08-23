@@ -18,6 +18,7 @@ const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
 const Core = @import("../core/core.zig");
+const Proc = @import("../core/proc.zig");
 const Store = Core.Store;
 
 /// Everything `server ping` sends. See the file header for why it may stay that
@@ -881,8 +882,8 @@ const Scratch = struct {
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         const path = try std.fmt.allocPrintSentinel(
             allocator,
-            "{s}/{s}_{d}.db",
-            .{ dir, name, std.Thread.getCurrentId() },
+            "{s}/{s}_{d}_{d}.db",
+            .{ dir, name, Proc.currentPid(), std.Thread.getCurrentId() },
             0,
         );
         var s: Scratch = .{ .io = io, .threaded = threaded, .path = path, .allocator = allocator };

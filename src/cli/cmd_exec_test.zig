@@ -48,6 +48,7 @@ const Ssh = Core.Ssh;
 const args = @import("args.zig");
 const cmd_exec = @import("cmd_exec.zig");
 const skill_doc = @import("skill_doc.zig");
+const Proc = @import("../core/proc.zig");
 
 const scratch_dir = ".zig-cache/tmp";
 
@@ -412,8 +413,8 @@ const Harness = struct {
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, scratch_dir) catch {};
         const n = counter.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}.db", .{
-            scratch_dir, name, std.Thread.getCurrentId(), n,
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}_{d}.db", .{
+            scratch_dir, name, Proc.currentPid(), std.Thread.getCurrentId(), n,
         }, 0);
 
         const cwd = std.Io.Dir.cwd();
@@ -1208,8 +1209,8 @@ const TextFixture = struct {
         const arena = arena_state.allocator();
 
         const n = counter.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrint(arena, "{s}/exec_cmdfile_{d}_{d}.sh", .{
-            scratch_dir, std.Thread.getCurrentId(), n,
+        const path = try std.fmt.allocPrint(arena, "{s}/exec_cmdfile_{d}_{d}_{d}.sh", .{
+            scratch_dir, Proc.currentPid(), std.Thread.getCurrentId(), n,
         });
         {
             const file = try std.Io.Dir.cwd().createFile(io, path, .{});

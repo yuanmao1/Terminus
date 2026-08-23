@@ -37,6 +37,7 @@ const cmd_sync = @import("cmd_sync.zig");
 const skill_doc = @import("skill_doc.zig");
 /// The shared source reader the text-level gates in this tree use.
 const Control = @import("../core/control.zig");
+const Proc = @import("../core/proc.zig");
 
 const scratch_dir = ".zig-cache/tmp";
 
@@ -63,8 +64,8 @@ const Harness = struct {
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, scratch_dir) catch {};
         const n = counter.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}.db", .{
-            scratch_dir, name, std.Thread.getCurrentId(), n,
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}_{d}.db", .{
+            scratch_dir, name, Proc.currentPid(), std.Thread.getCurrentId(), n,
         }, 0);
 
         const cwd = std.Io.Dir.cwd();

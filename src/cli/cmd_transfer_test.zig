@@ -31,6 +31,7 @@ const cmd_transfer = @import("cmd_transfer.zig");
 const Cli = @import("cli.zig");
 const skill_doc = @import("skill_doc.zig");
 const args = @import("args.zig");
+const Proc = @import("../core/proc.zig");
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -66,8 +67,8 @@ const Scratch = struct {
     /// A unique path this fixture will delete. Not created.
     fn path(s: *Scratch, label: []const u8) ![]const u8 {
         const n = counter.fetchAdd(1, .monotonic);
-        const p = try std.fmt.allocPrint(s.allocator, "{s}/xfer_{s}_{d}_{d}", .{
-            scratch_dir, label, std.Thread.getCurrentId(), n,
+        const p = try std.fmt.allocPrint(s.allocator, "{s}/xfer_{s}_{d}_{d}_{d}", .{
+            scratch_dir, label, Proc.currentPid(), std.Thread.getCurrentId(), n,
         });
         try s.paths.append(s.allocator, p);
         std.Io.Dir.cwd().deleteFile(s.io, p) catch {};
@@ -3524,8 +3525,8 @@ const StoreScratch = struct {
         const io = threaded.io();
         std.Io.Dir.cwd().createDirPath(io, scratch_dir) catch {};
         const n = counter.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}.db", .{
-            scratch_dir, name, std.Thread.getCurrentId(), n,
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}_{d}_{d}_{d}.db", .{
+            scratch_dir, name, Proc.currentPid(), std.Thread.getCurrentId(), n,
         }, 0);
         var s: StoreScratch = .{ .io = io, .threaded = threaded, .path = path, .allocator = allocator };
         s.removeFiles();

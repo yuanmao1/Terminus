@@ -18,6 +18,7 @@ const op_state = @import("store/op_state.zig");
 const scope_mod = @import("store/scope.zig");
 const execution = @import("execution.zig");
 const supervisor = @import("supervisor.zig");
+const Proc = @import("proc.zig");
 const Executor = @import("exec.zig").Executor;
 const Scripted = @import("exec.zig").Scripted;
 
@@ -58,7 +59,7 @@ const Harness = struct {
 
     fn uniqueName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
         const n = counter.fetchAdd(1, .monotonic);
-        return std.fmt.allocPrint(allocator, "{s}_{d}_{d}", .{ name, std.Thread.getCurrentId(), n });
+        return std.fmt.allocPrint(allocator, "{s}_{d}_{d}_{d}", .{ name, Proc.currentPid(), std.Thread.getCurrentId(), n });
     }
 
     fn init(allocator: std.mem.Allocator, name: []const u8) !Harness {

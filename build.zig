@@ -120,6 +120,13 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("terminus_package_json", .{
         .root_source_file = b.path("npm/package.json"),
     });
+    // This file, so a gate can hold a claim written *in* this file against what
+    // it actually says. The claim in question is that the exe test step is
+    // compiled and not run; the reason lives here and the count it depends on
+    // lives in `src/main.zig`, and a comment cannot check either one.
+    mod.addAnonymousImport("build_zig_source", .{
+        .root_source_file = b.path("build.zig"),
+    });
 
     const exe = b.addExecutable(.{
         .name = "Terminus",
@@ -152,11 +159,27 @@ pub fn build(b: *std.Build) void {
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // Compiled, not run.
+    //
+    // `src/main.zig` declares zero tests, and `refAllDecls` is not recursive, so
+    // nothing from the `Terminus` module is reached through it either — those are
+    // already covered by `mod_tests` above. Running this binary therefore
+    // executes a test runner with nothing in it, and that empty run has failed
+    // four times with `test runner failed to respond` under machine load. A
+    // binary with no tests cannot fail a test, so that is process start-up, and
+    // it is pure noise: a red suite that says nothing about the code.
+    //
+    // The *compile* is not noise and is why the step stays. `zig build test`
+    // does not depend on the install step, so without this nothing in the test
+    // step would compile the executable's root at all, and `main.zig` could stop
+    // building without the suite noticing.
+    //
+    // What is lost: nothing that runs. If a `test` block is ever added to
+    // `main.zig`, this has to become a run again — which is why the count is
+    // asserted rather than assumed.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
-
-    const run_exe_tests = b.addRunArtifact(exe_tests);
 
     // Black-box gates: drive the real binary as a subprocess and read its
     // stdout and exit code, because that is the contract an agent depends on.
@@ -278,6 +301,6 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&run_blackbox_tests.step);
 }
