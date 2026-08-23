@@ -2778,8 +2778,8 @@
       "file": "src/cli/cmd_setup.zig",
       "find": "    const floor = requiredBy(doc) catch return false;",
       "replace": "    const floor = requiredBy(doc) catch return true;",
-      "rule": "\"Cannot tell what this document requires\" is not \"this binary satisfies it\". Assuming satisfaction installs a document promising flags the binary rejects, and an unregistered flag consumes the argument after it rather than failing.",
-      "expect_gate": "gate: a version that cannot be read is refused, not assumed to satisfy"
+      "rule": "\"Cannot tell what this document requires\" is not \"this binary satisfies it\". Assuming satisfaction installs a document promising flags the binary rejects, and an unregistered flag consumes the argument after it rather than failing. The gate named here is the one that actually catches it: it drives mayInstall over a document nothing can read, alongside the version comparisons.",
+      "expect_gate": "gate: a document requiring more than the binary provides is not installed"
     },
     {
       "id": "Gv-overwrite-treats-unreadable-as-replaceable",
@@ -2793,7 +2793,7 @@
       "id": "Gv-overwrite-ignores-the-stated-minimum",
       "file": "src/cli/cmd_setup.zig",
       "find": "    return .{ .allowed = binary.atLeast(floor), .requires = stated };",
-      "replace": "    return .{ .allowed = floor.major >= 0, .requires = stated };",
+      "replace": "    return .{ .allowed = floor.atLeast(floor), .requires = stated };",
       "rule": "The mirror of mayInstall: this asks whether the document being destroyed was written by a newer terminus. Ignoring what it states is how an old local build silently downgrades what an npm upgrade installed. The replace keeps `floor` used: dropping it entirely left an unused local, so the compiler caught the mutation and it proved nothing about the gate.",
       "expect_gate": "gate: nothing overwrites a document a newer terminus installed"
     },
