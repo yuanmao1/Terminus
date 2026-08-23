@@ -2532,6 +2532,14 @@
       "find": "            .alias = op.alias,",
       "replace": "            .alias = null,",
       "expect_gate": "gate: the receipt document's shape is pinned at the depth each key is at"
+    },
+    {
+      "id": "M12-handoff-memories-dated-by-the-write",
+      "rule": "The memories section dates itself by the observation, never by the write. Reading `updated_at` makes a six-month-old note look as fresh as the moment somebody last re-tagged it, which is the distinction v13 exists to record.",
+      "file": "src/cli/cmd_handoff.zig",
+      "find": "        fresh.see(m.observed_at orelse m.updated_at, .cache);",
+      "replace": "        fresh.see(m.updated_at, .cache);",
+      "expect_gate": "gate: the memories section dates itself by the observation, not the write"
     }
   ]
 }

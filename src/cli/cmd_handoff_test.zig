@@ -345,6 +345,40 @@ fn render(arena: std.mem.Allocator, doc: handoff.HandoffJson) ![]u8 {
 
 // --- gate: every section answered, with its own observedAt --------------------
 
+test "gate: the memories section dates itself by the observation, not the write" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "handoff_memory_observed");
+    defer h.deinit();
+
+    // The whole point of goal 11, and the thing this section reported wrongly
+    // until v13 existed to answer it: a note about a host is a claim as of when
+    // it was *observed*, and re-tagging it a month later does not refresh the
+    // claim. Two timestamps a year apart, so neither can stand in for the other
+    // by coincidence.
+    const observed: i64 = 1_600_000_000;
+    const written: i64 = 1_700_000_000;
+    const result = try Store.memories.add(&h.store, .{ .server_id = 1 }, .{
+        .key = "port",
+        .content = "the api listens on 8080",
+        .now = written,
+        .observed = .{ .at = observed },
+    });
+    if (result != .inserted) return error.MemoryNotInserted;
+
+    const got = try handoff.readMemories(&h.store, h.arena, 1);
+    try t.expectEqual(@as(usize, 1), got.entries.len);
+
+    // Both facts are published, and they are not the same key.
+    try t.expectEqual(@as(?i64, observed), got.entries[0].observedAt);
+    try t.expectEqual(written, got.entries[0].updatedAt);
+
+    // And the section dates itself by the older one. Reading `updated_at` here
+    // is what made a six-month-old note look as fresh as the moment somebody
+    // last touched its tags.
+    try t.expectEqual(@as(?i64, observed), got.reading.observedAt);
+    try t.expect(got.reading.answered);
+}
+
 test "gate: every section is answered with its own observedAt, and only errors is live" {
     const t = std.testing;
     var h = try Harness.init(t.allocator, "handoff_complete");
@@ -942,7 +976,7 @@ test "gate: the published key set is exactly this, and the section names are the
         "scopeKind", "scopeKey",   "ownerRequestId", "profileToken", "ownerLabel",
         "note",      "acquiredAt", "renewedAt",      "expiresAt",
     };
-    const memory_keys = [_][]const u8{ "session", "key", "content", "tags", "updatedAt" };
+    const memory_keys = [_][]const u8{ "session", "key", "content", "tags", "observedAt", "updatedAt" };
     const error_keys = [_][]const u8{ "section", "code", "detail" };
     const resume_keys = [_][]const u8{ "section", "subject", "argv", "why" };
 
@@ -974,7 +1008,7 @@ test "gate: the published key set is exactly this, and the section names are the
         pinned += struct_fields.len;
     }
     try t.expectEqual(@as(usize, 10), cases.len);
-    try t.expectEqual(@as(usize, 102), pinned);
+    try t.expectEqual(@as(usize, 103), pinned);
 
     // `Sections` is the `Section` enum, field for field and in order. Two lists
     // that could drift is how a section ends up with a name nothing reports

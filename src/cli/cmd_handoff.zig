@@ -328,6 +328,11 @@ pub const MemoryEntry = struct {
     key: ?[]const u8,
     content: []const u8,
     tags: ?[]const u8,
+    /// When the fact was observed. Backfilled from `updatedAt` for rows
+    /// written before v13, which is why the two can be equal and why they
+    /// are still two keys.
+    observedAt: ?i64,
+    /// When the note was last written. Not the same question.
     updatedAt: i64,
 };
 
@@ -661,14 +666,24 @@ fn readLeases(
 /// about this host too and the session it belongs to is what tells the reader how
 /// to weigh it.
 ///
-/// **Freshness in the goal-11 sense is not here, and no field pretends it is.**
-/// The `memories` table has `created_at` and `updated_at` and nothing else: no
-/// verified-at column, no `verify_cmd`. So `observedAt` is the newest
-/// `updated_at` — when the note was last *written*, which is honestly all this
-/// store knows — and a reader must not read it as "checked against the host
-/// then". A handoff reads; it does not get to invent the column that would make
-/// that claim true.
-fn readMemories(
+/// **`observedAt` is the observation, and `updatedAt` is the write.** They are
+/// two different facts and both are published: a note saying "the API runs on
+/// 8080" observed six months ago is not the claim it was this morning, and until
+/// v13 this store could not tell them apart — so this function reported the write
+/// time and said, correctly at the time, that freshness in the goal-11 sense was
+/// not available. v13 added `observed_at` and backfilled it from `updated_at`, so
+/// the answer exists now and the section dates itself by the newest *observation*.
+///
+/// What is still not here, and is a stated boundary rather than an oversight:
+/// `observed_source`. It says whether a row's observation was live, a backfill or
+/// an import, and `memories.Exported` does not carry it — deliberately, because
+/// that field describes how *one particular store* came to hold a row and would
+/// only ever describe the sender if it travelled. A handoff is a local report, so
+/// the field would be meaningful here; getting it means widening a store struct,
+/// which is more than this correction is. Until then a reader cannot tell a
+/// backfilled observation from a live one **through this document** — `memory ls
+/// --json` reports it per row.
+pub fn readMemories(
     store: *Store,
     arena: Allocator,
     server_id: i64,
@@ -677,12 +692,17 @@ fn readMemories(
     var out: std.ArrayList(MemoryEntry) = .empty;
     var fresh: Freshest = .{};
     for (rows) |m| {
-        fresh.see(m.updated_at, .cache);
+        // The observation when there is one, the write only as the fallback a
+        // pre-v13 row would have had before the backfill ran. Dating the
+        // section by the write is what this function used to do, and it made a
+        // six-month-old note look as fresh as the moment somebody re-tagged it.
+        fresh.see(m.observed_at orelse m.updated_at, .cache);
         try out.append(arena, .{
             .session = try scrubOpt(arena, m.session),
             .key = try scrubOpt(arena, m.key),
             .content = try scrub(arena, m.content),
             .tags = try scrubOpt(arena, m.tags),
+            .observedAt = m.observed_at,
             .updatedAt = m.updated_at,
         });
     }
