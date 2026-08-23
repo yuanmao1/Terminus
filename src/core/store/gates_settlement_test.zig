@@ -2234,8 +2234,10 @@ test "gate: host key mismatch is reported, never auto-updated" {
     var store = try Store.open(scratch.path);
     defer store.close();
 
-    // Nothing known yet.
-    try t.expect((try Store.host_pins.verify(&store, arena, "h", 22, "ssh-ed25519", "SHA256:aaa")) == .unknown);
+    // Nothing known yet. This is the state every existing store is in: nothing
+    // before the pinning slice ever recorded a host key, so `active` answering
+    // null is what a first connection meets.
+    try t.expect((try Store.host_pins.active(&store, arena, "h", 22, "ssh-ed25519")) == null);
 
     _ = try Store.host_pins.record(&store, .{
         .host = "h",
@@ -2245,14 +2247,29 @@ test "gate: host key mismatch is reported, never auto-updated" {
         .trust_source = .first_use,
         .now = 100,
     });
-    try t.expect((try Store.host_pins.verify(&store, arena, "h", 22, "ssh-ed25519", "SHA256:aaa")) == .match);
+    try t.expectEqualStrings(
+        "SHA256:aaa",
+        (try Store.host_pins.active(&store, arena, "h", 22, "ssh-ed25519")).?.fingerprint_sha256,
+    );
 
-    // A different key must surface as a mismatch the caller has to act on.
-    const verdict = try Store.host_pins.verify(&store, arena, "h", 22, "ssh-ed25519", "SHA256:bbb");
-    try t.expectEqualStrings("SHA256:aaa", verdict.mismatch.expected.fingerprint_sha256);
+    // A second active pin for the same key type is the schema's refusal, not a
+    // convention: replacing one is `rotate`, which says so out loud.
+    try t.expectError(error.Constraint, Store.host_pins.record(&store, .{
+        .host = "h",
+        .port = 22,
+        .key_type = "ssh-ed25519",
+        .fingerprint_sha256 = "SHA256:bbb",
+        .trust_source = .explicit_pin,
+        .now = 150,
+    }));
+    try t.expectEqualStrings(
+        "SHA256:aaa",
+        (try Store.host_pins.active(&store, arena, "h", 22, "ssh-ed25519")).?.fingerprint_sha256,
+    );
 
-    // Verifying must not have quietly adopted the new key.
-    try t.expect((try Store.host_pins.verify(&store, arena, "h", 22, "ssh-ed25519", "SHA256:aaa")) == .match);
+    // A pin is keyed on the key *type* as well as the endpoint, so a second
+    // type is a second pin and neither answers for the other.
+    try t.expect((try Store.host_pins.active(&store, arena, "h", 22, "ssh-rsa")) == null);
 
     // Rotation is deliberate, keeps the old row, and links the two.
     _ = try Store.host_pins.rotate(&store, .{
@@ -2263,8 +2280,19 @@ test "gate: host key mismatch is reported, never auto-updated" {
         .trust_source = .rotated,
         .now = 200,
     }, "server rebuilt");
-    try t.expect((try Store.host_pins.verify(&store, arena, "h", 22, "ssh-ed25519", "SHA256:bbb")) == .match);
+    const rotated = (try Store.host_pins.active(&store, arena, "h", 22, "ssh-ed25519")).?;
+    try t.expectEqualStrings("SHA256:bbb", rotated.fingerprint_sha256);
     try t.expectEqual(@as(usize, 1), (try Store.host_pins.list(&store, arena)).len);
+    // The superseded row is still there, and `forEndpoint` is what shows it.
+    try t.expectEqual(@as(usize, 2), (try Store.host_pins.forEndpoint(&store, arena, "h", 22)).len);
+
+    // A revoked pin authorises nothing: `active` stops answering, so
+    // `Ssh.judge` sees `not_pinned` and the connection is refused.
+    try t.expect(try Store.host_pins.revoke(&store, rotated.id, "key was on a stolen backup", 300));
+    try t.expect((try Store.host_pins.active(&store, arena, "h", 22, "ssh-ed25519")) == null);
+    // And it does not vanish: withdrawing trust is a fact worth keeping.
+    try t.expectEqual(@as(usize, 2), (try Store.host_pins.forEndpoint(&store, arena, "h", 22)).len);
+    try t.expect(!try Store.host_pins.revoke(&store, rotated.id, "again", 310));
 }
 
 test "gate: the ledger records the time we looked, never a finish time we were not told" {

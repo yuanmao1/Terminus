@@ -2540,6 +2540,166 @@
       "find": "        fresh.see(m.observed_at orelse m.updated_at, .cache);",
       "replace": "        fresh.see(m.updated_at, .cache);",
       "expect_gate": "gate: the memories section dates itself by the observation, not the write"
+    },
+    {
+      "id": "M7-first-use-is-not-implied",
+      "rule": "A host with no pin is refused. Trust-on-first-use is never derived from the absence of a pin.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        return if (pins.trust_on_first_use) .first_use else .not_pinned;",
+      "replace": "        return .first_use;",
+      "expect_gate": "gate: a presented key is judged against the pin recorded for its own type"
+    },
+    {
+      "id": "M7-first-use-does-not-override-a-pin",
+      "rule": "Trust-on-first-use records a host nothing is known about; it never replaces a recorded key.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "    return .mismatch;",
+      "replace": "    return if (pins.trust_on_first_use) .first_use else .mismatch;",
+      "expect_gate": "gate: a presented key is judged against the pin recorded for its own type"
+    },
+    {
+      "id": "M7-mismatch-refuses",
+      "rule": "A key that does not match the active pin is a hard failure, not a warning.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        .mismatch => error.HostKeyMismatch,",
+      "replace": "        .mismatch => null,",
+      "expect_gate": "gate: every verdict that is not a match refuses the connection"
+    },
+    {
+      "id": "M7-not-pinned-refuses",
+      "rule": "An unpinned key does not open a session.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        .not_pinned => error.HostKeyNotPinned,",
+      "replace": "        .not_pinned => null,",
+      "expect_gate": "gate: every verdict that is not a match refuses the connection"
+    },
+    {
+      "id": "M7-no-trust-root-refuses",
+      "rule": "A caller with no trust store gets no session. \"No trust root\" is not \"trust anything\".",
+      "file": "src/core/ssh/Client.zig",
+      "find": "        .none => return .no_trust_root,",
+      "replace": "        .none => return .matches_pin,",
+      "expect_gate": "gate: the trust root has no member that opens a session without a pin"
+    },
+    {
+      "id": "M7-connect-judges-what-it-read",
+      "rule": "connect obeys the verdict on the key it read, before it hands back a session.",
+      "file": "src/core/ssh/Client.zig",
+      "find": "    if (refusalFor(judge(trust, key))) |refusal| return refusal;",
+      "replace": "    _ = judge(trust, key);",
+      "expect_gate": "gate: connect judges the key it read before it hands back a session"
+    },
+    {
+      "id": "M7-pin-is-keyed-on-the-key-type",
+      "rule": "A pin authorises one key type. A key of another type is unpinned, not measured against this one.",
+      "file": "src/core/store/host_pins.zig",
+      "find": "        \" WHERE host = ?1 AND port = ?2 AND key_type = ?3 AND revoked_at IS NULL\");",
+      "replace": "        \" WHERE host = ?1 AND port = ?2 AND ?3 IS NOT NULL AND revoked_at IS NULL\");",
+      "expect_gate": "gate: a presented key is judged against the pin recorded for its own type"
+    },
+    {
+      "id": "M7-revoked-pin-authorises-nothing",
+      "rule": "A revoked pin does not authorise a connection.",
+      "file": "src/core/store/host_pins.zig",
+      "find": "        \" WHERE host = ?1 AND port = ?2 AND key_type = ?3 AND revoked_at IS NULL\");",
+      "replace": "        \" WHERE host = ?1 AND port = ?2 AND key_type = ?3\");",
+      "expect_gate": "gate: a presented key is judged against the pin recorded for its own type"
+    },
+    {
+      "id": "M7-rotation-needs-a-fingerprint",
+      "rule": "Rotation requires the new fingerprint to be supplied. The tool does not decide what to trust.",
+      "file": "src/cli/cmd_server.zig",
+      "find": "    if (opts.rotate) return error.RotationNeedsAFingerprint;",
+      "replace": "    if (opts.rotate) return .{ .rotate = .{ .key_type = opts.key_type orelse \"ssh-rsa\", .fingerprint = \"\" } };",
+      "expect_gate": "gate: `server pin`'s flags decide one of five things or refuse by name"
+    },
+    {
+      "id": "M7-fingerprint-shape-is-checked-at-entry",
+      "rule": "A fingerprint that can never match is refused when it is given, not stored to refuse every connection for ever.",
+      "file": "src/cli/cmd_server.zig",
+      "find": "        if (!Core.Ssh.isCanonicalFingerprint(fp)) return error.FingerprintNotCanonical;\n",
+      "replace": "",
+      "expect_gate": "gate: `server pin`'s flags decide one of five things or refuse by name"
+    },
+    {
+      "id": "M7-refusal-names-the-command-that-clears-it",
+      "rule": "The refusal for an unpinned host names the command that records a pin. Every existing store hits it.",
+      "file": "src/cli/cli.zig",
+      "find": "            \\\\  terminus server pin {s} --key-type {s} --fingerprint <fingerprint>",
+      "replace": "            \\\\  {s} needs a pin for its {s} key",
+      "expect_gate": "gate: a refused connection names the command that records the pin"
+    },
+    {
+      "id": "G5-token-is-read-for-the-wrong-process",
+      "file": "src/helper/main.zig",
+      "find": "    const token = startToken(pid);",
+      "replace": "    const token = startToken(0);",
+      "rule": "The start token must be the child's. Reading a pid that has no /proc entry yields 0, which is the helper's 'no token' and leaves pid_proof no stronger than the shell's.",
+      "expect_gate": "blackbox: the helper's start token does not race a command that has already exited"
+    },
+    {
+      "id": "G5-token-vouches-for-the-supervisor",
+      "file": "src/helper/main.zig",
+      "find": "    const token = startToken(pid);",
+      "replace": "    const token = startToken(@intCast(linux.getpid()));",
+      "rule": "A nonzero token is not enough: this is exactly wrapShell's defect, which reports $$ (the wrapper's pid) and so vouches for a process that is not the command. Only the gate that compares against the child's own answer can see it.",
+      "expect_gate": "blackbox: the start token the helper reports is the child's, not its own"
+    },
+    {
+      "id": "G5-child-does-not-lead-its-own-group",
+      "file": "src/helper/main.zig",
+      "find": "        if (fail(linux.syscall0(.setsid))) exit(71);",
+      "replace": "        if (false) exit(71);",
+      "rule": "Without setsid the child inherits the helper's process group, so one kill(-pgid) either misses the tree or reaches the supervisor. pgid == pid is the readback that catches it.",
+      "expect_gate": "blackbox: the helper's start token does not race a command that has already exited"
+    },
+    {
+      "id": "G5-stop-targets-the-pid-not-the-group",
+      "file": "src/helper/main.zig",
+      "find": "    const target: i32 = if (pgid > 0) @intCast(-pgid) else -pid;",
+      "replace": "    const target: i32 = pid;",
+      "rule": "Signalling the pid leaves behind every child the command started. This is the shape pid_proof = .weak cannot handle, and the whole reason setsid is called.",
+      "expect_gate": "blackbox: the helper stops the process group, not just the shell it launched"
+    },
+    {
+      "id": "G5-escalates-straight-to-kill",
+      "file": "src/helper/main.zig",
+      "find": "    _ = linux.kill(target, linux.SIG.TERM);",
+      "replace": "    _ = linux.kill(target, linux.SIG.KILL);",
+      "rule": "A command that would have cleaned up on TERM must be given the chance. Asserting status 15 on the polite arm is what distinguishes this from a helper that always reaches for KILL.",
+      "expect_gate": "blackbox: the helper tries TERM before KILL, and escalates only when it must"
+    },
+    {
+      "id": "G5-a-signal-is-reported-as-an-exit-code",
+      "file": "src/helper/main.zig",
+      "find": "        .KILLED, .DUMPED => How.signalled,",
+      "replace": "        .KILLED, .DUMPED => How.exited,",
+      "rule": "waitid distinguishes CLD_KILLED from CLD_EXITED and the receipt must keep them apart; folding them is how a killed command reads as one that chose to exit.",
+      "expect_gate": "blackbox: the helper separates a signal from an exit code"
+    },
+    {
+      "id": "G5-frame-length-omits-the-kind-byte",
+      "file": "src/helper/main.zig",
+      "find": "    std.mem.writeInt(u32, out_buf[0..4], @intCast(body.len + 1), .little);",
+      "replace": "    std.mem.writeInt(u32, out_buf[0..4], @intCast(body.len), .little);",
+      "rule": "The declared length covers the kind byte as well as the body. One short and every frame loses its last byte, and the reader takes the next header for payload. The chunking loop that used to be on this line was unreachable, which is what a surviving mutation revealed.",
+      "expect_gate": "blackbox: the helper's streams carry a NUL and a forged exit marker unchanged"
+    },
+    {
+      "id": "G5-execve-failure-loses-the-127-convention",
+      "file": "src/helper/main.zig",
+      "find": "        exit(127);",
+      "replace": "        exit(70);",
+      "rule": "A command that is not there is the command's failure and 127 is the established word for it. A helper-specific code makes a caller learn a second vocabulary for the same event.",
+      "expect_gate": "blackbox: a command the helper cannot start is the command's failure, not the helper's"
+    },
+    {
+      "id": "G5-never-escalates-to-kill",
+      "file": "src/helper/main.zig",
+      "find": "    _ = linux.kill(target, linux.SIG.KILL);",
+      "replace": "    _ = linux.kill(target, @enumFromInt(0));",
+      "rule": "A command that traps TERM must still be stopped. Signal 0 is the existence probe, so this asks and does nothing; the child survives, the give-up window closes, and the helper reports timed_out_unconfirmed instead of claiming a stop. This mutation only became writable once the waits were bounded - before that it hung.",
+      "expect_gate": "blackbox: the helper tries TERM before KILL, and escalates only when it must"
     }
   ]
 }

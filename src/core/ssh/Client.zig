@@ -1,5 +1,11 @@
-//! libssh2-backed SSH client: TCP connect, handshake, authenticate, run
-//! one command over a session channel.
+//! libssh2-backed SSH client: TCP connect, handshake, **check the host key**,
+//! authenticate, run one command over a session channel.
+//!
+//! The third of those is not optional and is not a separate call. `connect`
+//! takes the trust root it checks against as a required argument and refuses
+//! before it returns, so there is no way to obtain a usable session whose host
+//! key nobody looked at. See the host key section below for why the check is
+//! shaped that way.
 //!
 //! The TCP socket is created with winsock directly rather than
 //! std.Io.net: on Windows the std Io implementation hands out raw AFD
@@ -36,6 +42,230 @@ pub fn lastConnectError() []const u8 {
     return connect_error;
 }
 
+// --- the host key ------------------------------------------------------------
+//
+// Until this section existed, `connect` completed the handshake and returned:
+// every connection was trust-on-every-use and a machine in the path could be
+// the server. What follows is the whole of the check, and three things about
+// where it lives are load-bearing rather than tidy.
+//
+// **It is inside `connect`.** There is no entry point that hands back a
+// `Client` and leaves a `verify` to the caller, because that is the shape in
+// which one path forgets. `connect` takes the trust root as a required
+// argument — no default, no second overload — so a session cannot be
+// constructed without one being named.
+//
+// **The lookup is never told what it will be compared against.** `Pins.recorded`
+// receives a key type and answers with what the store has for it. It does not
+// see the presented fingerprint, so a caller cannot arrange for the two to
+// agree; the comparison is `judge`'s, here, where nothing above can reach it.
+// That is what makes "every session goes through the check" a property of the
+// types rather than a list of call sites somebody kept up to date.
+//
+// **The decision is a pure function.** There is no server in this repository's
+// tests to hand a real handshake to — the one test host's key exists only inside
+// a database no test may open — so a decision buried in the socket path could
+// only ever be reviewed. `judge` and `refusalFor` take values and return values,
+// so the rules are driven against real stores and the reviewed part is narrowed
+// to the two libssh2 calls that read the key.
+
+/// SHA-256 as OpenSSH prints a host key fingerprint: `SHA256:` and then
+/// unpadded base64, which is 43 characters for 32 bytes.
+pub const fingerprint_text_len = "SHA256:".len + 43;
+
+/// The canonical text of a host key fingerprint.
+///
+/// Into the caller's buffer rather than allocated, for the reason `digest.hex`
+/// is: the width is a compile-time constant and `connect` has no allocator.
+/// Formatted the way `ssh-keyscan` prints it, so an operator can hold the two
+/// against each other by eye without converting either.
+pub fn formatFingerprint(out: *[fingerprint_text_len]u8, sha256: [32]u8) void {
+    const encoder = std.base64.standard_no_pad.Encoder;
+    @memcpy(out[0.."SHA256:".len], "SHA256:");
+    _ = encoder.encode(out["SHA256:".len..], &sha256);
+}
+
+/// Whether `text` is a fingerprint this build could ever match a key against.
+///
+/// Used on the one supplied by an operator to `server pin --fingerprint`. A pin
+/// in any other shape is not wrong later, it is wrong forever: it is compared
+/// byte-for-byte against `formatFingerprint`'s output, so a hex digest or an
+/// MD5 fingerprint or a padded base64 one would refuse every connection to that
+/// host and read as a key mismatch while doing it.
+pub fn isCanonicalFingerprint(text: []const u8) bool {
+    if (text.len != fingerprint_text_len) return false;
+    if (!std.mem.startsWith(u8, text, "SHA256:")) return false;
+    for (text["SHA256:".len..]) |ch| {
+        const ok = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or
+            (ch >= '0' and ch <= '9') or ch == '+' or ch == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// libssh2's host key type, under the name OpenSSH and `ssh-keyscan` use — the
+/// third of `host_pins`'s three key columns.
+///
+/// The *negotiated method* name is not usable for this and the difference
+/// matters: for an RSA host key that name is whichever of `rsa-sha2-512`,
+/// `rsa-sha2-256` or `ssh-rsa` the two ends agreed on, which identifies a
+/// signature algorithm rather than a key. A pin keyed on it would stop matching
+/// the moment either end's preferences moved, and the operator would be shown a
+/// key mismatch for a host whose key never changed. The type libssh2 reports is
+/// the key itself.
+///
+/// `null` for a type this build has no name for. A refusal and not a fallback:
+/// a pin has to be keyed on something stable, and an integer libssh2 added
+/// after this build is not a name an operator can record.
+pub fn keyTypeName(libssh2_type: c_int) ?[]const u8 {
+    return switch (libssh2_type) {
+        c.LIBSSH2_HOSTKEY_TYPE_RSA => "ssh-rsa",
+        c.LIBSSH2_HOSTKEY_TYPE_DSS => "ssh-dss",
+        c.LIBSSH2_HOSTKEY_TYPE_ECDSA_256 => "ecdsa-sha2-nistp256",
+        c.LIBSSH2_HOSTKEY_TYPE_ECDSA_384 => "ecdsa-sha2-nistp384",
+        c.LIBSSH2_HOSTKEY_TYPE_ECDSA_521 => "ecdsa-sha2-nistp521",
+        c.LIBSSH2_HOSTKEY_TYPE_ED25519 => "ssh-ed25519",
+        else => null,
+    };
+}
+
+/// The host key a server presented, in the two terms a pin is keyed and
+/// compared on.
+pub const HostKey = struct {
+    /// One of `keyTypeName`'s literals, so it outlives the session it was read
+    /// from and can be stored without being copied first.
+    key_type: []const u8,
+    /// `SHA256:`+base64, held as an array rather than a slice. Not tidiness:
+    /// a slice would have to point at a buffer with a shorter life than the
+    /// observation itself, which is the exact failure
+    /// `daemon/protocol.Accounting.Stream.sha256` records.
+    fingerprint: [fingerprint_text_len]u8,
+
+    pub fn text(self: *const HostKey) []const u8 {
+        return &self.fingerprint;
+    }
+};
+
+/// What a connection's host key is checked against.
+///
+/// Two members, and the closedness is the claim: one of them checks and the
+/// other refuses, so there is no third state in which a session opens
+/// unchecked. A permissive variant added here fails
+/// `gate: the trust root has no member that opens a session without a pin`.
+pub const TrustRoot = union(enum) {
+    /// A trust store to ask. See `Pins`.
+    pins: Pins,
+    /// The caller has no trust store to ask, so no session may be opened at
+    /// all: `connect` refuses before it dials.
+    ///
+    /// This is the daemon's position. Its protocol carries auth material in
+    /// every request precisely so the daemon never touches sqlite, so it has no
+    /// pin to check against and cannot acquire one — see
+    /// `daemon/Server.connectFor`. Named rather than left as an absence,
+    /// because "there is no trust root" and "trust anything" must not be the
+    /// same value.
+    none,
+
+    pub const Pins = struct {
+        context: *anyopaque,
+        /// The active pin's fingerprint text for `key_type`, or null when the
+        /// store has none.
+        ///
+        /// **It is not told what the presented key was**, and that is what makes
+        /// the check unfakeable from above: a lookup that cannot see the value
+        /// it will be compared against cannot be arranged to agree with it. The
+        /// strongest thing a wrong lookup can do is refuse a connection that
+        /// should have been allowed.
+        recorded: *const fn (context: *anyopaque, key_type: []const u8) ?[]const u8,
+        /// Whether a key type with no pin may be accepted, so the caller can
+        /// record what was seen.
+        ///
+        /// False by default and never derived from the absence of a pin —
+        /// "nothing is recorded for this host" is precisely the state an
+        /// attacker arranges. One command sets it, by name.
+        trust_on_first_use: bool = false,
+    };
+};
+
+/// What a presented key means against a trust root.
+pub const Verdict = enum {
+    /// It is the key the active pin records.
+    matches_pin,
+    /// Nothing is recorded for this key type and the caller asked for first-use
+    /// trust by name. The connection proceeds and the caller records what
+    /// `connect` observed.
+    first_use,
+    /// Nothing is recorded for this key type. The default answer.
+    not_pinned,
+    /// A pin exists and this is a different key. Never a warning, never a
+    /// prompt, and never an automatic update.
+    mismatch,
+    /// There was nothing to check against, so nothing was dialled.
+    no_trust_root,
+
+    /// Whether a session may exist after this verdict.
+    pub fn admits(v: Verdict) bool {
+        return switch (v) {
+            .matches_pin, .first_use => true,
+            .not_pinned, .mismatch, .no_trust_root => false,
+        };
+    }
+};
+
+/// The whole host key decision, as a function of two values.
+///
+/// Pure on purpose — see the section header. `connect` calls this and obeys it;
+/// the gates call it against real sqlite stores, which is the only way any of
+/// these rules can be *proven* in a tree with no server to handshake with.
+pub fn judge(trust: TrustRoot, key: HostKey) Verdict {
+    const pins = switch (trust) {
+        .none => return .no_trust_root,
+        .pins => |p| p,
+    };
+    const recorded = pins.recorded(pins.context, key.key_type) orelse
+        return if (pins.trust_on_first_use) .first_use else .not_pinned;
+    // Not constant-time, deliberately: both sides of this comparison are public
+    // — anybody who can reach the host can ask it for its key — so there is no
+    // secret here for a timing difference to leak.
+    if (std.mem.eql(u8, recorded, &key.fingerprint)) return .matches_pin;
+    // A first-use request does not reach here and must not: `trust_on_first_use`
+    // means "record a host nothing is known about", never "replace what is
+    // known". Rotation is the deliberate act that replaces a pin, and it takes
+    // the new fingerprint from the operator.
+    return .mismatch;
+}
+
+/// The error a verdict refuses with, or null when the session may live.
+///
+/// Split from `judge` so the mapping is total by inspection and drivable
+/// without a socket: `gate: every verdict that is not a match refuses the
+/// connection` walks every member of `Verdict` through this.
+pub fn refusalFor(v: Verdict) ?ConnectError {
+    return switch (v) {
+        .matches_pin, .first_use => null,
+        .not_pinned => error.HostKeyNotPinned,
+        .mismatch => error.HostKeyMismatch,
+        .no_trust_root => error.NoTrustRoot,
+    };
+}
+
+/// The key the far side proved it holds, read after a completed handshake.
+///
+/// The one part of this section a test cannot reach, and it is two libssh2
+/// calls wide on purpose: everything that decides anything is above, in `judge`.
+fn presentedKey(session: *c.LIBSSH2_SESSION) ?HostKey {
+    var len: usize = 0;
+    var kind: c_int = 0;
+    const blob = c.libssh2_session_hostkey(session, &len, &kind);
+    if (blob == null or len == 0) return null;
+    const name = keyTypeName(kind) orelse return null;
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(blob[0..len], &sha, .{});
+    var out: HostKey = .{ .key_type = name, .fingerprint = undefined };
+    formatFingerprint(&out.fingerprint, sha);
+    return out;
+}
+
 pub const ConnectError = error{
     Libssh2Init,
     HostNotFound,
@@ -43,10 +273,47 @@ pub const ConnectError = error{
     HandshakeFailed,
     HostNameTooLong,
     OutOfMemory,
+    /// The caller named no trust store, so there was nothing to check the
+    /// host's key against. Refused before the dial.
+    NoTrustRoot,
+    /// The handshake completed and libssh2 offered no host key, or offered one
+    /// of a type this build cannot name. Refused rather than waved through: a
+    /// key that cannot be identified cannot be pinned.
+    HostKeyUnreadable,
+    /// No pin is recorded for the key type this host presented.
+    HostKeyNotPinned,
+    /// A pin is recorded and the host presented a different key.
+    HostKeyMismatch,
 };
 
-pub fn connect(host: []const u8, port: u16) ConnectError!Client {
+/// TCP connect, handshake, and the host key check — in that order, and all of
+/// it before a `Client` exists.
+///
+/// `observed` carries what the far side presented and is written the moment a
+/// key can be read, on the failing paths as well as the succeeding one: the
+/// refusal an operator sees has to name the fingerprint that was rejected, and
+/// an error set cannot carry it. It is set to null before anything can fail, so
+/// a caller reading it after an error is reading this call's observation rather
+/// than the last call's.
+///
+/// **Nothing survives a refused key.** The two `errdefer`s below cover every
+/// error return past them, so a mismatch frees the session and closes the
+/// socket on its way out — there is no half-open handle and no `Client` value
+/// for a caller to find a use for.
+pub fn connect(
+    host: []const u8,
+    port: u16,
+    trust: TrustRoot,
+    observed: *?HostKey,
+) ConnectError!Client {
     connect_error = "";
+    observed.* = null;
+
+    // Before the socket, not after the handshake. A caller with nothing to
+    // check against has no business completing a handshake, and refusing later
+    // would still have told whatever is in the path that we are here.
+    if (trust == .none) return error.NoTrustRoot;
+
     if (!libssh2_ready) {
         var wsa: c.WSADATA = undefined;
         if (c.WSAStartup((2 << 8) | 2, &wsa) != 0) return error.Libssh2Init;
@@ -75,6 +342,10 @@ pub fn connect(host: []const u8, port: u16) ConnectError!Client {
         }
         return error.HandshakeFailed;
     }
+
+    const key = presentedKey(session) orelse return error.HostKeyUnreadable;
+    observed.* = key;
+    if (refusalFor(judge(trust, key))) |refusal| return refusal;
 
     return .{ .socket = socket, .session = session };
 }

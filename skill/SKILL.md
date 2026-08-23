@@ -18,6 +18,48 @@ commands. Everything supports `--json` for reliable parsing.
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
+## Host keys are pinned: the first command on each server is refused
+
+Every connection is checked against a host key pin recorded for that
+server's `host:port`. **No existing store has any pins** — nothing before
+this recorded a host key anywhere — so the first command against each
+server is refused, and the refusal names the command that clears it. Once
+per server, not once per command.
+
+```bash
+terminus server pin <server>                 # what this machine trusts (nothing, at first)
+
+# The strong one: a fingerprint from somewhere other than this connection.
+terminus server pin <server> --key-type ssh-ed25519 --fingerprint SHA256:<43-chars>
+#   get it with `ssh-keyscan -t ssh-ed25519 <host>` from a machine you trust,
+#   or from the host's own records. Recorded as trust_source=explicit_pin.
+
+# The weak one, and the ledger says so: record whatever answers right now.
+terminus server pin <server> --trust-on-first-use
+#   trust_source=first_use. It protects every connection after this one and
+#   nothing about this one. Never implied — a host with no pin is refused.
+```
+
+After that:
+
+- **A mismatch is a hard failure.** No prompt, no warning, no session, nothing
+  sent. If the host really was rebuilt, verify the new key out of band and then
+  say so explicitly:
+  `terminus server pin <server> --rotate --key-type <t> --fingerprint <fp>`.
+  The new fingerprint is required — terminus will not choose one for you, and
+  `--rotate` without it is refused.
+- `terminus server pin <server> --revoke --key-type <t>` withdraws trust with
+  no replacement. Connections are refused again until something is recorded.
+- A pin covers a `host:port`, not a server row: two servers on one box share
+  one, and changing a server's `--host` or `--port` leaves it unpinned at the
+  new address.
+
+**The daemon transport cannot check a pin yet.** The pooled connection is
+opened by the local daemon, which holds no database and therefore cannot read
+the pin — so it refuses rather than connecting unchecked. Until the daemon
+protocol carries the pin, use `--no-daemon` (or set `TERMINUS_NO_DAEMON=1`
+once for the session) and the direct transport does the check.
+
 ## Passing commands and content reliably (Windows/PowerShell!)
 
 PowerShell and some tool-call layers mangle `--`, `;`, `*` in bare
@@ -264,6 +306,9 @@ contradicted memory must not read as freshly confirmed.
 ## Quick reference
 
 ```bash
+# First contact with a server: record its host key, or nothing will connect
+terminus server pin <server> --trust-on-first-use     # or --key-type/--fingerprint
+
 # First contact with a server: probe its capabilities
 terminus doctor <server> --json      # shell, OS, tmux?, disk, memoryKeys
 

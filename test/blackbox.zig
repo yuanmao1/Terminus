@@ -6785,3 +6785,708 @@ test "gate: the receipt document's shape is pinned at the depth each key is at" 
     }
     try t.expect(occurrences >= 3);
 }
+
+// ---------------------------------------------------------------------------
+// The remote supervisor helper, driven on a real Linux kernel.
+// ---------------------------------------------------------------------------
+//
+// `shell_capability` claims four things it cannot do, and says so. The helper
+// claims it can, and these gates are why that claim is allowed to stand. Each
+// one asserts a syscall result the shell supervisor is structurally unable to
+// produce, not merely one it produces less well:
+//
+//   * `pid_proof = .strong`    — a fast command still reports a start token,
+//                                and the child leads its own process group
+//   * `binary_framing = true`  — a NUL and a forged exit marker pass through
+//                                untouched and change nothing
+//   * `remote_deadline = true` — the deadline is the helper's own, TERM is
+//                                tried before KILL, and both arms are pinned
+//                                by their exit status
+//   * `verified_cancellation`  — grandchildren that outlive their parent shell
+//                                are gone, confirmed by `ESRCH`
+//
+// `audit_isolation` is the fifth and is not implemented; nothing here claims it.
+//
+// This needs a Linux kernel, which makes one a prerequisite of `zig build test`
+// on Windows in the same way a POSIX shell already is — see `linux_runner` in
+// build.zig for why that is a hard requirement and not a skip.
+
+/// The cross-compiled helper, and the command prefix that can execute it.
+const helper_exe = build_options.helper_exe;
+const linux_runner = build_options.linux_runner;
+
+const HelperKind = struct {
+    const run: u8 = 0x01;
+    const started: u8 = 0x81;
+    const stdout: u8 = 0x82;
+    const stderr: u8 = 0x83;
+    const exited: u8 = 0x84;
+    const failed: u8 = 0x85;
+};
+
+const HelperHow = enum(u8) {
+    exited = 0,
+    signalled = 1,
+    timed_out_killed = 2,
+    timed_out_unconfirmed = 3,
+    _,
+};
+
+const HelperStarted = struct { pid: i64, pgid: i64, token: u64 };
+const HelperExit = struct { how: HelperHow, status: i32 };
+
+const HelperRun = struct {
+    /// One entry per `started` frame, so a gate driving several runs through a
+    /// single invocation can assert about every one of them.
+    started: []const HelperStarted,
+    exits: []const HelperExit,
+    stdout: []const u8,
+    stderr: []const u8,
+    failed: ?[]const u8,
+    /// Everything needed to tell a failed *command* from a failed *harness*,
+    /// kept because the first version of this reported neither. A gate that says
+    /// only "no terminal frame" sends the next reader looking at the supervisor
+    /// when the cause may be a path, a permission, or a runner that never ran.
+    diagnosis: Diagnosis,
+
+    const Diagnosis = struct {
+        /// The exact command line handed to the runner.
+        command: []const u8,
+        /// The runner's own argv, joined for printing.
+        argv: []const u8,
+        /// What the runner exited with, and what it said.
+        runner_status: []const u8,
+        runner_stderr: []const u8,
+        raw_stdout_len: usize,
+        /// The head of what actually came back, with non-printables escaped.
+        /// Without it "0 frames" is a dead end: the bytes are either frames the
+        /// parser rejected, a message from the shell, or `wsl.exe` complaining
+        /// in UTF-16 — three different causes with one symptom.
+        raw_head: []const u8,
+        frame_kinds: []const u8,
+    };
+
+    fn one(r: HelperRun) !HelperExit {
+        if (r.failed) |message| {
+            std.debug.print("helper reported a failure: {s}\n", .{message});
+            r.explain();
+            return error.HelperFailed;
+        }
+        if (r.exits.len != 1) {
+            std.debug.print(
+                "expected exactly one terminal frame, got {d}\n",
+                .{r.exits.len},
+            );
+            r.explain();
+            return error.ExpectedExactlyOneTerminalFrame;
+        }
+        return r.exits[0];
+    }
+
+    fn explain(r: HelperRun) void {
+        std.debug.print(
+            \\  runner argv : {s}
+            \\  command     : {s}
+            \\  runner exit : {s}
+            \\  runner stderr: {s}
+            \\  stdout      : {d} bytes, frame kinds [{s}]
+            \\  stdout head : {s}
+            \\  started frames: {d}
+            \\
+        , .{
+            r.diagnosis.argv,
+            r.diagnosis.command,
+            r.diagnosis.runner_status,
+            r.diagnosis.runner_stderr,
+            r.diagnosis.raw_stdout_len,
+            r.diagnosis.frame_kinds,
+            r.diagnosis.raw_head,
+            r.started.len,
+        });
+    }
+};
+
+/// A Linux path for something this build emitted.
+///
+/// `wsl.exe` sees the Windows volumes under `/mnt/<drive>`, so a path the Zig
+/// build produced has to be spelled the other way round before a Linux process
+/// can open it. Mechanical rather than shelling out to `wslpath`: one fewer
+/// subprocess whose absence would need its own diagnosis.
+///
+/// Two conversions, and the first one is the part I got wrong. `addOptionPath`
+/// hands back a path *relative to the build root* with Windows separators —
+/// `.zig-cache\o\<hash>\terminus-helper` — and a Linux process can use neither
+/// half of that. Assuming it was already absolute meant the separators were
+/// never rewritten either, so `sh` was handed a name it could not resolve and
+/// the gates came back with no output at all. A path that is already absolute is
+/// passed through, which is what the request file needs.
+fn linuxPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const absolute = if (hasDrive(path))
+        path
+    else
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ build_options.build_root, path });
+
+    const body = try arena.dupe(u8, if (hasDrive(absolute)) absolute[2..] else absolute);
+    for (body) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    // No drive letter even after the join means a Linux build host, where the
+    // path is already the one a Linux process wants.
+    if (!hasDrive(absolute)) return body;
+    return std.fmt.allocPrint(arena, "/mnt/{c}{s}", .{ std.ascii.toLower(absolute[0]), body });
+}
+
+fn hasDrive(path: []const u8) bool {
+    return path.len > 2 and path[1] == ':' and std.ascii.isAlphabetic(path[0]);
+}
+
+/// The first bytes of a reply, printable. Non-printables become `\xNN`, so a
+/// UTF-16 message from `wsl.exe` is recognisable as one rather than as frames
+/// the parser mishandled.
+fn escapeHead(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (bytes[0..@min(bytes.len, 160)]) |c| {
+        if (c >= 0x20 and c < 0x7f) {
+            try out.append(arena, c);
+        } else {
+            try out.print(arena, "\\x{x:0>2}", .{c});
+        }
+    }
+    return out.items;
+}
+
+/// Encodes one `run` request frame.
+fn helperRequest(
+    arena: std.mem.Allocator,
+    argv: []const []const u8,
+    deadline_ms: u64,
+    grace_ms: u64,
+) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    var head: [8]u8 = undefined;
+    std.mem.writeInt(u64, &head, deadline_ms, .little);
+    try body.appendSlice(arena, &head);
+    std.mem.writeInt(u64, &head, grace_ms, .little);
+    try body.appendSlice(arena, &head);
+    std.mem.writeInt(u32, head[0..4], @intCast(argv.len), .little);
+    try body.appendSlice(arena, head[0..4]);
+    for (argv) |a| {
+        std.mem.writeInt(u32, head[0..4], @intCast(a.len), .little);
+        try body.appendSlice(arena, head[0..4]);
+        try body.appendSlice(arena, a);
+    }
+
+    var frame: std.ArrayList(u8) = .empty;
+    std.mem.writeInt(u32, head[0..4], @intCast(body.items.len + 1), .little);
+    try frame.appendSlice(arena, head[0..4]);
+    try frame.append(arena, HelperKind.run);
+    try frame.appendSlice(arena, body.items);
+    return frame.items;
+}
+
+/// The runner's argv for a script file holding the commands to run.
+///
+/// Three layers, and each one is there for a stated reason.
+///
+/// `wsl.exe` **cannot be launched from a process `std.process.spawn` created**.
+/// It answers `Wsl/Service/0x8007072c` — Win32 1836, `RPC_X_SS_HANDLES_MISMATCH`,
+/// "the RPC call contains a handle that differs from the declared handle type" —
+/// and it does so whether the standard streams are pipes, inherited or ignored,
+/// for either `wsl.exe` on `PATH`, for `System32\bash.exe`, from bash, cmd and
+/// PowerShell alike, and even with a Python shim in between. `CreateProcessW` is
+/// called there with `bInheritHandles = TRUE` and no
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so every inheritable handle goes across;
+/// an interactive shell and Python's `subprocess` (which defaults to
+/// `close_fds=True`) both restrict that set, and both work.
+///
+/// So the outer layer is `posix_sh` — already discovered by the build, already
+/// spawned successfully by two other gates here — and it is what launches
+/// `wsl.exe`. MSYS does its own fork/exec and the handle set arrives intact.
+///
+/// The commands go in a **file** rather than in a `-c` argument, and the runner
+/// is handed a *bare filename* after a `cd`. Both avoid MSYS argument
+/// conversion, which rewrites anything path-shaped on the way to a Windows
+/// program: `/mnt/c/...` would reach `wsl.exe` as `C:\...\mnt\c\...`. Inside the
+/// script file the Linux paths are never on a command line, so nothing touches
+/// them. Nesting the commands in `-c` would also have exposed `$$`, `$i` and
+/// `$((...))` to the outer shell, which would have expanded all three before the
+/// inner one saw them.
+fn linuxArgv(arena: std.mem.Allocator, dir: []const u8, script: []const u8) ![]const []const u8 {
+    if (linux_runner.len == 0) {
+        // A Linux build host runs it directly; there is nothing to cross.
+        return &.{ "sh", try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, script }) };
+    }
+    const cut = std.mem.indexOfScalar(u8, linux_runner, ' ') orelse linux_runner.len;
+    const inner = try std.fmt.allocPrint(arena, "cd '{s}' && '{s}'{s} sh {s}", .{
+        try msysPath(arena, dir),
+        try msysPath(arena, linux_runner[0..cut]),
+        linux_runner[cut..],
+        script,
+    });
+    var full: std.ArrayList([]const u8) = .empty;
+    try full.append(arena, posix_sh);
+    try full.append(arena, "-c");
+    try full.append(arena, inner);
+    return full.items;
+}
+
+/// A Windows path as MSYS spells it: `C:\Windows\System32` becomes
+/// `/c/Windows/System32`.
+///
+/// A second mapping and not `linuxPath`, because the two subsystems disagree:
+/// MSYS mounts the volumes at `/<drive>` and WSL at `/mnt/<drive>`.
+fn msysPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const absolute = if (hasDrive(path))
+        path
+    else
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ build_options.build_root, path });
+    if (!hasDrive(absolute)) return absolute;
+    const body = try arena.dupe(u8, absolute[2..]);
+    for (body) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return std.fmt.allocPrint(arena, "/{c}{s}", .{ std.ascii.toLower(absolute[0]), body });
+}
+
+/// Runs the helper `repeat` times over one invocation of the runner, feeding it
+/// the same request each time, and returns every frame it wrote.
+///
+/// Repetition inside one runner invocation rather than one spawn per run: the
+/// claim under test is a race inside the helper, and `wsl.exe` start-up costs
+/// several times more than the thing being measured.
+fn runHelper(
+    arena: std.mem.Allocator,
+    f: *Fixture,
+    argv: []const []const u8,
+    opts: struct { deadline_ms: u64 = 0, grace_ms: u64 = 200, repeat: usize = 1, delay_request_ms: u64 = 0 },
+) !HelperRun {
+    const request = try helperRequest(arena, argv, opts.deadline_ms, opts.grace_ms);
+
+    const req_name = try std.fmt.allocPrint(arena, "{s}/helper_req.bin", .{f.dir});
+    try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = req_name, .data = request });
+
+    const helper_linux = try linuxPath(arena, helper_exe);
+    const req_linux = try linuxPath(arena, req_name);
+
+    // The request arrives on the helper's standard input, which is where it
+    // would arrive over SSH. The redirect is performed by the far side's own
+    // shell, and the quoting is the production quoter rather than a second one
+    // written for tests.
+    const shell = Terminus.Core.shell;
+    var line: std.ArrayList(u8) = .empty;
+    for (0..opts.repeat) |_| {
+        if (opts.delay_request_ms > 0) {
+            // Hold the request back, so the helper is already running well
+            // before it forks. Its own start time is then many clock ticks
+            // earlier than the child's, which is what lets a gate tell the two
+            // apart — see the token-owner gate for why that matters.
+            try line.print(arena, "( sleep {d}.{d:0>3}; cat {f} ) | {f}\n", .{
+                opts.delay_request_ms / 1000,
+                opts.delay_request_ms % 1000,
+                shell.word(req_linux),
+                shell.word(helper_linux),
+            });
+        } else {
+            try line.print(arena, "{f} < {f}\n", .{
+                shell.word(helper_linux),
+                shell.word(req_linux),
+            });
+        }
+    }
+
+    // The commands go to a file, which the runner's inner shell reads. See
+    // `linuxArgv` for why they cannot travel as a `-c` argument.
+    const script_name = try std.fmt.allocPrint(arena, "{s}/helper_cmd.sh", .{f.dir});
+    try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = script_name, .data = line.items });
+    const script_base = "helper_cmd.sh";
+
+    const result = std.process.run(arena, f.io, .{
+        .argv = try linuxArgv(arena, f.dir, script_base),
+        .stdout_limit = .limited(1 << 20),
+        .stderr_limit = .limited(1 << 16),
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print(
+                \\
+                \\these gates run the remote supervisor helper on a real Linux kernel, and
+                \\the runner '{s}' was not found. Install WSL, or pass
+                \\-Dlinux-runner=<prefix>. They are not skipped: the helper exists for
+                \\four guarantees a POSIX shell cannot make, and a skipped gate would
+                \\leave all four claimed and unproven.
+                \\
+                \\
+            , .{linux_runner});
+            return error.LinuxRunnerNotFound;
+        },
+        else => return err,
+    };
+
+    var started: std.ArrayList(HelperStarted) = .empty;
+    var exits: std.ArrayList(HelperExit) = .empty;
+    var out: std.ArrayList(u8) = .empty;
+    var err_out: std.ArrayList(u8) = .empty;
+    var failed: ?[]const u8 = null;
+
+    var at: usize = 0;
+    var kinds: std.ArrayList(u8) = .empty;
+    while (at + 4 <= result.stdout.len) {
+        const n = std.mem.readInt(u32, result.stdout[at..][0..4], .little);
+        at += 4;
+        if (n == 0 or at + n > result.stdout.len) break;
+        const kind = result.stdout[at];
+        const payload = result.stdout[at + 1 ..][0 .. n - 1];
+        at += n;
+        try kinds.print(arena, "{x} ", .{kind});
+        switch (kind) {
+            // Sizes are checked rather than assumed. A frame whose declared
+            // length is wrong by one byte would otherwise slice out of bounds
+            // and panic, and a panicking harness names the wrong defect — the
+            // reader is supposed to be the thing that notices.
+            HelperKind.started => {
+                if (payload.len != 24) return error.StartedFrameWrongSize;
+                try started.append(arena, .{
+                    .pid = std.mem.readInt(i64, payload[0..8], .little),
+                    .pgid = std.mem.readInt(i64, payload[8..16], .little),
+                    .token = std.mem.readInt(u64, payload[16..24], .little),
+                });
+            },
+            HelperKind.exited => {
+                if (payload.len != 5) return error.ExitedFrameWrongSize;
+                try exits.append(arena, .{
+                    .how = @enumFromInt(payload[0]),
+                    .status = std.mem.readInt(i32, payload[1..5], .little),
+                });
+            },
+            HelperKind.stdout => try out.appendSlice(arena, payload),
+            HelperKind.stderr => try err_out.appendSlice(arena, payload),
+            HelperKind.failed => failed = payload,
+            else => return error.UnknownHelperFrameKind,
+        }
+    }
+
+    const outcome: HelperRun = .{
+        .started = started.items,
+        .exits = exits.items,
+        .stdout = out.items,
+        .stderr = err_out.items,
+        .failed = failed,
+        .diagnosis = .{
+            .command = line.items,
+            .argv = try std.mem.join(arena, " ", try linuxArgv(arena, f.dir, "<script>")),
+            .runner_status = switch (result.term) {
+                .exited => |code| try std.fmt.allocPrint(arena, "exited {d}", .{code}),
+                .signal => |s| try std.fmt.allocPrint(arena, "signal {s}", .{@tagName(s)}),
+                .stopped => |s| try std.fmt.allocPrint(arena, "stopped {s}", .{@tagName(s)}),
+                .unknown => |u| try std.fmt.allocPrint(arena, "unknown {d}", .{u}),
+            },
+            .runner_stderr = result.stderr,
+            .raw_stdout_len = result.stdout.len,
+            .raw_head = try escapeHead(arena, result.stdout),
+            .frame_kinds = kinds.items,
+        },
+    };
+
+    // Nothing the parser recognised is never something the helper can produce —
+    // it writes the `started` frame before it does anything else. So it is the
+    // runner, the path, or a permission, and saying so here means every gate
+    // gets the diagnosis without having to remember to ask. Keyed on frames and
+    // not on byte count: in the case that made this necessary the count was 114
+    // and the frames were still zero.
+    if (kinds.items.len == 0) {
+        std.debug.print("the helper produced nothing the frame parser recognised\n", .{});
+        outcome.explain();
+    }
+    return outcome;
+}
+
+test "blackbox: the helper's start token does not race a command that has already exited" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_token");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // This is the whole difference between `weak` and `strong`, and it is an
+    // ordering fact rather than better code. `/bin/true` is gone before anyone
+    // could look at it; a shell reads `/proc/$!/stat` after it has already
+    // reaped the child and comes back empty, which for fast commands is the
+    // common case and not the corner. Here the parent owns the reap, so the
+    // child is still a zombie with a readable `/proc` entry.
+    const runs = 12;
+    const r = try runHelper(arena, &f, &.{"/bin/true"}, .{ .repeat = runs });
+
+    try t.expectEqual(@as(usize, runs), r.started.len);
+    try t.expectEqual(@as(usize, runs), r.exits.len);
+    for (r.started, 0..) |s, i| {
+        // Zero is the helper's "no token", so a single zero here would mean the
+        // race is still present and merely narrower.
+        std.testing.expect(s.token > 0) catch |err| {
+            std.debug.print("run {d} of {d} reported no start token\n", .{ i + 1, runs });
+            return err;
+        };
+        // `setsid` in the child, read back rather than assumed: this is what
+        // makes one `kill(-pgid, ...)` reach the whole tree.
+        try t.expectEqual(s.pid, s.pgid);
+    }
+    for (r.exits) |e| try t.expectEqual(HelperExit{ .how = .exited, .status = 0 }, e);
+}
+
+test "blackbox: the helper's streams carry a NUL and a forged exit marker unchanged" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_binary");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Shell mode annotates the stream with markers, so its output is a channel
+    // shared with its own control plane: a command that prints the attempt's
+    // marker line is writing into the parse. Framing with an exact length makes
+    // no byte special, and the forged marker below is the proof — it comes back
+    // verbatim *and* the status stays the command's own.
+    const r = try runHelper(arena, &f, &.{
+        "/bin/sh", "-c", "printf 'a\\000b__TERMINUS_EXIT_1__ code=9'",
+    }, .{});
+
+    try t.expectEqualSlices(u8, "a\x00b__TERMINUS_EXIT_1__ code=9", r.stdout);
+    try t.expectEqual(HelperExit{ .how = .exited, .status = 0 }, try r.one());
+}
+
+test "blackbox: the helper separates a signal from an exit code" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_signal");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `$?` folds this to 137 and no shell can unfold it. `waitid` reports
+    // `CLD_KILLED` and the number separately, so "killed by 9" and "exited 137"
+    // stay different events in the receipt.
+    const r = try runHelper(arena, &f, &.{ "/bin/sh", "-c", "kill -9 $$" }, .{});
+    try t.expectEqual(HelperExit{ .how = .signalled, .status = 9 }, try r.one());
+}
+
+test "blackbox: the helper tries TERM before KILL, and escalates only when it must" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_deadline");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Both statuses are asserted, and that is the point. `timed_out_killed`
+    // alone holds for either arm, so a helper that reached straight for KILL
+    // would pass a looser gate — and so would one that never escalated. The 15
+    // here and the 9 below pin the two arms against each other.
+    const polite = try runHelper(arena, &f, &.{ "/bin/sleep", "30" }, .{
+        .deadline_ms = 400,
+        .grace_ms = 200,
+    });
+    try t.expectEqual(
+        HelperExit{ .how = .timed_out_killed, .status = 15 },
+        try polite.one(),
+    );
+
+    const stubborn = try runHelper(arena, &f, &.{
+        "/bin/sh", "-c", "trap '' TERM; sleep 42",
+    }, .{ .deadline_ms = 400, .grace_ms = 300 });
+    try t.expectEqual(
+        HelperExit{ .how = .timed_out_killed, .status = 9 },
+        try stubborn.one(),
+    );
+
+    // A command that answers inside its deadline is not a timeout. Without this
+    // the two above would also pass a helper that timed everything out.
+    const prompt = try runHelper(arena, &f, &.{ "/bin/sh", "-c", "exit 5" }, .{
+        .deadline_ms = 5000,
+    });
+    try t.expectEqual(HelperExit{ .how = .exited, .status = 5 }, try prompt.one());
+}
+
+test "blackbox: the helper stops the process group, not just the shell it launched" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_group");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Three children that outlive the shell that started them — the shape
+    // `pid_proof = .weak` explicitly cannot handle, since a command that
+    // daemonizes or calls `disown` survives the pane that launched it.
+    // Signalling the pid would leave all three running.
+    //
+    // The three sleeps share the child's process group, and `kill -0 -<pgid>`
+    // succeeds while *any* process is still in it — so that is the claim itself,
+    // asked from outside the process making it. Counting `pgrep -fc 'sleep 41'`
+    // was the first version and it was wrong twice over: it matches on text, so
+    // it counted strays a previous run had leaked, and the pattern appears in
+    // the command line of the very shell doing the counting.
+    const r = try runHelper(arena, &f, &.{
+        "/bin/sh", "-c", "sleep 41 & sleep 41 & sleep 41 & wait",
+    }, .{ .deadline_ms = 400, .grace_ms = 200 });
+    const ended = try r.one();
+    try t.expectEqual(HelperHow.timed_out_killed, ended.how);
+    try t.expectEqual(@as(usize, 1), r.started.len);
+
+    const probe_script = try std.fmt.allocPrint(arena, "{s}/group_probe.sh", .{f.dir});
+    try std.Io.Dir.cwd().writeFile(f.io, .{
+        .sub_path = probe_script,
+        .data = try std.fmt.allocPrint(
+            arena,
+            "kill -0 -{d} 2>/dev/null; echo $?\n",
+            .{r.started[0].pgid},
+        ),
+    });
+    const survivors = try std.process.run(arena, f.io, .{
+        .argv = try linuxArgv(arena, f.dir, "group_probe.sh"),
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    // 1 is the shell's word for "that group is gone".
+    const answer = std.mem.trim(u8, survivors.stdout, " \r\n\t");
+    std.testing.expect(std.mem.eql(u8, answer, "1")) catch |err| {
+        std.debug.print(
+            "kill -0 -{d} answered '{s}', so something is still in the group\n",
+            .{ r.started[0].pgid, answer },
+        );
+        return err;
+    };
+}
+
+test "blackbox: a command the helper cannot start is the command's failure, not the helper's" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_execve");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 127 is the shell's own convention for a command that is not there, and
+    // the helper adopting it means a caller does not have to learn a second
+    // vocabulary for the same event. The second assertion is the one that
+    // matters: a supervisor reporting its *own* failure here would turn a
+    // missing binary into an unusable channel.
+    const r = try runHelper(arena, &f, &.{"/nonexistent/thing"}, .{});
+    try t.expectEqual(HelperExit{ .how = .exited, .status = 127 }, try r.one());
+    try t.expect(r.failed == null);
+}
+
+test "blackbox: the helper reassembles output larger than its own read buffer, in order" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_frames");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Past the helper's 32 KiB read buffer, so this really is several frames
+    // rather than one. Framing that lost a boundary shows up here as a
+    // duplicated or missing chunk rather than as a wrong total.
+    const lines = 12000;
+    const r = try runHelper(arena, &f, &.{
+        "/bin/sh", "-c", "i=0; while [ $i -lt 12000 ]; do printf '%s\\n' $i; i=$((i+1)); done",
+    }, .{});
+    try t.expectEqual(HelperExit{ .how = .exited, .status = 0 }, try r.one());
+    try t.expect(r.stdout.len > 32 * 1024);
+
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, r.stdout, "\n"), '\n');
+    var expect_next: usize = 0;
+    while (it.next()) |line| : (expect_next += 1) {
+        const got = std.fmt.parseInt(usize, line, 10) catch {
+            std.debug.print("line {d} was not a number: '{s}'\n", .{ expect_next, line });
+            return error.FrameBoundaryCorruptedALine;
+        };
+        if (got != expect_next) {
+            std.debug.print("expected {d}, got {d}\n", .{ expect_next, got });
+            return error.FramesArrivedOutOfOrder;
+        }
+    }
+    try t.expectEqual(@as(usize, lines), expect_next);
+}
+
+test "blackbox: the start token the helper reports is the child's, not its own" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_token_owner");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The gate above establishes that a token arrives. It does not establish
+    // whose it is — a helper reading `/proc/self/stat` would report its own
+    // start time, which is nonzero and passes that gate while being exactly the
+    // defect `pid_proof = .weak` describes: `wrapShell` reports `$$`, the
+    // wrapper's pid, and so vouches for the wrong process.
+    //
+    // So the child is asked to state its own start time and the two are
+    // compared. `$$` is expanded by the `sh` the helper exec'd — that process
+    // *is* the child — before `awk` ever runs, and a start time survives an
+    // `exec`, so this is the child's own answer about itself.
+    //
+    // The delay is what gives the comparison any power. `/proc` start times are
+    // in clock ticks of 10 ms, and a fork takes microseconds, so without it the
+    // helper and its child share a tick and their values are *equal* — a helper
+    // reporting its own start time would pass. Holding the request back 400 ms
+    // puts forty ticks between them. The mutation that reports the supervisor's
+    // own time survived this gate until the delay was added.
+    const r = try runHelper(arena, &f, &.{
+        "/bin/sh", "-c", "awk '{print $22}' /proc/$$/stat",
+    }, .{ .delay_request_ms = 400 });
+    try t.expectEqual(HelperExit{ .how = .exited, .status = 0 }, try r.one());
+    try t.expectEqual(@as(usize, 1), r.started.len);
+
+    const said = std.mem.trim(u8, r.stdout, " \r\n\t");
+    const child_says = std.fmt.parseInt(u64, said, 10) catch {
+        std.debug.print("the child did not report a start time: '{s}'\n", .{said});
+        return error.ChildReportedNoStartTime;
+    };
+    try t.expect(child_says > 0);
+    std.testing.expectEqual(child_says, r.started[0].token) catch |err| {
+        std.debug.print(
+            "the helper vouched for start time {d} while the child's own is {d}\n",
+            .{ r.started[0].token, child_says },
+        );
+        return err;
+    };
+}
+
+test "blackbox: a grandchild holding the pipe open does not stall the helper" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_linger");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `cmd &` then exit. The grandchild inherits stdout, so the write end stays
+    // open after the command itself is gone — and waiting for that pipe to close
+    // is waiting on a process the helper never supervised, with no bound at all.
+    // `nohup cmd &` is an ordinary thing to write, not a corner.
+    //
+    // The first version of this helper had two unbounded waits on exactly this
+    // shape: a blocking drain loop after the poll, and a blocking `waitid`. A
+    // supervisor that never answers is worse than one that answers badly, since
+    // the caller's channel stays open and the ledger gets nothing.
+    const started_at = std.Io.Timestamp.now(f.io, .awake);
+    const r = try runHelper(arena, &f, &.{ "/bin/sh", "-c", "sleep 25 & exit 0" }, .{});
+    const elapsed = @divTrunc(
+        started_at.durationTo(std.Io.Timestamp.now(f.io, .awake)).nanoseconds,
+        std.time.ns_per_ms,
+    );
+
+    try t.expectEqual(HelperExit{ .how = .exited, .status = 0 }, try r.one());
+
+    // Well under the grandchild's 25 s, and far above anything the command
+    // itself costs, so this fails on an unbounded wait without being sensitive
+    // to a slow machine.
+    std.testing.expect(elapsed < 8000) catch |err| {
+        std.debug.print(
+            "the helper took {d} ms to answer a command that exited immediately\n",
+            .{elapsed},
+        );
+        return err;
+    };
+}

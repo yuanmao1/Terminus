@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // All of libssh2 except the crypto backends, which crypto.c #includes
 // based on the LIBSSH2_* backend macro.
@@ -107,6 +108,18 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("terminus_skill", .{
         .root_source_file = b.path("skill/SKILL.md"),
     });
+    // The version origin, wired in the same way and for the same reason.
+    //
+    // `npm publish` reads the version out of this manifest and there is no way
+    // to make it read a Zig constant, so the manifest is the origin and the
+    // binary derives from it — see `version_string` in `src/cli/dispatch.zig`,
+    // which used to hand-write the same number twice. Passed as an embedded file
+    // rather than as a build option so the *file* is the single source: an option
+    // would put a second copy of the number here, in the one place a reader
+    // editing the manifest would never think to look.
+    mod.addAnonymousImport("terminus_package_json", .{
+        .root_source_file = b.path("npm/package.json"),
+    });
 
     const exe = b.addExecutable(.{
         .name = "Terminus",
@@ -164,6 +177,65 @@ pub fn build(b: *std.Build) void {
     // `sh` is kept so the gates fail with an explanation rather than the build
     // failing here with a different one — see `runPosixShell` in
     // test/blackbox.zig.
+    // The remote supervisor helper: a Linux binary that runs one command on the
+    // far side and reports on it with syscall results instead of parsed text.
+    // Cross-compiled from this tree rather than vendored, so the bytes that
+    // would be pushed to somebody's server are built at this commit.
+    //
+    // Static musl, because the destination's libc is not ours to assume and a
+    // supervisor that fails to start on a glibc version reports nothing at all.
+    // `ReleaseSmall` and not `ReleaseFast`: it is meant to be embedded in the
+    // CLI and sent over a network, and it spends its life blocked in `poll`.
+    // The difference is three orders of magnitude — ~11 KB against ~3.4 MB —
+    // which is what makes embedding it free.
+    //
+    // Not installed: nothing consumes it yet beyond the gates below, and
+    // dropping a Linux binary into `zig-out/bin` next to the Windows one would
+    // only invite someone to ship it.
+    const helper = b.addExecutable(.{
+        .name = "terminus-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/helper/main.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .x86_64,
+                .os_tag = .linux,
+                .abi = .musl,
+            }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+
+    // How to reach a Linux kernel from here: the `wsl.exe` to run and its
+    // flags, as a Windows command. Empty means the build host is itself Linux
+    // and the helper runs directly.
+    //
+    // The same reasoning as `posix-sh` above, one step further: those gates need
+    // a POSIX *shell*, and Git for Windows supplies one — but `sh.exe` is not a
+    // Linux kernel. It has no `/proc`, no real process groups and no real
+    // signals, so it cannot exercise the four things the helper exists to prove.
+    // WSL can.
+    //
+    // It is launched *through* `posix_sh` rather than directly, and that is not
+    // a stylistic choice: `wsl.exe` refuses to run at all when spawned by
+    // `std.process.spawn`, with `Wsl/Service/0x8007072c`
+    // (`RPC_X_SS_HANDLES_MISMATCH`). See `linuxArgv` in test/blackbox.zig for
+    // the evidence and the reason.
+    //
+    // If it is absent the literal is kept so the gates fail naming what is
+    // missing, rather than the build failing here with something less useful. A
+    // machine that cannot run a Linux binary cannot verify the Linux supervisor,
+    // and skipping the gates there would leave the capability claimed and
+    // unproven — which is the nominal support the release rules forbid.
+    const linux_runner = b.option(
+        []const u8,
+        "linux-runner",
+        "Windows command that runs a Linux program, e.g. `C:\\Windows\\System32\\wsl.exe -e` (default: discovered `wsl.exe`; empty on a Linux host)",
+    ) orelse if (builtin.os.tag == .windows)
+        b.fmt("{s} -e", .{b.findProgram(&.{"wsl"}, &.{"C:\\Windows\\System32"}) catch
+            "C:\\Windows\\System32\\wsl.exe"})
+    else
+        "";
+
     const posix_sh = b.option(
         []const u8,
         "posix-sh",
@@ -178,6 +250,14 @@ pub fn build(b: *std.Build) void {
     // A plain string, not a path: `addOptionPath` would resolve it against the
     // build root and defeat the PATH lookup the default relies on.
     blackbox_options.addOption([]const u8, "posix_sh", posix_sh);
+    blackbox_options.addOptionPath("helper_exe", helper.getEmittedBin());
+    blackbox_options.addOption([]const u8, "linux_runner", linux_runner);
+    // The helper gates hand a Linux process a path to a file they just wrote, so
+    // that path has to be absolute. Zig 0.16 has no `getCwd`-style call to build
+    // one at test time, and relying on the runner translating an inherited
+    // working directory would make the gates depend on something invisible from
+    // the test — so the build states it.
+    blackbox_options.addOption([]const u8, "build_root", b.build_root.path orelse ".");
 
     const blackbox_tests = b.addTest(.{
         .root_module = b.createModule(.{

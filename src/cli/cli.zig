@@ -1400,10 +1400,15 @@ pub const Target = struct {
 
 /// Resolves a server row plus its auth material, ready for Ssh.connect.
 /// Fatals with a user-oriented message on any misconfiguration.
+///
+/// Also arms the trust root every dial from here on is checked against — see
+/// `trust_source`. This is the right place for it because it is the only place:
+/// a command that dials has to come through here for the private key.
 pub fn resolveServer(ctx: *Ctx, store: *Store, name: []const u8) struct {
     server: Store.servers.Server,
     auth: Ssh.Auth,
 } {
+    trust_source = .{ .store = store, .arena = ctx.arena };
     const server = (Store.servers.getByName(store, ctx.arena, name) catch |err|
         storeFatal(store, err)) orelse fail("unknown server '{s}'", .{name});
     const key_name = server.key orelse
@@ -1452,6 +1457,230 @@ fn connectFatal(reporting_claim: bool, comptime fmt: []const u8, args: anytype) 
     fail(fmt, args);
 }
 
+// --- the trust root ----------------------------------------------------------
+//
+// Every connection is checked against a pin recorded for the host it dials.
+// `Ssh.connect` does the comparison and refuses before it returns a session;
+// what lives here is the store lookup it is handed, and the sentence an
+// operator gets when the answer is no.
+//
+// **Explicit pin is the default and there is no way to turn the check off.**
+// The only thing that widens it is `Pins.trust_on_first_use`, which one command
+// sets by name — `terminus server pin --trust-on-first-use` — and which is
+// never derived from a host having no pin, because that is the state an
+// attacker arranges.
+
+/// Where `sshOpen` reads host key pins from, and the arena those reads land on.
+///
+/// Module state rather than a parameter on the four connect entry points, and
+/// the reason is a file boundary rather than taste: those entry points are
+/// called from ten command modules, and `sshConnect` takes no context at all,
+/// so threading a store through would change signatures in files this change
+/// must not touch.
+///
+/// What keeps it honest is the direction of the failure. With nothing set,
+/// `pinLookup` hands `Ssh.connect` a `.none` trust root and the dial is refused
+/// before a socket opens. So a dial path that skipped `resolveServer` cannot
+/// connect at all — it cannot connect *unchecked*, which is the property that
+/// matters. Single-threaded CLI, like `active_ctx` above.
+var trust_source: ?struct { store: *Store, arena: std.mem.Allocator } = null;
+
+/// The `Ssh.TrustRoot.pins` lookup, over `host_pins`.
+///
+/// Holds what it answered, because the refusal has to name it: a mismatch that
+/// prints only the presented key tells an operator half of what they need to
+/// decide whether their host was rebuilt or is being impersonated. Kept from
+/// the lookup itself rather than queried a second time, so the sentence
+/// describes the row the decision was actually made against.
+pub const PinLookup = struct {
+    source: ?@TypeOf(trust_source.?),
+    host: []const u8,
+    port: u16,
+    /// The fingerprint the lookup answered with, when it found one.
+    answered: ?[]const u8 = null,
+    /// Why the lookup could not answer at all. Kept apart from having found
+    /// nothing: sending an operator to record a pin they already recorded,
+    /// because sqlite failed, is the wrong instruction.
+    store_error: ?[]const u8 = null,
+
+    /// Answers with what is recorded for `key_type`, and nothing else.
+    ///
+    /// A store failure answers `null`, which refuses the connection. That is
+    /// the only safe direction — "the pin table could not be read" and "this
+    /// key is authorised" are not interchangeable — and the reason is kept so
+    /// the refusal can say which of the two happened.
+    fn recorded(context: *anyopaque, key_type: []const u8) ?[]const u8 {
+        const self: *PinLookup = @ptrCast(@alignCast(context));
+        const source = self.source.?;
+        const pin = Store.host_pins.active(source.store, source.arena, self.host, self.port, key_type) catch |err| {
+            self.store_error = @errorName(err);
+            return null;
+        };
+        self.answered = (pin orelse return null).fingerprint_sha256;
+        return self.answered;
+    }
+
+    pub fn trustRoot(self: *PinLookup, trust_on_first_use: bool) Ssh.TrustRoot {
+        if (self.source == null) return .none;
+        return .{ .pins = .{
+            .context = self,
+            .recorded = recorded,
+            .trust_on_first_use = trust_on_first_use,
+        } };
+    }
+};
+
+/// A lookup over a store named outright.
+///
+/// `pub`, and it takes its store as a parameter, because the decision layer is
+/// the half of host key checking a test can actually reach: there is no server
+/// in this repository to hand a real handshake to, so the gates drive *this*
+/// lookup against real sqlite rather than a copy of it that could drift.
+pub fn pinsOf(store: *Store, arena: std.mem.Allocator, host: []const u8, port: u16) PinLookup {
+    return .{ .source = .{ .store = store, .arena = arena }, .host = host, .port = port };
+}
+
+fn pinLookup(server: Store.servers.Server) PinLookup {
+    const source = trust_source orelse
+        return .{ .source = null, .host = server.host, .port = server.port };
+    return pinsOf(source.store, source.arena, server.host, server.port);
+}
+
+/// The facts a host key refusal is worded from.
+pub const HostKeyRefusal = struct {
+    server: []const u8,
+    host: []const u8,
+    port: u16,
+    /// What the far side presented, when the handshake got far enough to read a
+    /// key. Absent when nothing was dialled.
+    observed: ?Ssh.HostKey = null,
+    /// The fingerprint the store held for that key type, when there was one.
+    recorded: ?[]const u8 = null,
+    /// Set when the pin table could not be read.
+    store_error: ?[]const u8 = null,
+};
+
+/// What a host key refusal tells the operator, or null when `err` is not one.
+///
+/// Its own function, and public, so a gate can read the sentence rather than
+/// the code. This is the refusal **every existing store hits on its first
+/// command after this build**: nothing before now recorded a host key anywhere,
+/// so no store has a pin, and there is no observation in any of them a
+/// migration could have promoted into one. That makes this text the whole of
+/// the transition — a refusal that does not name the command which clears it is
+/// a wall rather than a boundary.
+///
+/// The presented fingerprint is shown but is deliberately **not** offered as
+/// the value to paste after `--fingerprint`. Pasting back the key we have just
+/// been handed is trust-on-first-use, and it would land in the ledger as
+/// `explicit_pin` — a row claiming somebody checked something nobody checked.
+/// The two ways forward are named as the two different things they are.
+pub fn hostKeyRefusalText(
+    arena: std.mem.Allocator,
+    err: anyerror,
+    r: HostKeyRefusal,
+) std.mem.Allocator.Error!?[]const u8 {
+    const presented: []const u8 = if (r.observed) |k| k.text() else "nothing readable";
+    const key_type: []const u8 = if (r.observed) |k| k.key_type else "";
+    return switch (err) {
+        error.HostKeyMismatch => try std.fmt.allocPrint(arena,
+            \\refused: the host key for server '{s}' ({s}:{d}) is not the one pinned for it, and nothing was sent.
+            \\  pinned:    {s}
+            \\  presented: {s}  ({s})
+            \\Either the host was rebuilt, or something is answering for it — and this command will not
+            \\decide which. Check the fingerprint out of band ('ssh-keyscan -t {s} {s}'), and only if it
+            \\matches what the host really has, record the change deliberately:
+            \\  terminus server pin {s} --rotate --key-type {s} --fingerprint <the-verified-fingerprint>
+            \\If it does not match, the pin is doing its job and the answer is not to rotate it.
+        , .{
+            r.server,                                                                      r.host,    r.port,
+            r.recorded orelse "(the pin was there and its fingerprint could not be read)", presented, key_type,
+            key_type,                                                                      r.host,    r.server,
+            key_type,
+        }),
+        error.HostKeyNotPinned => if (r.store_error) |detail| try std.fmt.allocPrint(arena,
+            \\refused: the host key pins for '{s}' ({s}:{d}) could not be read ({s}), so nothing could
+            \\authorise the key it presented and no session was opened. This is a database failure and not
+            \\a missing pin — recording one again would not fix it.
+        , .{ r.server, r.host, r.port, detail }) else try std.fmt.allocPrint(arena,
+            \\refused: no host key is pinned for server '{s}' ({s}:{d}), so nothing vouches for the key it
+            \\presented and no session was opened. It presented a {s} key with fingerprint {s}.
+            \\Record a pin once and this server works from then on. Two ways, and they are not the same:
+            \\  terminus server pin {s} --key-type {s} --fingerprint <fingerprint>
+            \\      the strong one. Get the fingerprint from somewhere that is not this connection —
+            \\      'ssh-keyscan -t {s} {s}' run from a machine you trust, or the host's own records.
+            \\  terminus server pin {s} --trust-on-first-use
+            \\      records whatever answers now, checked against nothing. It protects every connection
+            \\      after this one and says so in the ledger.
+        , .{
+            r.server,  r.host,   r.port,   key_type,
+            presented, r.server, key_type, key_type,
+            r.host,    r.server,
+        }),
+        error.HostKeyUnreadable => try std.fmt.allocPrint(arena,
+            \\refused: the handshake with {s}:{d} completed and its host key could not be identified —
+            \\libssh2 offered no key, or one of a type this build has no name for. A key that cannot be
+            \\named cannot be pinned, so no session was opened.
+        , .{ r.host, r.port }),
+        error.NoTrustRoot => try std.fmt.allocPrint(arena,
+            \\refused: no trust store was open when a connection to {s}:{d} was attempted, so there was
+            \\nothing to check its host key against and nothing was dialled.
+        , .{ r.host, r.port }),
+        else => null,
+    };
+}
+
+fn hostKeyRefusal(lookup: *const PinLookup, server: Store.servers.Server, err: anyerror, observed: ?Ssh.HostKey) ?[]const u8 {
+    const arena = if (lookup.source) |s| s.arena else if (active_ctx) |c| c.arena else return null;
+    return hostKeyRefusalText(arena, err, .{
+        .server = server.name,
+        .host = server.host,
+        .port = server.port,
+        .observed = observed,
+        .recorded = lookup.answered,
+        .store_error = lookup.store_error,
+    }) catch "refused over the host key, and the sentence explaining it could not be allocated";
+}
+
+/// What `server pin --trust-on-first-use` found.
+pub const FirstUse = union(enum) {
+    /// Nothing was recorded for this key type and this is what the host proved
+    /// it holds. Recording it is the caller's next step, and it is a separate
+    /// one so "we just trusted something new" is always a deliberate line.
+    observed: Ssh.HostKey,
+    /// A pin already authorises this endpoint for that key type and it matched.
+    /// There is nothing to record.
+    already_pinned: Ssh.HostKey,
+    /// The dial or the check refused, and this is the sentence.
+    refused: []const u8,
+};
+
+/// Completes a handshake for the sole purpose of reading the host key.
+///
+/// **It does not authenticate, and that is not an omission.** The far side
+/// proves it holds the private half of the key it presents, which is what makes
+/// the fingerprint worth recording; a successful login proves nothing further,
+/// because a machine in the path terminating the connection can answer "auth
+/// ok" without checking anything. So this reads the key and hangs up, and the
+/// record it produces says `first_use` — which is exactly as much as a first
+/// connection can establish.
+pub fn observeHostKey(store: *Store, arena: std.mem.Allocator, server: Store.servers.Server) FirstUse {
+    trust_source = .{ .store = store, .arena = arena };
+    var lookup = pinLookup(server);
+    var observed: ?Ssh.HostKey = null;
+    var client = Ssh.connect(server.host, server.port, lookup.trustRoot(true), &observed) catch |err| {
+        return .{ .refused = hostKeyRefusal(&lookup, server, err, observed) orelse
+            std.fmt.allocPrint(arena, "cannot connect to {s}:{d}: {s} ({s})", .{
+                server.host, server.port, @errorName(err), Ssh.lastConnectError(),
+            }) catch "cannot connect, and the sentence explaining it could not be allocated" };
+    };
+    client.deinit();
+    // The lookup answered only if a pin was there, so this needs no second
+    // query and cannot disagree with the decision that was actually made.
+    if (lookup.answered != null) return .{ .already_pinned = observed.? };
+    return .{ .observed = observed.? };
+}
+
 /// Connect + authenticate, with user-oriented fatal messages.
 pub fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh {
     return sshOpen(server, auth, .fatal).?;
@@ -1459,20 +1688,34 @@ pub fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh {
 
 fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFailure) ?Ssh {
     const reporting_claim = on_failure == .fatal_reporting_claim;
-    var client = Ssh.connect(server.host, server.port) catch |err| switch (on_failure) {
-        // Reported rather than swallowed, and reported as its own kind of
-        // failure: "we never reached the host" and "the host turned us away"
-        // send the caller to different places, and an optional probe that
-        // returns a bare null tells them neither.
-        .report_and_continue => {
-            std.debug.print("terminus: could not reach {s}:{d} ({s}); continuing without it\n", .{
-                server.host, server.port, @errorName(err),
-            });
-            return null;
-        },
-        .fatal, .fatal_reporting_claim => connectFatal(reporting_claim, "cannot connect to {s}:{d}: {s} ({s})", .{
-            server.host, server.port, @errorName(err), Ssh.lastConnectError(),
-        }),
+    var lookup = pinLookup(server);
+    var observed: ?Ssh.HostKey = null;
+    var client = Ssh.connect(server.host, server.port, lookup.trustRoot(false), &observed) catch |err| {
+        // The host key refusals get their own sentence, and they are checked
+        // for first: a mismatch reported as "could not reach" would send an
+        // operator to look at the network for a key that was rejected.
+        if (hostKeyRefusal(&lookup, server, err, observed)) |sentence| switch (on_failure) {
+            .report_and_continue => {
+                std.debug.print("terminus: {s}\n", .{sentence});
+                return null;
+            },
+            .fatal, .fatal_reporting_claim => connectFatal(reporting_claim, "{s}", .{sentence}),
+        };
+        switch (on_failure) {
+            // Reported rather than swallowed, and reported as its own kind of
+            // failure: "we never reached the host" and "the host turned us away"
+            // send the caller to different places, and an optional probe that
+            // returns a bare null tells them neither.
+            .report_and_continue => {
+                std.debug.print("terminus: could not reach {s}:{d} ({s}); continuing without it\n", .{
+                    server.host, server.port, @errorName(err),
+                });
+                return null;
+            },
+            .fatal, .fatal_reporting_claim => connectFatal(reporting_claim, "cannot connect to {s}:{d}: {s} ({s})", .{
+                server.host, server.port, @errorName(err), Ssh.lastConnectError(),
+            }),
+        }
     };
     client.authenticate(server.username, auth) catch |err| {
         if (on_failure == .report_and_continue) {
@@ -1586,6 +1829,18 @@ pub fn connectReportingClaim(
 /// the input, not for the transport, so the transport is the thing that gives
 /// way — and which one carried it is reported either way, in `transport` and in
 /// the note below.
+///
+/// **The host key pin is not one of these reasons, and it is worth saying why
+/// not.** The daemon opens its own SSH session and has no trust store to check
+/// it against, so `Ssh.connect` refuses it one (`DaemonServer.connectFor`) —
+/// the refusal arrives from the daemon, by name, with the flag that clears it.
+/// Refusing the transport *here* instead would read better and cannot be done:
+/// the daemon socket is the only way anything in this tree can put a scripted
+/// host in front of the real binary (`test/blackbox.zig`'s `FakeHost`; a direct
+/// SSH connection needs a listening server and a real key, which `zig build
+/// test` has neither of), so a CLI that never dials the daemon is a CLI whose
+/// remote behaviour has thirty-five fewer gates on it. The pin belongs in the
+/// request; that is a wire change, and it is the one thing still owed here.
 fn daemonCannotCarry(parsed: *const Args.Parsed) ?[]const u8 {
     if (parsed.flag("stdin-file") != null)
         return "the daemon protocol has no channel for --stdin-file input; used direct SSH";
@@ -2604,4 +2859,5 @@ test "gate: the answer-dropping release has one caller, and it has already publi
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("host_key_test.zig");
 }

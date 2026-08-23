@@ -236,7 +236,7 @@ fn handleConnection(
 
         var retained: Ssh.Retained = .{};
         const result = execRequest(io, arena, request, &retained) catch |err| {
-            try respondError(&writer.interface, @errorName(err));
+            try respondError(&writer.interface, refusalText(err));
             continue;
         };
 
@@ -261,6 +261,24 @@ fn handleConnection(
 /// signature says which layer each failure came from.
 pub const RunError = Ssh.ExecError || Ssh.InputError || Ssh.ConnectError ||
     Ssh.AuthError || error{AuthMissing};
+
+/// `@errorName`, except for the one refusal whose name alone would send an
+/// operator looking for a network fault that is not there.
+///
+/// Any local process can write to this socket, so the refusal has to be
+/// legible on its own — it is not only the CLI that reads it, and the CLI
+/// does not dial the daemon for an exec at all while this holds.
+pub fn refusalText(err: RunError) []const u8 {
+    return switch (err) {
+        error.NoTrustRoot =>
+        \\the daemon has no trust store to check a host key against, so it will not open an SSH session.
+        \\Its protocol carries auth material in every request precisely so it never touches the database,
+        \\which is also why it cannot read the pin that authorises a host. Rerun with --no-daemon (or set
+        \\TERMINUS_NO_DAEMON=1) and the direct transport will check the pin and connect.
+        ,
+        else => @errorName(err),
+    };
+}
 
 /// Runs one exec, preferring the pooled connection. If another thread
 /// holds it (a long-running command), dial a fresh one-shot connection
@@ -336,7 +354,20 @@ fn acquirePooledLocked(request: protocol.Request) !*Ssh {
 }
 
 fn connectFor(request: protocol.Request) !Ssh {
-    var client = try Ssh.connect(request.host, request.port);
+    // `.none`, and not a policy this process could satisfy. The daemon has no
+    // trust store: its protocol carries auth material in every request
+    // precisely so it never touches sqlite, so there is no `host_pins` row it
+    // can read and nothing it could check this host's key against. Opening the
+    // default database instead would be worse than refusing — a CLI running
+    // against `--db <other>` would have its connections authorised by a trust
+    // root the operator never recorded a pin in.
+    //
+    // So `Ssh.connect` refuses before it dials, and the CLI does not offer this
+    // transport at all (`Cli.daemonCannotCarry`). Restoring the pooled
+    // connection means the request carrying the expected fingerprint, which is
+    // a change to the wire format in `protocol.zig`.
+    var observed: ?Ssh.HostKey = null;
+    var client = try Ssh.connect(request.host, request.port, .none, &observed);
     errdefer client.deinit();
     const auth: Ssh.Auth = switch (request.auth) {
         .none => return error.AuthMissing,

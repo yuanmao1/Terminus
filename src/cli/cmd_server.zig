@@ -31,6 +31,18 @@ const usage =
     \\  server ls     [--json]
     \\  server show   <name> [--json]
     \\  server ping   <name> [--json]     connect+auth check, ~1 round trip
+    \\  server pin    <name> [--json]     what this machine trusts for the host
+    \\                <name> --key-type <t> --fingerprint <fp>
+    \\                       record a pin you checked somewhere other than this
+    \\                       connection. Every later connection is compared to it.
+    \\                <name> --trust-on-first-use
+    \\                       connect once and record whatever answers. Protects
+    \\                       every connection after this one, and nothing else.
+    \\                <name> --rotate --key-type <t> --fingerprint <fp> [--reason ...]
+    \\                       the host's key really changed. The new fingerprint is
+    \\                       required: this command does not decide what to trust.
+    \\                <name> --revoke --key-type <t> [--reason ...]
+    \\                       stop trusting a key without naming a replacement.
     \\  server rename <old-name> <new-name>
     \\  server set    <name> [--host H] [--port P] [--user U] [--key K] [--note ...]
     \\  server rm     <name> [--force]
@@ -133,6 +145,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             }),
             .human => try ctx.out.print("'{s}' is reachable ({d} ms via {s})\n", .{ name, ms, conn.transport }),
         }
+    } else if (std.mem.eql(u8, verb, "pin")) {
+        try runPin(ctx, &store, &parsed);
     } else if (std.mem.eql(u8, verb, "rename")) {
         const old_name = parsed.positional(0) orelse fatal("{s}", .{usage});
         const new_name = parsed.positional(1) orelse fatal("{s}", .{usage});
@@ -228,6 +242,471 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     } else {
         fatal("unknown verb 'server {s}'\n{s}", .{ verb, usage });
     }
+}
+
+// --- `server pin` -------------------------------------------------------------
+//
+// The operator's whole interface to the trust root. Four verbs share one
+// command because they are four answers to one question — what does this
+// machine trust for this host — and because the contract they implement is one
+// sentence per flag:
+//
+//   * an explicit pin is the default, and `--fingerprint` is how it arrives;
+//   * trust-on-first-use is never implied, so it has its own flag and its own
+//     `trust_source` in the ledger;
+//   * rotation needs the new fingerprint supplied, so `--rotate` without one is
+//     refused rather than filled in from whatever the host is offering today;
+//   * a key can be stopped without a replacement, which is `--revoke`.
+//
+// With no flags it prints, and printing is the only one of the five with no
+// effect at all — which is why it is the default rather than something an
+// operator has to remember a subcommand for.
+//
+// A pin is keyed on `(host, port, key_type)` and a server row names a host and
+// a port, so two servers on one box share a pin and a server whose address is
+// changed has none at the new one. See `host_pins.zig`'s header.
+
+/// A pin identified the way the schema keys one, with the fingerprint that goes
+/// in it.
+const Keyed = struct {
+    key_type: []const u8,
+    fingerprint: []const u8,
+};
+
+/// What `server pin`'s flags asked for.
+const PinPlan = union(enum) {
+    /// No flags: print what is recorded, change nothing.
+    show,
+    /// Record a pin for a key type that has none.
+    record: Keyed,
+    /// Replace the active pin, keeping the old row as evidence.
+    rotate: Keyed,
+    /// Stop trusting the active pin without naming a replacement.
+    revoke: []const u8,
+    /// Connect once and record whatever answers.
+    first_use,
+};
+
+/// Every way the flags can fail to describe one of the five plans.
+///
+/// Named members rather than a message, so `pinPlanRefusal` is total over them
+/// and the gate below can walk the set: a seventh way to ask for something
+/// impossible cannot be added without a sentence for it.
+const PinPlanError = error{
+    /// More than one of `--trust-on-first-use` / `--rotate` / `--revoke`, or a
+    /// fingerprint handed to one of the two that does not take one.
+    ConflictingModes,
+    /// `--rotate` with no `--fingerprint`. The contract's third rule: "the key
+    /// changed, record the new one" is not something this decides.
+    RotationNeedsAFingerprint,
+    /// `--revoke` with no `--key-type`. A host can have several pins and this
+    /// will not guess which one to withdraw.
+    RevocationNeedsAKeyType,
+    /// A fingerprint with nothing saying which key it belongs to. The schema
+    /// keys on the type, so a pin without one has no address.
+    FingerprintNeedsAKeyType,
+    /// A key type on its own, which describes no action.
+    KeyTypeNeedsAFingerprint,
+    /// A fingerprint that could never match anything this build computes — an
+    /// MD5 one, a bare hex digest, a padded base64 one. Refused here rather
+    /// than stored, because stored it would refuse every connection to the host
+    /// for ever and report a key mismatch while doing it.
+    FingerprintNotCanonical,
+};
+
+/// The flags, as a plan or as the reason there is none.
+///
+/// A pure function over the five inputs, so the whole of this command's
+/// argument contract is drivable from a gate without a process, a store or a
+/// host. `run` does the parsing and the wording; this does the deciding.
+fn pinPlan(opts: struct {
+    key_type: ?[]const u8,
+    fingerprint: ?[]const u8,
+    trust_on_first_use: bool,
+    rotate: bool,
+    revoke: bool,
+}) PinPlanError!PinPlan {
+    const modes = @as(u8, @intFromBool(opts.trust_on_first_use)) +
+        @intFromBool(opts.rotate) + @intFromBool(opts.revoke);
+    if (modes > 1) return error.ConflictingModes;
+
+    if (opts.fingerprint) |fp| {
+        if (opts.trust_on_first_use or opts.revoke) return error.ConflictingModes;
+        if (!Core.Ssh.isCanonicalFingerprint(fp)) return error.FingerprintNotCanonical;
+        const key_type = opts.key_type orelse return error.FingerprintNeedsAKeyType;
+        const keyed: Keyed = .{ .key_type = key_type, .fingerprint = fp };
+        return if (opts.rotate) .{ .rotate = keyed } else .{ .record = keyed };
+    }
+
+    if (opts.rotate) return error.RotationNeedsAFingerprint;
+    if (opts.revoke) return .{ .revoke = opts.key_type orelse return error.RevocationNeedsAKeyType };
+    if (opts.trust_on_first_use) return .first_use;
+    if (opts.key_type != null) return error.KeyTypeNeedsAFingerprint;
+    return .show;
+}
+
+/// One sentence per refusal, and each one names the flag that fixes it.
+fn pinPlanRefusal(err: PinPlanError) []const u8 {
+    return switch (err) {
+        error.ConflictingModes => "--trust-on-first-use, --rotate and --revoke are three different answers and only one may be given; " ++
+            "--trust-on-first-use and --revoke take no --fingerprint",
+        error.RotationNeedsAFingerprint => "--rotate needs the new fingerprint: 'server pin <name> --rotate --key-type <t> --fingerprint <fp>'. " ++
+            "Recording whatever the host is offering today would make the tool decide what to trust, which is " ++
+            "exactly what a pin exists to stop",
+        error.RevocationNeedsAKeyType => "--revoke needs --key-type: a host can have a pin per key type and this will not guess which one to withdraw. " ++
+            "'server pin <name>' lists them",
+        error.FingerprintNeedsAKeyType => "--fingerprint needs --key-type (ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256, ...): a pin is keyed on the " ++
+            "key's type as well as the host, so without one it has no address",
+        error.KeyTypeNeedsAFingerprint => "--key-type on its own describes no action; add --fingerprint <fp> to record one, --revoke to withdraw one, " ++
+            "or drop it to list what is recorded",
+        error.FingerprintNotCanonical => "--fingerprint was not given a fingerprint this build can ever match. It must be exactly what " ++
+            "'ssh-keyscan' prints: 'SHA256:' followed by 43 unpadded base64 characters. Stored as given it would " ++
+            "refuse every connection to the host and report a key mismatch while doing it",
+    };
+}
+
+fn runPin(ctx: *Cli.Ctx, store: *Store, parsed: *const Cli.Args.Parsed) !void {
+    const name = parsed.positional(0) orelse fatal("{s}", .{usage});
+    const server = (Store.servers.getByName(store, ctx.arena, name) catch |err|
+        Cli.storeFatal(store, err)) orelse fatal("unknown server '{s}'", .{name});
+
+    const plan = pinPlan(.{
+        .key_type = parsed.flag("key-type"),
+        .fingerprint = parsed.flag("fingerprint"),
+        .trust_on_first_use = parsed.boolean("trust-on-first-use"),
+        .rotate = parsed.boolean("rotate"),
+        .revoke = parsed.boolean("revoke"),
+    }) catch |err| fatal("{s}", .{pinPlanRefusal(err)});
+
+    const reason = parsed.flag("reason");
+    switch (plan) {
+        .show => {
+            const pins = Store.host_pins.forEndpoint(store, ctx.arena, server.host, server.port) catch |err|
+                Cli.storeFatal(store, err);
+            try reportPins(ctx.out, name, server.host, server.port, pins);
+        },
+        .record => |keyed| {
+            _ = Store.host_pins.record(store, .{
+                .host = server.host,
+                .port = server.port,
+                .key_type = keyed.key_type,
+                .fingerprint_sha256 = keyed.fingerprint,
+                .trust_source = .explicit_pin,
+                .note = parsed.flag("note"),
+                .now = ctx.now,
+            }) catch |err| switch (err) {
+                // The schema's partial unique index, not a race: one active pin
+                // per (host, port, key type). Replacing it is a rotation, which
+                // says so out loud and keeps the old row.
+                error.Constraint => fatal(
+                    "a {s} pin is already active for {s}:{d}. If the host's key really changed, " ++
+                        "record it deliberately: 'terminus server pin {s} --rotate --key-type {s} --fingerprint <fp>'",
+                    .{ keyed.key_type, server.host, server.port, name, keyed.key_type },
+                ),
+                else => Cli.storeFatal(store, err),
+            };
+            try reportPinned(ctx.out, "pinned", name, server.host, server.port, keyed, .explicit_pin);
+        },
+        .rotate => |keyed| {
+            _ = Store.host_pins.rotate(store, .{
+                .host = server.host,
+                .port = server.port,
+                .key_type = keyed.key_type,
+                .fingerprint_sha256 = keyed.fingerprint,
+                .trust_source = .rotated,
+                .note = parsed.flag("note"),
+                .now = ctx.now,
+            }, reason orelse "rotated by operator") catch |err| Cli.storeFatal(store, err);
+            try reportPinned(ctx.out, "rotated", name, server.host, server.port, keyed, .rotated);
+        },
+        .revoke => |key_type| {
+            const active = (Store.host_pins.active(store, ctx.arena, server.host, server.port, key_type) catch |err|
+                Cli.storeFatal(store, err)) orelse fatal(
+                "no active {s} pin for {s}:{d}, so there is nothing to withdraw",
+                .{ key_type, server.host, server.port },
+            );
+            const withdrawn = Store.host_pins.revoke(
+                store,
+                active.id,
+                reason orelse "revoked by operator",
+                ctx.now,
+            ) catch |err| Cli.storeFatal(store, err);
+            if (!withdrawn) fatal(
+                "the {s} pin for {s}:{d} was active when it was read and was not when the withdrawal ran; nothing was changed",
+                .{ key_type, server.host, server.port },
+            );
+            switch (ctx.out.format) {
+                .json => try ctx.out.json(.{
+                    .ok = true,
+                    .action = "revoked",
+                    .server = name,
+                    .keyType = key_type,
+                    .fingerprint = active.fingerprint_sha256,
+                }),
+                .human => try ctx.out.print(
+                    "revoked the {s} pin for {s}:{d} ({s}). Connections to '{s}' are refused until a pin is recorded again\n",
+                    .{ key_type, server.host, server.port, active.fingerprint_sha256, name },
+                ),
+            }
+        },
+        .first_use => switch (Cli.observeHostKey(store, ctx.arena, server)) {
+            .refused => |sentence| fatal("{s}", .{sentence}),
+            .already_pinned => |key| switch (ctx.out.format) {
+                .json => try ctx.out.json(.{
+                    .ok = true,
+                    .action = "unchanged",
+                    .server = name,
+                    .keyType = key.key_type,
+                    .fingerprint = key.text(),
+                }),
+                .human => try ctx.out.print(
+                    "'{s}' ({s}:{d}) already has a matching {s} pin ({s}); nothing was recorded\n",
+                    .{ name, server.host, server.port, key.key_type, key.text() },
+                ),
+            },
+            .observed => |key| {
+                const keyed: Keyed = .{ .key_type = key.key_type, .fingerprint = key.text() };
+                _ = Store.host_pins.record(store, .{
+                    .host = server.host,
+                    .port = server.port,
+                    .key_type = keyed.key_type,
+                    .fingerprint_sha256 = keyed.fingerprint,
+                    .trust_source = .first_use,
+                    .note = parsed.flag("note"),
+                    .now = ctx.now,
+                }) catch |err| Cli.storeFatal(store, err);
+                try reportPinned(ctx.out, "trusted-on-first-use", name, server.host, server.port, keyed, .first_use);
+            },
+        },
+    }
+}
+
+/// A recorded pin, in both formats.
+///
+/// The `trust_source` is published rather than implied, and in the human line
+/// as well as the JSON: an operator reading back what they did needs to see
+/// which of the two kinds of trust this row carries, because one of them was
+/// checked against something and the other was not.
+fn reportPinned(
+    out: *Cli.Output,
+    action: []const u8,
+    name: []const u8,
+    host: []const u8,
+    port: u16,
+    keyed: Keyed,
+    source: Store.host_pins.TrustSource,
+) !void {
+    switch (out.format) {
+        .json => try out.json(.{
+            .ok = true,
+            .action = action,
+            .server = name,
+            .keyType = keyed.key_type,
+            .fingerprint = keyed.fingerprint,
+            .trustSource = source.text(),
+        }),
+        .human => switch (source) {
+            .first_use => try out.print(
+                "recorded the {s} key {s} answered with: {s}\n" ++
+                    "trust_source=first_use — nothing checked it, so it protects every connection after this one and not this one\n",
+                .{ keyed.key_type, host, keyed.fingerprint },
+            ),
+            else => try out.print(
+                "{s} {s} for {s}:{d}: {s} ({s})\n",
+                .{ action, keyed.key_type, host, port, keyed.fingerprint, source.text() },
+            ),
+        },
+    }
+}
+
+/// What this machine has ever trusted for one endpoint.
+///
+/// Revoked and superseded rows are shown, not filtered: somebody reading this
+/// after a refusal needs to see the key that used to be trusted, and an empty
+/// list is the answer that explains why every connection is being refused.
+fn reportPins(
+    out: *Cli.Output,
+    name: []const u8,
+    host: []const u8,
+    port: u16,
+    pins: []const Store.host_pins.Pin,
+) !void {
+    switch (out.format) {
+        .json => try out.json(.{ .ok = true, .server = name, .host = host, .port = port, .pins = pins }),
+        .human => {
+            if (pins.len == 0) return out.print(
+                "no host key is pinned for '{s}' ({s}:{d}), so every connection to it is refused.\n" ++
+                    "  terminus server pin {s} --key-type <t> --fingerprint <fp>   a key you checked elsewhere\n" ++
+                    "  terminus server pin {s} --trust-on-first-use                whatever answers now\n",
+                .{ name, host, port, name, name },
+            );
+            try out.print("pins for '{s}' ({s}:{d}):\n", .{ name, host, port });
+            for (pins) |p| {
+                try out.print("  {s}  {s}  {s}{s}\n", .{
+                    p.key_type,
+                    p.fingerprint_sha256,
+                    p.trust_source.text(),
+                    if (p.revoked_at != null) "  [no longer active]" else "  [active]",
+                });
+            }
+        },
+    }
+}
+
+// The whole of `server pin`'s argument contract, as a gate.
+//
+// Drives `pinPlan` rather than the process: the flags are where three of the
+// contract's four rules are actually enforced — first use is asked for by
+// name, rotation needs the new fingerprint supplied, and a fingerprint that
+// could never match is refused at the point of entry — and all three are
+// decisions about five values with no store, host or process in them.
+test "gate: `server pin`'s flags decide one of five things or refuse by name" {
+    const t = std.testing;
+    const fp = "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU";
+
+    // Every plan is reachable, and the count is held against the union so a
+    // sixth cannot be added without a case here.
+    try t.expectEqual(@as(std.meta.Tag(PinPlan), .show), std.meta.activeTag(try pinPlan(.{
+        .key_type = null,
+        .fingerprint = null,
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = false,
+    })));
+    try t.expectEqual(@as(std.meta.Tag(PinPlan), .first_use), std.meta.activeTag(try pinPlan(.{
+        .key_type = null,
+        .fingerprint = null,
+        .trust_on_first_use = true,
+        .rotate = false,
+        .revoke = false,
+    })));
+    const recorded = try pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = fp,
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = false,
+    });
+    try t.expectEqualStrings(fp, recorded.record.fingerprint);
+    try t.expectEqualStrings("ssh-ed25519", recorded.record.key_type);
+    const rotated = try pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = fp,
+        .trust_on_first_use = false,
+        .rotate = true,
+        .revoke = false,
+    });
+    try t.expectEqualStrings(fp, rotated.rotate.fingerprint);
+    const revoked = try pinPlan(.{
+        .key_type = "ssh-rsa",
+        .fingerprint = null,
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = true,
+    });
+    try t.expectEqualStrings("ssh-rsa", revoked.revoke);
+    try t.expectEqual(@as(usize, 5), @typeInfo(PinPlan).@"union".fields.len);
+
+    // **Rotation without a supplied fingerprint is refused.** The contract's
+    // third rule, and the one a helpful implementation breaks first: taking the
+    // key the host is offering today would make the tool decide what to trust,
+    // which is the whole thing a pin exists to stop.
+    try t.expectError(error.RotationNeedsAFingerprint, pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = null,
+        .trust_on_first_use = false,
+        .rotate = true,
+        .revoke = false,
+    }));
+    // Not even with a key type and a reason, which is what the shape of a
+    // rotation otherwise looks like.
+    try t.expectError(error.RotationNeedsAFingerprint, pinPlan(.{
+        .key_type = "ssh-rsa",
+        .fingerprint = null,
+        .trust_on_first_use = false,
+        .rotate = true,
+        .revoke = false,
+    }));
+
+    // First use and an explicit fingerprint are two different answers to one
+    // question, so asking for both is refused rather than one of them silently
+    // winning — and a `first_use` row carrying a fingerprint somebody checked,
+    // or an `explicit_pin` row carrying one nobody did, are both lies in the
+    // ledger.
+    try t.expectError(error.ConflictingModes, pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = fp,
+        .trust_on_first_use = true,
+        .rotate = false,
+        .revoke = false,
+    }));
+    try t.expectError(error.ConflictingModes, pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = fp,
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = true,
+    }));
+    try t.expectError(error.ConflictingModes, pinPlan(.{
+        .key_type = null,
+        .fingerprint = null,
+        .trust_on_first_use = true,
+        .rotate = true,
+        .revoke = false,
+    }));
+
+    // A pin is keyed on the type as well as the endpoint, so neither half of
+    // that key may be guessed.
+    try t.expectError(error.FingerprintNeedsAKeyType, pinPlan(.{
+        .key_type = null,
+        .fingerprint = fp,
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = false,
+    }));
+    try t.expectError(error.RevocationNeedsAKeyType, pinPlan(.{
+        .key_type = null,
+        .fingerprint = null,
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = true,
+    }));
+    try t.expectError(error.KeyTypeNeedsAFingerprint, pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = null,
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = false,
+    }));
+
+    // A fingerprint that cannot match is refused here rather than stored.
+    try t.expectError(error.FingerprintNotCanonical, pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = "MD5:ab:cd:ef",
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = false,
+    }));
+    try t.expectError(error.FingerprintNotCanonical, pinPlan(.{
+        .key_type = "ssh-ed25519",
+        .fingerprint = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        .trust_on_first_use = false,
+        .rotate = false,
+        .revoke = false,
+    }));
+
+    // Every refusal has a sentence, and each sentence names a flag. A member
+    // added to the error set without one would print an empty line.
+    var worded: usize = 0;
+    inline for (@typeInfo(PinPlanError).error_set.?) |e| {
+        worded += 1;
+        const sentence = pinPlanRefusal(@field(PinPlanError, e.name));
+        if (sentence.len < 40 or std.mem.indexOf(u8, sentence, "--") == null) {
+            std.debug.print("\n`{s}`'s refusal names no flag: \"{s}\"\n", .{ e.name, sentence });
+            return error.PinRefusalNamesNoFlag;
+        }
+    }
+    try t.expectEqual(@as(usize, 6), worded);
 }
 
 /// A successful removal, in both formats and in one place.
