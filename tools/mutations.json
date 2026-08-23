@@ -2800,10 +2800,10 @@
     {
       "id": "Gv-refresh-installs-what-it-cannot-honour",
       "file": "src/cli/cmd_setup.zig",
-      "find": "    if (!embeddedSatisfied()) {",
+      "find": "    if (!mayInstall(binary, doc)) {",
       "replace": "    if (false) {",
-      "rule": "The refresh refuses in both directions, and this is the outbound one: a binary that cannot honour the document it ships must not install it. `embeddedSatisfied` is a function rather than a const for the same reason - a const would leave these refusals uncompiled on any build that happened to satisfy its own document.",
-      "expect_gate": "gate: a document requiring more than the binary provides is not installed"
+      "rule": "The refresh refuses in both directions, and this is the outbound one: a binary that cannot honour the document it ships must not install it. This survived once - the guard read the pair the checkout happens to hold, which always satisfies, so `if (false)` changed nothing observable. The decision is parameterised now for the same reason `mayInstall` and `refreshUserSkills` already were.",
+      "expect_gate": "gate: a startup that cannot honour the document it ships installs nothing"
     }
   ]
 }

@@ -186,19 +186,41 @@ pub fn autoRefresh(ctx: *Cli.Ctx) void {
     // either, and a startup path should not narrate a decision it was never in a
     // position to take.
     const home = ctx.environ.get("USERPROFILE") orelse ctx.environ.get("HOME") orelse return;
-    if (!embeddedSatisfied()) {
+    autoRefreshFor(ctx, home, Cli.Dispatch.version, skill_md);
+}
+
+/// The refuse-or-write decision, over an explicit binary version and document.
+///
+/// Parameterised for the reason `mayInstall` and `refreshUserSkills` already are,
+/// and it was the one piece of this file that was not. Driven only through
+/// `autoRefresh` the guard below can be exercised for exactly one pair — whatever
+/// this checkout happens to hold — and this checkout's binary satisfies its own
+/// document, so the guard is unreachable and removing it changes nothing
+/// observable. A mutation replacing it with `if (false)` survived every gate,
+/// which is how that was found: the gate on this rule was driving the *write*
+/// half and never the refusal.
+pub fn autoRefreshFor(
+    ctx: *Cli.Ctx,
+    home: []const u8,
+    binary: Cli.Dispatch.Version,
+    doc: []const u8,
+) void {
+    if (!mayInstall(binary, doc)) {
         // Once per process rather than once per target: the reason is the same
         // for both, and this is a startup path.
+        //
+        // Both numbers come from the arguments rather than from the build, so the
+        // sentence a gate reads is the sentence a real mismatch would print.
         std.debug.print(
             "terminus: not refreshing the agent skill — the document in this binary requires " ++
-                "terminus >= {s} and this build is {s}. Installing it would promise flags this " ++
+                "terminus >= {s} and this build is {f}. Installing it would promise flags this " ++
                 "binary rejects, and an unregistered flag consumes the argument after it " ++
                 "instead of failing.\n",
-            .{ embedded_requirement_string, Cli.Dispatch.version_string },
+            .{ requirementText(doc) catch Overwrite.unreadable, binary },
         );
         return;
     }
-    refreshUserSkills(ctx, home, Cli.Dispatch.version, skill_md);
+    refreshUserSkills(ctx, home, binary, doc);
 }
 
 /// The write half of the refresh, over an explicit home, binary version and

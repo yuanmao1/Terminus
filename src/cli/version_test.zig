@@ -459,6 +459,24 @@ const Home = struct {
         Setup.refreshUserSkills(&ctx, h.path, binary, document);
     }
 
+    /// The same, through the startup entry point rather than its write half — so
+    /// the refuse-or-write guard is inside what is being driven.
+    fn startup(h: *Home, arena: std.mem.Allocator, binary: Version, document: []const u8) !void {
+        var discard: std.Io.Writer.Discarding = .init(&.{});
+        var out: Cli.Output = .{ .writer = &discard.writer };
+        var environ: std.process.Environ.Map = .init(arena);
+        defer environ.deinit();
+        try environ.put("USERPROFILE", h.path);
+        var ctx: Cli.Ctx = .{
+            .io = h.io,
+            .arena = arena,
+            .environ = &environ,
+            .out = &out,
+            .now = 0,
+        };
+        Setup.autoRefreshFor(&ctx, h.path, binary, document);
+    }
+
     fn deinit(h: *Home) void {
         const cwd = std.Io.Dir.cwd();
         cwd.deleteFile(h.io, h.skill_path) catch {};
@@ -577,6 +595,61 @@ test "gate: main.zig declares no tests, which is the whole reason the exe step i
     try t.expect(std.mem.indexOf(u8, build_src, "test_step.dependOn(&exe" ++ "_tests.step)") != null);
     std.testing.expect(std.mem.indexOf(u8, build_src, "run_exe" ++ "_tests") == null) catch |err| {
         std.debug.print("build.zig runs the exe test binary again; see the count above\n", .{});
+        return err;
+    };
+}
+
+test "gate: a startup that cannot honour the document it ships installs nothing" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The gate this file was missing, and a surviving mutation is what found it.
+    //
+    // The guard was written as `if (!embeddedSatisfied())` inside `autoRefresh`,
+    // reading the one pair this checkout happens to hold — and this checkout's
+    // binary satisfies its own document, so the guard was unreachable and `if
+    // (false)` in its place passed every gate. What was covered was the *write*
+    // half (`refreshUserSkills`, driven for versions this build is not); what was
+    // not covered was the refusal, which is the half that matters when the two do
+    // diverge: an npm upgrade moves the document ahead of a local build, and
+    // installing it then promises flags the binary rejects.
+    //
+    // A document is installed FIRST in both halves, and the refusal asserts that
+    // document is still there byte for byte. Asserting "no file afterwards"
+    // against an empty home would have been vacuous: the refresh only ever
+    // overwrites a document that is already present — it is a refresh and not an
+    // install — so an empty home ends with no file whether the guard runs or not,
+    // and the mutation would have survived this gate too.
+    const older = try doc(arena, "0.9.0");
+
+    var refused = try Home.init(t.allocator, "startup_refuses");
+    defer refused.deinit();
+    try refused.install(older);
+    try refused.startup(arena, try v("1.2.3"), try doc(arena, "9.9.9"));
+    const kept = try refused.read(arena);
+    t.expectEqualStrings(older, kept) catch |err| {
+        std.debug.print(
+            "a terminus 1.2.3 installed a document requiring 9.9.9 over {s}\n",
+            .{refused.skill_path},
+        );
+        return err;
+    };
+
+    // The other arm, so the gate cannot be satisfied by a startup that never
+    // writes at all. Same shape, a binary that can honour what it ships.
+    var written = try Home.init(t.allocator, "startup_writes");
+    defer written.deinit();
+    try written.install(older);
+    const honourable = try doc(arena, "1.0.0");
+    try written.startup(arena, try v("1.2.3"), honourable);
+    const landed = try written.read(arena);
+    t.expectEqualStrings(honourable, landed) catch |err| {
+        std.debug.print(
+            "a terminus 1.2.3 did not install a document requiring only 1.0.0\n",
+            .{},
+        );
         return err;
     };
 }
