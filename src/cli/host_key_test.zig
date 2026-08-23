@@ -344,10 +344,23 @@ test "gate: no session is constructed without naming a trust root" {
     try t.expectEqual(@as(usize, 2), occurrences(cli, needle));
     try t.expectEqual(@as(usize, 1), occurrences(daemon, needle));
 
-    // The daemon's site passes `.none` — it has no store to read a pin from,
-    // and opening the default database instead would authorise a `--db <other>`
-    // CLI's connections from a trust root the operator never recorded in.
-    try t.expect(std.mem.indexOf(u8, daemon, needle ++ "request.host, request.port, .none,") != null);
+    // The daemon's site passes the trust root the *request* carried, and the
+    // property underneath that is what this checks: the daemon has no store.
+    //
+    // This assertion used to read `..., .none,` — a proxy for "it has nothing to
+    // read a pin from", which stopped being true when the authority started
+    // travelling with the request. The proxy is replaced by the thing it stood
+    // for, which survives the change: a daemon that opened the default database
+    // would authorise a `--db <other>` CLI's connections from a trust root the
+    // operator never recorded in, and a background process would open the user's
+    // real store.
+    try t.expect(std.mem.indexOf(u8, daemon, needle ++ "request.host, request.port, lookup.trustRoot(), &observed") != null);
+    for ([_][]const u8{ "Store" ++ ".open", "host" ++ "_pins", "db" ++ "Path", "sqlite" }) |forbidden| {
+        std.testing.expectEqual(@as(usize, 0), occurrences(daemon, forbidden)) catch |err| {
+            std.debug.print("the daemon reaches for '{s}', so it has a store after all\n", .{forbidden});
+            return err;
+        };
+    }
 
     // The scans really did read code: a failed embed or an over-eager stripper
     // would satisfy every count above.

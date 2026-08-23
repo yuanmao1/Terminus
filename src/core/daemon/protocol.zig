@@ -60,7 +60,11 @@ const Allocator = std.mem.Allocator;
 const Ssh = @import("../ssh/Client.zig");
 const digest = @import("../digest.zig");
 
-pub const version = 3;
+/// v4 added `Request.trust`. A v3 daemon has no host-key authority to compare
+/// against and would dial without one, so the skew must be refused rather than
+/// tolerated: this is the one field whose absence changes what the far side is
+/// permitted to do.
+pub const version = 4;
 
 pub const Op = enum { exec, ping, stop };
 
@@ -78,6 +82,47 @@ pub const Request = struct {
     /// — verifies a digest over the whole reply and so may not be given a
     /// truncated one.
     output: Output = .whole,
+
+    /// The authority under which this daemon may accept the host's key.
+    ///
+    /// The daemon has no trust store — its protocol carries auth material in
+    /// every request precisely so it never touches sqlite — so it cannot look
+    /// up the pin that authorises a host. The authority travels with the
+    /// request instead, and **the daemon compares rather than decides**: the
+    /// process holding the store is the one that reads it, and this is what it
+    /// read.
+    ///
+    /// Note what is *not* here. There is no `trust_on_first_use`, and its
+    /// absence is structural rather than an omission: first-use trust means
+    /// recording the key that answered, and a process with no store cannot
+    /// record anything. A first-use flow has to go over direct SSH, where the
+    /// writer is.
+    trust: Trust = .none,
+
+    /// Why a list rather than one pin: the key type is not known until the host
+    /// presents a key, so the caller sends every pin it has for the endpoint and
+    /// the far side looks up by type. That also keeps
+    /// `Ssh.TrustRoot.Pins.recorded`'s ignorance intact across the wire — the
+    /// lookup searches by key type and never sees the fingerprint it will be
+    /// compared against, so a wrong lookup can only refuse, never accept.
+    pub const Trust = union(enum) {
+        /// No authority travelled with this request. Refused before dialling:
+        /// "there is no trust root" and "trust anything" are not the same value.
+        none,
+        /// The caller's active pins for this endpoint. An empty list is a real
+        /// answer — the caller has a store and nothing in it authorises this
+        /// host — and it refuses just as `none` does, with a different sentence.
+        pins: []const Pin,
+
+        pub const Pin = struct {
+            key_type: []const u8,
+            /// Base64 SHA-256 as OpenSSH prints it. A public value, so it is
+            /// also safe to put in the connection pool's key — which it must
+            /// be, or a request bearing one pin could be served a connection
+            /// opened under another.
+            fingerprint: []const u8,
+        };
+    };
 
     /// The two output disciplines, which are the two entry points on `Ssh`.
     pub const Output = enum {

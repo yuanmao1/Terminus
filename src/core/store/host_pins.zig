@@ -107,6 +107,31 @@ pub fn active(store: *Store, arena: Allocator, host: []const u8, port: u16, key_
     return try rowToPin(arena, &stmt);
 }
 
+/// Every pin for one endpoint that still authorises, newest first.
+///
+/// The same `revoked_at IS NULL` filter `active` applies, and it is in SQL for
+/// that reason: a caller filtering the result of `forEndpoint` by hand would be
+/// a second copy of the rule about what a withdrawn pin means, and the two
+/// would come to disagree.
+///
+/// This is what the daemon transport carries. The daemon has no store, so the
+/// authority to accept a host key cannot be looked up there; it travels with
+/// the request instead, and the daemon compares rather than decides. A *list*
+/// and not one pin because the key type is not known until the host presents a
+/// key — which is also what keeps `Ssh.TrustRoot.Pins.recorded`'s ignorance
+/// intact on the far side: it searches by key type and never sees the
+/// fingerprint it will be compared against.
+pub fn activeForEndpoint(store: *Store, arena: Allocator, host: []const u8, port: u16) Error![]Pin {
+    var out: std.ArrayList(Pin) = .empty;
+    var stmt = try store.db.prepare(select_columns ++
+        " WHERE host = ?1 AND port = ?2 AND revoked_at IS NULL ORDER BY trusted_at DESC, id DESC");
+    defer stmt.deinit();
+    try stmt.bindText(1, host);
+    try stmt.bindInt(2, port);
+    while (try stmt.step()) try out.append(arena, try rowToPin(arena, &stmt));
+    return out.toOwnedSlice(arena);
+}
+
 pub const RecordOptions = struct {
     host: []const u8,
     port: u16,

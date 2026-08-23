@@ -1830,17 +1830,21 @@ pub fn connectReportingClaim(
 /// way — and which one carried it is reported either way, in `transport` and in
 /// the note below.
 ///
-/// **The host key pin is not one of these reasons, and it is worth saying why
-/// not.** The daemon opens its own SSH session and has no trust store to check
-/// it against, so `Ssh.connect` refuses it one (`DaemonServer.connectFor`) —
-/// the refusal arrives from the daemon, by name, with the flag that clears it.
-/// Refusing the transport *here* instead would read better and cannot be done:
-/// the daemon socket is the only way anything in this tree can put a scripted
-/// host in front of the real binary (`test/blackbox.zig`'s `FakeHost`; a direct
-/// SSH connection needs a listening server and a real key, which `zig build
-/// test` has neither of), so a CLI that never dials the daemon is a CLI whose
-/// remote behaviour has thirty-five fewer gates on it. The pin belongs in the
-/// request; that is a wire change, and it is the one thing still owed here.
+/// **The host key pin is not one of these reasons, and the reason it is not has
+/// changed.** It used to be that the daemon had no trust store, so
+/// `Ssh.connect` refused it a session and every ordinary command needed
+/// `--no-daemon`. The authority now travels with the request
+/// (`protocol.Request.trust`), so the daemon compares against the pins the CLI
+/// read and this transport carries a pinned connection like any other.
+///
+/// Refusing the transport here for a *missing* pin would still be wrong, and
+/// not only for tidiness: the daemon socket is the only way anything in this
+/// tree can put a scripted host in front of the real binary
+/// (`test/blackbox.zig`'s `FakeHost`; a direct SSH connection needs a listening
+/// server and a real key, which `zig build test` has neither of), so a CLI that
+/// declines to dial the daemon is a CLI whose remote behaviour has thirty-five
+/// fewer gates on it. An unpinned host is refused where every other unpinned
+/// host is refused — inside `connect`, after the key is read.
 fn daemonCannotCarry(parsed: *const Args.Parsed) ?[]const u8 {
     if (parsed.flag("stdin-file") != null)
         return "the daemon protocol has no channel for --stdin-file input; used direct SSH";
@@ -1860,7 +1864,7 @@ fn openConnection(
         false;
     const cannot_carry = daemonCannotCarry(parsed);
     if (!parsed.boolean("no-daemon") and !env_disabled and cannot_carry == null) {
-        const request = daemonRequest(server, auth);
+        const request = daemonRequest(ctx, server, auth);
         switch (DaemonClient.acquire(ctx.io, ctx.arena, ctx.environ, request)) {
             .ok => |client| {
                 registerDaemonSocket(ctx.io, client.stream);
@@ -1889,7 +1893,11 @@ fn openConnection(
     };
 }
 
-fn daemonRequest(server: Store.servers.Server, auth: Ssh.Auth) Core.daemon_protocol.Request {
+fn daemonRequest(
+    ctx: *Ctx,
+    server: Store.servers.Server,
+    auth: Ssh.Auth,
+) Core.daemon_protocol.Request {
     return .{
         .v = Core.daemon_protocol.version,
         .op = .exec,
@@ -1904,7 +1912,44 @@ fn daemonRequest(server: Store.servers.Server, auth: Ssh.Auth) Core.daemon_proto
                 .passphrase = key.passphrase,
             } },
         },
+        .trust = daemonTrust(ctx, server),
     };
+}
+
+/// The pins that authorise this endpoint, for the daemon to compare against.
+///
+/// Read here rather than there because **the process holding the store is the
+/// one that reads it**. The daemon has none, so its authority has to arrive with
+/// the request; see `protocol.Request.trust`.
+///
+/// A store failure yields `.none` rather than an empty list, and the difference
+/// is load-bearing: an empty list says "this store authorises nothing for this
+/// host", which sends an operator to `terminus server pin`, and that is the
+/// wrong instruction when the truth is that sqlite could not be read.
+fn daemonTrust(ctx: *Ctx, server: Store.servers.Server) Core.daemon_protocol.Request.Trust {
+    const source = trust_source orelse return .none;
+    return daemonTrustFrom(source.store, ctx.arena, server.host, server.port);
+}
+
+/// The wire form of what a store authorises for one endpoint.
+///
+/// `pub` and taking its store as a parameter for the same reason `pinsOf` does:
+/// this is the half a test can reach. There is no server in this repository to
+/// hand a real handshake to, so the gates drive *this* against real sqlite
+/// rather than a copy of it that could drift.
+pub fn daemonTrustFrom(
+    store: *Store,
+    arena: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+) Core.daemon_protocol.Request.Trust {
+    const pins = Store.host_pins.activeForEndpoint(store, arena, host, port) catch return .none;
+    const wire = arena.alloc(Core.daemon_protocol.Request.Trust.Pin, pins.len) catch return .none;
+    for (pins, wire) |pin, *slot| slot.* = .{
+        .key_type = pin.key_type,
+        .fingerprint = pin.fingerprint_sha256,
+    };
+    return .{ .pins = wire };
 }
 
 /// Opens (and migrates) the metadata database. Honors `--db <path>` (both

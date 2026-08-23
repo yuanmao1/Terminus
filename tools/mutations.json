@@ -2700,6 +2700,38 @@
       "replace": "    _ = linux.kill(target, @enumFromInt(0));",
       "rule": "A command that traps TERM must still be stopped. Signal 0 is the existence probe, so this asks and does nothing; the child survives, the give-up window closes, and the helper reports timed_out_unconfirmed instead of claiming a stop. This mutation only became writable once the waits were bounded - before that it hung.",
       "expect_gate": "blackbox: the helper tries TERM before KILL, and escalates only when it must"
+    },
+    {
+      "id": "G17d-pool-ignores-the-authority",
+      "file": "src/core/daemon/Server.zig",
+      "find": "            .pins => |pins| for (pins) |pin| {",
+      "replace": "            .pins => |pins| for (pins[0..0]) |pin| {",
+      "rule": "A pooled connection carries the authority it was opened under. Leaving the pins out of the key lets a request bearing one pin be served a session opened under another - the check happened, against the wrong value, and nothing downstream can tell.",
+      "expect_gate": "gate: a pooled connection is not shared across different authorities"
+    },
+    {
+      "id": "G17d-lookup-answers-any-key-type",
+      "file": "src/core/daemon/Server.zig",
+      "find": "            if (std.mem.eql(u8, pin.key_type, key_type)) return pin.fingerprint;",
+      "replace": "            return pin.fingerprint;",
+      "rule": "A host offering a key type nobody pinned must get `not_pinned`, not a comparison against a different type's fingerprint. host_pins is keyed on the type for exactly this reason.",
+      "expect_gate": "gate: the daemon's lookup answers by key type and never invents an authority"
+    },
+    {
+      "id": "G17d-no-authority-becomes-a-trust-root",
+      "file": "src/core/daemon/Server.zig",
+      "find": "            .none => .none,",
+      "replace": "            .none => .{ .pins = .{ .context = self, .recorded = recorded } },",
+      "rule": "\"No authority travelled with this request\" and \"this store authorises nothing\" are different states with different sentences. Collapsing them makes `connect` dial before refusing, and reports a missing pin where the truth is a missing trust root.",
+      "expect_gate": "gate: the daemon's lookup answers by key type and never invents an authority"
+    },
+    {
+      "id": "G17d-daemon-asks-for-first-use",
+      "file": "src/core/daemon/Server.zig",
+      "find": "            .pins => .{ .pins = .{ .context = self, .recorded = recorded } },",
+      "replace": "            .pins => .{ .pins = .{ .context = self, .recorded = recorded, .trust_on_first_use = true } },",
+      "rule": "First-use trust means recording the key that answered, and this process has no store to record it in. A daemon that accepted an unpinned host would accept it silently and permanently, since nothing would ever write the pin that a later connection could be checked against.",
+      "expect_gate": "gate: trust-on-first-use is turned on in exactly one place"
     }
   ]
 }

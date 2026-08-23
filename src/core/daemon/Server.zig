@@ -42,10 +42,30 @@ const Pooled = struct {
     key: []u8,
     gpa: std.mem.Allocator,
 
+    /// What makes two requests able to share one SSH session.
+    ///
+    /// The trust is part of it, and that is not tidiness: **a pooled connection
+    /// carries the authority it was opened under.** Serving a request that
+    /// bears one pin from a session opened under another would authorise a host
+    /// nobody pinned — the check would have happened, against the wrong value,
+    /// and nothing downstream could tell.
+    ///
+    /// The fingerprints are public values, so putting them in the key exposes
+    /// nothing. `{t}` on `auth` is deliberate and pre-existing: it prints the
+    /// union's tag and never the material.
     fn keyOf(gpa: std.mem.Allocator, req: protocol.Request) ![]u8 {
-        return std.fmt.allocPrint(gpa, "{s}\x00{d}\x00{s}\x00{t}", .{
+        var key: std.ArrayList(u8) = .empty;
+        errdefer key.deinit(gpa);
+        try key.print(gpa, "{s}\x00{d}\x00{s}\x00{t}", .{
             req.host, req.port, req.username, req.auth,
         });
+        switch (req.trust) {
+            .none => try key.appendSlice(gpa, "\x00none"),
+            .pins => |pins| for (pins) |pin| {
+                try key.print(gpa, "\x00{s}\x00{s}", .{ pin.key_type, pin.fingerprint });
+            },
+        }
+        return key.toOwnedSlice(gpa);
     }
 
     fn deinit(p: *Pooled) void {
@@ -354,20 +374,23 @@ fn acquirePooledLocked(request: protocol.Request) !*Ssh {
 }
 
 fn connectFor(request: protocol.Request) !Ssh {
-    // `.none`, and not a policy this process could satisfy. The daemon has no
-    // trust store: its protocol carries auth material in every request
-    // precisely so it never touches sqlite, so there is no `host_pins` row it
-    // can read and nothing it could check this host's key against. Opening the
-    // default database instead would be worse than refusing — a CLI running
-    // against `--db <other>` would have its connections authorised by a trust
-    // root the operator never recorded a pin in.
+    // The authority comes with the request. The daemon has no trust store —
+    // its protocol carries auth material in every request precisely so it never
+    // touches sqlite — so it cannot read a `host_pins` row. Opening the default
+    // database instead would be worse than refusing: a CLI running against
+    // `--db <other>` would have its connections authorised by a trust root the
+    // operator never recorded a pin in, and a background daemon would open the
+    // user's real store.
     //
-    // So `Ssh.connect` refuses before it dials, and the CLI does not offer this
-    // transport at all (`Cli.daemonCannotCarry`). Restoring the pooled
-    // connection means the request carrying the expected fingerprint, which is
-    // a change to the wire format in `protocol.zig`.
+    // So the process that holds the store does the reading, and this process
+    // does the comparing. `Lookup` searches the list by key type and is never
+    // handed the presented fingerprint, which is the same ignorance
+    // `Ssh.TrustRoot.Pins.recorded` requires locally: a wrong lookup can refuse
+    // a host that should have been allowed, and cannot accept one that should
+    // not.
+    var lookup: Lookup = .{ .request = request };
     var observed: ?Ssh.HostKey = null;
-    var client = try Ssh.connect(request.host, request.port, .none, &observed);
+    var client = try Ssh.connect(request.host, request.port, lookup.trustRoot(), &observed);
     errdefer client.deinit();
     const auth: Ssh.Auth = switch (request.auth) {
         .none => return error.AuthMissing,
@@ -381,6 +404,37 @@ fn connectFor(request: protocol.Request) !Ssh {
     try client.authenticate(request.username, auth);
     return client;
 }
+
+/// The request's own pins, as a `TrustRoot`.
+const Lookup = struct {
+    request: protocol.Request,
+
+    fn recorded(context: *anyopaque, key_type: []const u8) ?[]const u8 {
+        const self: *Lookup = @ptrCast(@alignCast(context));
+        const pins = switch (self.request.trust) {
+            // Unreachable through `trustRoot`, which answers `.none` for this
+            // case so `connect` refuses before dialling. Present so that this
+            // function has no arm that could invent an authority.
+            .none => return null,
+            .pins => |list| list,
+        };
+        for (pins) |pin| {
+            if (std.mem.eql(u8, pin.key_type, key_type)) return pin.fingerprint;
+        }
+        return null;
+    }
+
+    fn trustRoot(self: *Lookup) Ssh.TrustRoot {
+        return switch (self.request.trust) {
+            .none => .none,
+            // `trust_on_first_use` is left at its default `false` and there is
+            // no wire field that could set it: recording what answered needs a
+            // store, and this process has none. A first-use flow belongs on the
+            // direct transport, where the writer is.
+            .pins => .{ .pins = .{ .context = self, .recorded = recorded } },
+        };
+    }
+};
 
 fn respondError(writer: *std.Io.Writer, message: []const u8) !void {
     try protocol.writeMessage(writer, protocol.Response{
@@ -413,4 +467,127 @@ fn currentPid() u32 {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.c.getpid()),
     };
+}
+
+// --- The daemon's borrowed authority -----------------------------------------
+//
+// These are in this file rather than in `transport_test.zig` because the things
+// under test are private to it: a pool key and a trust-root lookup. Making them
+// `pub` so a sibling could reach them would widen the surface for the benefit of
+// the gate, which is the trade this tree does not take.
+
+const testing = std.testing;
+
+fn requestWith(trust: protocol.Request.Trust) protocol.Request {
+    return .{
+        .v = protocol.version,
+        .op = .exec,
+        .host = "10.0.0.1",
+        .port = 22,
+        .username = "ubuntu",
+        .auth = .{ .password = "hunter2" },
+        .trust = trust,
+    };
+}
+
+test "gate: a pooled connection is not shared across different authorities" {
+    const gpa = testing.allocator;
+
+    const ed = protocol.Request.Trust.Pin{
+        .key_type = "ssh-ed25519",
+        .fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+    const other = protocol.Request.Trust.Pin{
+        .key_type = "ssh-ed25519",
+        .fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    };
+
+    const none = try Pooled.keyOf(gpa, requestWith(.none));
+    defer gpa.free(none);
+    const with_ed = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{ed} }));
+    defer gpa.free(with_ed);
+    const with_other = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{other} }));
+    defer gpa.free(with_other);
+    const empty = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{} }));
+    defer gpa.free(empty);
+
+    // The one that matters: same host, same port, same user, same auth, and a
+    // *different fingerprint*. Sharing a session here would serve a request
+    // bearing one pin from a connection opened under another — the check would
+    // have happened, against the wrong value, and nothing downstream could tell.
+    try testing.expect(!std.mem.eql(u8, with_ed, with_other));
+    // "No authority travelled" and "this authority travelled" are not the same
+    // connection either.
+    try testing.expect(!std.mem.eql(u8, none, with_ed));
+    // Nor is "a store that authorises nothing" the same as "no store".
+    try testing.expect(!std.mem.eql(u8, none, empty));
+
+    // And the same authority does still pool, or the field would have cost the
+    // daemon its whole reason for existing.
+    const again = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{ed} }));
+    defer gpa.free(again);
+    try testing.expectEqualStrings(with_ed, again);
+}
+
+test "gate: the daemon's lookup answers by key type and never invents an authority" {
+    const ed = protocol.Request.Trust.Pin{
+        .key_type = "ssh-ed25519",
+        .fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+    const rsa = protocol.Request.Trust.Pin{
+        .key_type = "ssh-rsa",
+        .fingerprint = "SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    };
+
+    var lookup: Lookup = .{ .request = requestWith(.{ .pins = &.{ ed, rsa } }) };
+    try testing.expectEqualStrings(ed.fingerprint, Lookup.recorded(&lookup, "ssh-ed25519").?);
+    try testing.expectEqualStrings(rsa.fingerprint, Lookup.recorded(&lookup, "ssh-rsa").?);
+    // A key type nobody pinned is not answered with somebody else's pin — that
+    // would let a host offering an unpinned type be judged against a different
+    // key's fingerprint.
+    try testing.expect(Lookup.recorded(&lookup, "ecdsa-sha2-nistp256") == null);
+
+    // Nothing travelled, so nothing is authorised, and `trustRoot` refuses
+    // before `connect` dials rather than handing back a lookup that answers null
+    // for everything — those two produce different sentences.
+    var empty: Lookup = .{ .request = requestWith(.none) };
+    try testing.expect(Lookup.recorded(&empty, "ssh-ed25519") == null);
+    try testing.expectEqual(
+        @as(std.meta.Tag(Ssh.TrustRoot), .none),
+        @as(std.meta.Tag(Ssh.TrustRoot), empty.trustRoot()),
+    );
+
+    // A store that authorises nothing still gives the daemon a trust root, so
+    // the refusal is `not_pinned` — the same one a direct connection produces —
+    // rather than "no trust root".
+    var nothing: Lookup = .{ .request = requestWith(.{ .pins = &.{} }) };
+    const root = nothing.trustRoot();
+    try testing.expectEqual(@as(std.meta.Tag(Ssh.TrustRoot), .pins), @as(std.meta.Tag(Ssh.TrustRoot), root));
+    try testing.expect(Lookup.recorded(&nothing, "ssh-ed25519") == null);
+}
+
+test "gate: no wire field can turn on trust-on-first-use over the daemon" {
+    // First-use trust means *recording* the key that answered, and a process
+    // with no store cannot record anything. So the daemon must not be able to
+    // be told to do it — and the way that is guaranteed is that there is no
+    // field to say it with.
+    //
+    // Held against `@typeInfo` rather than by reading the struct, because a
+    // field added later is exactly the change this is here to catch.
+    const pin_fields = @typeInfo(protocol.Request.Trust.Pin).@"struct".fields;
+    try testing.expectEqual(@as(usize, 2), pin_fields.len);
+    try testing.expectEqualStrings("key_type", pin_fields[0].name);
+    try testing.expectEqualStrings("fingerprint", pin_fields[1].name);
+
+    const trust_members = @typeInfo(protocol.Request.Trust).@"union".fields;
+    try testing.expectEqual(@as(usize, 2), trust_members.len);
+    try testing.expectEqualStrings("none", trust_members[0].name);
+    try testing.expectEqualStrings("pins", trust_members[1].name);
+
+    // There was an assertion here that the root this file builds leaves the flag
+    // false. It is gone, and deliberately: `host_key_test.zig`'s
+    // `gate: trust-on-first-use is turned on in exactly one place` already
+    // requires the *name* to appear zero times in this file's code, which is the
+    // stronger statement. Asserting it is false would have meant mentioning it,
+    // and mentioning it would have broken the gate that says nobody here may.
 }
