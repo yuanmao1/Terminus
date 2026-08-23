@@ -537,9 +537,25 @@ def main() -> int:
     base_seconds = time.time() - base_started
     print(f"{'green' if base_code == 0 else 'RED'} ({base_seconds:.0f}s)")
     if base_code != 0:
+        # Which of the two failures this is, said out loud. A suite that ran and
+        # failed names the tests that failed; a build that could not start names
+        # none — and this runner once reported a two-second red baseline as "the
+        # tree does not pass its own gates" while the same tree was 576/576 green
+        # seconds later. Sending somebody to debug their gates when the build
+        # never ran is the same defect as `NOT_APPLIED` without a count.
+        named = failing_gate_names(base_output)
+        if named:
+            sys.exit(
+                "\nthe unmutated tree does not pass its own gates, so nothing below "
+                "would measure a mutation. Failing: " + ", ".join(named[:6]) +
+                "\n\n" + tail_of(base_output)
+            )
         sys.exit(
-            "\nthe unmutated tree does not pass its own gates, so nothing below "
-            "would measure a mutation.\n\n" + tail_of(base_output)
+            "\nthe build did not run: it failed in {0:.0f}s without naming a single "
+            "failing gate, so this says nothing about the tree. Check for a peer "
+            "`zig build` holding the cache lock, a stale `.zig-cache` lock, or a "
+            "killed build leaving one behind, then re-run.\n\n".format(base_seconds)
+            + tail_of(base_output)
         )
 
     print(f"\n{len(muts)} mutation(s); each one runs the full gate suite\n")
