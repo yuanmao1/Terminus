@@ -129,7 +129,7 @@ test "gate: a reply far larger than the old frame arrives whole with its exit co
     // The real exit code is still readable out of what came back, which is the
     // whole point: `supervisor.parseShell` reads it from the last line.
     const observed = try Core.supervisor.parseShell(arena, 77, stdout, "");
-    try t.expectEqual(@as(?i32, 7), observed.exit_code);
+    try t.expectEqual(Core.supervisor.Ending{ .exited = 7 }, observed.ending);
 
     const passed = trip.response.passed.?;
     try t.expectEqual(@as(u64, raw.len), passed.stdout.bytes);
@@ -400,7 +400,7 @@ test "gate: over the ceiling, both transports say the same thing about the same 
     // And the exit code is still readable out of the tail on both.
     try t.expectEqual(@as(i32, 9), trip.response.exitCode);
     const observed = try Core.supervisor.parseShell(arena, 31, carried, "");
-    try t.expectEqual(@as(?i32, 9), observed.exit_code);
+    try t.expectEqual(Core.supervisor.Ending{ .exited = 9 }, observed.ending);
 }
 
 test "gate: a reply with no accounting is refused rather than read as zeros" {

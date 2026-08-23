@@ -2262,6 +2262,48 @@ pub const Input = Ssh.InputStream;
 /// rendered at their widest, plus a CRLF for a shell that sends one.
 /// `wrapShell`'s own output is held against it by a gate, so the literal below
 /// cannot drift away from the line it describes.
+/// The one terminal each `Ending` maps to.
+///
+/// A switch and not a chain of ifs, so a new arm is a compile error here rather
+/// than a silent fall-through to `indeterminate`. Named and `pub` so the mapping
+/// can be driven without a production caller for every arm: four of the five are
+/// only produced by the remote helper, and a rule reachable solely through code
+/// that does not exist yet is a rule with no gate.
+///
+/// The two that matter most:
+///
+/// `.signalled` becomes `exited` with `term_signal` set. The column exists for
+/// exactly this, and `128 + signal` comes from `Ending.shellStatus` so that no
+/// call site carries the convention and none can disagree about it.
+///
+/// `.timed_out_unconfirmed` becomes `indeterminate`, never `remote_deadline`. The
+/// supervisor signalled and its window closed with the process group still there,
+/// so the only thing established is that we asked. Reporting it as a deadline we
+/// enforced would release the scope barrier for a process that may still be
+/// running — which is the whole failure this vocabulary exists to prevent.
+pub fn terminalFor(ending: supervisor.Ending, last_observed: op_state.Status) op_state.Terminal {
+    return switch (ending) {
+        .exited => |code| .{ .exited = .{ .exit_code = code } },
+        .signalled => |sig| .{ .exited = .{
+            .exit_code = 128 + sig,
+            .term_signal = sig,
+        } },
+        .timed_out => |d| .{ .remote_deadline = .{ .after_ms = d.after_ms } },
+        .timed_out_unconfirmed => .{ .indeterminate = .{
+            .reason = "the remote supervisor signalled its deadline but could not confirm the process group had gone",
+            .last_observed = last_observed,
+        } },
+        // The channel closed cleanly but no outcome arrived: the command's fate
+        // is genuinely unknown. The channel's own exit code is not the command's,
+        // and treating it as the command's is the mistake this path exists to
+        // avoid.
+        .unknown => |why| .{ .indeterminate = .{
+            .reason = why,
+            .last_observed = last_observed,
+        } },
+    };
+}
+
 pub const exit_marker_max_line = std.fmt.comptimePrint(
     "__TERMINUS_EXIT_{d}__ code={d}\r\n",
     .{ std.math.maxInt(u64), std.math.minInt(i32) },
@@ -2354,29 +2396,21 @@ pub fn runCommand(
         .remote_start_token = if (observed.identity) |i| i.start_token else null,
     };
 
-    if (observed.exit_code) |code| {
-        _ = try execution.settle(.{ .exited = .{ .exit_code = code } }, stream_extra);
-        return .{ .ran = .{
-            .status = execution.status,
-            .exit_code = code,
-            .stdout = observed.stdout,
-            .stderr = observed.stderr,
-            .identity = observed.identity,
-            .output = output,
-        } };
-    }
-
-    // The channel closed cleanly but the exit marker never arrived: the
-    // command's fate is genuinely unknown. `result.exit_code` here is the
-    // channel's, not the command's, and treating it as the command's is the
-    // mistake this whole path exists to avoid.
-    _ = try execution.settle(.{ .indeterminate = .{
-        .reason = "remote closed the channel before reporting an exit status",
-        .last_observed = execution.status,
-    } }, stream_extra);
+    // Every arm of `Ending` maps to exactly one terminal, and the mapping is a
+    // switch rather than a chain of ifs so that a new arm is a compile error here
+    // instead of silently falling through to `indeterminate`.
+    //
+    // Two of them are worth naming. `.signalled` becomes `exited` with
+    // `term_signal` set — the column exists for this, and `128 + signal` is
+    // computed by `Ending.shellStatus` so no call site carries the convention.
+    // `.timed_out_unconfirmed` becomes `indeterminate` and never
+    // `remote_deadline`: the supervisor signalled and the window closed with the
+    // group still there, so all it established is that we asked.
+    const terminal = terminalFor(observed.ending, execution.status);
+    _ = try execution.settle(terminal, stream_extra);
     return .{ .ran = .{
         .status = execution.status,
-        .exit_code = null,
+        .exit_code = observed.ending.shellStatus(),
         .stdout = observed.stdout,
         .stderr = observed.stderr,
         .identity = observed.identity,
@@ -2443,4 +2477,84 @@ comptime {
 
 test {
     _ = @import("execution_test.zig");
+}
+
+test "gate: every ending maps to one terminal, and a deadline we could not confirm is not one we enforced" {
+    const t = std.testing;
+
+    // Four of the five arms are produced only by the remote helper, which has no
+    // production caller yet — so without this gate the mapping that decides
+    // whether an unconfirmed stop is reported as an enforced deadline would be
+    // reachable by nothing at all.
+    const cases = [_]struct {
+        what: []const u8,
+        ending: supervisor.Ending,
+        want: std.meta.Tag(op_state.Terminal),
+    }{
+        .{ .what = "a status", .ending = .{ .exited = 3 }, .want = .exited },
+        .{ .what = "a signal", .ending = .{ .signalled = 9 }, .want = .exited },
+        .{
+            .what = "a confirmed deadline",
+            .ending = .{ .timed_out = .{ .after_ms = 1500, .signal = 15 } },
+            .want = .remote_deadline,
+        },
+        .{
+            .what = "a deadline that could not be confirmed",
+            .ending = .{ .timed_out_unconfirmed = .{ .after_ms = 1500, .signal = 9 } },
+            .want = .indeterminate,
+        },
+        .{ .what = "nothing", .ending = .{ .unknown = "no marker" }, .want = .indeterminate },
+    };
+    var mapped: usize = 0;
+    for (cases) |case| {
+        const got = terminalFor(case.ending, .remote_started);
+        t.expectEqual(case.want, std.meta.activeTag(got)) catch |err| {
+            std.debug.print(
+                "{s} mapped to .{s}, not .{s}\n",
+                .{ case.what, @tagName(std.meta.activeTag(got)), @tagName(case.want) },
+            );
+            return err;
+        };
+        mapped += 1;
+    }
+    // Asserted, so that deleting a row — the way an arm stops being checked
+    // without anything failing — is itself a failure.
+    try t.expectEqual(@as(usize, 5), mapped);
+    // And exhaustive over the union, so a sixth arm cannot be added with no case
+    // above naming it. A `switch` on the tag with no `else` is the check.
+    inline for (@typeInfo(supervisor.Ending).@"union".fields) |f| {
+        const covered = switch (@field(std.meta.Tag(supervisor.Ending), f.name)) {
+            .exited, .signalled, .timed_out, .timed_out_unconfirmed, .unknown => true,
+        };
+        try t.expect(covered);
+    }
+
+    // The two deadline arms differ in the only way that matters. `timed_out`
+    // releases the scope barrier; `indeterminate` does not — so confusing them
+    // frees a scope for a process that may still be running.
+    const confirmed = terminalFor(.{ .timed_out = .{ .after_ms = 1500, .signal = 15 } }, .remote_started);
+    try t.expectEqual(@as(i64, 1500), confirmed.remote_deadline.after_ms);
+    const unconfirmed = terminalFor(
+        .{ .timed_out_unconfirmed = .{ .after_ms = 1500, .signal = 9 } },
+        .remote_started,
+    );
+    try t.expect(std.mem.indexOf(u8, unconfirmed.indeterminate.reason, "could not confirm") != null);
+
+    // A signal is carried as a signal, not only as a number. `term_signal` is
+    // what tells a reader that 137 was a kill rather than an exit status the
+    // command chose.
+    const killed = terminalFor(.{ .signalled = 9 }, .remote_started);
+    try t.expectEqual(@as(i32, 137), killed.exited.exit_code);
+    try t.expectEqual(@as(?i32, 9), killed.exited.term_signal);
+    // And an ordinary exit carries no signal, so the field cannot be read as
+    // always set.
+    try t.expectEqual(@as(?i32, null), terminalFor(.{ .exited = 3 }, .remote_started).exited.term_signal);
+
+    // `shellStatus` is the only place the `128 + signal` convention lives.
+    try t.expectEqual(@as(?i32, 137), (supervisor.Ending{ .signalled = 9 }).shellStatus());
+    try t.expectEqual(@as(?i32, 3), (supervisor.Ending{ .exited = 3 }).shellStatus());
+    try t.expectEqual(
+        @as(?i32, null),
+        (supervisor.Ending{ .timed_out = .{ .after_ms = 1, .signal = 15 } }).shellStatus(),
+    );
 }

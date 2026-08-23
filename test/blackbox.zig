@@ -359,7 +359,7 @@ test "blackbox: a bare `exit` cannot swallow the wrapper's exit marker" {
         const result = try runPosixShell(arena, f.io, path, .inherit);
 
         const observed = try Terminus.Core.supervisor.parseShell(arena, nonce, result.stdout, result.stderr);
-        std.testing.expectEqual(@as(?i32, 42), observed.exit_code) catch |err| {
+        std.testing.expectEqual(Terminus.Core.supervisor.Ending{ .exited = 42 }, observed.ending) catch |err| {
             std.debug.print("command {s} lost its marker\nstdout:\n{s}\n", .{ command, result.stdout });
             return err;
         };

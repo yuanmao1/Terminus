@@ -2820,6 +2820,22 @@
       "find": "        std.mem.writeInt(u32, head[0..4], @intCast(body.items.len + 1), .little);",
       "replace": "        std.mem.writeInt(u32, head[0..4], @intCast(body.items.len), .little);",
       "expect_gate": "blackbox: the helper reassembles output larger than its own read buffer, in order"
+    },
+    {
+      "id": "G6-unconfirmed-deadline-reported-as-enforced",
+      "rule": "The remote supervisor signalled its deadline and its window closed with the process group still there, which establishes only that we asked. Reporting it as `remote_deadline` makes it a `timed_out` terminal, and that releases the scope barrier for a process that may still be running - the exact failure this vocabulary exists to prevent. It is also an arm no production caller can reach yet, so this gate is the only thing holding it.",
+      "file": "src/core/execution.zig",
+      "find": "        .timed_out_unconfirmed => .{ .indeterminate = .{\n            .reason = \"the remote supervisor signalled its deadline but could not confirm the process group had gone\",\n            .last_observed = last_observed,\n        } },",
+      "replace": "        .timed_out_unconfirmed => |d| .{ .remote_deadline = .{ .after_ms = d.after_ms } },",
+      "expect_gate": "gate: every ending maps to one terminal, and a deadline we could not confirm is not one we enforced"
+    },
+    {
+      "id": "G6-a-signal-loses-its-signal",
+      "rule": "A signalled command settles `exited` with `term_signal` set, because `term_signal` is what tells a reader that 137 was a kill rather than a status the command chose. Dropping it leaves a number indistinguishable from an ordinary exit.",
+      "file": "src/core/execution.zig",
+      "find": "        .signalled => |sig| .{ .exited = .{\n            .exit_code = 128 + sig,\n            .term_signal = sig,\n        } },",
+      "replace": "        .signalled => |sig| .{ .exited = .{\n            .exit_code = 128 + sig,\n        } },",
+      "expect_gate": "gate: every ending maps to one terminal, and a deadline we could not confirm is not one we enforced"
     }
   ]
 }

@@ -445,11 +445,57 @@ pub const Identity = struct {
     start_token: ?[]const u8 = null,
 };
 
+/// How a command ended, in the terms the ledger settles on.
+///
+/// A tagged union and not `?i32`, because a number cannot hold what a real
+/// supervisor measures. `waitid` separates a child that exited from one a signal
+/// killed (`src/helper/main.zig` reports both), and a remote deadline has two
+/// outcomes that settle differently: the supervisor stopped the group and
+/// confirmed it gone, or it signalled and the window closed with the group still
+/// there. The first is `timed_out`. The second is `indeterminate` — it claims
+/// only that we asked.
+///
+/// The point of the union is that the wrong read cannot be written. With `?i32`
+/// the caller unwraps a number and has no way to ask what kind of number it is,
+/// which is how `128 + signal` comes to be reported as an exit status and how a
+/// deadline we could not confirm comes to be reported as one we enforced.
+pub const Ending = union(enum) {
+    /// The command ran to completion; this is its status.
+    exited: i32,
+    /// A signal ended it. The number is the signal.
+    signalled: i32,
+    /// A remote deadline fired and the supervisor confirmed the group is gone.
+    timed_out: Deadline,
+    /// A remote deadline fired and the supervisor could not confirm the stop.
+    timed_out_unconfirmed: Deadline,
+    /// Nothing was established. The text says why, for the receipt.
+    unknown: []const u8,
+
+    pub const Deadline = struct {
+        after_ms: i64,
+        /// The signal the supervisor last sent, for the receipt to name.
+        signal: i32,
+    };
+
+    /// The status a POSIX shell would report for this ending.
+    ///
+    /// `128 + signal` is the shell convention, and it is computed here rather
+    /// than at each call site so that no caller has to remember it and none can
+    /// disagree about it.
+    pub fn shellStatus(e: Ending) ?i32 {
+        return switch (e) {
+            .exited => |code| code,
+            .signalled => |sig| 128 + sig,
+            .timed_out, .timed_out_unconfirmed, .unknown => null,
+        };
+    }
+};
+
 pub const Observed = struct {
     /// Present once the remote confirmed a running process.
     identity: ?Identity = null,
-    /// Present once the command finished.
-    exit_code: ?i32 = null,
+    /// How it ended, once it has.
+    ending: Ending = .{ .unknown = "no outcome was reported" },
     /// Output with the supervision markers removed.
     stdout: []const u8,
     stderr: []const u8,
@@ -522,7 +568,9 @@ pub fn parseShell(arena: Allocator, nonce: u64, stdout: []const u8, stderr: []co
 
     return .{
         .identity = identity,
-        .exit_code = exit_code,
+        .ending = if (exit_code) |code| .{ .exited = code } else .{
+            .unknown = "remote closed the channel before reporting an exit status",
+        },
         .stdout = kept.items,
         .stderr = stderr,
     };
@@ -580,7 +628,7 @@ test parseShell {
     try t.expectEqual(@as(i64, 4242), observed.identity.?.pid);
     try t.expectEqual(@as(i64, 4242), observed.identity.?.pgid.?);
     try t.expectEqualStrings("91823", observed.identity.?.start_token.?);
-    try t.expectEqual(@as(i32, 3), observed.exit_code.?);
+    try t.expectEqual(Ending{ .exited = 3 }, observed.ending);
     try t.expectEqualStrings("hello\nworld\n", observed.stdout);
 }
 
@@ -596,7 +644,7 @@ test "a missing exit marker leaves the outcome unknown" {
     const truncated = "__TERMINUS_START_9__ pid=51 pgid=51 token=1\npartial outp";
     const observed = try parseShell(arena, 9, truncated, "");
     try t.expectEqual(@as(i64, 51), observed.identity.?.pid);
-    try t.expectEqual(@as(?i32, null), observed.exit_code);
+    try t.expectEqual(@as(?i32, null), observed.ending.shellStatus());
     try t.expectEqualStrings("partial outp", observed.stdout);
 }
 
@@ -613,7 +661,7 @@ test "identity is optional when the shell could not report it" {
     try t.expectEqual(@as(i64, 8), observed.identity.?.pid);
     try t.expectEqual(@as(?i64, null), observed.identity.?.pgid);
     try t.expectEqual(@as(?[]const u8, null), observed.identity.?.start_token);
-    try t.expectEqual(@as(i32, 0), observed.exit_code.?);
+    try t.expectEqual(Ending{ .exited = 0 }, observed.ending);
     try t.expectEqualStrings("ok\n", observed.stdout);
 }
 
@@ -630,6 +678,6 @@ test "command output resembling a marker is not stripped" {
         "__TERMINUS_EXIT_999__ code=0\n" ++
         "__TERMINUS_EXIT_5__ code=0\n";
     const observed = try parseShell(arena, 5, out, "");
-    try t.expectEqual(@as(i32, 0), observed.exit_code.?);
+    try t.expectEqual(Ending{ .exited = 0 }, observed.ending);
     try t.expectEqualStrings("__TERMINUS_EXIT_999__ code=0\n", observed.stdout);
 }
