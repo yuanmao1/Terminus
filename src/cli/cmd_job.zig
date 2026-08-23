@@ -3449,7 +3449,12 @@ fn removalUnrecordable(
     cause: anyerror,
 ) noreturn {
     const local_row = localRowAfterFailedRemoval(rollback);
-    const unknown = std.mem.eql(u8, local_row, "unknown");
+    // Asked of the union, not of the word the union produced. Reading the answer
+    // back out of the published text meant a rename of that literal changed
+    // which hint every unconfirmed rollback prints, and the unit test above
+    // asserts the literal without exercising this selection - so the rename
+    // plus its test update would have been silent.
+    const unknown = rollback == .unconfirmed;
     Cli.clearExecution();
     const lease = Cli.releaseClaimReporting();
     const hint: []const u8 = if (unknown)

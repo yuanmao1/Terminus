@@ -274,7 +274,7 @@ const code = struct {
     /// found a peer's claim on the scope. Distinct from `AUTHORITY_LOST`: there
     /// the renewal said so, here the renewals all passed and the atomic
     /// re-validation is what refused.
-    pub const scope_taken_before_commit = "SCOPE_TAKEN_BEFORE_COMMIT";
+    pub const scope_taken_before_commit = Core.execution.Refusal.codes.scope_taken;
     /// Every renewal held, and the transaction that was to record the removal
     /// found *this command's own* lease no longer live and ours.
     ///
@@ -282,7 +282,7 @@ const code = struct {
     /// this exists for has none: a lease that lapsed during the last round trip
     /// and was swept with nobody replacing it leaves the scope genuinely clear,
     /// which is exactly why the overlap check used to let it through.
-    pub const claim_lost_before_commit = "CLAIM_LOST_BEFORE_COMMIT";
+    pub const claim_lost_before_commit = Core.execution.Refusal.codes.claim_lost;
     /// The kill went out and the host still reports the session present.
     pub const survived = "SESSION_SURVIVED_KILL";
     /// The host answered that it has no tmux, so the kill provably never ran.

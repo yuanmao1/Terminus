@@ -44,15 +44,21 @@ pub const Executor = union(enum) {
         input: ?Ssh.InputStream,
         output: *Ssh.Retained,
     ) (Ssh.ExecError || Ssh.InputError)!Ssh.ExecResult {
+        // One answer to "can this transport carry an input", consulted rather
+        // than restated. The `.daemon` arm below used to decide it a second
+        // time with its own hard-coded condition; two enumerations of the same
+        // fact are two places for it to disagree, and the one further from
+        // `carriesInput` is the one a new transport's author would miss.
+        //
+        // The refusal itself is not new and is not a fallback: the daemon
+        // protocol carries a command and an answer and nothing else — there is
+        // no third channel to stream into — and a command that reads stdin and
+        // is handed an immediate EOF reports success having done nothing. The
+        // CLI keeps this unreachable by taking a direct connection when an input
+        // source was named; this is the refusal behind that.
+        if (input != null and !e.carriesInput()) return error.InputUnsupported;
         return switch (e) {
             .direct => |client| client.execRetained(arena, command, input, output),
-            // The daemon protocol carries a command and an answer and nothing
-            // else — there is no third channel to stream into. Refused rather
-            // than run without its input: a command that reads stdin and is
-            // handed an immediate EOF reports success having done nothing. The
-            // CLI keeps this unreachable by taking a direct connection when an
-            // input source was named; this is the refusal behind that.
-            //
             // Without an input it serves the command path like any other
             // transport, and under the same `Ssh.output_ceiling` — applied by
             // the daemon at the channel it drained, not here. A ceiling here
@@ -60,10 +66,7 @@ pub const Executor = union(enum) {
             // it has already been read, and the daemon would still have held all
             // of them. The accounting comes back on the wire because it is an
             // observation of bytes this process never saw.
-            .daemon => |client| if (input != null)
-                error.InputUnsupported
-            else
-                client.execRetained(arena, command, output),
+            .daemon => |client| client.execRetained(arena, command, output),
             .scripted => |client| client.execRetained(arena, command, input, output),
         };
     }
@@ -80,7 +83,13 @@ pub const Executor = union(enum) {
     ///
     /// Asked *before* the scope guard binds, so a transport that cannot carry
     /// the input refuses with nothing sent rather than settling an attempt that
-    /// never reached a host.
+    /// never reached a host — and asked again at the head of `execRetained`, so
+    /// this is the only place the answer is written down.
+    ///
+    /// That makes it load-bearing on the transport path, which is worth stating:
+    /// a new variant that answered `true` here while having nowhere to put the
+    /// bytes would drop them silently instead of refusing. The arms are one line
+    /// each so that the question is unavoidable when one is added.
     pub fn carriesInput(e: Executor) bool {
         return switch (e) {
             .direct, .scripted => true,

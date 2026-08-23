@@ -33,6 +33,31 @@ const protocol = Terminus.Core.daemon_protocol;
 
 const exe_path = build_options.terminus_exe;
 
+/// How long any subprocess a gate spawns may take before the gate fails instead
+/// of waiting.
+///
+/// `std.process.run` defaults to `Io.Timeout.none`, which is an unbounded wait
+/// on the child's pipes closing. That is not a theoretical hazard here: WSL2
+/// terminates an idle instance on its own, and when it did so mid-call the
+/// helper gates left a `test.exe` alive for twenty-one minutes with its CPU time
+/// frozen at 8.88 seconds and a mutation run queued behind it. Three wedges
+/// today traced to an unbounded wait; this is the one that was introduced rather
+/// than inherited.
+///
+/// Ninety seconds is far above every legitimate case — the slowest gate here
+/// drives twelve helper runs through one `wsl.exe` start-up and finishes in a
+/// few seconds — and far below the point at which somebody starts wondering
+/// whether the suite is stuck.
+const subprocess_bound: std.Io.Timeout = .{
+    .duration = .{
+        .raw = .fromMilliseconds(90_000),
+        // `.awake` and not `.monotonic`: a machine that suspends mid-run should not
+        // spend the bound while nothing was executing, which is the same clock the
+        // rest of this tree measures elapsed work against.
+        .clock = .awake,
+    },
+};
+
 /// The POSIX shell the two shell-execution gates below run their generated
 /// text through. Resolved by the build: `-Dposix-sh=<path>`, else PATH, else
 /// Git for Windows' own `sh.exe`.
@@ -64,6 +89,7 @@ fn runPosixShell(
         .cwd = cwd,
         .stdout_limit = .limited(1 << 16),
         .stderr_limit = .limited(1 << 16),
+        .timeout = subprocess_bound,
     }) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print(
@@ -7104,6 +7130,7 @@ fn runHelper(
         .argv = try linuxArgv(arena, f.dir, script_base),
         .stdout_limit = .limited(1 << 20),
         .stderr_limit = .limited(1 << 16),
+        .timeout = subprocess_bound,
     }) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print(
@@ -7117,6 +7144,18 @@ fn runHelper(
                 \\
             , .{linux_runner});
             return error.LinuxRunnerNotFound;
+        },
+        error.Timeout => {
+            std.debug.print(
+                \\
+                \\the runner '{s}' did not finish inside the subprocess bound. WSL2 terminates an
+                \\idle instance on its own, and a call that was in flight when it did so leaves
+                \\pipes that never close — which is why this is a bound and not a wait. Re-run;
+                \\if it repeats, something on the far side is genuinely stuck.
+                \\
+                \\
+            , .{linux_runner});
+            return error.LinuxRunnerTimedOut;
         },
         else => return err,
     };
@@ -7344,6 +7383,7 @@ test "blackbox: the helper stops the process group, not just the shell it launch
         .argv = try linuxArgv(arena, f.dir, "group_probe.sh"),
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
+        .timeout = subprocess_bound,
     });
     // 1 is the shell's word for "that group is gone".
     const answer = std.mem.trim(u8, survivors.stdout, " \r\n\t");

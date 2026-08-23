@@ -164,12 +164,17 @@ pub const CascadeCounts = struct {
 /// that true.** Two of the seven were missing and were not oversights of the same
 /// kind:
 ///
-///  * `redaction_rules` is a **security declaration** — the secret locations an
-///    operator wrote down so that redaction does not depend on pattern guessing.
-///    Nothing refused over them and no number mentioned them, so `server rm`
-///    destroyed them in silence; of the seven that is the least acceptable one to
-///    lose without being told, because what it costs is not a record of the past
-///    but a rule that was protecting something.
+///  * `redaction_rules` is where a **security declaration** would live — the
+///    secret locations an operator names outright, so that redaction does not
+///    depend on pattern guessing. **No verb writes one today**, so the count is
+///    structurally zero and nothing is being lost in silence yet; `policy.zig`'s
+///    header records why the CRUD that would have written them was deleted
+///    rather than kept as an uncalled path. The field is declared anyway, and
+///    that is the decision: whoever builds the declaration path should not have
+///    to notice, at the same time, that `server rm` would take the rules away
+///    without saying so. An earlier version of this paragraph claimed the rules
+///    were something an operator *had* written down, which was a description of
+///    a feature that does not exist.
 ///  * `leases` sits behind a barrier already, and a barrier is not a count. The
 ///    barrier asks "is anybody holding a claim here right now" and refuses while
 ///    the answer is yes; this asks "how much goes when the answer is no", and the

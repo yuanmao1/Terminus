@@ -26,8 +26,10 @@
 //! Audit isolation is the fifth and is not implemented here yet; nothing in
 //! this file claims it.
 //!
-//! Not wired into `build.zig` yet — built directly for `x86_64-linux-musl` and
-//! driven under WSL. See `docs/v2.0-progress.md`.
+//! Cross-compiled by `build.zig` for `x86_64-linux-musl` at `ReleaseSmall` and
+//! driven by nine gates in `test/blackbox.zig` on a real Linux kernel. It has no
+//! production caller yet: nothing embeds it, pushes it, or runs it outside those
+//! gates. See `docs/v2.0-progress.md`.
 //!
 //! No allocator, and every buffer below is a fixed size with a stated bound:
 //! this runs on somebody else's machine, and a supervisor that can fail to

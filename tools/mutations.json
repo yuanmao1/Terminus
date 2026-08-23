@@ -1031,7 +1031,7 @@
     },
     {
       "id": "S2e-server-cascade-declaration-drifts",
-      "rule": "The declared cascade set is held in both directions: a declaration that no longer names a table the schema cascades leaves that table's rows going with the server under nothing that records anybody having decided so. `redaction_rules` is the entry that carries the point - declared secret locations, and until the volume count named them nothing did.",
+      "rule": "The declared cascade set is held in both directions: a declaration that no longer names a table the schema cascades leaves that table's rows going with the server under nothing that records anybody having decided so. `redaction_rules` is the entry that carries the point - it is where declared secret locations would live, no verb writes one yet, and the declaration is what stops the day somebody builds that path from also being the day they discover `server rm` takes the rules away in silence.",
       "file": "src/core/store/gates_schema_test.zig",
       "find": "    .{ .name = \"redaction_rules\", .barrier = false, .counted = true },",
       "replace": "    .{ .name = \"redaction_rules_renamed\", .barrier = false, .counted = true },",
@@ -1063,7 +1063,7 @@
     },
     {
       "id": "S2f-server-cascade-table-behind-nothing",
-      "rule": "Every table the `servers` DELETE cascades is behind a barrier or behind the volume count. `redaction_rules` used to be behind neither, and the declaration could say so out loud - which made the silent destruction of declared secret locations a documented state rather than a defect. Both columns false is a gate failure now, so the shape that could record it is gone.",
+      "rule": "Every table the `servers` DELETE cascades is behind a barrier or behind the volume count. `redaction_rules` used to be behind neither, and the declaration could say so out loud - which made the destruction of a table meant to hold declared secret locations a documented state rather than a defect. Both columns false is a table that goes with no barrier and no number.",
       "file": "src/core/store/gates_schema_test.zig",
       "find": "    .{ .name = \"redaction_rules\", .barrier = false, .counted = true },",
       "replace": "    .{ .name = \"redaction_rules\", .barrier = false, .counted = false },",
@@ -1785,8 +1785,8 @@
       "id": "M4d-daemon-asks-for-the-ceiling",
       "rule": "On the daemon transport the command path asks for the bounded output discipline, so the ceiling is applied at the end that drains the channel and the accounting comes back on the wire. Asking for the whole reply instead leaves the receipt with nothing at all to say about the streams.",
       "file": "src/core/exec.zig",
-      "find": "                client.execRetained(arena, command, output),",
-      "replace": "                client.exec(arena, command),",
+      "find": "            .daemon => |client| client.execRetained(arena, command, output),",
+      "replace": "            .daemon => |client| client.exec(arena, command),",
       "expect_gate": "gate: a large successful command over the daemon socket settles with its real exit code"
     },
     {
@@ -2713,7 +2713,7 @@
       "id": "G17d-lookup-answers-any-key-type",
       "file": "src/core/daemon/Server.zig",
       "find": "            if (std.mem.eql(u8, pin.key_type, key_type)) return pin.fingerprint;",
-      "replace": "            return pin.fingerprint;",
+      "replace": "            if (key_type.len > 0) return pin.fingerprint;",
       "rule": "A host offering a key type nobody pinned must get `not_pinned`, not a comparison against a different type's fingerprint. host_pins is keyed on the type for exactly this reason.",
       "expect_gate": "gate: the daemon's lookup answers by key type and never invents an authority"
     },
