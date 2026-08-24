@@ -158,6 +158,23 @@ fn runWrite(
     // about the input itself, which nothing here has read.
     var detail: []const u8 = "the terminal accepted the bytes; nothing here says whether the input ran";
 
+    // A pane transcript contains the terminal's echo. Stop it before typing so
+    // the raw input never becomes a remote plaintext log entry. It is resumed
+    // only by the next explicit `read`, after the echo interval has passed.
+    Tmux.pauseLog(executor, ctx.arena, session_name) catch |err| switch (err) {
+        error.SessionNotFound => {
+            const why = "the session is gone, or tmux is not installed, so logging could not be stopped and nothing was typed";
+            _ = execution.settle(.{ .input_refused = .{ .reason = why } }, .{}) catch |e|
+                Cli.receiptFatal(execution.id(), e, "the terminal refused the input");
+            fatal("{s} (request {s})", .{ why, execution.id() });
+        },
+        else => {
+            _ = execution.transportLoss(Core.execution.describe(executor, err)) catch |e|
+                Cli.receiptFatal(execution.id(), e, execution.status.text());
+            Cli.failIndeterminate(execution.id(), "could not prove pane logging stopped; nothing was intentionally typed", execution.status.text());
+        },
+    };
+
     if (Tmux.sendKeys(executor, ctx.arena, session_name, input, parsed.boolean("no-enter"))) |_| {
         // The one fact this operation has: the terminal took exactly these
         // bytes. It goes on the receipt as the input stream's size and digest,
@@ -255,6 +272,7 @@ fn runWrite(
             .runningAlongside = advisory,
             .transport = conn.transport,
             .daemonError = conn.daemon_error,
+            .paneLog = "paused_until_next_read",
         }),
         .human => {
             switch (answer) {
@@ -305,6 +323,11 @@ fn runRead(
     var conn = Cli.connect(ctx, parsed, server, auth);
     defer conn.deinit();
     const executor = conn.executor();
+
+    // Reattach prospectively. Never recover the gap from pane scrollback: it
+    // contains the operator input `write` deliberately kept out of the log.
+    Tmux.resumeLog(executor, ctx.arena, session_name) catch |err|
+        fatalTmux(err, executor, session_name);
 
     const limit: i64 = if (parsed.flag("limit")) |l|
         std.fmt.parseInt(i64, l, 10) catch fatal("invalid --limit '{s}'", .{l})

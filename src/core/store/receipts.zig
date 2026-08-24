@@ -895,6 +895,12 @@ pub const ResolutionEvidence = union(enum) {
     /// status it reported, so the claim and the conclusion are one fact
     /// rather than two independently-chosen ones.
     supervisor_report: struct {
+        /// Identity written by the remote supervisor, not copied from the
+        /// operation row. `resolve` matches all three fields before allowing
+        /// this mechanical report to release a scope.
+        request_id: []const u8 = "",
+        pid: i64 = 0,
+        start_token: ?[]const u8 = null,
         reported: op_state.ResolvedStatus,
         detail: []const u8,
     },
@@ -1326,7 +1332,7 @@ pub const ResolutionEvidence = union(enum) {
             // constructs this variant, so no operator route disappears, and
             // `operator_override` remains admissible for every kind — nothing is
             // left with no way to be settled.
-            .supervisor_report => false,
+            .supervisor_report => can.records_process_identity,
             // A pid and start-token reading of a process. `resolve` requires it to
             // be a reading of *this operation's own* recorded process, so it may
             // speak only for a kind that recorded one — which is a fact about what
@@ -1444,6 +1450,9 @@ pub const ResolutionEvidence = union(enum) {
     ) std.mem.Allocator.Error![]u8 {
         const redacted: ResolutionEvidence = switch (e) {
             .supervisor_report => |s| .{ .supervisor_report = .{
+                .request_id = s.request_id,
+                .pid = s.pid,
+                .start_token = s.start_token,
                 .reported = s.reported,
                 .detail = try redact(arena, s.detail),
             } },
@@ -2306,6 +2315,21 @@ pub fn resolve(
     // for a probe that never got past the check — nothing is written then.
     var probe_binding: ?ProbeBinding = null;
     switch (evidence) {
+        .supervisor_report => |report| if (evidence.appliesToKind(kind)) {
+            const recorded = try recordedProcessLocked(store, arena, request_id);
+            const fits = std.mem.eql(u8, report.request_id, request_id) and if (recorded) |had|
+                had.pid == report.pid and startTokenFits(had.start_token, report.start_token)
+            else
+                false;
+            if (!fits) {
+                try rollback(store);
+                return .{ .evidence_wrong_process = .{
+                    .probed_pid = report.pid,
+                    .probed_start_token = report.start_token,
+                    .recorded = recorded,
+                } };
+            }
+        },
         .job_result => |r| if (!std.mem.eql(u8, r.request_id, request_id)) {
             try rollback(store);
             return .{ .evidence_wrong_operation = .{

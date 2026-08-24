@@ -760,6 +760,67 @@ pub fn sendKeys(executor: Executor, arena: Allocator, name: []const u8, input: [
     }
 }
 
+/// Stops the pane transcript before operator-controlled input is typed.
+///
+/// A tmux pane echoes ordinary shell input, so leaving `pipe-pane` attached
+/// writes the raw input to the remote log even when the local ledger stores only
+/// a digest and a redacted form. The pipe stays stopped after this call: turning
+/// it back on in the same remote script races the terminal echo. `resumeLog`
+/// reattaches it when the operator next asks to read the session, after the echo
+/// has already happened.
+pub fn pauseLog(executor: Executor, arena: Allocator, name: []const u8) Error!void {
+    const tname = try targetName(arena, name);
+    const script = try std.fmt.allocPrint(arena,
+        \\tmux has-session -t ={s} 2>/dev/null || exit 43
+        \\tmux pipe-pane -t ={s}: || exit 42
+    , .{ tname, tname });
+    const result = try run(executor, arena, script);
+    switch (result.exit_code) {
+        0 => {},
+        43 => return error.SessionNotFound,
+        else => return error.RemoteFailed,
+    }
+}
+
+/// Reattaches pane logging after a deliberate secret-safe gap made by
+/// `pauseLog`. It never reconstructs the missing interval from scrollback:
+/// doing so would copy the input that was deliberately kept out.
+pub fn resumeLog(executor: Executor, arena: Allocator, name: []const u8) Error!void {
+    const tname = try targetName(arena, name);
+    const script = try std.fmt.allocPrint(arena,
+        \\tmux has-session -t ={s} 2>/dev/null || exit 43
+        \\mkdir -p {s}
+        \\tmux pipe-pane -o -t ={s}: 'cat >> {s}/{s}.log' || exit 42
+    , .{ tname, log_dir, tname, log_dir, name });
+    const result = try run(executor, arena, script);
+    switch (result.exit_code) {
+        0 => {},
+        43 => return error.SessionNotFound,
+        else => return error.RemoteFailed,
+    }
+}
+
+test "secret gate: pane logging can be paused and only resumed prospectively" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Scripted = @import("../exec.zig").Scripted;
+
+    var scripted = Scripted.init(arena, &.{
+        .{ .reply = .{ .exit_code = 0, .stdout = "", .stderr = "" } },
+        .{ .reply = .{ .exit_code = 0, .stdout = "", .stderr = "" } },
+    });
+    try pauseLog(scripted.executor(), arena, "shell");
+    try resumeLog(scripted.executor(), arena, "shell");
+
+    try t.expectEqual(@as(usize, 2), scripted.seen.items.len);
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[0], "pipe-pane -t =t-shell:") != null);
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[0], "cat >>") == null);
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "pipe-pane -o -t =t-shell:") != null);
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "cat >> $HOME/.terminus/logs/shell.log") != null);
+}
+
 /// The script `probeTail` runs, and the one the black-box gate executes
 /// through a real POSIX shell.
 ///

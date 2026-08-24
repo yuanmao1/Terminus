@@ -64,6 +64,33 @@ pub const shell_capability: Capability = .{
     .audit_isolation = false,
 };
 
+/// The exact helper bytes built from `src/helper/main.zig` for this CLI.
+pub const helper_executable = @embedFile("terminus_helper");
+pub const helper_fact_key = "terminus.helper.sha256";
+
+/// The installation surface will put the embedded binary here. Kept as one
+/// production constant so installation and invocation cannot drift silently.
+pub const remote_helper_command = "exec \"$HOME/.terminus/bin/terminus-helper\"";
+
+/// Invocation used for every helper-backed execution. The digest check and
+/// `exec` are one remote shell program, so a replaced helper is refused at the
+/// last possible moment instead of being trusted from a stale local fact.
+pub fn guardedRemoteHelperCommand(arena: Allocator) Allocator.Error![]const u8 {
+    const digest = @import("digest.zig");
+    var hex: [digest.hex_len]u8 = undefined;
+    const want = digest.hex(helper_executable, &hex);
+    return std.fmt.allocPrint(
+        arena,
+        "cd \"$HOME\" || exit 126; actual=$(sha256sum \"$HOME/.terminus/bin/terminus-helper\" 2>/dev/null | awk '{{print $1}}') || exit 126; " ++
+            "[ \"$actual\" = \"{s}\" ] || exit 126; " ++ remote_helper_command,
+        .{want},
+    );
+}
+
+pub fn helperSha256(out: *[32]u8) void {
+    std.crypto.hash.sha2.Sha256.hash(helper_executable, out, .{});
+}
+
 /// The helper's wire protocol, host side.
 ///
 /// This lived in `test/blackbox.zig` — the nine gates that drive
@@ -91,12 +118,15 @@ pub const wire = struct {
     pub const Kind = struct {
         // host -> helper
         pub const run: u8 = 0x01;
+        pub const query: u8 = 0x02;
+        pub const cancel: u8 = 0x03;
         // helper -> host
         pub const started: u8 = 0x81;
         pub const stdout: u8 = 0x82;
         pub const stderr: u8 = 0x83;
         pub const exited: u8 = 0x84;
         pub const failed: u8 = 0x85;
+        pub const state: u8 = 0x86;
     };
 
     /// How a command ended, as the helper measured it.
@@ -115,6 +145,7 @@ pub const wire = struct {
         signalled = 1,
         timed_out_killed = 2,
         timed_out_unconfirmed = 3,
+        cancelled = 4,
         _,
     };
 
@@ -135,6 +166,17 @@ pub const wire = struct {
         deadline_ms: u64,
         grace_ms: u64,
     ) EncodeError![]u8 {
+        return encodeRunFor(arena, "", argv, deadline_ms, grace_ms);
+    }
+
+    pub fn encodeRunFor(
+        arena: Allocator,
+        request_id: []const u8,
+        argv: []const []const u8,
+        deadline_ms: u64,
+        grace_ms: u64,
+    ) EncodeError![]u8 {
+        if (request_id.len > 64) return error.ArgumentsTooLarge;
         if (argv.len > max_argv) return error.TooManyArguments;
         var total: usize = 0;
         for (argv) |a| total += a.len + 1;
@@ -142,6 +184,8 @@ pub const wire = struct {
 
         var body: std.ArrayList(u8) = .empty;
         var head: [8]u8 = undefined;
+        try body.append(arena, @intCast(request_id.len));
+        try body.appendSlice(arena, request_id);
         std.mem.writeInt(u64, &head, deadline_ms, .little);
         try body.appendSlice(arena, &head);
         std.mem.writeInt(u64, &head, grace_ms, .little);
@@ -159,6 +203,27 @@ pub const wire = struct {
         std.mem.writeInt(u32, head[0..4], @intCast(body.items.len + 1), .little);
         try frame.appendSlice(arena, head[0..4]);
         try frame.append(arena, Kind.run);
+        try frame.appendSlice(arena, body.items);
+        return frame.items;
+    }
+
+    pub fn encodeControl(
+        arena: Allocator,
+        kind: enum { query, cancel },
+        request_id: []const u8,
+        grace_ms: u64,
+    ) EncodeError![]u8 {
+        if (request_id.len == 0 or request_id.len > 64) return error.ArgumentsTooLarge;
+        var body: std.ArrayList(u8) = .empty;
+        try body.append(arena, @intCast(request_id.len));
+        try body.appendSlice(arena, request_id);
+        var word: [8]u8 = undefined;
+        std.mem.writeInt(u64, &word, grace_ms, .little);
+        try body.appendSlice(arena, &word);
+        var frame: std.ArrayList(u8) = .empty;
+        std.mem.writeInt(u32, word[0..4], @intCast(body.items.len + 1), .little);
+        try frame.appendSlice(arena, word[0..4]);
+        try frame.append(arena, if (kind == .query) Kind.query else Kind.cancel);
         try frame.appendSlice(arena, body.items);
         return frame.items;
     }
@@ -261,6 +326,17 @@ pub const helper_capability: Capability = .{
     .audit_isolation = false,
 };
 
+/// Granted only to the closed audit request path after the helper returns the
+/// compiled policy manifest acknowledgement. Ordinary helper runs continue to
+/// use `helper_capability` and cannot inherit this claim.
+pub const audit_capability: Capability = .{
+    .supervisor = .helper,
+    .pid_proof = .strong,
+    .binary_framing = true,
+    .remote_deadline = true,
+    .audit_isolation = true,
+};
+
 test "gate: the host's wire constants are the helper's own" {
     const t = std.testing;
     // The helper is a separate compilation unit for a different target, so its
@@ -303,6 +379,8 @@ test "gate: the host's wire constants are the helper's own" {
         .{ .block = source, .decl = "\nconst argv_bytes = ", .want = "1 << 19" },
         .{ .block = source, .decl = "\nconst pump_bytes = ", .want = "32 * 1024" },
         .{ .block = kind, .decl = "const run: u8 = ", .want = "0x01" },
+        .{ .block = kind, .decl = "const query: u8 = ", .want = "0x02" },
+        .{ .block = kind, .decl = "const cancel: u8 = ", .want = "0x03" },
         .{ .block = kind, .decl = "const started: u8 = ", .want = "0x81" },
         .{ .block = kind, .decl = "const stdout: u8 = ", .want = "0x82" },
         .{ .block = kind, .decl = "const stderr: u8 = ", .want = "0x83" },
@@ -312,6 +390,7 @@ test "gate: the host's wire constants are the helper's own" {
         .{ .block = how, .decl = "const signalled: u8 = ", .want = "1" },
         .{ .block = how, .decl = "const timed_out_killed: u8 = ", .want = "2" },
         .{ .block = how, .decl = "const timed_out_unconfirmed: u8 = ", .want = "3" },
+        .{ .block = how, .decl = "const cancelled: u8 = ", .want = "4" },
     };
     for (cases) |c| {
         const got = Block.value(c.block, c.decl) catch |err| {
@@ -329,7 +408,7 @@ test "gate: the host's wire constants are the helper's own" {
     }
     // Asserted so that deleting a row above — the way a rule stops being checked
     // without anything failing — is itself a failure.
-    try t.expectEqual(@as(usize, 14), checked);
+    try t.expectEqual(@as(usize, 17), checked);
 
     // And the values the host actually uses, against the same numbers.
     try t.expectEqual(@as(usize, 1 << 20), wire.max_frame);
@@ -337,9 +416,12 @@ test "gate: the host's wire constants are the helper's own" {
     try t.expectEqual(@as(usize, 1 << 19), wire.argv_bytes);
     try t.expectEqual(@as(usize, 32 * 1024), wire.pump_bytes);
     try t.expectEqual(@as(u8, 0x01), wire.Kind.run);
+    try t.expectEqual(@as(u8, 0x02), wire.Kind.query);
+    try t.expectEqual(@as(u8, 0x03), wire.Kind.cancel);
     try t.expectEqual(@as(u8, 0x85), wire.Kind.failed);
     try t.expectEqual(@as(u8, 2), @intFromEnum(wire.How.timed_out_killed));
     try t.expectEqual(@as(u8, 3), @intFromEnum(wire.How.timed_out_unconfirmed));
+    try t.expectEqual(@as(u8, 4), @intFromEnum(wire.How.cancelled));
 }
 
 test "gate: a request too large for the helper is refused before it is sent" {
@@ -501,6 +583,66 @@ pub const Observed = struct {
     stderr: []const u8,
 };
 
+pub const HelperReplyError = wire.DecodeError || error{
+    TruncatedFrame,
+    HelperDidNotStart,
+    HelperDidNotFinish,
+    HelperReportedFailure,
+    HelperReplyAmbiguous,
+};
+
+/// Converts the framed helper reply into the same `Observed` vocabulary the
+/// shell supervisor feeds to the ledger. Exactly one start and one ending are
+/// required; accepting the first of two would make process identity depend on
+/// frame order after a protocol fault.
+pub fn parseHelper(arena: Allocator, bytes: []const u8, deadline_ms: u64) HelperReplyError!Observed {
+    const reply = try wire.decode(arena, bytes);
+    if (reply.failed != null) return error.HelperReportedFailure;
+    if (reply.trailing != 0) return error.TruncatedFrame;
+    if (reply.started.len == 0) return error.HelperDidNotStart;
+    if (reply.started.len != 1 or reply.ended.len > 1) return error.HelperReplyAmbiguous;
+    if (reply.ended.len == 0) return error.HelperDidNotFinish;
+    const started = reply.started[0];
+    const ended = reply.ended[0];
+    return .{
+        .identity = .{
+            .pid = started.pid,
+            .pgid = started.pgid,
+            .start_token = try std.fmt.allocPrint(arena, "{d}", .{started.token}),
+        },
+        .ending = switch (ended.how) {
+            .exited => .{ .exited = ended.status },
+            .signalled => .{ .signalled = ended.status },
+            .timed_out_killed => .{ .timed_out = .{ .after_ms = @intCast(deadline_ms), .signal = ended.status } },
+            .timed_out_unconfirmed => .{ .timed_out_unconfirmed = .{ .after_ms = @intCast(deadline_ms), .signal = ended.status } },
+            .cancelled => .{ .unknown = "the remote helper reported an independent cancellation; query its durable request state to reconcile it" },
+            _ => .{ .unknown = "the remote helper reported an ending this binary does not know" },
+        },
+        .stdout = reply.stdout,
+        .stderr = reply.stderr,
+    };
+}
+
+test "helper bytes, digest, capability and reply parser are wired into production" {
+    const t = std.testing;
+    try t.expect(helper_executable.len > 0);
+    var digest: [32]u8 = undefined;
+    helperSha256(&digest);
+    var nonzero = false;
+    for (digest) |b| nonzero = nonzero or b != 0;
+    try t.expect(nonzero);
+    try t.expect(Requirement.remote_deadline.satisfiedBy(helper_capability));
+    try t.expect(Requirement.verified_cancellation.satisfiedBy(helper_capability));
+    try t.expect(!Requirement.audited_execution.satisfiedBy(helper_capability));
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const guarded = try guardedRemoteHelperCommand(arena_state.allocator());
+    var hex: [@import("digest.zig").hex_len]u8 = undefined;
+    const want = @import("digest.zig").hex(helper_executable, &hex);
+    try t.expect(std.mem.indexOf(u8, guarded, want) != null);
+    try t.expect(std.mem.endsWith(u8, guarded, remote_helper_command));
+}
+
 /// Wraps a command so the shell reports the process identity before running
 /// it and the exit status after.
 ///
@@ -535,6 +677,39 @@ pub fn wrapShell(arena: Allocator, command: []const u8, nonce: u64) Allocator.Er
     , .{ nonce, command, nonce });
 }
 
+fn powerShellEncoded(arena: Allocator, script: []const u8) Allocator.Error![]u8 {
+    const utf16 = std.unicode.utf8ToUtf16LeAlloc(arena, script) catch return error.OutOfMemory;
+    const bytes = std.mem.sliceAsBytes(utf16);
+    const encoded = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    return encoded;
+}
+
+/// Supervises a native Windows PowerShell command without asking PowerShell to
+/// parse caller text from a command-line quote.  Both the child command and
+/// the fixed parent wrapper travel as UTF-16LE `-EncodedCommand` payloads.  The
+/// parent survives `exit` in the child, publishes its wrapper PID/start token,
+/// waits for it, then emits the same terminal marker `parseShell` consumes.
+pub fn wrapPowerShell(arena: Allocator, command: []const u8, nonce: u64) Allocator.Error![]u8 {
+    const child_script = try std.fmt.allocPrint(arena, "$ProgressPreference='SilentlyContinue'; {s}", .{command});
+    const child = try powerShellEncoded(arena, child_script);
+    const wrapper = try std.fmt.allocPrint(arena,
+        \\$ErrorActionPreference = 'Stop'
+        \\$ProgressPreference = 'SilentlyContinue'
+        \\$__t_tok = (Get-Process -Id $PID).StartTime.ToFileTimeUtc()
+        \\[Console]::Out.WriteLine(('__TERMINUS_START_{d}__ pid={{0}} pgid= token={{1}}' -f $PID,$__t_tok))
+        \\& powershell.exe -NoLogo -NoProfile -NonInteractive -InputFormat Text -OutputFormat Text -EncodedCommand '{s}'
+        \\$__t_rc = if ($null -eq $LASTEXITCODE) {{ 1 }} else {{ [int]$LASTEXITCODE }}
+        \\[Console]::Out.WriteLine(('__TERMINUS_EXIT_{d}__ code={{0}}' -f $__t_rc))
+        \\exit $__t_rc
+    , .{ nonce, child, nonce });
+    const encoded = try powerShellEncoded(arena, wrapper);
+    return std.fmt.allocPrint(arena,
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -InputFormat Text -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {s}",
+        .{encoded},
+    );
+}
+
 /// Splits the supervision markers back out of the captured output.
 ///
 /// A missing exit marker is meaningful rather than an error: it means the
@@ -557,9 +732,22 @@ pub fn parseShell(arena: Allocator, nonce: u64, stdout: []const u8, stderr: []co
             identity = parseIdentity(arena, line[start_marker.len..]) catch null;
             continue;
         }
-        if (std.mem.startsWith(u8, line, exit_marker)) {
-            exit_code = parseExit(line[exit_marker.len..]);
-            continue;
+        // A command is allowed to finish without printing a newline.  In that
+        // case the shell appends our terminal marker to the command's last
+        // output line.  Looking only at line prefixes would leave the marker
+        // visible and, worse, report a proven exit as unknown.  The wrapper's
+        // marker is terminal and nonce-bound, so consume its final occurrence
+        // while preserving every byte before it.
+        if (std.mem.lastIndexOf(u8, line, exit_marker)) |marker_at| {
+            if (parseExit(line[marker_at + exit_marker.len ..])) |code| {
+                if (!first) try kept.append(arena, '\n');
+                if (marker_at != 0) {
+                    try kept.appendSlice(arena, raw[0..marker_at]);
+                    first = false;
+                }
+                exit_code = code;
+                break;
+            }
         }
         if (!first) try kept.append(arena, '\n');
         try kept.appendSlice(arena, raw);
@@ -630,6 +818,49 @@ test parseShell {
     try t.expectEqualStrings("91823", observed.identity.?.start_token.?);
     try t.expectEqual(Ending{ .exited = 3 }, observed.ending);
     try t.expectEqualStrings("hello\nworld\n", observed.stdout);
+}
+
+test "shell exit marker may follow output without a newline" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+
+    const out =
+        "__TERMINUS_START_17__ pid=4242 pgid=4242 token=91823\n" ++
+        "no-newline__TERMINUS_EXIT_17__ code=0\n";
+    const observed = try parseShell(arena_state.allocator(), 17, out, "");
+    try t.expectEqual(Ending{ .exited = 0 }, observed.ending);
+    try t.expectEqualStrings("no-newline", observed.stdout);
+}
+
+test "PowerShell wrapper survives child exit and publishes identity and terminal markers" {
+    if (@import("builtin").os.tag != .windows) return;
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const wrapped = try wrapPowerShell(arena, "Write-Output 'powershell-wrapper-ok'; exit 7", 71);
+    const encoded_at = std.mem.lastIndexOfScalar(u8, wrapped, ' ') orelse return error.InvalidWrapper;
+    const result = try std.process.run(arena, t.io, .{
+        .argv = &.{
+            "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-InputFormat", "Text", "-OutputFormat", "Text",
+            "-ExecutionPolicy", "Bypass", "-EncodedCommand", wrapped[encoded_at + 1 ..],
+        },
+        .stdout_limit = .limited(1 << 16),
+        .stderr_limit = .limited(1 << 16),
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } },
+    });
+    try t.expectEqual(@as(u8, 7), switch (result.term) {
+        .exited => |code| code,
+        else => return error.PowerShellWrapperDidNotExit,
+    });
+    const observed = try parseShell(arena, 71, result.stdout, result.stderr);
+    try t.expect(observed.identity != null);
+    try t.expect(observed.identity.?.pid > 0);
+    try t.expect(observed.identity.?.start_token != null);
+    try t.expectEqual(Ending{ .exited = 7 }, observed.ending);
+    try t.expect(std.mem.indexOf(u8, observed.stdout, "powershell-wrapper-ok") != null);
 }
 
 test "a missing exit marker leaves the outcome unknown" {

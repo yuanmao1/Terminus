@@ -473,15 +473,72 @@ fn runVerify(
     };
     defer slot.deinit();
 
-    const outcome = verify(
-        store,
-        ctx.arena,
-        scope,
-        selector(parsed),
-        targetName(parsed.*),
-        slot.dial(),
-        ctx.now,
-    ) catch |err| Cli.storeFatal(store, err);
+    // Refusals remain pre-connection and pre-operation: stored text is not an
+    // authorised remote call. Once trust is established, however, this is a
+    // real remote execution and must have the same request id and immutable
+    // receipt trail as `exec`.
+    const selected = Store.memories.find(store, ctx.arena, scope, selector(parsed)) catch |err|
+        Cli.storeFatal(store, err);
+    var request_id: ?[]const u8 = null;
+    const outcome: VerifyOutcome = if (selected == null or Store.memories.trustState(selected.?) != .trusted)
+        verify(
+            store,
+            ctx.arena,
+            scope,
+            selector(parsed),
+            targetName(parsed.*),
+            slot.dial(),
+            ctx.now,
+        ) catch |err| Cli.storeFatal(store, err)
+    else trusted: {
+        const memory = selected.?;
+        const command = memory.verify_cmd.?;
+        const owner_token = Store.policy.ownerToken(store, ctx.arena, ctx.io, ctx.now) catch |err|
+            Cli.storeFatal(store, err);
+        const redacted = Store.history.redactSecrets(ctx.arena, command) catch
+            fatal("cannot redact the verify command for the operation record; refusing to store it unredacted", .{});
+        var raw_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(command, &raw_digest, .{});
+        const digest = std.fmt.allocPrint(ctx.arena, "{x}", .{&raw_digest}) catch
+            fatal("out of memory", .{});
+
+        var execution = switch (Core.execution.begin(store, ctx.arena, ctx.io, .{
+            .server_id = scope.server_id,
+            .server_name = target.server,
+            .kind = .exec,
+            .scope = .{ .kind = .server },
+            .alias = memory.key,
+            .mutating = false,
+            .argv_redacted = redacted,
+            .argv_sha256 = digest,
+            .owner_token = owner_token,
+            .now = ctx.now,
+        }) catch |err| Cli.storeFatal(store, err)) {
+            .ready => |e| e,
+            // Read-only begin does not refuse on a peer; keep this exhaustive
+            // so a future change cannot silently execute outside the ledger.
+            .blocked => fatal("the verify operation was unexpectedly blocked before connecting", .{}),
+        };
+        defer execution.deinit();
+        execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
+        request_id = try ctx.arena.dupe(u8, execution.id());
+
+        const dial = slot.dial();
+        const executor = dial.open(dial.context);
+        const run_result = Core.execution.runCommand(&execution, executor, command, null) catch |err|
+            Cli.receiptFatal(execution.id(), err, execution.status.text());
+        const answer = switch (run_result) {
+            .refused => fatal("the read-only verify operation was refused at submission", .{}),
+            .ran => |r| r,
+        };
+        if (answer.status == .indeterminate or answer.exit_code == null)
+            break :trusted .{ .transport_failed = .{ .reason = "the verify command's remote outcome is indeterminate; reconcile its request id before retrying" } };
+        if (answer.exit_code.? != 0)
+            break :trusted .{ .disagreed = .{ .exit_code = answer.exit_code.?, .stderr = answer.stderr } };
+        if (!(Store.memories.recordObservation(store, scope.server_id, memory.id, ctx.now, .live) catch |err|
+            Cli.storeFatal(store, err))) break :trusted .no_such_memory;
+        break :trusted .{ .observed = .{ .at = ctx.now, .command = command } };
+    };
 
     switch (outcome) {
         .no_such_memory => fatal("no matching memory in '{s}'", .{targetName(parsed.*)}),
@@ -514,8 +571,13 @@ fn runVerify(
                 .observedAt = o.at,
                 .observedSource = "live",
                 .verifyCmd = o.command,
+                .requestId = request_id,
             }),
-            .human => try ctx.out.print("verified '{s}' at {d} (live)\n", .{ targetName(parsed.*), o.at }),
+            .human => try ctx.out.print("verified '{s}' at {d} (live; request {s})\n", .{
+                targetName(parsed.*),
+                o.at,
+                request_id orelse "none (refused before execution)",
+            }),
         },
         .disagreed => |d| switch (ctx.out.format) {
             .json => try ctx.out.json(.{
@@ -524,10 +586,11 @@ fn runVerify(
                 .target = targetName(parsed.*),
                 .exitCode = d.exit_code,
                 .stderr = d.stderr,
+                .requestId = request_id,
             }),
             .human => try ctx.out.print(
-                "the verify command for '{s}' exited {d}; the memory's observation is left as it was\n{s}",
-                .{ targetName(parsed.*), d.exit_code, d.stderr },
+                "the verify command for '{s}' exited {d} (request {s}); the memory's observation is left as it was\n{s}",
+                .{ targetName(parsed.*), d.exit_code, request_id orelse "none", d.stderr },
             ),
         },
         .transport_failed => |f| switch (ctx.out.format) {
@@ -536,10 +599,11 @@ fn runVerify(
                 .errorCode = "VERIFY_CMD_TRANSPORT_FAILED",
                 .target = targetName(parsed.*),
                 .reason = f.reason,
+                .requestId = request_id,
             }),
             .human => try ctx.out.print(
-                "could not verify '{s}': {s}; nothing was recorded\n",
-                .{ targetName(parsed.*), f.reason },
+                "could not verify '{s}' (request {s}): {s}; no live observation was recorded\n",
+                .{ targetName(parsed.*), request_id orelse "none", f.reason },
             ),
         },
     }

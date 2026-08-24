@@ -32,6 +32,7 @@ const op_state = @import("store/op_state.zig");
 const scope_mod = @import("store/scope.zig");
 const ids = @import("store/ids.zig");
 const supervisor = @import("supervisor.zig");
+const digest = @import("digest.zig");
 const Executor = @import("exec.zig").Executor;
 const Ssh = @import("ssh/Client.zig");
 
@@ -68,6 +69,9 @@ pub const BeginOptions = struct {
     shell: ?[]const u8 = null,
     transport: ?[]const u8 = null,
     capability: Capability = supervisor.shell_capability,
+    /// Deadline enforced by helper mode on the remote host. Zero disables it.
+    remote_deadline_ms: u64 = 0,
+    deadline_grace_ms: u64 = 1000,
     /// The machine profile this attempt is running as (`policy.ownerToken`).
     ///
     /// Audit subject, never identity. It used to be what the lease guard
@@ -109,7 +113,13 @@ pub const Submit = union(enum) {
 
 pub const Error = Store.Db.Error || receipts.Error || operations.Error ||
     Allocator.Error || leases.Error ||
-    error{ IllegalTransition, UnknownOperation, UnknownScopeKind };
+    supervisor.wire.EncodeError || error{
+    IllegalTransition,
+    UnknownOperation,
+    UnknownScopeKind,
+    HelperRequiresDirectTransport,
+    HelperDoesNotAcceptUserInput,
+};
 
 /// What the `jobs` cache row must become when an attempt is settled, or why
 /// there is none to write.
@@ -1178,6 +1188,8 @@ pub const Execution = struct {
     io: std.Io,
     scope: Scope,
     capability: Capability,
+    remote_deadline_ms: u64 = 0,
+    deadline_grace_ms: u64 = 1000,
     /// Whether this attempt changes remote state. Decides whether a claim on
     /// the same scope refuses it or merely warns. Safe default; see
     /// `BeginOptions.mutating`.
@@ -1960,6 +1972,8 @@ pub fn begin(
         .io = io,
         .scope = opts.scope,
         .capability = opts.capability,
+        .remote_deadline_ms = opts.remote_deadline_ms,
+        .deadline_grace_ms = opts.deadline_grace_ms,
         .mutating = opts.mutating,
         .force = opts.force,
         .owner_token = opts.owner_token,
@@ -2325,7 +2339,23 @@ pub fn runCommand(
     command: []const u8,
     input: ?Input,
 ) Error!RunResult {
-    const wrapped = try supervisor.wrapShell(execution.arena, command, execution.nonce);
+    return runCommandAs(execution, executor, command, input, .bash);
+}
+
+pub fn runCommandAs(
+    execution: *Execution,
+    executor: Executor,
+    command: []const u8,
+    input: ?Input,
+    shell_kind: @import("shell.zig").Kind,
+) Error!RunResult {
+    if (execution.capability.supervisor == .helper)
+        return runHelperCommand(execution, executor, command, input);
+
+    const wrapped = if (shell_kind == .powershell)
+        try supervisor.wrapPowerShell(execution.arena, command, execution.nonce)
+    else
+        try supervisor.wrapShell(execution.arena, command, execution.nonce);
 
     switch (try execution.submitted()) {
         .submitted => {},
@@ -2430,6 +2460,132 @@ pub fn runCommand(
         .identity = observed.identity,
         .output = output,
     } };
+}
+
+/// Drives the shipped helper through the same operation boundary as shell
+/// mode. Installation and capability selection are deliberately outside this
+/// function; once a caller selected `.helper`, however, `runCommand` must not
+/// silently fall back to markers and weak pid evidence.
+fn runHelperCommand(
+    execution: *Execution,
+    executor: Executor,
+    command: []const u8,
+    input: ?Input,
+) Error!RunResult {
+    // The current helper protocol owns stdin for its framed request. Pretending
+    // it can also carry the command's stdin would turn a supplied input into an
+    // immediate EOF at the child.
+    if (input != null) return error.HelperDoesNotAcceptUserInput;
+    if (!executor.carriesInput()) return error.HelperRequiresDirectTransport;
+
+    const deadline_ms = execution.remote_deadline_ms;
+    const grace_ms = execution.deadline_grace_ms;
+    const frame = try supervisor.wire.encodeRunFor(
+        execution.arena,
+        execution.id(),
+        &.{ "/bin/sh", "-lc", command },
+        deadline_ms,
+        grace_ms,
+    );
+    var reader: std.Io.Reader = .fixed(frame);
+    var accepted: Ssh.Accepted = .{};
+
+    switch (try execution.submitted()) {
+        .submitted => {},
+        .refused => |blocker| return .{ .refused = blocker },
+    }
+
+    var wire_output: Ssh.Retained = .{};
+    const result = executor.execRetained(
+        execution.arena,
+        try supervisor.guardedRemoteHelperCommand(execution.arena),
+        .{ .source = &reader, .accepted = &accepted },
+        &wire_output,
+    ) catch |err| {
+        const why = try std.fmt.allocPrint(
+            execution.arena,
+            "remote helper transport failed after accepting {d} protocol byte(s): {s}",
+            .{ accepted.bytes, describe(executor, err) },
+        );
+        _ = try execution.transportLoss(why);
+        return .{ .ran = .{
+            .status = execution.status,
+            .exit_code = null,
+            .stdout = "",
+            .stderr = "",
+            .identity = null,
+            .output = .{},
+        } };
+    };
+
+    const observed = supervisor.parseHelper(execution.arena, result.stdout, deadline_ms) catch |err| {
+        // Exit 126 is reserved by the integrity guard above. It proves the
+        // user's command was never started, so do not turn a named refusal
+        // into an indeterminate attempt that blocks the scope.
+        if (result.exit_code == 126 and result.stdout.len == 0) {
+            _ = try execution.settle(.{ .exited = .{ .exit_code = 126 } }, .{});
+            return .{ .ran = .{
+                .status = execution.status,
+                .exit_code = 126,
+                .stdout = "",
+                .stderr = "remote helper integrity check failed; reinstall it explicitly",
+                .identity = null,
+                .output = .{},
+            } };
+        }
+        const why = try std.fmt.allocPrint(
+            execution.arena,
+            "remote helper reply was not a complete single execution: {s}",
+            .{@errorName(err)},
+        );
+        _ = try execution.settle(.{ .indeterminate = .{
+            .reason = why,
+            .last_observed = execution.status,
+        } }, .{});
+        return .{ .ran = .{
+            .status = execution.status,
+            .exit_code = null,
+            .stdout = "",
+            .stderr = "",
+            .identity = null,
+            .output = .{},
+        } };
+    };
+
+    if (observed.identity) |identity| try execution.remoteStarted(identity);
+    const application_output: Ssh.Retained = .{
+        .stdout = passed(observed.stdout),
+        .stderr = passed(observed.stderr),
+    };
+    _ = try execution.settle(terminalFor(observed.ending, execution.status), .{
+        .stdout = .{
+            .bytes = @intCast(application_output.stdout.bytes),
+            .sha256 = application_output.stdout.sha256[0..],
+            .truncated = false,
+        },
+        .stderr = .{
+            .bytes = @intCast(application_output.stderr.bytes),
+            .sha256 = application_output.stderr.sha256[0..],
+            .truncated = false,
+        },
+        .remote_pid = if (observed.identity) |i| i.pid else null,
+        .remote_pgid = if (observed.identity) |i| i.pgid else null,
+        .remote_start_token = if (observed.identity) |i| i.start_token else null,
+    });
+    return .{ .ran = .{
+        .status = execution.status,
+        .exit_code = observed.ending.shellStatus(),
+        .stdout = observed.stdout,
+        .stderr = observed.stderr,
+        .identity = observed.identity,
+        .output = application_output,
+    } };
+}
+
+fn passed(bytes: []const u8) Ssh.Passed {
+    var sha256: [digest.hex_len]u8 = undefined;
+    _ = digest.hex(bytes, &sha256);
+    return .{ .bytes = bytes.len, .sha256 = sha256, .truncated = false };
 }
 
 /// How a transport loss reads when the command was being fed input.

@@ -23,7 +23,7 @@ const Tmux = Core.Tmux;
 /// `--help` prints.
 pub const usage =
     \\usage: terminus exec <server>[:<session>] [--json] [--timeout <sec>] [--login]
-    \\                    [--strict] [--interpreter <bin>] [--shell <name>]
+    \\                    [--strict] [--interpreter <bin>] [--shell bash|zsh|none|powershell]
     \\                    <command input>
     \\
     \\command input, most quote-proof first:
@@ -53,7 +53,7 @@ pub const usage =
     \\(nvm/bun/pm2 live in profile files that plain SSH exec skips). A
     \\'<server>:<session>' target refuses it: a session is already one.
     \\
-    \\--shell bash|zsh|none declares the interpreter. 'none' means terminus adds
+    \\--shell bash|zsh|none|powershell declares the interpreter. 'none' means terminus adds
     \\no shell layer of its own — no login wrap, no set -euo pipefail, no staged
     \\script. Any other value is refused before anything is sent: the supervisor
     \\that reports the pid and the exit status is a POSIX shell program.
@@ -82,6 +82,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         std.fmt.parseInt(i64, t, 10) catch fatal("invalid --timeout '{s}'", .{t})
     else
         120);
+    if (timeout_ms <= 0) fatal("--timeout must be greater than zero", .{});
 
     // The command's standard input, opened before anything is recorded and
     // before anything is dialled: a source that cannot be read has sent
@@ -111,6 +112,19 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     var store = try Cli.openStore(ctx, &parsed);
     defer store.close();
     const resolved = Cli.resolveServer(ctx, &store, target.server);
+    var helper_digest_buf: [Core.digest.hex_len]u8 = undefined;
+    const helper_digest = Core.digest.hex(Core.supervisor.helper_executable, &helper_digest_buf);
+    const installed_helper = Store.facts.get(
+        &store,
+        ctx.arena,
+        resolved.server.id,
+        Core.supervisor.helper_fact_key,
+    ) catch |err| Cli.storeFatal(&store, err);
+    // Command stdin and live tmux sessions have their own input semantics;
+    // the helper protocol owns stdin for its framed request, so those two stay
+    // on the explicitly weaker shell capability.
+    const use_helper = target.session == null and input == null and inv.kind != .powershell and
+        (if (installed_helper) |installed| std.mem.eql(u8, installed, helper_digest) else false);
     // Recall hint: every JSON exec response carries the server's memory
     // keys (a local, zero-network query) so agents see what knowledge
     // exists before they re-discover it over SSH.
@@ -163,6 +177,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
         .cwd = working_dir,
         .shell = inv.shellWord(),
+        .capability = if (use_helper) Core.supervisor.helper_capability else Core.supervisor.shell_capability,
+        .remote_deadline_ms = if (use_helper) @intCast(timeout_ms) else 0,
         .owner_token = owner_token,
         .force = parsed.boolean("force"),
         .now = ctx.now,
@@ -187,7 +203,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         // hide the fact that nothing was sent.
         .blocked => |blocker| retry: {
             if (!Cli.blockerMayBeProvable(blocker)) reportBlocked(blocker);
-            conn_slot = Cli.tryConnect(ctx, &parsed, resolved.server, resolved.auth) orelse
+            conn_slot = (if (use_helper)
+                Cli.tryConnectDirect(ctx, resolved.server, resolved.auth)
+            else
+                Cli.tryConnect(ctx, &parsed, resolved.server, resolved.auth)) orelse
                 reportBlocked(blocker);
             Cli.settleProvableBlocker(ctx, &store, conn_slot.?.executor(), blocker);
             const second = Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
@@ -207,7 +226,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const started = std.Io.Timestamp.now(ctx.io, .awake);
     execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
 
-    if (conn_slot == null) conn_slot = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
+    if (conn_slot == null) conn_slot = if (use_helper)
+        Cli.connectDirect(ctx, resolved.server, resolved.auth)
+    else
+        Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
     var conn = &conn_slot.?;
     const executor = conn.executor();
 
@@ -336,7 +358,10 @@ fn runOneShot(
     // `"cd {s} && ({s})"` template, splicing `--cwd` in raw — see
     // `shell.cdInto`. The directory was refused or accepted before `begin`.
     const effective = if (working_dir) |dir|
-        try Core.shell.cdInto(ctx.arena, dir, command)
+        if (inv.kind == .powershell)
+            try Core.shell.powerShellCdInto(ctx.arena, dir, command)
+        else
+            try Core.shell.cdInto(ctx.arena, dir, command)
     else
         command;
 
@@ -349,11 +374,12 @@ fn runOneShot(
         .{},
     );
 
-    const result = Core.execution.runCommand(
+    const result = Core.execution.runCommandAs(
         execution,
         executor,
         effective,
         if (input) |source| .{ .source = source, .accepted = accepted } else null,
+        inv.kind,
     ) catch |err|
         // The command may well have run; what failed is our record of it.
         Cli.receiptFatal(execution.id(), err, execution.status.text());

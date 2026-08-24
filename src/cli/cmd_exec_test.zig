@@ -1733,7 +1733,7 @@ test "gate: a malformed --argv-json is refused by which mistake it was" {
 
 // --- gates: the declared shell ------------------------------------------------
 
-test "gate: a --shell value with no supervisor wrapper is refused by name" {
+test "gate: every accepted shell has a supervisor wrapper and the rest are refused by name" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -1768,7 +1768,7 @@ test "gate: a --shell value with no supervisor wrapper is refused by name" {
         // takes cannot be missing from the list an operator is offered.
         try t.expect(std.mem.indexOf(u8, Core.shell.kind_list, field.name) != null);
     }
-    try t.expectEqual(@as(usize, 3), accepted);
+    try t.expectEqual(@as(usize, 4), accepted);
 
     // Every named shell with no wrapper, refused with the supervisor's reason.
     var refused: usize = 0;
@@ -1788,11 +1788,11 @@ test "gate: a --shell value with no supervisor wrapper is refused by name" {
         try t.expect(std.mem.indexOf(u8, why, "indeterminate") != null);
         try t.expect(std.mem.indexOf(u8, why, Core.shell.kind_list) != null);
     }
-    try t.expectEqual(@as(usize, 8), refused);
-
-    // powershell by name, so a list edited down to nothing relevant fails here
-    // rather than passing over an empty region.
-    try t.expectError(error.Unsupervised, Core.shell.parseKind("powershell"));
+    try t.expectEqual(@as(usize, 7), refused);
+    try t.expectEqual(Core.shell.Kind.powershell, try Core.shell.parseKind("powershell"));
+    const ps_wrapper = try Core.supervisor.wrapPowerShell(arena, "Write-Output ok", 8);
+    try t.expect(std.mem.indexOf(u8, ps_wrapper, "-EncodedCommand") != null);
+    try t.expect(std.mem.indexOf(u8, ps_wrapper, "Write-Output ok") == null);
     try t.expectError(error.Unsupervised, Core.shell.parseKind("pwsh"));
 
     // An unrecognised word is a different refusal: a typo, so it points at the
@@ -2049,7 +2049,7 @@ test "gate: the ledger's shell word is the wrap that happened, session included"
                 // are refused before a shape exists, and the gate above holds
                 // that. Skipped here rather than asserted, because an
                 // invocation that cannot be built has no text to check.
-                if (kind == .none and (login or strict)) continue;
+                if ((kind == .none and (login or strict)) or (kind == .powershell and login)) continue;
                 checked += 1;
                 const inv: Cli.Invocation = .{
                     .kind = kind,
@@ -2074,7 +2074,7 @@ test "gate: the ledger's shell word is the wrap that happened, session included"
             }
         }
     }
-    try t.expectEqual(@as(usize, 9), checked);
+    try t.expectEqual(@as(usize, 11), checked);
 
     // The exact vocabulary, pinned, because these words go into an append-only
     // ledger and renaming one is a migration nobody asked for.
@@ -2084,6 +2084,7 @@ test "gate: the ledger's shell word is the wrap that happened, session included"
         .{ .kind = .bash, .login = true, .word = "bash-login" },
         .{ .kind = .zsh, .login = false, .word = "zsh" },
         .{ .kind = .zsh, .login = true, .word = "zsh-login" },
+        .{ .kind = .powershell, .login = false, .word = "powershell" },
         .{ .kind = .none, .login = false, .word = "none" },
     }) |case| {
         words += 1;
@@ -2098,7 +2099,7 @@ test "gate: the ledger's shell word is the wrap that happened, session included"
         };
         try t.expectEqualStrings(case.word, inv.shellWord());
     }
-    try t.expectEqual(@as(usize, 5), words);
+    try t.expectEqual(@as(usize, 6), words);
 
     // **The session target.** This is the row that was wrong: `exec
     // host:sess --login -- cmd` computed its word before the fork into
@@ -2285,11 +2286,11 @@ test "gate: the skill document describes the argv channel and the shell vocabula
         "the account's shell",
         // The whole accepted vocabulary, so a value the binary takes cannot be
         // undocumented.
-        "`bash|zsh|none`",
-        // The refusal that matters most, with its reason.
+        "`bash|zsh|none|powershell`",
+        // The native Windows shell and its fail-loud boundary.
         "powershell",
-        "before anything is sent",
-        "indeterminate",
+        "EncodedCommand",
+        "one-shot",
         // What is refused alongside the argv channel, since each of these is a
         // command an agent would otherwise expect to work.
         "`--interpreter` alongside it is refused",
@@ -2316,7 +2317,7 @@ test "gate: the skill document describes the argv channel and the shell vocabula
     // Both flags are in the usage each verb prints, so `--help` and the
     // document cannot drift apart.
     try t.expect(std.mem.indexOf(u8, cmd_exec.usage, "--argv-json") != null);
-    try t.expect(std.mem.indexOf(u8, cmd_exec.usage, "--shell bash|zsh|none") != null);
+    try t.expect(std.mem.indexOf(u8, cmd_exec.usage, "--shell bash|zsh|none|powershell") != null);
 
     // And the promise the old document made about sessions is gone rather than
     // merely surrounded by new text: it said they "don't need `--login`", which

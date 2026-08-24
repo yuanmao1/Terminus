@@ -147,6 +147,8 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // shell the operator named — `--login` has something to do here.
     const inv = try Cli.shapeInvocation(ctx, &parsed, null, run_usage);
     const raw_command = inv.text;
+    const redacted_command = Store.history.redactSecrets(ctx.arena, raw_command) catch
+        fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{});
 
     var store = try Cli.openStore(ctx, &parsed);
     defer store.close();
@@ -191,10 +193,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         .scope = jobScope(job_name),
         .alias = job_name,
         .mutating = true,
-        .argv_redacted = Store.history.redactSecrets(ctx.arena, raw_command) catch
-            // Falling back to the raw text would write the very secrets the
-            // redaction exists to keep out of an append-only ledger.
-            fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
+        .argv_redacted = redacted_command,
         .argv_sha256 = try sha256Hex(ctx.arena, raw_command),
         .cwd = parsed.flag("cwd") orelse resolved.server.cwd,
         .shell = inv.shellWord(),
@@ -314,7 +313,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // database failed afterwards, the command would be running on the server
     // with nothing locally able to find it — `status`, `kill` and `reconcile`
     // all key off this row and the attempt.
-    _ = Store.jobs.create(&store, resolved.server.id, job_name, raw_command, sentinel, execution.id(), ctx.now) catch |err| switch (err) {
+    _ = Store.jobs.create(&store, resolved.server.id, job_name, redacted_command, sentinel, execution.id(), ctx.now) catch |err| switch (err) {
         error.NameTaken => fatal("job '{s}' was claimed by another launch just now; nothing was sent", .{job_name}),
         else => Cli.storeFatal(&store, err),
     };
@@ -479,7 +478,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             .attempt = attempt_no,
             .server = server_name,
             .job = job_name,
-            .command = raw_command,
+            .command = redacted_command,
             .cwd = cwd,
             .transport = conn.transport,
             .daemonError = conn.daemon_error,

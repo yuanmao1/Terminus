@@ -805,10 +805,8 @@ pub fn pushFile(
 /// Uploads an in-memory buffer, SHA-256 verified against the remote's own
 /// reading.
 ///
-/// The shape `cmd_sync` needs for a tar archive it already holds. It verifies
-/// where `pushFile` does not, because its caller has no checkpoint to record a
-/// comparison against and no state machine to record it in — the answer has to
-/// be the return value or nothing.
+/// For bounded buffers. Directory sync uses `pushFile` so archive size cannot
+/// become process memory.
 pub fn pushBytes(
     client: *Ssh,
     arena: Allocator,
@@ -990,9 +988,7 @@ pub fn pullFile(
 
 /// Downloads `remote_path` in one `base64 < file` exec, SHA-256 verified.
 ///
-/// The shape `cmd_sync` needs for a tar archive it is about to unpack in
-/// memory. It holds the whole object by construction, which is why the streaming
-/// `pullFile` exists beside it rather than replacing it.
+/// For bounded buffers. Directory sync uses `pullFile` and extracts from disk.
 pub fn pullBytes(
     client: *Ssh,
     arena: Allocator,

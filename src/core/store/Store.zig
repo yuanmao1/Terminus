@@ -23,11 +23,9 @@ pub const receipts = @import("receipts.zig");
 pub const transfers = @import("transfers.zig");
 pub const job_attempts = @import("job_attempts.zig");
 pub const leases = @import("leases.zig");
-/// The fail-stop phase-ordering rule (`canSubmit`) and nothing else — no
-/// orchestrator, no persistence, no `plan` verb. The `plan_runs` /
-/// `phase_attempts` tables exist ahead of goal 16; the CRUD written against a
-/// guess at that decision has been removed. Nothing here has a caller, which
-/// is why the module compile-checks itself.
+/// Durable fail-stop PlanRun / PhaseAttempt metadata. The CLI attaches only
+/// existing operation attempts; mutation approval and predecessor success are
+/// checked here before a phase may proceed.
 pub const plans = @import("plans.zig");
 pub const host_pins = @import("host_pins.zig");
 /// Builtin secret classification (the lists `history.redactSecrets` reads) and

@@ -1953,6 +1953,7 @@ test "gate: a supervisor report settles nothing until something binds it to an a
     const rid = testId("report");
     const request_id: []const u8 = &rid;
     try seedOperation(&store, request_id);
+    try recordProcess(&store, request_id, 4242, "boot+4242", 200);
     _ = try Store.receipts.settle(
         &store,
         request_id,
@@ -1966,7 +1967,7 @@ test "gate: a supervisor report settles nothing until something binds it to an a
     // before the kind check and is a property of the variant rather than of
     // where it is aimed, so it survives the refusal below unchanged.
     try t.expect((try Store.receipts.resolve(&store, arena, request_id, .completed, .{
-        .supervisor_report = .{ .reported = .timed_out, .detail = "deadline hit" },
+        .supervisor_report = .{ .request_id = request_id, .pid = 4242, .start_token = "boot+4242", .reported = .timed_out, .detail = "deadline hit" },
     }, 400)) == .evidence_does_not_support);
 
     // And the pairing that used to settle it now does not, on the one kind that
@@ -1984,8 +1985,7 @@ test "gate: a supervisor report settles nothing until something binds it to an a
     const unbound = try Store.receipts.resolve(&store, arena, request_id, .timed_out, .{
         .supervisor_report = .{ .reported = .timed_out, .detail = "deadline hit" },
     }, 401);
-    try t.expectEqualStrings("exec", unbound.evidence_wrong_kind.operation_kind);
-    try t.expectEqualStrings("supervisor_report", unbound.evidence_wrong_kind.evidence_kind);
+    try t.expectEqual(@as(i64, 0), unbound.evidence_wrong_process.probed_pid);
 
     // Refused everywhere, not merely here. Stated as a property so a single
     // cell going back to `true` cannot be hidden behind a gate that only ever
@@ -1994,20 +1994,24 @@ test "gate: a supervisor report settles nothing until something binds it to an a
         const report: Store.receipts.ResolutionEvidence = .{
             .supervisor_report = .{ .reported = .completed, .detail = "the wrapper reported an exit" },
         };
-        try t.expect(!report.appliesToKind(kind));
+        try t.expectEqual(kind == .exec or kind == .audit, report.appliesToKind(kind));
     }
 
-    // The refusal recorded nothing, and the attempt is still settleable — by an
-    // operator, which is the honest description of what an unbound report is
-    // worth. Without this control the gate above would be satisfied by an
-    // operation that refuses everything.
+    // The refusal recorded nothing. A report carrying the identity emitted by
+    // the helper is bound to this attempt and can settle it mechanically.
     try t.expectEqual(
         @as(?op_state.ResolvedStatus, null),
         (try Store.operations.get(&store, arena, request_id)).?.resolved_status,
     );
     try t.expectEqual(@as(usize, 0), try countKind(&store, arena, request_id, "reconcile"));
     try t.expect((try Store.receipts.resolve(&store, arena, request_id, .timed_out, .{
-        .operator_override = .{ .reason = "the wrapper's log says it hit the deadline", .by = "tester" },
+        .supervisor_report = .{
+            .request_id = request_id,
+            .pid = 4242,
+            .start_token = "boot+4242",
+            .reported = .timed_out,
+            .detail = "durable helper report",
+        },
     }, 402)) == .resolved);
 }
 

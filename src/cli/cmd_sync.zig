@@ -1,10 +1,10 @@
 //! `terminus sync push/pull` — recursive directory transfer.
 //!
-//! Implementation: tar the tree (std.tar locally, `tar` remotely), move
-//! one archive over SCP, unpack on the other side, verify with a whole-
-//! archive MD5. One archive beats per-file SCP round trips by orders of
-//! magnitude on many-small-file trees, and `tar` exists on any remote
-//! that has a shell.
+//! Implementation: tar the tree to a local staging file (std.tar locally,
+//! `tar` remotely), stream that archive over SCP or the exec backend, unpack on
+//! the other side, and verify with a whole-archive MD5. The staging file keeps
+//! peak memory independent of the tree size while retaining the one-archive
+//! round-trip advantage for many-small-file trees.
 //!
 //!   terminus sync push <server> <local-dir> <remote-dir> [--exclude p1,p2] [--dry-run] [--delete]
 //!   terminus sync pull <server> <remote-dir> <local-dir> [--exclude p1,p2] [--dry-run]
@@ -393,6 +393,40 @@ pub fn stagingPath(arena: std.mem.Allocator, request_id: []const u8) ![]const u8
     return std.fmt.allocPrint(arena, "/tmp/.terminus_sync_{s}.tar", .{request_id});
 }
 
+/// Local staging counterpart to `stagingPath`. The request id makes concurrent
+/// syncs distinct; the system temp directory avoids requiring the source tree or
+/// destination parent to be writable.
+pub fn localStagingPath(arena: std.mem.Allocator, environ: *std.process.Environ.Map, request_id: []const u8) ![]const u8 {
+    const root = environ.get("TEMP") orelse environ.get("TMP") orelse ".";
+    const name = try std.fmt.allocPrint(arena, ".terminus_sync_{s}.tar", .{request_id});
+    return std.fs.path.join(arena, &.{ root, name });
+}
+
+fn md5File(ctx: *Cli.Ctx, path: []const u8) !struct { hex: []const u8, bytes: u64 } {
+    const file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |err|
+        fatal("cannot read staged archive '{s}': {s}", .{ path, @errorName(err) });
+    defer file.close(ctx.io);
+    const total = file.length(ctx.io) catch |err|
+        fatal("cannot size staged archive '{s}': {s}", .{ path, @errorName(err) });
+    var hasher = std.crypto.hash.Md5.init(.{});
+    var buffer: [1 << 20]u8 = undefined;
+    var reader = file.reader(ctx.io, &buffer);
+    var read: u64 = 0;
+    while (read < total) {
+        const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => fatal("staged archive '{s}' ended before its recorded size", .{path}),
+            else => fatal("cannot hash staged archive '{s}': {s}", .{ path, @errorName(err) }),
+        };
+        const take = chunk[0..@min(chunk.len, @as(usize, @intCast(total - read)))];
+        hasher.update(take);
+        reader.interface.toss(take.len);
+        read += take.len;
+    }
+    var digest: [16]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .hex = try std.fmt.allocPrint(ctx.arena, "{x}", .{&digest}), .bytes = total };
+}
+
 /// One `--exclude` argument for the remote `tar`, as exactly one shell word.
 ///
 /// **The bug this replaces.** `pull` built `" --exclude='*<pattern>*'"` straight
@@ -480,14 +514,13 @@ pub fn probeScript(arena: std.mem.Allocator, remote_dir: []const u8) ![]const u8
     , .{ .dir = Core.shell.word(remote_dir), .missing = missing_dir_exit });
 }
 
-/// Local tree → tar in memory → SCP → remote `tar -x` → md5 verify.
+/// Local tree → staged tar file → streaming SCP/exec → remote `tar -x` → md5 verify.
 ///
 /// The archive is built and staged *before* `remoteAct` submits, on the same rule
 /// `cmd_exec` stages a script under: writing a temp file really does reach the
 /// host, and a failure doing it provably never ran the destructive part. From
 /// `remoteAct` onwards a lost channel is `indeterminate`.
 ///
-/// The whole-tree-in-memory tar is a separate problem and is left alone here.
 fn push(
     ctx: *Cli.Ctx,
     execution: *Core.execution.Execution,
@@ -503,9 +536,15 @@ fn push(
         fatal("cannot open local directory '{s}'", .{local_dir});
     defer dir.close(ctx.io);
 
-    // Build the archive in memory (dev trees; not multi-GB datasets).
-    var archive: std.Io.Writer.Allocating = .init(ctx.arena);
-    var tar_writer: std.tar.Writer = .{ .underlying_writer = &archive.writer };
+    const local_tmp = try localStagingPath(ctx.arena, ctx.environ, execution.id());
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, local_tmp) catch {};
+    const archive_file = std.Io.Dir.cwd().createFile(ctx.io, local_tmp, .{}) catch |err|
+        fatal("cannot create staged archive '{s}': {s}", .{ local_tmp, @errorName(err) });
+    var archive_open = true;
+    defer if (archive_open) archive_file.close(ctx.io);
+    var archive_buffer: [1 << 20]u8 = undefined;
+    var archive_writer = archive_file.writer(ctx.io, &archive_buffer);
+    var tar_writer: std.tar.Writer = .{ .underlying_writer = &archive_writer.interface };
 
     var files: u64 = 0;
     var bytes: u64 = 0;
@@ -539,11 +578,11 @@ fn push(
     }
 
     tar_writer.finishPedantically() catch fatal("tar finish failed", .{});
-    const tar_bytes = archive.writer.buffered();
-
-    var md5: [16]u8 = undefined;
-    std.crypto.hash.Md5.hash(tar_bytes, &md5, .{});
-    const md5_hex = try std.fmt.allocPrint(ctx.arena, "{x}", .{&md5});
+    archive_writer.interface.flush() catch fatal("tar flush failed", .{});
+    archive_file.close(ctx.io);
+    archive_open = false;
+    const archive = try md5File(ctx, local_tmp);
+    const md5_hex = archive.hex;
 
     // Stage the archive remotely (scp, or base64-over-exec when the server has
     // no scp binary). Still before submission: this writes one temp file and
@@ -551,8 +590,9 @@ fn push(
     // failure through `Cli.fail`'s hook rather than an unknown.
     const remote_tmp = try stagingPath(ctx.arena, execution.id());
     const remote_tmp_z = try ctx.arena.dupeZ(u8, remote_tmp);
-    _ = client.scpSendBytes(ctx.io, tar_bytes, remote_tmp_z, 0o600) catch {
-        Core.transfer.pushBytes(client, ctx.arena, tar_bytes, remote_tmp, 0o600) catch |err|
+    var moved: Core.Ssh.Moved = .{};
+    _ = client.scpSend(ctx.io, local_tmp, remote_tmp_z, 0o600, null, &moved) catch {
+        _ = Core.transfer.pushFile(executor, ctx.arena, ctx.io, local_tmp, remote_tmp, 0, 0o600, null, &moved) catch |err|
             fatal("upload failed (scp and exec both): {s} ({s})", .{ client.errorMessage(), @errorName(err) });
     };
 
@@ -574,7 +614,7 @@ fn push(
     }
 }
 
-/// Remote `tar -c` → SCP down → std.tar extract → md5 verify.
+/// Remote `tar -c` → streaming SCP/exec to a staged file → std.tar extract → md5 verify.
 ///
 /// The operation covers the **remote** half: the host is asked to tar a directory
 /// into `/tmp` and report its digest, and that script's exit status is the
@@ -634,10 +674,16 @@ fn pull(
         },
     };
 
+    const local_tmp = try localStagingPath(ctx.arena, ctx.environ, execution.id());
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, local_tmp) catch {};
     const remote_tmp_z = try ctx.arena.dupeZ(u8, remote_tmp);
-    const tar_bytes = client.scpRecvBytes(ctx.io, ctx.arena, remote_tmp_z) catch
-        Core.transfer.pullBytes(client, ctx.arena, remote_tmp) catch |err|
-        fatal("download failed (scp and exec both): {s} ({s})", .{ client.errorMessage(), @errorName(err) });
+    var moved: Core.Ssh.Moved = .{};
+    _ = client.scpRecv(ctx.io, remote_tmp_z, local_tmp, null, &moved) catch {
+        const remote = Core.transfer.probeRemoteFile(executor, ctx.arena, remote_tmp) catch |err|
+            fatal("cannot size remote staged archive for exec fallback: {s}", .{@errorName(err)});
+        _ = Core.transfer.pullFile(executor, ctx.arena, ctx.io, remote_tmp, local_tmp, 0, remote.size, null, &moved) catch |err|
+            fatal("download failed (scp and exec both): {s} ({s})", .{ client.errorMessage(), @errorName(err) });
+    };
 
     // Removing the archive this request's own script wrote, at a path derived
     // from this request's id. It happens after the terminal because the download
@@ -650,9 +696,8 @@ fn pull(
             .{ remote_tmp, @errorName(err) },
         );
 
-    var md5: [16]u8 = undefined;
-    std.crypto.hash.Md5.hash(tar_bytes, &md5, .{});
-    const local_md5 = try std.fmt.allocPrint(ctx.arena, "{x}", .{&md5});
+    const archive = try md5File(ctx, local_tmp);
+    const local_md5 = archive.hex;
     const verified = std.mem.eql(u8, local_md5, remote_md5);
     if (!verified) fatal("transfer corrupted: remote md5 {s} != local {s}", .{ remote_md5, local_md5 });
 
@@ -662,8 +707,12 @@ fn pull(
         fatal("cannot open '{s}'", .{local_dir});
     defer dir.close(ctx.io);
 
-    var tar_reader = std.Io.Reader.fixed(tar_bytes);
-    std.tar.extract(ctx.io, dir, &tar_reader, .{}) catch |err|
+    const archive_file = std.Io.Dir.cwd().openFile(ctx.io, local_tmp, .{}) catch |err|
+        fatal("cannot open staged archive '{s}': {s}", .{ local_tmp, @errorName(err) });
+    defer archive_file.close(ctx.io);
+    var extract_buffer: [1 << 20]u8 = undefined;
+    var tar_reader = archive_file.reader(ctx.io, &extract_buffer);
+    std.tar.extract(ctx.io, dir, &tar_reader.interface, .{}) catch |err|
         fatal("extract failed: {s}", .{@errorName(err)});
 
     // Count what we extracted for the summary.
@@ -673,7 +722,7 @@ fn pull(
     while (walker.next(ctx.io) catch null) |entry| {
         if (entry.kind == .file) files += 1;
     }
-    return .{ .files = files, .bytes = tar_bytes.len, .verified = true };
+    return .{ .files = files, .bytes = archive.bytes, .verified = true };
 }
 
 /// What a `push --dry-run`'s terminal says, in full.

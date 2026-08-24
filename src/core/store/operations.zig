@@ -307,7 +307,17 @@ pub const Kind = enum {
             // `gates_admissibility_test.zig` holds that `judgement_undeclared` excludes every other
             // axis, so nobody can leave a kind claiming both that it publishes an
             // artifact and that nothing is known about it.
-            .tunnel, .plan_phase, .audit, .cleanup => .{
+            .audit => .{
+                .runs_our_command = true,
+                .supervised_deadline = true,
+                .records_process_identity = true,
+                .offers_input_bytes = false,
+                .publishes_declared_artifact = false,
+                .supervises_another_subject = false,
+                .wrapper_documents_exit = false,
+                .judgement_undeclared = false,
+            },
+            .tunnel, .plan_phase, .cleanup => .{
                 .judgement_undeclared = true,
                 .runs_our_command = false,
                 .supervised_deadline = false,
@@ -468,6 +478,20 @@ pub const Operation = struct {
 };
 
 pub const Error = Db.Error || error{ UnknownStatus, InvalidRequestId };
+
+/// Upgrades the recorded capability only after a remote protocol handshake
+/// has established it (native audit is the first such negotiation).
+pub fn setCapability(store: *Store, request_id: []const u8, capability_json: []const u8, now: i64) Error!void {
+    try ids.validate(request_id);
+    var stmt = try store.db.prepare(
+        "UPDATE operations SET capability_json = ?1, updated_at = ?2 WHERE request_id = ?3",
+    );
+    defer stmt.deinit();
+    try stmt.bindText(1, capability_json);
+    try stmt.bindInt(2, now);
+    try stmt.bindText(3, request_id);
+    _ = try stmt.step();
+}
 
 pub fn create(store: *Store, opts: CreateOptions) Error!void {
     try ids.validate(opts.request_id);

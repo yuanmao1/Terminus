@@ -26,7 +26,9 @@ const usage =
     \\                          unsettled attempts (what is blocking a scope)
     \\  request show    <request-id> [--json]     status, scope, capability
     \\  request receipt <request-id> [--json]     the full append-only trail
-    \\  request reconcile <request-id> [--from-log]
+    \\  request query   <request-id> [--json]     ask the remote helper
+    \\  request cancel  <request-id> [--grace-ms N] [--json]
+    \\  request reconcile <request-id> [--from-log | --from-helper]
     \\                          [--override "<reason>" --by <who> --resolved <status>]
     \\
     \\reconcile establishes what an attempt actually did, so the scope it
@@ -63,6 +65,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, verb, "show")) return showRequest(ctx, &store, request_id);
     if (std.mem.eql(u8, verb, "receipt")) return showReceipt(ctx, &store, request_id);
+    if (std.mem.eql(u8, verb, "query")) return helperControl(ctx, &store, request_id, &parsed, false);
+    if (std.mem.eql(u8, verb, "cancel")) return helperControl(ctx, &store, request_id, &parsed, true);
     if (std.mem.eql(u8, verb, "reconcile")) return reconcile(ctx, &store, request_id, &parsed);
     fatal("unknown verb 'request {s}'\n{s}", .{ verb, usage });
 }
@@ -192,6 +196,162 @@ fn showReceipt(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) !void {
     }
 }
 
+const HelperReading = struct {
+    identity: Core.supervisor.Identity,
+    ended: ?Core.supervisor.wire.Ended,
+};
+
+fn readHelper(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    op: Store.operations.Operation,
+    cancel: bool,
+    grace_ms: u64,
+) !HelperReading {
+    const resolved = Cli.resolveServer(ctx, store, op.server_name);
+    var conn = Cli.connectDirect(ctx, resolved.server, resolved.auth);
+    defer conn.deinit();
+    const frame = Core.supervisor.wire.encodeControl(
+        ctx.arena,
+        if (cancel) .cancel else .query,
+        op.request_id,
+        grace_ms,
+    ) catch |err| fatal("cannot encode helper control request: {s}", .{@errorName(err)});
+    var reader: std.Io.Reader = .fixed(frame);
+    var accepted: Core.Ssh.Accepted = .{};
+    var retained: Core.Ssh.Retained = .{};
+    const executor = conn.executor();
+    const result = executor.execRetained(
+        ctx.arena,
+        try Core.supervisor.guardedRemoteHelperCommand(ctx.arena),
+        .{ .source = &reader, .accepted = &accepted },
+        &retained,
+    ) catch |err| fatal(
+        "remote helper control failed after accepting {d} byte(s): {s} ({s})",
+        .{ accepted.bytes, executor.errorMessage(), @errorName(err) },
+    );
+    if (result.exit_code != 0) fatal(
+        "remote helper control exited {d}: {s}",
+        .{ result.exit_code, result.stderr },
+    );
+    const reply = Core.supervisor.wire.decode(ctx.arena, result.stdout) catch |err|
+        fatal("remote helper returned an invalid frame stream: {s}", .{@errorName(err)});
+    if (reply.trailing != 0) fatal("remote helper reply ended mid-frame", .{});
+    if (reply.failed) |message| fatal("remote helper refused the request: {s}", .{message});
+    if (reply.started.len != 1 or reply.ended.len > 1 or reply.stdout.len != 0 or reply.stderr.len != 0)
+        fatal("remote helper returned an ambiguous control reply", .{});
+    const started = reply.started[0];
+    return .{
+        .identity = .{
+            .pid = started.pid,
+            .pgid = started.pgid,
+            .start_token = try std.fmt.allocPrint(ctx.arena, "{d}", .{started.token}),
+        },
+        .ended = if (reply.ended.len == 1) reply.ended[0] else null,
+    };
+}
+
+fn helperProbeJson(ctx: *Cli.Ctx, reading: HelperReading, cancelled: bool) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(ctx.arena);
+    std.json.Stringify.value(.{
+        .schemaVersion = Store.receipts.schema_version,
+        .event = if (cancelled) "helper_cancel" else "helper_query",
+        .pid = reading.identity.pid,
+        .pgid = reading.identity.pgid,
+        .startToken = reading.identity.start_token,
+        .running = reading.ended == null,
+        .how = if (reading.ended) |ended| @tagName(ended.how) else null,
+        .status = if (reading.ended) |ended| ended.status else null,
+    }, .{}, &writer.writer) catch return error.OutOfMemory;
+    return writer.toOwnedSlice();
+}
+
+fn helperControl(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    request_id: []const u8,
+    parsed: *const Cli.Args.Parsed,
+    cancel: bool,
+) !void {
+    const op = (Store.operations.get(store, ctx.arena, request_id) catch |err| Cli.storeFatal(store, err)) orelse
+        fatal("no such request '{s}'", .{request_id});
+    const grace_ms = if (parsed.flag("grace-ms")) |raw|
+        std.fmt.parseInt(u64, raw, 10) catch fatal("invalid --grace-ms '{s}'", .{raw})
+    else
+        2_000;
+    const reading = try readHelper(ctx, store, op, cancel, grace_ms);
+    _ = Store.receipts.append(store, .{
+        .request_id = request_id,
+        .kind = .checkpoint,
+        .phase = if (cancel) "helper_cancel" else "helper_query",
+        .observed_at = ctx.now,
+        .detail_json = try helperProbeJson(ctx, reading, cancel),
+    }) catch |err| Cli.receiptFatal(request_id, err, op.status.text());
+
+    if (cancel and reading.ended != null and reading.ended.?.how == .cancelled) switch (op.status) {
+        .submitted, .remote_started => {
+            var execution = (Core.execution.attach(store, ctx.arena, ctx.io, request_id) catch |err|
+                Cli.storeFatal(store, err)) orelse {
+                // The owning CLI can observe the helper's cancellation frame
+                // and settle indeterminate between our initial read and this
+                // attach.  Re-read that one legitimate race and annotate its
+                // frozen terminal with the helper's bound cancellation proof.
+                const fresh = (Store.operations.get(store, ctx.arena, request_id) catch |err|
+                    Cli.storeFatal(store, err)) orelse fatal("request {s} disappeared while cancellation was being recorded", .{request_id});
+                if (fresh.status == .indeterminate) {
+                    try resolveHelperCancellation(ctx, store, request_id, reading);
+                    return printHelperReading(ctx, request_id, reading);
+                }
+                fatal("request {s} was settled concurrently; read it back with 'request show'", .{request_id});
+            };
+            if (op.status == .submitted) execution.remoteStarted(reading.identity) catch |err|
+                Cli.receiptFatal(request_id, err, op.status.text());
+            _ = execution.settleAttached(helperTerminal(ctx, execution.status, reading), .{
+                .source = .reconcile,
+                .remote_pid = reading.identity.pid,
+                .remote_pgid = reading.identity.pgid,
+                .remote_start_token = reading.identity.start_token,
+            }) catch |err| Cli.receiptFatal(request_id, err, op.status.text());
+        },
+        .indeterminate => {
+            try resolveHelperCancellation(ctx, store, request_id, reading);
+        },
+        else => {},
+    };
+
+    return printHelperReading(ctx, request_id, reading);
+}
+
+fn resolveHelperCancellation(ctx: *Cli.Ctx, store: *Store, request_id: []const u8, reading: HelperReading) !void {
+    _ = Store.receipts.resolve(store, ctx.arena, request_id, .cancelled, .{
+        .supervisor_report = .{
+            .request_id = request_id,
+            .pid = reading.identity.pid,
+            .start_token = reading.identity.start_token,
+            .reported = .cancelled,
+            .detail = "terminus-helper matched pid/pgid/start token and confirmed kill(-pgid, 0) returned ESRCH",
+        },
+    }, ctx.now) catch |err| Cli.receiptFatal(request_id, err, "cancel reconcile");
+}
+
+fn printHelperReading(ctx: *Cli.Ctx, request_id: []const u8, reading: HelperReading) !void {
+    const state = if (reading.ended) |ended| @tagName(ended.how) else "running";
+    switch (ctx.out.format) {
+        .json => try ctx.out.json(.{
+            .ok = true,
+            .requestId = request_id,
+            .state = state,
+            .pid = reading.identity.pid,
+            .pgid = reading.identity.pgid,
+            .startToken = reading.identity.start_token,
+            .status = if (reading.ended) |ended| ended.status else null,
+        }),
+        .human => try ctx.out.print("{s}: {s} (pid {d}, pgid {d})\n", .{
+            request_id, state, reading.identity.pid, reading.identity.pgid orelse 0,
+        }),
+    }
+}
+
 /// Establishes what an attempt did, from whichever state it is stuck in.
 ///
 /// Two different states need reconciling, and they need different machinery:
@@ -216,7 +376,9 @@ fn reconcile(ctx: *Cli.Ctx, store: *Store, request_id: []const u8, parsed: *cons
     );
 
     const outcome = switch (op.status) {
-        .indeterminate => if (parsed.boolean("from-log"))
+        .indeterminate => if (parsed.boolean("from-helper"))
+            try resolveFromHelper(ctx, store, op, parsed)
+        else if (parsed.boolean("from-log"))
             try resolveFromLog(ctx, store, op, parsed)
         else if (parsed.flag("override")) |reason|
             try reconcileByOverride(ctx, store, op, reason, parsed)
@@ -226,22 +388,22 @@ fn reconcile(ctx: *Cli.Ctx, store: *Store, request_id: []const u8, parsed: *cons
                 .{},
             ),
 
-        // Still in flight. An override may not settle this: the work might be
-        // running right now, and a human assertion that it "completed" would
-        // release the scope on top of a live process. --from-log is the only
-        // route, and if it finds the session gone it records `indeterminate`
-        // — which can then be overridden, in that order.
-        .submitted, .remote_started => if (parsed.boolean("from-log"))
+        // Still in flight. Jobs have a mechanical log route. Every kind also
+        // has an explicit human adjudication route: the operator must provide
+        // a reason, an owner and a resolved state. That route first writes an
+        // indeterminate terminal, then the immutable resolution beside it, so
+        // a submitted exec/transfer/sync can never become a permanent blocker
+        // merely because it has no job_attempts row.
+        .submitted, .remote_started => if (parsed.boolean("from-helper"))
+            try settleFromHelper(ctx, store, op, parsed)
+        else if (parsed.boolean("from-log"))
             try settleFromLog(ctx, store, op, parsed)
-        else if (parsed.flag("override") != null)
-            fatal(
-                "request {s} is {s}: it was never settled, so there is nothing to override yet — the work may still be running. Run 'request reconcile {s} --from-log' first; it settles the real outcome from the job's log, or records indeterminate if the session is gone, and you can override that",
-                .{ request_id, op.status.text(), request_id },
-            )
+        else if (parsed.flag("override")) |reason|
+            try reconcileLiveByOverride(ctx, store, op, reason, parsed)
         else
             fatal(
-                "request {s} is {s} and still holds its scope; establish what happened with 'request reconcile {s} --from-log'",
-                .{ request_id, op.status.text(), request_id },
+                "request {s} is {s} and still holds its scope; use --from-log for a job, or after checking the host use --override \"<reason>\" --by <who> --resolved <status>",
+                .{ request_id, op.status.text() },
             ),
 
         .created, .connecting => fatal(
@@ -1015,6 +1177,142 @@ fn refusedReason(e: LogEvidence, arena: std.mem.Allocator, declined: Tmux.JobPro
     ) catch note;
 }
 
+fn resolvedFromHelper(ended: Core.supervisor.wire.Ended) ?Store.op_state.ResolvedStatus {
+    return switch (ended.how) {
+        .exited => if (ended.status == 0) .completed else .failed,
+        .signalled => .failed,
+        .timed_out_killed => .timed_out,
+        .cancelled => .cancelled,
+        .timed_out_unconfirmed, _ => null,
+    };
+}
+
+fn helperTerminal(
+    ctx: *Cli.Ctx,
+    current: Store.op_state.Status,
+    reading: HelperReading,
+) Store.op_state.Terminal {
+    const ended = reading.ended orelse unreachable;
+    return switch (ended.how) {
+        .exited => .{ .exited = .{ .exit_code = ended.status } },
+        .signalled => .{ .exited = .{ .exit_code = 128 + ended.status, .term_signal = ended.status } },
+        .timed_out_killed => .{ .remote_deadline = .{ .after_ms = 0 } },
+        .cancelled => .{ .remote_cancel_confirmed = .{
+            .pid = reading.identity.pid,
+            .start_token = reading.identity.start_token,
+            .term_sent = true,
+            .kill_sent = true,
+            .absence_verified_at = ctx.now,
+            .verification_method = "terminus-helper: start token and pgid matched; kill(-pgid, 0) returned ESRCH",
+        } },
+        .timed_out_unconfirmed, _ => .{ .indeterminate = .{
+            .reason = "the remote helper could not confirm the process group was gone",
+            .last_observed = current,
+        } },
+    };
+}
+
+fn resolveFromHelper(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    op: Store.operations.Operation,
+    parsed: *const Cli.Args.Parsed,
+) !Outcome {
+    _ = parsed;
+    const reading = try readHelper(ctx, store, op, false, 0);
+    const ended = reading.ended orelse return .{
+        .ok = true,
+        .resolved = null,
+        .mechanical = true,
+        .status = op.status.text(),
+        .still_running = true,
+        .detail = "the remote helper matched the recorded pid, pgid and start token; the command is still running",
+        .exit = .ok,
+    };
+    const resolved = resolvedFromHelper(ended) orelse return .{
+        .ok = false,
+        .resolved = null,
+        .mechanical = true,
+        .status = op.status.text(),
+        .detail = "the remote helper recorded an unconfirmed terminal; it cannot release the scope mechanically",
+        .exit = .indeterminate,
+    };
+    const result = Store.receipts.resolve(store, ctx.arena, op.request_id, resolved, .{
+        .supervisor_report = .{
+            .request_id = op.request_id,
+            .pid = reading.identity.pid,
+            .start_token = reading.identity.start_token,
+            .reported = resolved,
+            .detail = "durable terminus-helper request state, keyed by request id and bound to pid/pgid/start token",
+        },
+    }, ctx.now) catch |err| return semanticRefusal(err, op.status.text()) orelse
+        Cli.receiptFatal(op.request_id, err, "reconcile");
+    return interpret(result, resolved, true, "the remote helper's durable terminal report established the outcome", ctx.arena);
+}
+
+fn settleFromHelper(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    op: Store.operations.Operation,
+    parsed: *const Cli.Args.Parsed,
+) !Outcome {
+    _ = parsed;
+    const reading = try readHelper(ctx, store, op, false, 0);
+    var execution = (Core.execution.attach(store, ctx.arena, ctx.io, op.request_id) catch |err|
+        Cli.storeFatal(store, err)) orelse return .{
+        .ok = false,
+        .resolved = null,
+        .mechanical = true,
+        .status = op.status.text(),
+        .detail = "the attempt was settled by someone else while the helper was being queried; read it back with 'request show'",
+        .exit = .failure,
+    };
+
+    if (reading.ended == null) {
+        _ = Store.receipts.append(store, .{
+            .request_id = op.request_id,
+            .kind = .checkpoint,
+            .phase = "helper_reconcile_probe",
+            .observed_at = ctx.now,
+            .detail_json = try helperProbeJson(ctx, reading, false),
+        }) catch |err| Cli.receiptFatal(op.request_id, err, op.status.text());
+        return .{
+            .ok = true,
+            .resolved = null,
+            .mechanical = true,
+            .status = op.status.text(),
+            .still_running = true,
+            .detail = "the remote helper matched the recorded pid, pgid and start token; the command is still running",
+            .exit = .ok,
+        };
+    }
+
+    if (op.status == .submitted) execution.remoteStarted(reading.identity) catch |err|
+        Cli.receiptFatal(op.request_id, err, op.status.text());
+    const settled = execution.settleAttached(helperTerminal(ctx, execution.status, reading), .{
+        .source = .reconcile,
+        .remote_pid = reading.identity.pid,
+        .remote_pgid = reading.identity.pgid,
+        .remote_start_token = reading.identity.start_token,
+        .detail_json = try helperProbeJson(ctx, reading, false),
+    }) catch |err| Cli.receiptFatal(op.request_id, err, op.status.text());
+    const status = switch (settled) {
+        .recorded => |row| row.status,
+        .already_settled => |row| row.status,
+    };
+    return .{
+        .ok = status != .indeterminate,
+        .resolved = if (status == .indeterminate) null else status.text(),
+        .mechanical = true,
+        .status = status.text(),
+        .detail = if (status == .indeterminate)
+            "the helper terminal did not prove absence; recorded as indeterminate and kept the scope blocked"
+        else
+            "the remote helper's durable terminal report settled the attempt",
+        .exit = if (status == .indeterminate) .indeterminate else .ok,
+    };
+}
+
 /// Annotates an already-`indeterminate` attempt with what the job proves.
 fn resolveFromLog(
     ctx: *Cli.Ctx,
@@ -1300,6 +1598,45 @@ fn reconcileByOverride(
             Cli.receiptFatal(op.request_id, err, "reconcile");
 
     return interpret(result, resolved, false, "recorded as a human decision, not as proof", ctx.arena);
+}
+
+/// Gives every operation kind a bounded escape from a stranded live row.
+///
+/// Mechanical evidence remains kind-specific: only a job owns a result sidecar
+/// and sentinel. A human who inspected the actual effect can nevertheless
+/// adjudicate any kind, and the ledger preserves both facts: the original live
+/// status is closed as `indeterminate`, then `resolved_status` records the later
+/// decision with its owner and reason. This is deliberately not labelled
+/// mechanical proof.
+fn reconcileLiveByOverride(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    op: Store.operations.Operation,
+    reason: []const u8,
+    parsed: *const Cli.Args.Parsed,
+) !Outcome {
+    // Validate the whole decision before changing the live row. A misspelled
+    // status or absent owner must not turn `submitted` into `indeterminate`
+    // and only then report that no usable adjudication was supplied.
+    _ = parsed.flag("by") orelse fatal("--override requires --by <who>, so the decision has an owner", .{});
+    const status_text = parsed.flag("resolved") orelse
+        fatal("--override requires --resolved <completed|failed|timed_out|cancelled>", .{});
+    _ = Store.op_state.ResolvedStatus.parse(status_text) catch
+        fatal("invalid --resolved '{s}' (completed|failed|timed_out|cancelled)", .{status_text});
+
+    var execution = (Core.execution.attach(store, ctx.arena, ctx.io, op.request_id) catch |err|
+        Cli.receiptFatal(op.request_id, err, op.status.text())) orelse
+        fatal("request {s} changed while it was being reconciled; read it again before deciding", .{op.request_id});
+    defer execution.deinit();
+
+    _ = execution.settle(.{ .indeterminate = .{
+        .reason = "the live attempt was closed for explicit operator adjudication; no mechanical evidence established its outcome",
+        .last_observed = op.status,
+    } }, .{}) catch |err| Cli.receiptFatal(op.request_id, err, op.status.text());
+
+    const settled = (Store.operations.get(store, ctx.arena, op.request_id) catch |err|
+        Cli.storeFatal(store, err)) orelse fatal("request {s} disappeared while reconciling", .{op.request_id});
+    return reconcileByOverride(ctx, store, settled, reason, parsed);
 }
 
 fn sideName(side: Store.transfers.Side) []const u8 {

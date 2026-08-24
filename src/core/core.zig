@@ -15,6 +15,14 @@ pub const transfer = @import("transfer.zig");
 pub const digest = @import("digest.zig");
 pub const proc = @import("proc.zig");
 pub const supervisor = @import("supervisor.zig");
+/// Native Windows process-tree supervisor for local PowerShell execution.
+/// The module is kept separate so POSIX/remote paths cannot accidentally
+/// claim Windows Job Object semantics.
+pub const windows_supervisor = @import("windows_supervisor.zig");
+/// Closed native-audit policy and helper wire contract. This module is shared
+/// with the cross-compiled helper so the host cannot silently drift from the
+/// remote allowlist.
+pub const audit = @import("audit.zig");
 /// The execution boundary: every remote side effect goes through it.
 pub const execution = @import("execution.zig");
 /// The lease-renewal barrier every destructive verb renews through.

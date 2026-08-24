@@ -38,6 +38,31 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Linux supervisor shipped inside the Windows CLI. Declared before the
+    // library module so its emitted bytes can be an anonymous @embedFile import
+    // of that module rather than a loose side artifact.
+    const helper = b.addExecutable(.{
+        .name = "terminus-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/helper/main.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .x86_64,
+                .os_tag = .linux,
+                .abi = .musl,
+            }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    helper.root_module.addImport("audit", b.createModule(.{
+        .root_source_file = b.path("src/core/audit.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .musl,
+        }),
+        .optimize = .ReleaseSmall,
+    }));
+
     // SQLite: translate-c the amalgamation header into an importable module,
     // and compile sqlite3.c into the library module below.
     const sqlite_h = b.addTranslateC(.{
@@ -127,6 +152,9 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("build_zig_source", .{
         .root_source_file = b.path("build.zig"),
     });
+    mod.addAnonymousImport("terminus_helper", .{
+        .root_source_file = helper.getEmittedBin(),
+    });
 
     const exe = b.addExecutable(.{
         .name = "Terminus",
@@ -212,22 +240,9 @@ pub fn build(b: *std.Build) void {
     // The difference is three orders of magnitude — ~11 KB against ~3.4 MB —
     // which is what makes embedding it free.
     //
-    // Not installed: nothing consumes it yet beyond the gates below, and
-    // dropping a Linux binary into `zig-out/bin` next to the Windows one would
-    // only invite someone to ship it.
-    const helper = b.addExecutable(.{
-        .name = "terminus-helper",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/helper/main.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .linux,
-                .abi = .musl,
-            }),
-            .optimize = .ReleaseSmall,
-        }),
-    });
-
+    // Embedded in the CLI above, not installed beside the Windows executable:
+    // the remote installation surface will publish these exact bytes after its
+    // own architecture and integrity checks.
     // How to reach a Linux kernel from here: the `wsl.exe` to run and its
     // flags, as a Windows command. Empty means the build host is itself Linux
     // and the helper runs directly.

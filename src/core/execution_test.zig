@@ -177,6 +177,30 @@ fn completeOutput(arena: std.mem.Allocator, nonce: u64, body: []const u8, code: 
     );
 }
 
+fn helperFrame(arena: std.mem.Allocator, kind: u8, payload: []const u8, out: *std.ArrayList(u8)) !void {
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @intCast(payload.len + 1), .little);
+    try out.appendSlice(arena, &header);
+    try out.append(arena, kind);
+    try out.appendSlice(arena, payload);
+}
+
+fn completeHelperOutput(arena: std.mem.Allocator, stdout: []const u8, stderr: []const u8, code: i32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var started: [24]u8 = undefined;
+    std.mem.writeInt(i64, started[0..8], 4242, .little);
+    std.mem.writeInt(i64, started[8..16], 4242, .little);
+    std.mem.writeInt(u64, started[16..24], 99, .little);
+    try helperFrame(arena, 0x81, &started, &out);
+    try helperFrame(arena, 0x82, stdout, &out);
+    try helperFrame(arena, 0x83, stderr, &out);
+    var ended: [5]u8 = undefined;
+    ended[0] = 0;
+    std.mem.writeInt(i32, ended[1..5], code, .little);
+    try helperFrame(arena, 0x84, &ended, &out);
+    return out.items;
+}
+
 test "M2 gate: disconnect before submission is a proven failure" {
     const t = std.testing;
     var h = try Harness.init(t.allocator, "m2_before_submit");
@@ -366,6 +390,49 @@ test "M2 gate: a clean run records identity and the real exit code" {
     try t.expectEqualStrings("REMOTE_NONZERO_EXIT", terminal.error_code.?);
     try t.expectEqual(@as(i64, 4242), terminal.remote_pid.?);
     try t.expectEqual(@as(?bool, true), terminal.connected);
+}
+
+test "G5 gate: runCommand drives the embedded helper protocol when capability selects it" {
+    const t = std.testing;
+    var h = try Harness.init(t.allocator, "g5_helper_run_command");
+    defer h.deinit();
+
+    const start = try h.begin(.{ .capability = supervisor.helper_capability });
+    var exec = start.ready;
+    defer exec.deinit();
+    try exec.connecting();
+
+    const reply = try completeHelperOutput(h.arena, "exact\x00bytes", "warning", 0);
+    var scripted = Scripted.init(h.arena, &.{.{ .reply = .{
+        .exit_code = 0,
+        .stdout = reply,
+        .stderr = "",
+    } }});
+    const outcome = try mustRun(&exec, scripted.executor(), "printf exact");
+
+    try t.expectEqual(op_state.Status.completed, outcome.status);
+    try t.expectEqualStrings("exact\x00bytes", outcome.stdout);
+    try t.expectEqualStrings("warning", outcome.stderr);
+    try t.expectEqual(@as(i64, 4242), outcome.identity.?.pid);
+    try t.expectEqual(@as(u64, 11), outcome.output.?.stdout.bytes);
+    try t.expectEqual(@as(u64, 7), outcome.output.?.stderr.bytes);
+    try t.expectEqual(@as(usize, 1), scripted.seen.items.len);
+    const helper_command = try supervisor.guardedRemoteHelperCommand(h.arena);
+    try t.expectEqualStrings(helper_command, scripted.seen.items[0]);
+    try t.expect(scripted.input_ended);
+    const expected = try supervisor.wire.encodeRunFor(
+        h.arena,
+        exec.id(),
+        &.{ "/bin/sh", "-lc", "printf exact" },
+        0,
+        1000,
+    );
+    try t.expectEqualSlices(u8, expected, scripted.input.items);
+
+    const terminal = try h.terminalRow(exec.id());
+    try t.expectEqual(@as(i64, 4242), terminal.remote_pid.?);
+    try t.expectEqual(@as(i64, 11), terminal.stdout_bytes.?);
+    try t.expectEqual(@as(i64, 7), terminal.stderr_bytes.?);
 }
 
 test "M2 gate: the capability of the supervisor is on the record" {

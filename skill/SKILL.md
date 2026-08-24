@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.1.10.** If a documented flag is rejected, the
+**Requires terminus >= 0.2.0.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -54,11 +54,84 @@ After that:
   one, and changing a server's `--host` or `--port` leaves it unpinned at the
   new address.
 
-**The daemon transport cannot check a pin yet.** The pooled connection is
-opened by the local daemon, which holds no database and therefore cannot read
-the pin — so it refuses rather than connecting unchecked. Until the daemon
-protocol carries the pin, use `--no-daemon` (or set `TERMINUS_NO_DAEMON=1`
-once for the session) and the direct transport does the check.
+The daemon receives the active pins with each request and compares the key; it
+does not open the database or decide what to trust. Its pool key includes that
+authority, so a connection authorised by one pin cannot be reused under
+another. Trust-on-first-use remains direct-only because recording trust needs
+the process that owns the database.
+
+## Optional remote helper
+
+On an x86_64 Linux server, install the helper only after the operator has
+authorised that host change:
+
+```bash
+terminus server helper <server> --allow-helper-install --json
+```
+
+The command checks the architecture and the helper directory's mount options,
+streams this CLI's embedded helper over pinned direct SSH, verifies its SHA-256
+before and after atomic replacement, and retains the prior binary as
+`$HOME/.terminus/bin/terminus-helper.previous`. The install has its own request
+ID and terminal receipt. Consent is remembered for that server and that exact
+helper digest; subsequent one-shot `exec` calls select it automatically. Every
+launch rechecks the remote digest. A mismatch refuses the launch with exit 126
+instead of falling back to the weaker shell supervisor.
+
+Helper mode reports strong PID/PGID proof, binary framing and a remote deadline
+in the receipt capability. `--timeout` is enforced on the host with TERM then
+KILL. Execs with `--stdin-file` and persistent tmux sessions remain on the
+shell capability because their stdin already has a different owner.
+
+Helper request state is durable and can be inspected independently of the CLI
+that launched it:
+
+```bash
+terminus request query <request-id> --json
+terminus request cancel <request-id> --grace-ms 2000 --json
+terminus request reconcile <request-id> --from-helper --json
+```
+
+The helper binds these answers to request id, PID and process start token.
+Cancellation is reported only after the process group is confirmed gone;
+`--from-helper` settles no operation when that identity does not match.
+
+Native read-only inspection uses the helper's closed policy manifest rather
+than caller-provided command text:
+
+```bash
+terminus audit <server> host|filesystem|processes|services|containers|journal --json
+```
+
+The helper acknowledges the exact compiled manifest before the receipt gains
+`auditIsolation:true`. `journal` uses non-interactive sudo; a missing sudo rule
+fails instead of prompting or falling back to an arbitrary command.
+
+For a pinned direct TCP byte stream without exporting private-key material:
+
+```bash
+terminus tunnel <server> --to <host>:<port>
+```
+
+stdin/stdout are payload, so this command deliberately has no `--json` mode and
+never falls back to the daemon.
+
+Fail-stop plans are durable orchestration metadata; they never create remote
+work themselves:
+
+```bash
+terminus plan create <server> --sha256 <64-hex> [--name <name>] [--body <redacted>]
+terminus plan phase-add <run-id> <phase-id> --index <n> [--read-only]
+terminus plan approve <run-id> <phase-id> --by <operator>
+terminus plan attach <run-id> <phase-id> <existing-request-id>
+terminus plan refresh <run-id>
+terminus plan check <run-id> <phase-id>
+terminus plan show <run-id>
+```
+
+A mutation phase requires approval and successful predecessors. Failed,
+timed-out, cancelled, or indeterminate predecessors stop later mutation phases;
+there is no implicit retry or compensation.
 
 ## Passing commands and content reliably (Windows/PowerShell!)
 
@@ -153,10 +226,16 @@ ambiguity, not a precedence question. A malformed value is refused by which
 mistake it was: not JSON, not an array, an element that is not a string (with
 its index), or an empty array.
 
-`--shell` declares the interpreter and takes `bash|zsh|none`:
+`--shell` declares the interpreter and takes `bash|zsh|none|powershell`:
 
 - `bash` is the default and is what every earlier version did.
 - `zsh` wraps and stages under zsh instead (`zsh -ilc`, `zsh <script>`).
+- `powershell` is a native Windows, one-shot supervisor. The caller command and
+  fixed parent wrapper travel through PowerShell's UTF-16LE `EncodedCommand`
+  channel, so PowerShell never reparses it from a command-line quote. The parent
+  reports its wrapper PID/start token and survives a child `exit` long enough to
+  publish the terminal marker. Persistent tmux sessions, `--login`, and
+  `--interpreter` are refused with this shell.
 - `none` means **terminus adds no shell layer of its own** — no `bash -ilc`, no
   `set -euo pipefail` prefix, no staged script. It does not and cannot mean "no
   shell ran it": SSH exec takes a command *string*, and the remote sshd hands
@@ -164,16 +243,12 @@ its index), or an empty array.
   `--strict`, `--interpreter` and a multiline command are each refused with
   `--shell none`, because each of them is a layer it says are absent.
 
-**Any other value is refused before anything is sent**, and `powershell` is the
-one worth stating: terminus supervises a command with a POSIX shell wrapper —
-that wrapper is what reports the pid, the pgid, a start token and the exit
-status. PowerShell does not run it, so a command sent there would come back with
-no exit marker and every run would settle `indeterminate`. A shell enters the
-vocabulary once a wrapper exists for it, not before, which is why `sh` and `dash`
-are refused too.
+**Any other value is refused before anything is sent.** A shell enters the
+vocabulary only once it has a supervisor wrapper; `pwsh`, `cmd`, `sh` and `dash`
+are not aliases and are refused rather than silently changing semantics.
 
 The shell that ran a command is recorded on its ledger row (`bash`,
-`bash-login`, `zsh`, `zsh-login`, `none`) and is the wrap that actually
+`bash-login`, `zsh`, `zsh-login`, `powershell`, `none`) and is the wrap that actually
 happened — `exec`, `run` and session `exec` all shape their command through one
 code path, so `--strict --login` composes the same way on all of them:
 `bash -ilc 'set -euo pipefail; <cmd>'`, with `--strict` inside the wrap so the
@@ -362,6 +437,9 @@ terminus fact ls <server> --json
 terminus history <server> --limit 20 --json
 
 # Raw session I/O (when you need keystroke-level control)
+# `write` pauses tmux pane logging before typing, so the terminal echo is not
+# persisted as plaintext. The next `read` resumes logging prospectively; output
+# produced in that pause is intentionally absent from the pane log.
 terminus write <server>:<name> -- "journalctl -f"
 terminus read <server>:<name> --from-cursor --json
 
@@ -431,7 +509,7 @@ a process state. The complete set:
 | `completed` | the command exited 0 |
 | `failed` | the command exited non-zero — `exitCode` says which |
 | `indeterminate` | the outcome could not be established; the command exits 75 |
-| `timed_out`, `cancelled` | only after a human `request reconcile --override` (full form below) |
+| `timed_out`, `cancelled` | helper-proven remote deadline/cancellation, or a recorded manual reconcile decision |
 
 There is no `pending`, `running`, `exited` or `killed` in this field — those are
 the four cached row labels `job ls` prints from its local snapshot, and matching
@@ -844,7 +922,8 @@ Three things it will not do:
 - **It will not carry a secret.** It reads `operations` and `operation_events` and
   takes nothing from the launch record but the attempt number. `command` is
   `argv_redacted` — the form the redactor produced before the row was inserted;
-  the raw text was never stored anywhere — and `commandSha256` is a digest. The
+  the raw text is not stored in the operation, attempt, or mutable job row — and
+  `commandSha256` is a digest. The
   script body is `job inspect --show-script`'s and stays there.
 
 `--json` keys, all on every run. Never null: `ok`, `job`, `attempt`,

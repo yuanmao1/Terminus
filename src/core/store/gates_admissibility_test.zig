@@ -151,7 +151,17 @@ fn pinnedCapabilities(kind: Store.operations.Kind) Store.operations.Capabilities
         },
         // Nothing constructs one and nothing is known about what one would be
         // judged by. The four kinds that absorbed 204 of the old cells.
-        .tunnel, .plan_phase, .audit, .cleanup => .{
+        .audit => .{
+            .runs_our_command = true,
+            .supervised_deadline = true,
+            .records_process_identity = true,
+            .offers_input_bytes = false,
+            .publishes_declared_artifact = false,
+            .supervises_another_subject = false,
+            .wrapper_documents_exit = false,
+            .judgement_undeclared = false,
+        },
+        .tunnel, .plan_phase, .cleanup => .{
             .judgement_undeclared = true,
             .runs_our_command = false,
             .supervised_deadline = false,
@@ -194,7 +204,7 @@ fn pinnedEvidenceRule(can: Store.operations.Capabilities, tag: EvidenceTag) bool
     return switch (tag) {
         // No producer, and no field on the variant that could bind a report to the
         // attempt it is offered against.
-        .supervisor_report => false,
+        .supervisor_report => can.records_process_identity,
         // A reading of a process, admissible only where an identity was recorded
         // for it to be checked against.
         .process_probe => can.records_process_identity,
@@ -274,12 +284,12 @@ test "gate: every kind × evidence cell is decided, and none of them by default"
         // records its *pane's* pid, which is a different process, and admitting
         // it there let "the pane is gone" mean "the job was cancelled" while a
         // daemonized child ran on.
-        try t.expectEqual(kind == .exec, sampleEvidence(.process_probe).appliesToKind(kind));
+        try t.expectEqual(kind == .exec or kind == .audit, sampleEvidence(.process_probe).appliesToKind(kind));
         // A supervisor's report speaks for nothing at all until a producer
         // exists that binds it to the attempt it is offered against. It is the
         // only mechanical variant with no identity check in `resolve`, and
         // mechanical is the grade that releases a scope barrier unattended.
-        try t.expect(!sampleEvidence(.supervisor_report).appliesToKind(kind));
+        try t.expectEqual(kind == .exec or kind == .audit, sampleEvidence(.supervisor_report).appliesToKind(kind));
         // Every kind keeps its escape hatch. A kind with no admissible
         // evidence at all would hold its scope forever with no way out, which
         // is the trap `request reconcile` exists to prevent — and with the two

@@ -159,6 +159,16 @@ const tmux_exemptions = [_]shell.Exemption{
         .why = "the validated session name three times as a tmux target, the operator's input already materialised by shell.quote on the line above, and the optional Enter line this function composed itself",
     },
     .{
+        .header = "\npub fn pauseLog(",
+        .placeholders = 2,
+        .why = "the validated session name twice as an exact tmux target; no operator input is rendered into this script",
+    },
+    .{
+        .header = "\npub fn resumeLog(",
+        .placeholders = 5,
+        .why = "the validated session name three times as an exact tmux target and log_dir twice as the fixed $HOME-relative transcript directory",
+    },
+    .{
         .header = "\npub fn probeScript(",
         .placeholders = 5,
         .why = "the sidecar address (result_dir plus a minted ULID), the probe split marker, and the log path from logPath — all of them this file's own text or values it validated",
@@ -200,10 +210,10 @@ test "gate: every raw value Tmux.zig sends to a host is exempted by name and rea
 
     // The number the old blanket exemption never had to state. Pinned, so an
     // entry that is silently dropped from the table takes the total with it.
-    try t.expectEqual(@as(usize, 40), accounted);
-    try t.expectEqual(@as(usize, 14), tmux_exemptions.len);
+    try t.expectEqual(@as(usize, 47), accounted);
+    try t.expectEqual(@as(usize, 16), tmux_exemptions.len);
 
-    // And nothing outside those fourteen functions splices a raw value into
+    // And nothing outside those sixteen functions splices a raw value into
     // anything, bar one sentence. This is the half that catches a *new* script
     // builder rather than a new line in an old one.
     try shell.expectAccounted("session/Tmux.zig", tmux_source, accounted, 1);
@@ -468,5 +478,5 @@ test "gate: the registry's own reasons are reasons" {
             try t.expect(std.mem.startsWith(u8, exemption.header, "\n"));
         }
     }
-    try t.expectEqual(@as(usize, 20), entries);
+    try t.expectEqual(@as(usize, 22), entries);
 }

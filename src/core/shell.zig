@@ -144,6 +144,40 @@ pub fn render(arena: Allocator, argv: []const []const u8) Allocator.Error![]u8 {
     return buf;
 }
 
+fn powerShellQuotedLen(s: []const u8) usize {
+    var n: usize = 2;
+    for (s) |ch| n += if (ch == '\'') 2 else 1;
+    return n;
+}
+
+fn writePowerShellWord(writer: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    try writer.writeByte('\'');
+    for (s) |ch| {
+        if (ch == '\'') try writer.writeByte('\'');
+        try writer.writeByte(ch);
+    }
+    try writer.writeByte('\'');
+}
+
+/// A PowerShell invocation reconstructed from an argv.  `&` invokes the first
+/// literal word and every single-quoted argument remains one argument; the only
+/// terminator, an apostrophe, is doubled according to PowerShell's literal
+/// string grammar.
+pub fn renderPowerShell(arena: Allocator, argv: []const []const u8) Allocator.Error![]u8 {
+    std.debug.assert(argv.len != 0);
+    var total: usize = 2 + argv.len - 1;
+    for (argv) |element| total += powerShellQuotedLen(element);
+    const buf = try arena.alloc(u8, total);
+    var writer = std.Io.Writer.fixed(buf);
+    writer.writeAll("& ") catch unreachable;
+    for (argv, 0..) |element, i| {
+        if (i != 0) writer.writeByte(' ') catch unreachable;
+        writePowerShellWord(&writer, element) catch unreachable;
+    }
+    std.debug.assert(writer.end == buf.len);
+    return buf;
+}
+
 /// `<binary> -ilc <command>`, with the command as one shell word.
 ///
 /// Both letters are load-bearing. `-l` alone is not enough: distros guard
@@ -278,10 +312,17 @@ pub fn cdInto(arena: Allocator, dir: []const u8, command: []const u8) Allocator.
     return std.fmt.allocPrint(arena, "cd -- {f} && ({s})", .{ cwd(dir), command });
 }
 
+pub fn powerShellCdInto(arena: Allocator, dir: []const u8, command: []const u8) Allocator.Error![]u8 {
+    const quoted = try arena.alloc(u8, powerShellQuotedLen(dir));
+    var writer = std.Io.Writer.fixed(quoted);
+    writePowerShellWord(&writer, dir) catch unreachable;
+    return std.fmt.allocPrint(arena, "Set-Location -LiteralPath {s}; {s}", .{ quoted, command });
+}
+
 /// The `--shell` vocabulary: which interpreter a command is declared to run
 /// under, and whether terminus adds a shell layer of its own at all.
 ///
-/// **Why the vocabulary is closed, and why `powershell` is not in it.**
+/// **Why the vocabulary is closed.**
 /// `supervisor.wrapShell` is what provides the start marker, the pid, the pgid,
 /// the start token and the exit marker that `parseShell` reads, and it is
 /// written in POSIX shell — `$$`, `$?`, `$(…)`, `/proc`, `awk`, `printf`,
@@ -294,6 +335,9 @@ pub fn cdInto(arena: Allocator, dir: []const u8, command: []const u8) Allocator.
 pub const Kind = enum {
     bash,
     zsh,
+    /// Native Windows PowerShell, carried through its UTF-16LE
+    /// `-EncodedCommand` channel and supervised by a parent PowerShell process.
+    powershell,
     /// No shell layer from terminus. The command is sent as it stands — no
     /// login wrap, no `set -euo pipefail` prefix, no staged script — and an
     /// argv is rendered one word per element so nothing in it can become
@@ -307,6 +351,8 @@ pub const Kind = enum {
         return switch (k) {
             .bash => "bash",
             .zsh => "zsh",
+            // PowerShell commands are encoded inline rather than staged.
+            .powershell => null,
             .none => null,
         };
     }
@@ -327,7 +373,7 @@ pub const kind_list = list: {
 /// "powershell is not a value terminus has" invites a second attempt while "the
 /// supervisor is POSIX shell" does not.
 pub const unsupervised_names = [_][]const u8{
-    "powershell", "pwsh", "powershell.exe", "cmd", "cmd.exe", "fish", "csh", "tcsh",
+    "pwsh", "powershell.exe", "cmd", "cmd.exe", "fish", "csh", "tcsh",
 };
 
 pub const KindError = error{

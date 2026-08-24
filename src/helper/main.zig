@@ -27,15 +27,17 @@
 //! this file claims it.
 //!
 //! Cross-compiled by `build.zig` for `x86_64-linux-musl` at `ReleaseSmall` and
-//! driven by nine gates in `test/blackbox.zig` on a real Linux kernel. It has no
-//! production caller yet: nothing embeds it, pushes it, or runs it outside those
-//! gates. See `docs/v2.0-progress.md`.
+//! driven by nine gates in `test/blackbox.zig` on a real Linux kernel. The CLI
+//! embeds these bytes and `execution.runCommand` drives this protocol when the
+//! selected capability is `.helper`; remote installation and capability
+//! selection are still separate release work. See `docs/v2.0-progress.md`.
 //!
 //! No allocator, and every buffer below is a fixed size with a stated bound:
 //! this runs on somebody else's machine, and a supervisor that can fail to
 //! allocate is a supervisor that can lose a child it has already forked.
 const std = @import("std");
 const linux = std.os.linux;
+const audit = @import("audit");
 
 /// Wire limits. A request larger than this is refused rather than truncated —
 /// a truncated argv is a different command.
@@ -47,6 +49,9 @@ const argv_bytes = 1 << 19;
 const Kind = struct {
     // host -> helper
     const run: u8 = 0x01;
+    const query: u8 = 0x02;
+    const cancel: u8 = 0x03;
+    const audit_run: u8 = audit.wire.Kind.audit_run;
     // helper -> host
     const started: u8 = 0x81;
     const stdout: u8 = 0x82;
@@ -64,6 +69,7 @@ const How = struct {
     const signalled: u8 = 1;
     const timed_out_killed: u8 = 2;
     const timed_out_unconfirmed: u8 = 3;
+    const cancelled: u8 = 4;
 };
 
 /// How much of a stream is carried in one frame.
@@ -91,29 +97,89 @@ const Error = error{
     WriteFailed,
 };
 
+const IdentityState = struct {
+    pid: i64,
+    pgid: i64,
+    token: u64,
+};
+
+const TerminalState = struct {
+    pid: i64,
+    pgid: i64,
+    token: u64,
+    how: u8,
+    status: i32,
+};
+
+const State = union(enum) {
+    started: IdentityState,
+    /// An independent control request has committed to cancellation and is
+    /// waiting for the process group to disappear.  Persisting the intent
+    /// before TERM closes the race where the owning supervisor reaps first
+    /// and records the resulting signal as an ordinary command failure.
+    cancelling: IdentityState,
+    terminal: TerminalState,
+};
+
+const state_magic = "TRS1";
+const state_bytes = 34;
+
 fn run() Error!void {
     var frame: [max_frame]u8 = undefined;
     const body = try readFrame(&frame);
-    if (body.len < 1 or body[0] != Kind.run) return error.BadFrame;
+    if (body.len < 1) return error.BadFrame;
 
     var p = Parser{ .bytes = body[1..] };
-    const deadline_ms = try p.u64le();
-    const grace_ms = try p.u64le();
-    const argc = try p.u32le();
-    if (argc == 0 or argc > max_argv) return error.TooManyArgs;
-
+    if (body[0] == Kind.query or body[0] == Kind.cancel) {
+        const id_len = try p.u8le();
+        const request_id = try p.take(id_len);
+        const grace_ms = try p.u64le();
+        if (!validRequestId(request_id)) return error.BadFrame;
+        control(request_id, body[0] == Kind.cancel, grace_ms);
+        return;
+    }
     // argv for `execve`: null-terminated strings, null-terminated array.
     var strings: [argv_bytes]u8 = undefined;
     var used: usize = 0;
     var argv: [max_argv + 1]?[*:0]const u8 = undefined;
-    for (0..argc) |i| {
-        const len = try p.u32le();
-        const s = try p.take(len);
-        if (used + s.len + 1 > strings.len) return error.ArgvTooLarge;
-        @memcpy(strings[used..][0..s.len], s);
-        strings[used + s.len] = 0;
-        argv[i] = @ptrCast(strings[used..].ptr);
-        used += s.len + 1;
+    var argc: usize = 0;
+    var request_id: []const u8 = undefined;
+    var deadline_ms: u64 = 0;
+    var grace_ms: u64 = 0;
+    var audit_mode = false;
+
+    if (body[0] == Kind.audit_run) {
+        const request = audit.decodeRequestBody(body) catch return error.BadFrame;
+        if (!validRequestId(request.request_id)) return error.BadFrame;
+        const selected = audit.spec(request.check, request.use_sudo) catch return error.BadFrame;
+        request_id = request.request_id;
+        deadline_ms = request.deadline_ms;
+        grace_ms = request.grace_ms;
+        argc = selected.argv.len;
+        for (selected.argv, 0..) |s, i| {
+            // Every word is a static, nul-terminated literal from audit.zig.
+            argv[i] = @ptrCast(s.ptr);
+        }
+        audit_mode = true;
+        auditAccepted(request);
+    } else {
+        if (body[0] != Kind.run) return error.BadFrame;
+        const id_len = try p.u8le();
+        request_id = try p.take(id_len);
+        if (request_id.len != 0 and !validRequestId(request_id)) return error.BadFrame;
+        deadline_ms = try p.u64le();
+        grace_ms = try p.u64le();
+        argc = try p.u32le();
+        if (argc == 0 or argc > max_argv) return error.TooManyArgs;
+        for (0..argc) |i| {
+            const len = try p.u32le();
+            const s = try p.take(len);
+            if (used + s.len + 1 > strings.len) return error.ArgvTooLarge;
+            @memcpy(strings[used..][0..s.len], s);
+            strings[used + s.len] = 0;
+            argv[i] = @ptrCast(strings[used..].ptr);
+            used += s.len + 1;
+        }
     }
     argv[argc] = null;
 
@@ -149,6 +215,11 @@ fn run() Error!void {
         _ = linux.close(err_pipe[0]);
         if (fail(linux.dup2(out_pipe[1], 1))) exit(72);
         if (fail(linux.dup2(err_pipe[1], 2))) exit(72);
+        if (audit_mode) {
+            const null_fd = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+            if (fail(null_fd) or fail(linux.dup2(@intCast(null_fd), 0))) exit(72);
+            _ = linux.close(@intCast(null_fd));
+        }
         _ = linux.close(out_pipe[1]);
         _ = linux.close(err_pipe[1]);
         _ = linux.execve(argv[0].?, @ptrCast(&argv), @ptrCast(&empty_env));
@@ -183,7 +254,7 @@ fn run() Error!void {
     }
     _ = linux.close(sync_pipe[0]);
 
-    supervise(pid, out_pipe[0], err_pipe[0], deadline_ms, grace_ms, acked);
+    supervise(pid, out_pipe[0], err_pipe[0], deadline_ms, grace_ms, acked, request_id);
 }
 
 /// Whether `fd` becomes readable inside `ms`. EOF counts, so a child that died
@@ -204,7 +275,7 @@ var empty_env: [1]?[*:0]const u8 = .{null};
 
 /// Reports the child's identity, pumps its output, enforces the deadline, and
 /// reports how it ended.
-fn supervise(pid: i32, out_fd: i32, err_fd: i32, deadline_ms: u64, grace_ms: u64, acked: bool) void {
+fn supervise(pid: i32, out_fd: i32, err_fd: i32, deadline_ms: u64, grace_ms: u64, acked: bool, request_id: []const u8) void {
     // Read the start token *before* reaping. The child may already have
     // exited; as a zombie its `/proc` entry is still there, which is why this
     // cannot come back empty for a fast command the way the shell's does.
@@ -226,6 +297,7 @@ fn supervise(pid: i32, out_fd: i32, err_fd: i32, deadline_ms: u64, grace_ms: u64
     writeI64(started[0..8], pid);
     writeI64(started[8..16], pgid);
     writeU64(started[16..24], token);
+    if (request_id.len != 0) writeState(request_id, .{ .started = .{ .pid = pid, .pgid = pgid, .token = token } });
     frameOut(Kind.started, &started);
 
     // A pidfd turns "has the child exited" into a pollable fd, so the deadline
@@ -354,6 +426,13 @@ fn supervise(pid: i32, out_fd: i32, err_fd: i32, deadline_ms: u64, grace_ms: u64
         var unconfirmed: [5]u8 = undefined;
         unconfirmed[0] = How.timed_out_unconfirmed;
         writeI32(unconfirmed[1..5], 0);
+        if (request_id.len != 0) writeState(request_id, .{ .terminal = .{
+            .pid = pid,
+            .pgid = pgid,
+            .token = token,
+            .how = How.timed_out_unconfirmed,
+            .status = 0,
+        } });
         frameOut(Kind.exited, &unconfirmed);
         exit(0);
     }
@@ -390,6 +469,29 @@ fn supervise(pid: i32, out_fd: i32, err_fd: i32, deadline_ms: u64, grace_ms: u64
         else => How.exited,
     };
     writeI32(payload[1..5], status);
+    // An independent `cancel` helper may have established cancellation while
+    // this original supervisor was waking to reap the child. Its durable
+    // verdict wins over the generic signal status observed here; otherwise
+    // the original helper would overwrite `cancelled` with `signalled` purely
+    // because it happens to be the parent.
+    if (request_id.len != 0) if (readState(request_id)) |existing| switch (existing) {
+        .terminal => |ended| if (ended.how == How.cancelled) {
+            payload[0] = How.cancelled;
+            writeI32(payload[1..5], ended.status);
+        },
+        .cancelling => {
+            payload[0] = How.cancelled;
+            writeI32(payload[1..5], 0);
+        },
+        .started => {},
+    };
+    if (request_id.len != 0) writeState(request_id, .{ .terminal = .{
+        .pid = pid,
+        .pgid = pgid,
+        .token = token,
+        .how = payload[0],
+        .status = status,
+    } });
     frameOut(Kind.exited, &payload);
     exit(0);
 }
@@ -476,6 +578,226 @@ fn readPgid(pid: i32) i64 {
     return @intCast(@as(isize, @bitCast(rc)));
 }
 
+// --- durable request state and independent control ------------------------
+
+fn validRequestId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 64) return false;
+    for (id) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return false;
+    return true;
+}
+
+fn statePath(into: []u8, request_id: []const u8, suffix: []const u8) ?[:0]u8 {
+    return std.fmt.bufPrintZ(into, ".terminus/operations/{s}.state{s}", .{ request_id, suffix }) catch null;
+}
+
+fn ensureStateDir() bool {
+    const first = linux.mkdir(".terminus", 0o700);
+    if (fail(first) and errno(first) != .EXIST) return false;
+    const second = linux.mkdir(".terminus/operations", 0o700);
+    return !fail(second) or errno(second) == .EXIST;
+}
+
+fn encodeState(state: State, out: *[state_bytes]u8) void {
+    @memcpy(out[0..4], state_magic);
+    const common = switch (state) {
+        .started => |s| blk: {
+            out[4] = 0;
+            out[29] = 0;
+            writeI32(out[30..34], 0);
+            break :blk s;
+        },
+        .cancelling => |s| blk: {
+            out[4] = 2;
+            out[29] = 0;
+            writeI32(out[30..34], 0);
+            break :blk s;
+        },
+        .terminal => |s| blk: {
+            out[4] = 1;
+            out[29] = s.how;
+            writeI32(out[30..34], s.status);
+            break :blk IdentityState{ .pid = s.pid, .pgid = s.pgid, .token = s.token };
+        },
+    };
+    writeI64(out[5..13], common.pid);
+    writeI64(out[13..21], common.pgid);
+    writeU64(out[21..29], common.token);
+}
+
+fn writeFdAll(fd: i32, bytes: []const u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (fail(rc)) {
+            if (errno(rc) == .INTR) continue;
+            return false;
+        }
+        if (rc == 0) return false;
+        off += rc;
+    }
+    return true;
+}
+
+fn writeState(request_id: []const u8, state: State) void {
+    if (!ensureStateDir()) {
+        failFrame("StateDirectoryFailed");
+        return;
+    }
+    var final_buf: [160]u8 = undefined;
+    var temp_buf: [192]u8 = undefined;
+    const final = statePath(&final_buf, request_id, "") orelse {
+        failFrame("StatePathTooLong");
+        return;
+    };
+    var pid_suffix_buf: [48]u8 = undefined;
+    const process_id = linux.syscall0(.getpid);
+    const suffix = std.fmt.bufPrint(&pid_suffix_buf, ".tmp.{d}", .{process_id}) catch {
+        failFrame("StatePathTooLong");
+        return;
+    };
+    const temp = statePath(&temp_buf, request_id, suffix) orelse {
+        failFrame("StatePathTooLong");
+        return;
+    };
+    const opened = linux.open(temp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    if (fail(opened)) {
+        failFrame("StateOpenFailed");
+        return;
+    }
+    const fd: i32 = @intCast(opened);
+    var bytes: [state_bytes]u8 = undefined;
+    encodeState(state, &bytes);
+    const written = writeFdAll(fd, &bytes);
+    if (written) _ = linux.fsync(fd);
+    _ = linux.close(fd);
+    if (!written) {
+        _ = linux.unlink(temp);
+        failFrame("StateWriteFailed");
+        return;
+    }
+    const renamed = linux.rename(temp, final);
+    if (fail(renamed)) {
+        _ = linux.unlink(temp);
+        failFrame("StateRenameFailed");
+    }
+}
+
+fn readState(request_id: []const u8) ?State {
+    var path_buf: [160]u8 = undefined;
+    const path = statePath(&path_buf, request_id, "") orelse return null;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (fail(opened)) return null;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+    var bytes: [state_bytes]u8 = undefined;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.read(fd, bytes[off..].ptr, bytes.len - off);
+        if (fail(rc)) {
+            if (errno(rc) == .INTR) continue;
+            return null;
+        }
+        if (rc == 0) return null;
+        off += rc;
+    }
+    if (!std.mem.eql(u8, bytes[0..4], state_magic)) return null;
+    const identity = IdentityState{
+        .pid = std.mem.readInt(i64, bytes[5..13], .little),
+        .pgid = std.mem.readInt(i64, bytes[13..21], .little),
+        .token = std.mem.readInt(u64, bytes[21..29], .little),
+    };
+    return switch (bytes[4]) {
+        0 => .{ .started = identity },
+        2 => .{ .cancelling = identity },
+        1 => .{ .terminal = .{
+            .pid = identity.pid,
+            .pgid = identity.pgid,
+            .token = identity.token,
+            .how = bytes[29],
+            .status = std.mem.readInt(i32, bytes[30..34], .little),
+        } },
+        else => null,
+    };
+}
+
+fn emitStarted(s: IdentityState) void {
+    var payload: [24]u8 = undefined;
+    writeI64(payload[0..8], s.pid);
+    writeI64(payload[8..16], s.pgid);
+    writeU64(payload[16..24], s.token);
+    frameOut(Kind.started, &payload);
+}
+
+fn emitTerminal(how: u8, status: i32) void {
+    var payload: [5]u8 = undefined;
+    payload[0] = how;
+    writeI32(payload[1..5], status);
+    frameOut(Kind.exited, &payload);
+}
+
+fn identityAlive(s: IdentityState) bool {
+    if (s.pid <= 0 or s.pgid <= 0 or s.token == 0) return false;
+    const pid: i32 = std.math.cast(i32, s.pid) orelse return false;
+    return startToken(pid) == s.token and readPgid(pid) == s.pgid and !groupGone(s.pgid);
+}
+
+fn control(request_id: []const u8, cancel: bool, grace_ms: u64) void {
+    const state = readState(request_id) orelse {
+        failFrame("StateNotFound");
+        return;
+    };
+    switch (state) {
+        .terminal => |s| {
+            emitStarted(.{ .pid = s.pid, .pgid = s.pgid, .token = s.token });
+            emitTerminal(s.how, s.status);
+        },
+        .started, .cancelling => |s| {
+            if (!identityAlive(s)) {
+                // The supervising helper may be committing the terminal state
+                // at this exact instant. One re-read distinguishes that race
+                // from an actually lost outcome without inventing a result.
+                if (readState(request_id)) |fresh| switch (fresh) {
+                    .terminal => |ended| {
+                        emitStarted(.{ .pid = ended.pid, .pgid = ended.pgid, .token = ended.token });
+                        emitTerminal(ended.how, ended.status);
+                        return;
+                    },
+                    .started, .cancelling => {},
+                };
+                failFrame("ProcessGoneWithoutTerminal");
+                return;
+            }
+            emitStarted(s);
+            if (!cancel) return;
+            writeState(request_id, .{ .cancelling = s });
+            stopGroup(s.pgid, @intCast(s.pid), grace_ms);
+            if (!groupGone(s.pgid)) {
+                failFrame("CancellationUnconfirmed");
+                return;
+            }
+            // The owning supervisor may have observed the persisted intent,
+            // reaped the child and committed the same terminal verdict while
+            // this control request was waiting for groupGone().
+            if (readState(request_id)) |fresh| switch (fresh) {
+                .terminal => |ended| {
+                    emitTerminal(ended.how, ended.status);
+                    return;
+                },
+                .started, .cancelling => {},
+            };
+            const ended = TerminalState{
+                .pid = s.pid,
+                .pgid = s.pgid,
+                .token = s.token,
+                .how = How.cancelled,
+                .status = 0,
+            };
+            writeState(request_id, .{ .terminal = ended });
+            emitTerminal(ended.how, ended.status);
+        },
+    }
+}
+
 /// Whether this fd has something waiting, asked without blocking.
 ///
 /// End-of-file counts as something: `pump` then returns false and the caller's
@@ -553,6 +875,16 @@ fn failFrame(message: []const u8) void {
     frameOut(Kind.failed, message);
 }
 
+fn auditAccepted(request: audit.Request) void {
+    var payload: [35]u8 = undefined;
+    payload[0] = audit.version;
+    payload[1] = @intFromEnum(request.check);
+    payload[2] = @intFromBool(request.use_sudo);
+    const manifest = audit.manifestDigest();
+    @memcpy(payload[3..35], &manifest);
+    frameOut(audit.wire.Kind.audit_accepted, &payload);
+}
+
 fn writeAll(bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -574,6 +906,10 @@ const Parser = struct {
         if (p.at + n > p.bytes.len) return error.BadFrame;
         defer p.at += n;
         return p.bytes[p.at..][0..n];
+    }
+
+    fn u8le(p: *Parser) Error!u8 {
+        return (try p.take(1))[0];
     }
 
     fn u32le(p: *Parser) Error!u32 {

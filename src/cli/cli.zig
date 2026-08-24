@@ -1849,7 +1849,37 @@ pub fn connectReportingClaim(
 fn daemonCannotCarry(parsed: *const Args.Parsed) ?[]const u8 {
     if (parsed.flag("stdin-file") != null)
         return "the daemon protocol has no channel for --stdin-file input; used direct SSH";
+    if (parsed.boolean("allow-helper-install"))
+        return "helper installation streams the embedded binary over stdin; used direct SSH";
     return null;
+}
+
+/// Direct-only connection for a capability whose wire protocol owns stdin.
+/// Host-key verification is unchanged; only daemon selection is bypassed.
+pub fn connectDirect(
+    ctx: *Ctx,
+    server: Store.servers.Server,
+    auth: Ssh.Auth,
+) Connection {
+    _ = ctx;
+    return .{
+        .inner = .{ .direct = sshOpen(server, auth, .fatal).? },
+        .transport = "direct",
+        .daemon_error = "the selected helper capability requires a direct stdin channel",
+    };
+}
+
+pub fn tryConnectDirect(
+    ctx: *Ctx,
+    server: Store.servers.Server,
+    auth: Ssh.Auth,
+) ?Connection {
+    _ = ctx;
+    return .{
+        .inner = .{ .direct = sshOpen(server, auth, .report_and_continue) orelse return null },
+        .transport = "direct",
+        .daemon_error = "the selected helper capability requires a direct stdin channel",
+    };
 }
 
 fn openConnection(
@@ -2217,6 +2247,7 @@ pub const Invocation = struct {
         return switch (inv.kind) {
             .bash => if (inv.login) "bash-login" else "bash",
             .zsh => if (inv.login) "zsh-login" else "zsh",
+            .powershell => "powershell",
             // No layer of ours, so there is no wrap to name.
             .none => "none",
         };
@@ -2252,7 +2283,10 @@ pub const Invocation = struct {
     /// The one composition order in the program.
     pub fn inlineCommand(inv: Invocation, arena: std.mem.Allocator) ![]const u8 {
         var command = inv.text;
-        if (inv.strict) command = try std.fmt.allocPrint(arena, "set -euo pipefail; {s}", .{command});
+        if (inv.strict) command = if (inv.kind == .powershell)
+            try std.fmt.allocPrint(arena, "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; {s}", .{command})
+        else
+            try std.fmt.allocPrint(arena, "set -euo pipefail; {s}", .{command});
         // `.?` and not a fallback: `--shell none --login` is refused by
         // `shapeInvocation`, so a login with no binary cannot get here.
         if (inv.login) command = try Core.shell.loginWrap(arena, inv.kind.binary().?, command);
@@ -2393,6 +2427,17 @@ pub const Request = struct {
 /// Every sentence names both flags and says which of them to drop, because a
 /// refusal an agent cannot act on is a refusal it retries.
 pub fn combinationRefusal(arena: std.mem.Allocator, req: Request) std.mem.Allocator.Error!?[]const u8 {
+    if (req.kind == .powershell) {
+        if (req.session != null) return try std.fmt.allocPrint(arena,
+            "--shell powershell is available only for one-shot exec; persistent sessions are tmux/POSIX shells. Nothing was sent",
+            .{});
+        if (req.login) return try std.fmt.allocPrint(arena,
+            "--shell powershell and --login are not combined: the native supervisor uses a deterministic non-profile process. Nothing was sent; put required setup in the command",
+            .{});
+        if (req.interpreter) |interpreter| return try std.fmt.allocPrint(arena,
+            "--shell powershell and --interpreter {s} contradict each other: PowerShell is already the selected interpreter. Nothing was sent",
+            .{interpreter});
+    }
     // `--shell none` is a statement that terminus adds no shell layer of its
     // own. Each of these three flags *is* such a layer, so accepting one
     // alongside it would be answering the operator's declaration with its
@@ -2471,7 +2516,10 @@ pub fn shapeInvocation(
     } else null;
 
     const text = if (argv) |elements|
-        try Core.shell.render(ctx.arena, elements)
+        if (kind == .powershell)
+            try Core.shell.renderPowerShell(ctx.arena, elements)
+        else
+            try Core.shell.render(ctx.arena, elements)
     else
         (try trailingContent(ctx, parsed, "cmd-file", 1)) orelse
             fail("no command given\n{s}", .{usage});

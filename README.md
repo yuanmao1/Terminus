@@ -126,8 +126,6 @@ agent / human
 └──────────────────┘   └───────────────────────┘
 ```
 
-Design notes live in [docs/PLAN.md](docs/PLAN.md), including a milestone-by-milestone record of what's done and the gotchas hit along the way (Zig 0.16 Windows IO, tmux races, WinCNG limits).
-
 ## Building from source
 
 Requires Zig 0.16.0 on Windows. All C dependencies are vendored:

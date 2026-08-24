@@ -100,15 +100,6 @@ const placeholder = "[REDACTED]";
 /// `-H 'Cookie: session=xyz'` reached the ledger in clear — the `Bearer` rule
 /// was the only header handling there was.
 pub fn redactSecrets(arena: Allocator, input: []const u8) Allocator.Error![]const u8 {
-    // Fast path: skip the scan when no trigger substring is present. Both
-    // `policy` lists are consulted here as well as in the scan below —
-    // otherwise a name added to a list that matches no suffix would be found
-    // by `secretNameEndsAt` on a scan that never runs.
-    if (!containsAny(input, &.{ "PASSWORD", "TOKEN", "SECRET", "KEY", "Bearer", "sk-", "password", "token", "secret" }) and
-        !containsAny(input, &policy.builtin_secret_env) and
-        !containsBuiltinSecretHeader(input))
-        return input;
-
     var out: std.ArrayList(u8) = .empty;
     try out.ensureTotalCapacity(arena, input.len);
     var i: usize = 0;
@@ -297,6 +288,12 @@ test redactSecrets {
     try t.expectEqualStrings("ls -la /srv/app", try redactSecrets(a, "ls -la /srv/app"));
     // Quoted value.
     try t.expectEqualStrings("DB_PASSWORD=\"[REDACTED]\" run", try redactSecrets(a, "DB_PASSWORD=\"p@ss w0rd\" run"));
+    // Every suffix the scanner accepts must be reachable without a narrower
+    // trigger list in front of it. These three used to bypass the scan and
+    // reached operations.argv_redacted verbatim.
+    try t.expectEqualStrings("DB_PASSWD=[REDACTED] run", try redactSecrets(a, "DB_PASSWD=hunter2 run"));
+    try t.expectEqualStrings("Password=[REDACTED] run", try redactSecrets(a, "Password=hunter2 run"));
+    try t.expectEqualStrings("APP_PWD=[REDACTED] run", try redactSecrets(a, "APP_PWD=hunter2 run"));
 
     // A builtin secret header masks its whole value, scheme included. This is
     // the case the `Bearer` rule alone used to leave in the clear: a cookie

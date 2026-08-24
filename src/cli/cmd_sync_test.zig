@@ -4,11 +4,11 @@
 //!
 //! There is no server here: the test host's key exists only inside a database
 //! these tests may not touch, and a libssh2 channel cannot be stood up without
-//! one. So the two byte-moving halves of this verb are **reviewed, not proven** —
-//! `Ssh.scpSendBytes`/`scpRecvBytes` and the `Core.transfer.pushBytes`/`pullBytes`
-//! fallbacks both take an `*Ssh` and cannot be handed a stand-in. They are also
-//! not what this slice is about: they are staging, they happen before submission,
-//! and a failure in either provably never unpacked anything.
+//! one. The two byte-moving halves therefore remain integration evidence rather
+//! than a fake transport stand-in. The production path now stages the archive in
+//! a unique local file and uses `scpSend`/`scpRecv` or `pushFile`/`pullFile`; it
+//! never calls the whole-buffer `*Bytes` APIs. A failure during staging happens
+//! before remote unpack and cannot publish a successful terminal.
 //!
 //! What *is* driven is everything the ledger is made of. `Core.execution.begin`,
 //! `runCommand`, `settle` and the scope guard run against a real store on disk and
@@ -40,6 +40,20 @@ const Control = @import("../core/control.zig");
 const Proc = @import("../core/proc.zig");
 
 const scratch_dir = ".zig-cache/tmp";
+
+test "gate: sync stages archives as files and never selects whole-buffer transfer APIs" {
+    const t = std.testing;
+    const source = @embedFile("cmd_sync.zig");
+    for ([_][]const u8{ "scpSendBytes", "scpRecvBytes", "pushBytes", "pullBytes", "readToEndAlloc" }) |forbidden| {
+        if (std.mem.indexOf(u8, source, forbidden) != null) {
+            std.debug.print("cmd_sync regained a whole-buffer archive path through `{s}`\n", .{forbidden});
+            return error.WholeArchiveBuffered;
+        }
+    }
+    for ([_][]const u8{ "localStagingPath", "scpSend", "scpRecv", "pushFile", "pullFile", "md5File" }) |required| {
+        try t.expect(std.mem.indexOf(u8, source, required) != null);
+    }
+}
 
 // --- fixtures ----------------------------------------------------------------
 

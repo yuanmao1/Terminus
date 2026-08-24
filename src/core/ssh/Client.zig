@@ -13,6 +13,7 @@
 //! Blocking mode throughout — fine for the M1 CLI process model. The M3
 //! daemon revisits this with long-lived sessions.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const c = @import("ssh2");
 // The input channel hashes what it sends as it sends it. `digest` imports only
@@ -481,6 +482,295 @@ pub const ExecError = error{
     /// refuses before `execution.begin` and never reaches a settle at all.
     RemoteRefused,
 };
+
+// --- direct TCP stdio tunnel -------------------------------------------------
+//
+// A tunnel is deliberately a different API from `exec`: the bytes are not a
+// command's stdout and stdin, and no shell ever sees them.  The SSH session is
+// opened by the caller after the normal host-pin check, then this function
+// opens libssh2's `direct-tcpip` channel and copies bytes in both directions.
+//
+// libssh2 is kept on one thread.  A second thread only performs the potentially
+// blocking local-stdin read and puts those bytes in a fixed ring.  This avoids
+// both a whole-input allocation and concurrent libssh2 calls on one session.
+// The ring is intentionally private to this operation: it is a back-pressure
+// boundary, not an unbounded queue.
+pub const tunnel_buffer_bytes = 16 * 1024;
+pub const tunnel_queue_bytes = 64 * 1024;
+
+pub const TunnelStats = struct {
+    /// Bytes accepted by the remote direct-tcpip channel.
+    sent: u64 = 0,
+    /// Bytes written to the local stdout file.
+    received: u64 = 0,
+};
+
+pub const TunnelError = error{
+    DestinationEmpty,
+    DestinationContainsNul,
+    DestinationHostTooLong,
+    DestinationPortInvalid,
+    DirectChannelOpenFailed,
+    InputThreadFailed,
+    InputReadFailed,
+    OutputWriteFailed,
+    InputEofNotSent,
+    RemoteReadFailed,
+    RemoteWriteFailed,
+    RemoteDisconnected,
+    OutOfMemory,
+};
+
+const InputQueue = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    storage: [tunnel_queue_bytes]u8 = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    len: usize = 0,
+    done: bool = false,
+    failed: bool = false,
+    stop: bool = false,
+
+    const Snapshot = struct {
+        len: usize,
+        done: bool,
+        failed: bool,
+    };
+
+    fn init(io: std.Io) InputQueue {
+        return .{ .io = io };
+    }
+
+    fn snapshot(self: *InputQueue) Snapshot {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return .{ .len = self.len, .done = self.done, .failed = self.failed };
+    }
+
+    /// Copy into the bounded ring. Returns false when the pump was stopped.
+    fn put(self: *InputQueue, bytes: []const u8) bool {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            self.mutex.lockUncancelable(self.io);
+            while (self.len == self.storage.len and !self.stop)
+                self.condition.waitUncancelable(self.io, &self.mutex);
+            if (self.stop) {
+                self.mutex.unlock(self.io);
+                return false;
+            }
+            const room = self.storage.len - self.len;
+            const n = @min(room, bytes.len - offset);
+            const first = @min(n, self.storage.len - self.tail);
+            @memcpy(self.storage[self.tail .. self.tail + first], bytes[offset .. offset + first]);
+            const second = n - first;
+            if (second != 0)
+                @memcpy(self.storage[0..second], bytes[offset + first .. offset + n]);
+            self.tail = (self.tail + n) % self.storage.len;
+            self.len += n;
+            offset += n;
+            self.condition.signal(self.io);
+            self.mutex.unlock(self.io);
+        }
+        return true;
+    }
+
+    /// Copy the current contiguous head without removing it. The caller may
+    /// hand the returned bytes to libssh2 and then call `consume` with the
+    /// number the channel accepted.
+    fn peek(self: *InputQueue, out: []u8) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.len == 0) return 0;
+        const n = @min(out.len, @min(self.len, self.storage.len - self.head));
+        @memcpy(out[0..n], self.storage[self.head .. self.head + n]);
+        return n;
+    }
+
+    fn consume(self: *InputQueue, n: usize) void {
+        self.mutex.lockUncancelable(self.io);
+        std.debug.assert(n <= self.len);
+        self.head = (self.head + n) % self.storage.len;
+        self.len -= n;
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
+    }
+
+    fn finish(self: *InputQueue, failed: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        self.failed = failed;
+        self.done = true;
+        self.condition.broadcast(self.io);
+        self.mutex.unlock(self.io);
+    }
+
+    fn requestStop(self: *InputQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        self.stop = true;
+        self.condition.broadcast(self.io);
+        self.mutex.unlock(self.io);
+    }
+};
+
+fn inputPump(queue: *InputQueue, input: std.Io.File) void {
+    var buffer: [tunnel_buffer_bytes]u8 = undefined;
+    var reader = input.readerStreaming(queue.io, &buffer);
+    while (true) {
+        const n = reader.interface.readSliceShort(&buffer) catch {
+            queue.finish(true);
+            return;
+        };
+        if (n == 0) {
+            queue.finish(false);
+            return;
+        }
+        if (!queue.put(buffer[0..n])) return;
+    }
+}
+
+/// Interrupt a local synchronous stdin read before joining the input thread.
+/// On Windows this is the same cancellation primitive used by the threaded IO
+/// backend.  POSIX builds currently do not ship this libssh2 backend; retaining
+/// the branch makes the intent explicit rather than pretending an arbitrary
+/// detached thread is safe.
+fn cancelInputRead(thread: *std.Thread) void {
+    if (comptime builtin.os.tag == .windows) {
+        var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
+        _ = std.os.windows.ntdll.NtCancelSynchronousIoFile(thread.getHandle(), null, &iosb);
+    }
+}
+
+/// Stream local stdin/stdout through a pinned SSH direct-tcpip channel.
+///
+/// The caller must have authenticated `client` through `connect`, which is the
+/// only constructor that can pass the host-key trust root.  No auth material is
+/// accepted here or put on the wire as tunnel payload.  The command is
+/// direct-only because the daemon protocol has no byte stream for either side.
+/// A remote EOF before local stdin EOF is reported as `RemoteDisconnected`; it
+/// is never converted into a successful empty answer.
+pub fn tunnel(
+    client: *Client,
+    io: std.Io,
+    destination_host: []const u8,
+    destination_port: u16,
+    input: std.Io.File,
+    output: std.Io.File,
+) TunnelError!TunnelStats {
+    if (destination_host.len == 0) return error.DestinationEmpty;
+    if (std.mem.indexOfScalar(u8, destination_host, 0) != null)
+        return error.DestinationContainsNul;
+    var host_buffer: [256]u8 = undefined;
+    const host_z = std.fmt.bufPrintZ(&host_buffer, "{s}", .{destination_host}) catch
+        return error.DestinationHostTooLong;
+    if (destination_port == 0) return error.DestinationPortInvalid;
+
+    // `direct_tcpip_ex` is the SSH channel's destination request.  The source
+    // endpoint is only an informational origin for sshd and must not be used as
+    // a second network connection; loopback/port 0 is the conventional value.
+    const channel = c.libssh2_channel_direct_tcpip_ex(
+        client.session,
+        host_z.ptr,
+        @intCast(destination_port),
+        "127.0.0.1",
+        0,
+    ) orelse return error.DirectChannelOpenFailed;
+    defer _ = c.libssh2_channel_free(channel);
+
+    var queue = InputQueue.init(io);
+    var input_thread = std.Thread.spawn(.{}, inputPump, .{ &queue, input }) catch
+        return error.InputThreadFailed;
+    var joined = false;
+    defer {
+        if (!joined) {
+            queue.requestStop();
+            cancelInputRead(&input_thread);
+            input_thread.join();
+        }
+    }
+
+    const was_blocking = c.libssh2_session_get_blocking(client.session) != 0;
+    c.libssh2_session_set_blocking(client.session, 0);
+    defer c.libssh2_session_set_blocking(client.session, if (was_blocking) 1 else 0);
+
+    var stats: TunnelStats = .{};
+    var sent_eof = false;
+    var remote_eof = false;
+    var input_buffer: [tunnel_buffer_bytes]u8 = undefined;
+    var output_buffer: [tunnel_buffer_bytes]u8 = undefined;
+    var writer = output.writerStreaming(io, &output_buffer);
+
+    while (true) {
+        var progressed = false;
+
+        // Drain at most one contiguous queue segment per iteration.  A large
+        // input cannot starve remote output, and the queue's memory stays fixed.
+        if (!sent_eof) {
+            const queued = queue.peek(&input_buffer);
+            if (queued != 0) {
+                const n = c.libssh2_channel_write_ex(channel, 0, &input_buffer, queued);
+                if (n > 0) {
+                    queue.consume(@intCast(n));
+                    stats.sent += @intCast(n);
+                    progressed = true;
+                } else if (n != c.LIBSSH2_ERROR_EAGAIN) {
+                    return error.RemoteWriteFailed;
+                }
+            } else {
+                const state = queue.snapshot();
+                if (state.failed) return error.InputReadFailed;
+                if (state.done) {
+                    if (c.libssh2_channel_send_eof(channel) != 0)
+                        return error.InputEofNotSent;
+                    sent_eof = true;
+                    progressed = true;
+                }
+            }
+        }
+
+        // A direct-tcpip channel carries only one normal byte stream.  Read it
+        // nonblocking so writes above can keep making progress when the peer is
+        // silent, and write each chunk immediately instead of retaining it.
+        if (!remote_eof) {
+            var remote_buffer: [tunnel_buffer_bytes]u8 = undefined;
+            const n = c.libssh2_channel_read_ex(channel, 0, &remote_buffer, remote_buffer.len);
+            if (n > 0) {
+                writer.interface.writeAll(remote_buffer[0..@intCast(n)]) catch
+                    return error.OutputWriteFailed;
+                stats.received += @intCast(n);
+                progressed = true;
+            } else if (n == 0) {
+                remote_eof = true;
+                progressed = true;
+            } else if (n != c.LIBSSH2_ERROR_EAGAIN) {
+                return error.RemoteReadFailed;
+            }
+        }
+
+        if (remote_eof) {
+            const state = queue.snapshot();
+            if (!sent_eof) return error.RemoteDisconnected;
+            if (state.failed) return error.InputReadFailed;
+            break;
+        }
+
+        if (!progressed)
+            std.Io.sleep(io, .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    writer.interface.flush() catch return error.OutputWriteFailed;
+    queue.requestStop();
+    cancelInputRead(&input_thread);
+    input_thread.join();
+    joined = true;
+    _ = c.libssh2_channel_close(channel);
+    // Restore blocking before these teardown calls: a nonblocking wait returns
+    // EAGAIN and would leave libssh2's channel half-open on an otherwise clean
+    // tunnel completion.
+    c.libssh2_session_set_blocking(client.session, 1);
+    _ = c.libssh2_channel_wait_closed(channel);
+    return stats;
+}
 
 /// Runs one command over a fresh session channel and drains stdout/stderr
 /// to completion, **keeping the whole of both**.
@@ -1307,7 +1597,7 @@ pub fn scpSend(
     return sent;
 }
 
-/// Uploads an in-memory buffer over SCP (sync uses this for tar archives).
+/// Uploads an in-memory buffer over SCP. Large callers use `scpSend`.
 ///
 /// Cannot under-send: the loop only leaves at `offset == data.len`. What it
 /// could do was spin forever on a zero-length write, which is now a failure.
@@ -1342,17 +1632,15 @@ pub fn scpSendBytes(
     return data.len;
 }
 
-/// Downloads a remote file over SCP into memory.
+/// Downloads a remote file over SCP into memory. Large callers use `scpRecv`.
 ///
 /// A truncated download used to come back as `data[0..received]` — a shorter
 /// slice, which a caller reads as a shorter file. It is `ShortReceive` now, for
 /// the same reason `scpRecv`'s is.
 ///
 /// No `moved` out-parameter, unlike the two streaming primitives, and the
-/// signature is the reason: `cmd_sync` calls this for its tar archive and
-/// recovers by falling back to the exec backend, so it never asks how far the
-/// SCP attempt got. Adding a parameter only the caller that does not exist would
-/// read is a signature change made for nobody.
+/// Kept for bounded protocol objects; directory sync deliberately stages to a
+/// file so archive size cannot become process memory.
 pub fn scpRecvBytes(
     client: *Client,
     io: std.Io,
@@ -1472,4 +1760,33 @@ fn tuneSocket(socket: c.libssh2_socket_t) void {
     _ = c.setsockopt(socket, 6, 1, @ptrCast(&one), @sizeOf(c_int));
     var rcvbuf: c_int = 4 * 1024 * 1024;
     _ = c.setsockopt(socket, 0xffff, 0x1002, @ptrCast(&rcvbuf), @sizeOf(c_int));
+}
+
+test "direct tunnel input queue is bounded and preserves ring order" {
+    const t = std.testing;
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    var queue = InputQueue.init(threaded.io());
+
+    var first: [tunnel_queue_bytes]u8 = undefined;
+    for (&first, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    try t.expect(queue.put(&first));
+    try t.expectEqual(tunnel_queue_bytes, queue.snapshot().len);
+
+    var head: [tunnel_buffer_bytes]u8 = undefined;
+    try t.expectEqual(tunnel_buffer_bytes, queue.peek(&head));
+    try t.expectEqualSlices(u8, first[0..tunnel_buffer_bytes], &head);
+    queue.consume(tunnel_buffer_bytes);
+
+    var appended: [tunnel_buffer_bytes]u8 = undefined;
+    @memset(&appended, 0xee);
+    try t.expect(queue.put(&appended));
+
+    var next: [tunnel_buffer_bytes]u8 = undefined;
+    try t.expectEqual(tunnel_buffer_bytes, queue.peek(&next));
+    try t.expectEqualSlices(u8, first[tunnel_buffer_bytes .. 2 * tunnel_buffer_bytes], &next);
+    queue.consume(tunnel_queue_bytes - tunnel_buffer_bytes);
+    try t.expectEqual(tunnel_buffer_bytes, queue.snapshot().len);
+    try t.expectEqual(tunnel_buffer_bytes, queue.peek(&next));
+    try t.expectEqualSlices(u8, &appended, &next);
 }

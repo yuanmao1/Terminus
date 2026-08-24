@@ -163,6 +163,9 @@ pub const TopCommand = enum {
     import,
     setup,
     request,
+    audit,
+    plan,
+    tunnel,
     daemon,
     help,
     version,
@@ -183,6 +186,9 @@ const usage =
     \\  run        start a tracked background job    (--name; needs tmux)
     \\  job        manage jobs                       (ls/status/read/kill/rm)
     \\  request    inspect and settle operations     (ls/show/receipt/reconcile)
+    \\  audit      native helper-enforced read-only checks
+    \\  plan       persistent fail-stop plan phases
+    \\  tunnel     pinned direct stdio TCP tunnel
     \\  read       read session output by cursor
     \\  write      write input into a session
     \\  push       upload a file over SCP
@@ -198,13 +204,19 @@ const usage =
     \\  daemon     connection daemon lifecycle       (status/stop/run)
     \\
     \\Global flags (any position): --json (stable machine output), --db <path>.
+    \\Version: terminus version | terminus --version | terminus -v.
     \\
 ;
+
+fn topCommand(arg: []const u8) ?TopCommand {
+    if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) return .version;
+    return std.meta.stringToEnum(TopCommand, arg);
+}
 
 pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
     if (args.len == 0) return ctx.out.print("{s}", .{usage});
 
-    const command = std.meta.stringToEnum(TopCommand, args[0]) orelse
+    const command = topCommand(args[0]) orelse
         Cli.fail("unknown command '{s}'; run 'terminus help'", .{args[0]});
     switch (command) {
         .version => switch (ctx.out.format) {
@@ -252,8 +264,19 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .import => try @import("cmd_export_import.zig").importCmd(ctx, args[1..]),
         .setup => try @import("cmd_setup.zig").run(ctx, args[1..]),
         .request => try @import("cmd_request.zig").run(ctx, args[1..]),
+        .audit => try @import("cmd_audit.zig").run(ctx, args[1..]),
+        .plan => try @import("cmd_plan.zig").run(ctx, args[1..]),
+        .tunnel => try @import("cmd_tunnel.zig").run(ctx, args[1..]),
         .daemon => try @import("cmd_daemon.zig").run(ctx, args[1..]),
     }
+}
+
+test "version command accepts conventional top-level aliases" {
+    const t = std.testing;
+    try t.expectEqual(TopCommand.version, topCommand("version").?);
+    try t.expectEqual(TopCommand.version, topCommand("--version").?);
+    try t.expectEqual(TopCommand.version, topCommand("-v").?);
+    try t.expectEqual(@as(?TopCommand, null), topCommand("-V"));
 }
 
 test {
@@ -274,6 +297,9 @@ test {
     _ = @import("cmd_memory.zig");
     _ = @import("cmd_read_write.zig");
     _ = @import("cmd_request.zig");
+    _ = @import("cmd_audit.zig");
+    _ = @import("cmd_plan.zig");
+    _ = @import("cmd_tunnel.zig");
     _ = @import("cmd_server.zig");
     _ = @import("cmd_session.zig");
     _ = @import("cmd_setup.zig");

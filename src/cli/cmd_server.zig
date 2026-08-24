@@ -12,8 +12,9 @@
 //! change something.
 //!
 //! The claim is only as strong as the word, so the gate at the bottom of this
-//! file holds both halves of it: the command is exactly `true`, and it is the
-//! only remote call this file makes.
+//! file holds both halves of it: the untracked command is exactly `true`, and
+//! the helper install's separate remote call is inside an Execution with a
+//! request id and terminal receipt.
 const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
@@ -32,6 +33,9 @@ const usage =
     \\  server ls     [--json]
     \\  server show   <name> [--json]
     \\  server ping   <name> [--json]     connect+auth check, ~1 round trip
+    \\  server helper <name> --allow-helper-install [--json]
+    \\                       install/upgrade the embedded helper after architecture,
+    \\                       executable-mount and SHA-256 checks; records local consent
     \\  server pin    <name> [--json]     what this machine trusts for the host
     \\                <name> --key-type <t> --fingerprint <fp>
     \\                       record a pin you checked somewhere other than this
@@ -148,6 +152,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         }
     } else if (std.mem.eql(u8, verb, "pin")) {
         try runPin(ctx, &store, &parsed);
+    } else if (std.mem.eql(u8, verb, "helper")) {
+        try runHelperInstall(ctx, &store, &parsed);
     } else if (std.mem.eql(u8, verb, "rename")) {
         const old_name = parsed.positional(0) orelse fatal("{s}", .{usage});
         const new_name = parsed.positional(1) orelse fatal("{s}", .{usage});
@@ -242,6 +248,120 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         }
     } else {
         fatal("unknown verb 'server {s}'\n{s}", .{ verb, usage });
+    }
+}
+
+const helper_install_script =
+    \\set -eu
+    \\[ "$(uname -m)" = x86_64 ] || { echo "unsupported architecture: $(uname -m)" >&2; exit 78; }
+    \\command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; exit 69; }
+    \\command -v findmnt >/dev/null 2>&1 || { echo "findmnt is required" >&2; exit 69; }
+    \\base="$HOME/.terminus/bin"
+    \\final="$base/terminus-helper"
+    \\umask 077
+    \\mkdir -p "$base"
+    \\chmod 700 "$HOME/.terminus" "$base" 2>/dev/null || true
+    \\mount_opts=$(findmnt -n -o OPTIONS -T "$base")
+    \\case ",$mount_opts," in *,noexec,*) echo "helper directory filesystem is mounted noexec" >&2; exit 77;; esac
+    \\tmp=$(mktemp "$base/.terminus-helper.new.XXXXXX")
+    \\trap 'rm -f "$tmp"' EXIT HUP INT TERM
+    \\cat >"$tmp"
+    \\actual=$(sha256sum "$tmp" | awk '{print $1}')
+    \\[ "$actual" = "$TERMINUS_HELPER_SHA256" ] || { echo "uploaded helper digest mismatch" >&2; exit 74; }
+    \\chmod 700 "$tmp"
+    \\if [ -e "$final" ]; then cp -p "$final" "$base/terminus-helper.previous"; fi
+    \\mv -f "$tmp" "$final"
+    \\trap - EXIT HUP INT TERM
+    \\[ "$(sha256sum "$final" | awk '{print $1}')" = "$TERMINUS_HELPER_SHA256" ]
+    \\printf '%s\\n' "$actual"
+;
+
+fn runHelperInstall(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.zig").Parsed) !void {
+    const name = parsed.positional(0) orelse fatal("{s}", .{usage});
+    if (!parsed.boolean("allow-helper-install")) fatal(
+        "helper installation changes the remote host; pass --allow-helper-install to authorize this server once",
+        .{},
+    );
+    const resolved = Cli.resolveServer(ctx, store, name);
+    const owner_token = Store.policy.ownerToken(store, ctx.arena, ctx.io, ctx.now) catch |err|
+        Cli.storeFatal(store, err);
+    var digest_buf: [Core.digest.hex_len]u8 = undefined;
+    const helper_sha = Core.digest.hex(Core.supervisor.helper_executable, &digest_buf);
+    const command = try std.fmt.allocPrint(
+        ctx.arena,
+        "TERMINUS_HELPER_SHA256={s} /bin/sh -c {s}",
+        .{ helper_sha, try Core.shell.quote(ctx.arena, helper_install_script) },
+    );
+    const start = Core.execution.begin(store, ctx.arena, ctx.io, .{
+        .server_id = resolved.server.id,
+        .server_name = resolved.server.name,
+        .kind = .exec,
+        .scope = .{ .kind = .server },
+        .mutating = true,
+        .argv_redacted = "install embedded terminus helper",
+        .shell = "sh",
+        .owner_token = owner_token,
+        .now = ctx.now,
+    }) catch |err| Cli.storeFatal(store, err);
+    var execution = switch (start) {
+        .ready => |ready| ready,
+        .blocked => |blocker| fatal("helper install is blocked by request {s}; reconcile it first", .{switch (blocker) {
+            .unsettled => |op| op.request_id,
+            .lease => |lease| lease.owner_request_id,
+        }}),
+    };
+    Cli.registerExecution(&execution);
+    defer {
+        Cli.clearExecution();
+        execution.deinit();
+    }
+    execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
+    var conn = Cli.connect(ctx, parsed, resolved.server, resolved.auth);
+    defer conn.deinit();
+    var reader: std.Io.Reader = .fixed(Core.supervisor.helper_executable);
+    var accepted: Core.Ssh.Accepted = .{};
+    switch (execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "connecting")) {
+        .submitted => {},
+        .refused => fatal("helper install was refused at submission; reconcile request {s}", .{execution.id()}),
+    }
+    var retained: Core.Ssh.Retained = .{};
+    const executor = conn.executor();
+    const outcome = executor.execRetained(
+        ctx.arena,
+        command,
+        .{ .source = &reader, .accepted = &accepted },
+        &retained,
+    ) catch |err| {
+        const why = try std.fmt.allocPrint(ctx.arena, "helper install transport failed after accepting {d} byte(s): {s} ({s})", .{
+            accepted.bytes, executor.errorMessage(), @errorName(err),
+        });
+        _ = execution.transportLoss(why) catch |receipt_err|
+            Cli.receiptFatal(execution.id(), receipt_err, execution.status.text());
+        Cli.failIndeterminateAfterOutput(execution.id());
+    };
+    _ = execution.settle(.{ .exited = .{ .exit_code = outcome.exit_code } }, .{
+        .connected = true,
+        .stdin = .{ .bytes = @intCast(accepted.bytes), .sha256 = accepted.sha256[0..] },
+        .stdout = .{ .bytes = @intCast(retained.stdout.bytes), .sha256 = retained.stdout.sha256[0..], .truncated = retained.stdout.truncated },
+        .stderr = .{ .bytes = @intCast(retained.stderr.bytes), .sha256 = retained.stderr.sha256[0..], .truncated = retained.stderr.truncated },
+    }) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
+    if (outcome.exit_code != 0) fatal(
+        "helper install failed on '{s}' (exit {d}): {s}",
+        .{ name, outcome.exit_code, outcome.stderr },
+    );
+    Store.facts.set(store, resolved.server.id, Core.supervisor.helper_fact_key, helper_sha, ctx.now) catch |err|
+        Cli.storeFatal(store, err);
+    switch (ctx.out.format) {
+        .json => try ctx.out.json(.{
+            .ok = true,
+            .server = name,
+            .requestId = execution.id(),
+            .helperSha256 = helper_sha,
+            .bytesAccepted = accepted.bytes,
+            .transport = conn.transport,
+            .rollback = "$HOME/.terminus/bin/terminus-helper.previous",
+        }),
+        .human => try ctx.out.print("installed helper on '{s}' (sha256 {s}, request {s}); previous copy retained when present\n", .{ name, helper_sha, execution.id() }),
     }
 }
 
@@ -1187,9 +1307,9 @@ test "gate: a successful removal names the private key it leaves unreferenced" {
 //
 // Two halves, because dropping either one would let the verb start changing a
 // host with no request id: the word it sends, and the fact that it is the only
-// remote call in here. The second is read over the source rather than asserted
-// from memory — a second `exec` added anywhere in this file fails this gate,
-// which is where the question "does that one need an operation?" gets asked.
+// *untracked* remote call in here. `server helper` uses `execRetained`, but only
+// after `execution.begin`, `connecting` and `submitted` have created and bound
+// its request.
 test "gate: `server ping` sends a command that cannot change the host" {
     const t = std.testing;
 
@@ -1208,11 +1328,9 @@ test "gate: `server ping` sends a command that cannot change the host" {
     if (calls != 1) {
         std.debug.print(
             \\
-            \\cmd_server.zig makes {d} exec calls. It may have exactly one — `ping`'s — and
-            \\the reason this verb has no operation row is that the one it has sends a word
-            \\with no effect. A second one is a remote call nothing in the ledger describes;
-            \\give it an execution (`cmd_sync.zig` has the shape) rather than widening this
-            \\count.
+            \\cmd_server.zig makes {d} untracked exec calls. It may have exactly one — `ping`'s —
+            \\and the reason this verb has no operation row is that the one it has sends a word
+            \\with no effect. A second one needs an Execution rather than a wider count.
             \\
         , .{calls});
         return error.MoreThanOneRemoteCall;

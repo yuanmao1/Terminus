@@ -662,12 +662,12 @@ test "blackbox: an in-flight attempt is visible and says it blocks its scope" {
     try show.expectSays("\"status\": \"submitted\"");
 }
 
-test "blackbox: reconcile names the escape hatch instead of leaving a dead end" {
+test "blackbox: a live non-job operation has an explicit adjudication escape hatch" {
     const t = std.testing;
     var f = try Fixture.init(t.allocator, "hatch");
     defer f.deinit();
     try f.seedServer();
-    try seedInFlightJob(&f, in_flight_id, "deploy");
+    try seedInFlight(&f, in_flight_id, "deploy", .exec);
 
     // Bare `reconcile` on a live attempt must not settle anything — the work
     // may be running right now — but it must say what *would* settle it.
@@ -676,25 +676,36 @@ test "blackbox: reconcile names the escape hatch instead of leaving a dead end" 
     try bare.expectCode(1);
     try bare.expectSays("--from-log");
 
-    // Nor may a human assertion jump the queue: overriding a `submitted`
-    // attempt would release the scope on top of a process nobody has looked
-    // at. The refusal has to route to --from-log, not just say no.
+    // An incomplete decision is rejected before the live row is changed.
+    var incomplete = try run(&f, &.{
+        "request", "reconcile", in_flight_id, "--override", "looks done", "--db", f.db,
+    });
+    defer incomplete.deinit(f.allocator);
+    try incomplete.expectCode(1);
+    try incomplete.expectSays("--by");
+    var still_live = try run(&f, &.{ "request", "show", in_flight_id, "--json", "--db", f.db });
+    defer still_live.deinit(f.allocator);
+    try still_live.expectSays("\"status\": \"submitted\"");
+
+    // Every kind also has an explicit human adjudication route. It is not
+    // mechanical evidence and is recorded as such, but a non-job operation
+    // must not be an eternal barrier merely because it has no sentinel log.
     var override = try run(&f, &.{
         "request", "reconcile", in_flight_id, "--override", "looks done to me",
         "--by",    "operator",  "--resolved", "completed",  "--db",
         f.db,
     });
     defer override.deinit(f.allocator);
-    try override.expectCode(1);
-    try override.expectSays("--from-log");
+    try override.expectCode(0);
+    try override.expectSays("completed");
 
-    // And nothing moved: a refusal that quietly advanced the ledger would be
-    // worse than the dead end it replaced.
+    // The decision releases the scope and remains visibly a human resolution.
     var show = try run(&f, &.{ "request", "show", in_flight_id, "--json", "--db", f.db });
     defer show.deinit(f.allocator);
     try show.expectCode(0);
-    try show.expectSays("\"status\": \"submitted\"");
-    try show.expectSays("\"resolvedStatus\": null");
+    try show.expectSays("\"effectiveStatus\": \"completed\"");
+    try show.expectSays("operator_override");
+    try show.expectSays("mechanical");
 }
 
 test "blackbox: an override releases an indeterminate scope and is marked as a decision" {
