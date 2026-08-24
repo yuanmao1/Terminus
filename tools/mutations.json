@@ -2836,6 +2836,14 @@
       "find": "        .signalled => |sig| .{ .exited = .{\n            .exit_code = 128 + sig,\n            .term_signal = sig,\n        } },",
       "replace": "        .signalled => |sig| .{ .exited = .{\n            .exit_code = 128 + sig,\n        } },",
       "expect_gate": "gate: every ending maps to one terminal, and a deadline we could not confirm is not one we enforced"
+    },
+    {
+      "id": "Gf-a-boolean-flag-goes-unregistered",
+      "rule": "An unregistered boolean is always false AND the argument after the flag is eaten as its value, so --revoke --key-type X becomes revoke=\"--key-type\" with revoke reading false. Three of server pin five actions shipped exactly that way, while the comment above bool_flags already said a new flag belongs there and in a gate in the same commit. This holds the class: the gate walks src/cli at test time, so a new file is covered without anyone remembering to add it.",
+      "file": "src/cli/args.zig",
+      "find": "\"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
+      "replace": "\"normalize-lf\", \"trust-on-first-use\", \"rotate\" };",
+      "expect_gate": "gate: every boolean flag production code reads is registered, and every registration is read"
     }
   ]
 }

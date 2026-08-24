@@ -12,7 +12,7 @@ const Allocator = std.mem.Allocator;
 /// found by running the binary. `cmd_transfer_test` gates `--restart` and
 /// `--resume` against this list for that reason; a new boolean flag belongs
 /// here and in a gate, in the same commit.
-const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force", "stdin", "login", "append", "strict", "include-keys", "active", "discard-evidence", "from-log", "read-only", "show-script", "all", "restart", "resume", "no-clobber", "normalize-lf" };
+const bool_flags = [_][]const u8{ "json", "from-cursor", "no-enter", "raw", "no-daemon", "dry-run", "delete", "force", "stdin", "login", "append", "strict", "include-keys", "active", "discard-evidence", "from-log", "read-only", "show-script", "all", "restart", "resume", "no-clobber", "normalize-lf", "trust-on-first-use", "rotate", "revoke" };
 
 pub const Parsed = struct {
     positionals: []const []const u8,
@@ -142,4 +142,100 @@ test "trailing: --cmd, --, and bare positionals" {
     // Nothing given.
     p = try parse(arena, &.{"prod"});
     try t.expectEqual(null, try p.trailing(arena, 1));
+}
+
+test "gate: every boolean flag production code reads is registered, and every registration is read" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A boolean read that is not registered is always `false`, and the argument
+    // after the flag is eaten as that flag's value — so `--revoke --key-type X`
+    // silently becomes `revoke = "--key-type"` with `revoke` reading false. Three
+    // of `server pin`'s five actions shipped that way, and the comment above
+    // `bool_flags` had already said a new flag belongs "here and in a gate, in
+    // the same commit". The instruction was written down and still missed, so this
+    // holds the class rather than the three instances.
+    //
+    // A directory walk and not a registry of files: a new file in src/cli/ is
+    // covered without anybody remembering to add it.
+    var threaded: std.Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var dir = try std.Io.Dir.cwd().openDir(io, "src/cli", .{ .iterate = true });
+    defer dir.close(io);
+
+    var read: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var files: usize = 0;
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        // Tests are excluded on purpose: cmd_exec_test.zig asserts that the
+        // parser does NOT treat `stdin-file` as a boolean, precisely because
+        // `--stdin-file` takes a value and registering it would make the path it
+        // was given parse as a positional. A scan that included tests would
+        // demand the opposite of what that assertion proves.
+        //
+        // The flag name above is deliberately not written in the shape this scan
+        // looks for. The first version of this comment was, and the gate found its
+        // own text and reported `stdin-file` as an unregistered production read —
+        // the fourth time in this tree that a scanner has been confused by prose
+        // about scanning.
+        if (std.mem.indexOf(u8, entry.basename, "_test") != null) continue;
+        files += 1;
+        const body = try entry.dir.readFileAlloc(io, entry.basename, arena, .limited(1 << 23));
+        var at: usize = 0;
+        // Split inside the word, not at the quote. Splitting at the quote still
+        // leaves the searched-for sequence intact — the first literal's closing
+        // quote completes it — so the gate found itself a second time and reported
+        // ` ++ ` as an unregistered flag. Then it found itself a third time, in the
+        // comment that explained the second. Splitting mid-identifier is the only
+        // spelling that cannot match, and no prose here may spell the sequence out.
+        const needle = "bool" ++ "ean(\"";
+        while (std.mem.indexOfPos(u8, body, at, needle)) |hit| {
+            const start = hit + needle.len;
+            const end = std.mem.indexOfScalarPos(u8, body, start, '"') orelse break;
+            try read.put(arena, body[start..end], {});
+            at = end;
+        }
+    }
+
+    // The walk found files, so an empty scan cannot pass as agreement. This is the
+    // failure mode a source-scanning gate has: it finds nothing and says nothing
+    // is wrong.
+    try t.expect(files >= 15);
+    try t.expect(read.count() >= 20);
+
+    for (read.keys()) |name| {
+        if (!isBoolFlag(name)) {
+            std.debug.print(
+                \\
+                \\production code asks the parser for the boolean "{s}", but "{s}" is not in
+                \\`bool_flags`, so that read is always false and the argument after
+                \\the flag is consumed as its value. Add it to the list.
+                \\
+            , .{ name, name });
+            return error.BooleanFlagNotRegistered;
+        }
+    }
+
+    // And the reverse, because a registration nothing reads means the flag was
+    // renamed or dropped while the parser kept treating the old spelling as a
+    // boolean — which silently changes how the next argument is read.
+    for (bool_flags) |name| {
+        if (read.get(name) == null) {
+            std.debug.print(
+                \\
+                \\"{s}" is registered in `bool_flags` but no production file reads
+                \\that boolean. Either it was renamed and the old spelling is
+                \\still swallowing arguments, or it is dead and should go.
+                \\
+            , .{name});
+            return error.RegisteredBooleanFlagNeverRead;
+        }
+    }
 }
