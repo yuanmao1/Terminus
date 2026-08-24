@@ -2335,6 +2335,20 @@ pub fn runCommand(
     // Filled on every path, so a transport loss still reports what arrived.
     var output: Ssh.Retained = .{};
     const result = executor.execRetained(execution.arena, wrapped, input, &output) catch |err| {
+        // `error.RemoteRefused` is classified by the transport but not acted on
+        // here, and that is deliberate. It is a proven non-execution, and the
+        // terminal that says so is refused for an `exec`: `receipts.terminalDescribes`
+        // admits `proven_failure` only for a kind that supervises another subject,
+        // because for an exec a proven post-submission failure *is* an exit status
+        // and `exited` carries the number. `never_submitted` is the true claim and
+        // `op_state.canSettle` refuses it after submission — correctly, since
+        // `submitted()` is also the scope barrier and cannot be deferred.
+        //
+        // So the refusal is prevented rather than settled: the daemon transport
+        // judges the host key at connection time (`protocol.Op.authorise`), before
+        // any operation row exists, which is where the direct transport has always
+        // done it. Reaching this line means that check was bypassed, and the
+        // honest answer then is the same as for any other transport failure.
         // We do not know whether the remote ran it. Say so — and when there was
         // an input, say how much of it went, because a command that read a
         // prefix may have acted on it.

@@ -1871,6 +1871,15 @@ fn openConnection(
                 registerDaemonSocket(ctx.io, client.stream);
                 return .{ .inner = .{ .daemon = client }, .transport = "daemon" };
             },
+            // Not a fallback. The daemon judged the host key against the pins
+            // this command carries, and a direct connection would judge the same
+            // key against the same pins — so retrying over direct SSH would reach
+            // the same refusal by a longer route, with a different message, after
+            // a second dial. Reported here, before `execution.begin`, so a refused
+            // connection leaves no operation row and holds no scope.
+            .refused => |message| {
+                fail("{s}", .{message});
+            },
             .unavailable => |reason| {
                 // Fall back, loudly: human mode warns on stderr now; JSON
                 // mode carries transport+daemonError in the response. Warned

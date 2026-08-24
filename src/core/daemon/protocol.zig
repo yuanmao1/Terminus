@@ -64,9 +64,28 @@ const digest = @import("../digest.zig");
 /// against and would dial without one, so the skew must be refused rather than
 /// tolerated: this is the one field whose absence changes what the far side is
 /// permitted to do.
-pub const version = 4;
+///
+/// v5 added `Response.dialled`. Without it a refusal cannot be told from a
+/// failure, so every refusal had to be settled `indeterminate` — and
+/// `indeterminate` blocks the scope, which meant one wrong pin made a server
+/// refuse every later command until an operator reconciled an attempt that had
+/// never run. Measured against a live host, not reasoned about. The field is not
+/// merely additive for the same reason `trust` was not: a v4 daemon's refusals
+/// would be read as proven non-executions if the default went the other way, so
+/// the default is `true` (unknown) and the version is bumped so a v4 peer is
+/// refused outright rather than half-believed.
+pub const version = 5;
 
-pub const Op = enum { exec, ping, stop };
+/// `authorise` exists so the daemon's host-key judgement happens at connection
+/// time rather than inside the first exec.
+///
+/// Without it the judgement landed after `execution.submitted()` — which is also
+/// the scope barrier and so cannot be deferred — leaving no terminal that was
+/// both true and admissible: `never_submitted` is refused after submission and
+/// `proven_failure` is refused for `exec`. The measured consequence was that one
+/// wrong pin wedged a server until an operator reconciled an attempt that had
+/// never run.
+pub const Op = enum { exec, ping, stop, authorise };
 
 pub const Request = struct {
     v: u32,
@@ -152,6 +171,19 @@ pub const Response = struct {
     v: u32,
     ok: bool,
     @"error": ?[]const u8 = null,
+    /// For a refusal: whether the daemon had established an SSH session when it
+    /// failed.
+    ///
+    /// `false` means it had not — the command provably never left this machine,
+    /// so the caller may settle a proven failure and leave the scope free.
+    /// `true`, or an absent field from an older peer, means the outcome is
+    /// unknown and the caller must settle `indeterminate`.
+    ///
+    /// The default is the safe direction on purpose. A daemon that does not send
+    /// this field is one whose refusals must keep being treated as unknown, and
+    /// defaulting to `false` would turn every such refusal into a false claim
+    /// that nothing ran.
+    dialled: bool = true,
     exitCode: i32 = 0,
     /// The command's stdout as the daemon retained it — the rendering
     /// `Ssh.Capture.render` produced, gap line and all, so the caller's bytes

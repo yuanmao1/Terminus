@@ -220,7 +220,7 @@ fn handleConnection(
             // header, it gets one framed refusal terminated by the newline it
             // is delimiting on, and it falls back to direct SSH rather than
             // waiting for a reply that would never come.
-            respondError(&writer.interface, @errorName(err)) catch {};
+            respondError(&writer.interface, @errorName(err), false) catch {};
             return false;
         } orelse return false;
         if (payload.len == 0) continue;
@@ -232,7 +232,7 @@ fn handleConnection(
         }
 
         const request = protocol.parseMessage(protocol.Request, arena, payload) catch |err| {
-            try respondError(&writer.interface, @errorName(err));
+            try respondError(&writer.interface, @errorName(err), false);
             continue;
         };
 
@@ -252,12 +252,33 @@ fn handleConnection(
                 });
                 return true;
             },
+            // Establish the session this request's authority permits, and answer
+            // whether it was permitted. Nothing is run, so a refusal here is a
+            // refusal to connect and nothing more — which is the whole point: the
+            // caller has not opened an operation yet, so there is no ledger row to
+            // settle and no scope to hold.
+            .authorise => {
+                if (authorise(io, request)) |_| {
+                    try protocol.writeMessage(&writer.interface, protocol.Response{
+                        .v = protocol.version,
+                        .ok = true,
+                        .pid = currentPid(),
+                    });
+                } else |err| {
+                    try respondError(&writer.interface, refusalText(err), false);
+                }
+                continue;
+            },
             .exec => {},
         }
 
         var retained: Ssh.Retained = .{};
-        const result = execRequest(io, arena, request, &retained) catch |err| {
-            try respondError(&writer.interface, refusalText(err));
+        // Whether the command reached a channel. Set inside `execRequest` at the
+        // one line where the answer changes, so a refusal before the dial can be
+        // settled as the proven non-execution it is instead of an unknown.
+        var sent = false;
+        const result = execRequest(io, arena, request, &retained, &sent) catch |err| {
+            try respondError(&writer.interface, refusalText(err), sent);
             continue;
         };
 
@@ -283,19 +304,41 @@ fn handleConnection(
 pub const RunError = Ssh.ExecError || Ssh.InputError || Ssh.ConnectError ||
     Ssh.AuthError || error{AuthMissing};
 
-/// `@errorName`, except for the one refusal whose name alone would send an
-/// operator looking for a network fault that is not there.
+/// `@errorName`, except for the refusals whose name alone would send an operator
+/// looking for a network fault that is not there.
 ///
-/// Any local process can write to this socket, so the refusal has to be
-/// legible on its own — it is not only the CLI that reads it, and the CLI
-/// does not dial the daemon for an exec at all while this holds.
+/// Any local process can write to this socket, so the refusal has to be legible
+/// on its own — it is not only the CLI that reads it.
+///
+/// Measured against the live host on 2026-08-24: a mismatch over this transport
+/// came back with **no message at all** and settled `indeterminate`, while the
+/// direct transport gave a paragraph naming both fingerprints and exited 1. Two
+/// separate defects, and this fixes the legible one. The disposition is recorded
+/// in `docs/v2.0-progress.md` — a refusal the daemon issues before it dials is
+/// proof the command did not run, and `indeterminate` says the opposite.
 pub fn refusalText(err: RunError) []const u8 {
     return switch (err) {
         error.NoTrustRoot =>
-        \\the daemon has no trust store to check a host key against, so it will not open an SSH session.
-        \\Its protocol carries auth material in every request precisely so it never touches the database,
-        \\which is also why it cannot read the pin that authorises a host. Rerun with --no-daemon (or set
-        \\TERMINUS_NO_DAEMON=1) and the direct transport will check the pin and connect.
+        \\no host-key authority travelled with this request, so the daemon will not open an SSH session.
+        \\The daemon holds no database on purpose — its protocol carries both the auth material and the
+        \\caller's pins in every request — so a request that arrives without pins is one whose sender had
+        \\none to send. Record a pin for this server ('terminus server pin <name>') and retry.
+        ,
+        error.HostKeyMismatch =>
+        \\the host key this server presented is not the one the request pinned, and nothing was sent.
+        \\Either the host was rebuilt, or something is answering for it. The daemon will not decide which,
+        \\and it will not connect. Check the fingerprint out of band with 'ssh-keyscan', and only if it
+        \\matches what the host really has, record the change with 'terminus server pin <name> --rotate'.
+        ,
+        error.HostKeyNotPinned =>
+        \\the request carried pins, but none of them is for the key type this server presented, so nothing
+        \\vouches for it and no session was opened. Pin the type the host actually offers — the direct
+        \\transport ('--no-daemon') names it in its refusal.
+        ,
+        error.HostKeyUnreadable =>
+        \\this server presented a host key of a type this build cannot name, so it cannot be compared
+        \\against a pin and no session was opened. This is a refusal rather than a fallback: a key that
+        \\cannot be identified cannot be the pinned one.
         ,
         else => @errorName(err),
     };
@@ -312,10 +355,12 @@ fn execRequest(
     arena: std.mem.Allocator,
     request: protocol.Request,
     retained: *Ssh.Retained,
+    sent: *bool,
 ) RunError!Ssh.ExecResult {
     if (pool_mutex.tryLock()) {
         defer pool_mutex.unlock(io);
         const client = acquirePooledLocked(request) catch |err| return err;
+        sent.* = true;
         return runOn(client, arena, request, retained) catch |err| {
             // Pooled connection may have died (server restart, network
             // drop); drop it so the next request reconnects fresh.
@@ -328,6 +373,7 @@ fn execRequest(
     // Pool busy: independent short-lived connection for this request.
     var client = try connectFor(request);
     defer client.deinit();
+    sent.* = true;
     return runOn(&client, arena, request, retained);
 }
 
@@ -355,6 +401,23 @@ fn runOn(
 }
 
 /// Caller holds pool_mutex.
+/// Opens the session a request's authority permits, without running anything.
+///
+/// Prefers the pool so the common case costs no dial. When the pool is busy — a
+/// long command is in flight — it dials a throwaway rather than skipping the
+/// check: a validation that is sometimes skipped is a validation an operator
+/// cannot rely on, and the window where it would be skipped is exactly the window
+/// where somebody is already talking to that host.
+fn authorise(io: std.Io, request: protocol.Request) RunError!void {
+    if (pool_mutex.tryLock()) {
+        defer pool_mutex.unlock(io);
+        _ = try acquirePooledLocked(request);
+        return;
+    }
+    var client = try connectFor(request);
+    client.deinit();
+}
+
 fn acquirePooledLocked(request: protocol.Request) !*Ssh {
     const gpa = std.heap.smp_allocator;
     const key = try Pooled.keyOf(gpa, request);
@@ -437,10 +500,16 @@ const Lookup = struct {
     }
 };
 
-fn respondError(writer: *std.Io.Writer, message: []const u8) !void {
+/// `dialled` is the caller's answer to "could this have run?", and it is a
+/// parameter rather than a default because the two answers settle differently on
+/// the other side: `false` licenses a proven failure and leaves the scope free,
+/// `true` forces `indeterminate`. Getting it wrong in the `false` direction is a
+/// claim that nothing ran when something may have.
+fn respondError(writer: *std.Io.Writer, message: []const u8, dialled: bool) !void {
     try protocol.writeMessage(writer, protocol.Response{
         .v = protocol.version,
         .ok = false,
+        .dialled = dialled,
         // Bounded here, because this is the one field of a reply whose width is
         // not a function of the output ceiling.
         .@"error" = message[0..@min(message.len, protocol.max_error_bytes)],
@@ -460,7 +529,10 @@ fn respondTooLarge(writer: *std.Io.Writer, response: protocol.Response) !void {
         "reply of {d} bytes exceeds the {d}-byte daemon protocol frame; rerun with --no-daemon",
         .{ size, protocol.max_frame_bytes },
     ) catch "reply exceeds the daemon protocol frame; rerun with --no-daemon";
-    try respondError(writer, message);
+    // `true`, and this is the one that matters: this reply is sent after the
+    // command ran. A frame that will not fit is not a command that did not run,
+    // and saying otherwise would release a scope over work that happened.
+    try respondError(writer, message, true);
 }
 
 // --- The daemon's borrowed authority -----------------------------------------

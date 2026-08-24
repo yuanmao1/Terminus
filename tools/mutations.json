@@ -2844,6 +2844,14 @@
       "find": "\"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
       "replace": "\"normalize-lf\", \"trust-on-first-use\", \"rotate\" };",
       "expect_gate": "gate: every boolean flag production code reads is registered, and every registration is read"
+    },
+    {
+      "id": "G17e-daemon-judges-the-key-inside-the-exec",
+      "rule": "The daemon transport must judge the host key at connection time, not inside the first exec. Judged inside the exec it lands after execution.submitted() - which is also the scope barrier and so cannot be deferred - leaving no terminal both true and admissible: never_submitted is refused after submission, proven_failure is refused for an exec. The refusal then settles indeterminate, and indeterminate blocks the scope, so one wrong pin makes the server refuse every later command until an operator reconciles an attempt that never ran. Measured against a live host on 2026-08-24, before and after.",
+      "file": "src/core/daemon/Client.zig",
+      "find": "                if (client.authorise()) |refusal| {\n                    client.deinit();\n                    return .{ .refused = refusal };\n                }\n                return .{ .ok = client };",
+      "replace": "                return .{ .ok = client };",
+      "expect_gate": "blackbox: a daemon that will not open a session refuses before an operation exists"
     }
   ]
 }

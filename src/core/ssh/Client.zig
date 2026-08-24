@@ -471,6 +471,15 @@ pub const ExecError = error{
     ExecFailed,
     ReadFailed,
     OutOfMemory,
+    /// The far side replied with a refusal it issued **before** it had a session,
+    /// so the command provably did not run.
+    ///
+    /// Distinct from `ExecFailed` because the two settle differently and only one
+    /// of them is a guess: this one licenses `proven_failure`, which leaves the
+    /// scope free, while `ExecFailed` after submission is `indeterminate`, which
+    /// does not. Only the daemon transport produces it — a direct connection
+    /// refuses before `execution.begin` and never reaches a settle at all.
+    RemoteRefused,
 };
 
 /// Runs one command over a fresh session channel and drains stdout/stderr

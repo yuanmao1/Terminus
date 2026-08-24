@@ -124,6 +124,14 @@ const Stub = struct {
                 .pid = 4242,
             }) catch return,
             .stop => return,
+            // The connection-time authority check. This stub stands in for the
+            // socket, not for a host, so there is nothing here to judge and `ok`
+            // is the answer that keeps it a reachable daemon.
+            .authorise => protocol.writeMessage(&writer.interface, protocol.Response{
+                .v = protocol.version,
+                .ok = true,
+                .pid = 4242,
+            }) catch return,
             .exec => {
                 stub.seen_output = request.output;
                 stub.seen_command = stub.gpa.dupe(u8, request.command) catch return;
@@ -615,6 +623,14 @@ test "gate: a CLI that finds no daemon gets a named refusal, never a hang and ne
             .unavailable => |reason| {
                 std.debug.print("\nacquire refused a live daemon: {s}\n", .{reason});
                 return error.AcquireRefusedALiveDaemon;
+            },
+            // The stub answers `authorise` with `ok`, so reaching this arm means
+            // the connection-time authority check has started refusing a daemon
+            // that raised no objection — which would make every command on this
+            // transport fail with a refusal nobody issued.
+            .refused => |message| {
+                std.debug.print("\nacquire reported a refusal the stub never sent: {s}\n", .{message});
+                return error.AcquireInventedARefusal;
             },
         }
     }

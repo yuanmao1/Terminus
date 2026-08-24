@@ -1062,6 +1062,14 @@ const FakeHost = struct {
     /// connection, and a second seizure would displace the peer's own row and
     /// make the assertions afterwards about a different lease.
     seize_on_ping: bool,
+    /// Refuse the connection-time authority check, the way a daemon does when the
+    /// host key it was handed does not match the pins the request carried.
+    ///
+    /// Defaulted off so every existing gate is unaffected. What it makes drivable
+    /// is a refusal that happens *before* the binary opens an operation — which is
+    /// where a host-key refusal belongs, and which nothing could exercise until
+    /// this existed.
+    refuse_authorise: bool = false,
     seized_on_ping: std.atomic.Value(bool),
 
     fn start(f: *Fixture, rules: []Rule) !*FakeHost {
@@ -1373,6 +1381,19 @@ const FakeHost = struct {
                     break :blk .{ .v = protocol.version, .ok = true, .pid = 1 };
                 },
                 .stop => .{ .v = protocol.version, .ok = true },
+                // The connection-time authority check. `FakeHost` is the scripted
+                // host, so its keys are whatever the gate says they are and there
+                // is nothing to refuse here; the refusal path is driven by the
+                // host-key gates against a real judgement.
+                .authorise => if (host.refuse_authorise) .{
+                    .v = protocol.version,
+                    .ok = false,
+                    // `dialled = false` is the load-bearing part: it says the
+                    // refusal came before a session existed, which is what makes
+                    // "the command did not run" a fact rather than a guess.
+                    .dialled = false,
+                    .@"error" = "the host key this server presented is not the one the request pinned",
+                } else .{ .v = protocol.version, .ok = true, .pid = 1 },
                 .exec => try host.replyTo(arena_state.allocator(), request),
             };
             try protocol.writeMessage(&writer.interface, response);
@@ -7538,4 +7559,74 @@ test "blackbox: no scratch path is named without this process's id" {
         );
         return err;
     };
+}
+
+test "blackbox: a daemon that will not open a session refuses before an operation exists" {
+    var f = try Fixture.init(std.testing.allocator, "authorise_refused");
+    defer f.deinit();
+
+    // The gate that was missing, and a live host is what found the defect it holds.
+    //
+    // Before the connection-time check existed, the daemon judged the host key
+    // *inside* the first exec — after `execution.submitted()`, which is also the
+    // scope barrier and therefore cannot be deferred. That left no terminal both
+    // true and admissible (`never_submitted` is refused after submission,
+    // `proven_failure` is refused for an `exec`), so the refusal settled
+    // `indeterminate` — and since `indeterminate` blocks the scope, one wrong pin
+    // made the server refuse every later command until an operator reconciled an
+    // attempt that had never run.
+    //
+    // `FakeHost` answered `authorise` with `ok` unconditionally, so nothing in the
+    // suite could reach a daemon that declines. Measured against a real host
+    // before and after; held mechanically here.
+    try f.seedServer();
+
+    const host = try FakeHost.start(&f, &.{});
+    host.refuse_authorise = true;
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    var result = try runWithEnvironment(&f, &.{
+        "exec", "box", "--json", "--db", f.db, "--cmd", "echo hi",
+    }, &environ);
+    defer result.deinit(f.allocator);
+
+    // Refused as a refusal: exit 1, not the 75 that means the outcome is unknown.
+    // That distinction is the point — 75 forbids a blind retry and this does not.
+    try result.expectCode(1);
+    try result.expectSays("\"ok\": false");
+
+    // The daemon's own words reach the caller. They did not before — the reply's
+    // message was dropped and an operator saw `indeterminate` with no reason at all.
+    if (std.mem.indexOf(u8, result.stdout, "not the one the request pinned") == null) {
+        std.debug.print(
+            "\nthe daemon's refusal did not reach the caller:\n{s}\n",
+            .{result.stdout},
+        );
+        return error.RefusalTextLost;
+    }
+
+    // The part that matters most, and the part an exit code cannot show: no
+    // operation row, so nothing holds the scope. A refusal that leaves a blocker
+    // behind is the defect this gate exists for.
+    var store = try f.open();
+    defer store.close();
+    var stmt = try store.db.prepare(
+        \\SELECT request_id, status FROM operations
+        \\WHERE status IN ('submitted', 'remote_started', 'indeterminate')
+    );
+    defer stmt.deinit();
+    var blocking: usize = 0;
+    while (try stmt.step()) : (blocking += 1) {
+        std.debug.print(
+            "a refused connection left {s} at '{s}', which holds the scope\n",
+            .{ stmt.columnText(0), stmt.columnText(1) },
+        );
+    }
+    // Blocking rows, not all rows. A remnant at `created` or `connecting` is
+    // untidy and harmless — `Status.blocksScope` is false for both — while a
+    // blocking one is the defect itself: it makes every later command on this
+    // server refuse until somebody reconciles an attempt that never ran.
+    if (blocking != 0) return error.RefusedConnectionHeldTheScope;
 }

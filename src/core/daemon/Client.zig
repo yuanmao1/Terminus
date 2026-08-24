@@ -66,6 +66,16 @@ pub const AcquireResult = union(enum) {
     ok: DaemonClient,
     /// Daemon unusable; carries the reason for transport reporting.
     unavailable: []const u8,
+    /// The daemon answered, and what it answered is that it will not open a
+    /// session for this host under this authority. Carries its own words.
+    ///
+    /// Distinct from `unavailable` because the two are not the same event and
+    /// must not share a disposition. `unavailable` is a reason to use direct SSH;
+    /// this is not, because the key the daemon judged is the key a direct
+    /// connection would judge, so falling back would reach the same refusal by a
+    /// longer route. Reported instead — and reported *here*, before the caller
+    /// opens an operation, which is the whole reason this check exists.
+    refused: []const u8,
 };
 
 /// Tries: connect → (version-check via ping) → spawn + retry. Never
@@ -84,7 +94,19 @@ pub fn acquire(
         // Version handshake: a stale daemon (older build) must not serve
         // new-protocol requests.
         switch (client.handshake()) {
-            .ok => return .{ .ok = client },
+            .ok => {
+                // The authority check, before the caller has an operation to
+                // settle. A refusal after `execution.submitted()` had no terminal
+                // that was both true and admissible, and the one it settled for —
+                // `indeterminate` — blocks the scope, so a single wrong pin made a
+                // server refuse every later command until somebody reconciled an
+                // attempt that had never run.
+                if (client.authorise()) |refusal| {
+                    client.deinit();
+                    return .{ .refused = refusal };
+                }
+                return .{ .ok = client };
+            },
             // Spawning past it is impossible and stopping it is impossible; the
             // operator is the only one who can clear it. See the file header.
             .skew => |reason| {
@@ -111,7 +133,18 @@ pub fn acquire(
         if (connectTo(io, path)) |stream| {
             var client: DaemonClient = .{ .io = io, .arena = arena, .stream = stream, .request = request };
             switch (client.handshake()) {
-                .ok => return .{ .ok = client },
+                // The same authority check as the first path. Skipping it here was
+                // a real hole rather than a tidiness point: `daemon restart
+                // --force` sends the next command down this branch, so the check
+                // would have been absent for exactly the command that follows a
+                // restart.
+                .ok => {
+                    if (client.authorise()) |refusal| {
+                        client.deinit();
+                        return .{ .refused = refusal };
+                    }
+                    return .{ .ok = client };
+                },
                 .skew => |reason| {
                     client.deinit();
                     return .{ .unavailable = reason };
@@ -217,6 +250,18 @@ fn execExchange(
         // Onto this client's arena, because the message is read after the
         // caller's work — and its arena — may be gone.
         client.last_error = client.arena.dupe(u8, response.@"error" orelse "daemon error") catch "daemon error";
+        // A refusal the daemon issued before it had a session is proof the
+        // command did not run, and it settles differently: a proven failure,
+        // which leaves the scope free, rather than `indeterminate`, which does
+        // not. `error.ExecFailed` cannot carry that, so it gets its own member.
+        //
+        // Measured on a live host before this existed: one wrong host-key pin
+        // made every later command on that server refuse, because the refusal
+        // had settled `indeterminate` and `indeterminate` blocks the scope.
+        //
+        // `dialled` defaults to true, so a daemon that does not send the field
+        // keeps the old, safe answer.
+        if (!response.dialled) return error.RemoteRefused;
         return error.ExecFailed;
     }
     return response;
@@ -262,6 +307,30 @@ fn handshake(client: *DaemonClient) Handshake {
         .reply => |response| if (response.ok) .{ .ok = response.pid } else .broken,
         .skew => |peer| .{ .skew = skewReason(client.arena, peer) },
         .broken => .broken,
+    };
+}
+
+/// Asks the daemon to open the session this client's authority permits, and
+/// returns its refusal if it will not.
+///
+/// `null` means authorised. The request carries the same host, auth and trust the
+/// exec will, so what is checked here is what will be used — the daemon keys its
+/// pool on exactly those, so the session this validates is the session that runs
+/// the command.
+///
+/// A skew or a broken conversation is deliberately *not* a refusal: those mean the
+/// daemon is unusable, and the caller's existing fallback to direct SSH is the
+/// right answer for them.
+fn authorise(client: *DaemonClient) ?[]const u8 {
+    var request = client.request;
+    request.op = .authorise;
+    return switch (client.roundTrip(client.arena, request)) {
+        .reply => |response| if (response.ok)
+            null
+        else
+            client.arena.dupe(u8, response.@"error" orelse "the daemon refused to open a session") catch
+                "the daemon refused to open a session",
+        .skew, .broken => null,
     };
 }
 
