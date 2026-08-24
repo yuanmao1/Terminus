@@ -1,5 +1,6 @@
 //! CLI namespace: shared context plus per-command modules.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Output = @import("output.zig");
 pub const Dispatch = @import("dispatch.zig");
@@ -1893,7 +1894,14 @@ fn openConnection(
         !std.mem.eql(u8, v, "0")
     else
         false;
-    const cannot_carry = daemonCannotCarry(parsed);
+    const windows_daemon_opt_in = if (ctx.environ.get("TERMINUS_ENABLE_WINDOWS_DAEMON")) |v|
+        std.mem.eql(u8, v, "1")
+    else
+        false;
+    const cannot_carry: ?[]const u8 = if (builtin.os.tag == .windows and !windows_daemon_opt_in)
+        "Windows daemon SSH transport is disabled because its first connection can wedge; used direct SSH immediately"
+    else
+        daemonCannotCarry(parsed);
     if (!parsed.boolean("no-daemon") and !env_disabled and cannot_carry == null) {
         const request = daemonRequest(ctx, server, auth);
         switch (DaemonClient.acquire(ctx.io, ctx.arena, ctx.environ, request)) {
@@ -2515,8 +2523,15 @@ pub fn shapeInvocation(
         break :argv read.argv;
     } else null;
 
-    const text = if (argv) |elements|
-        if (kind == .powershell)
+    const rest_argv = if (argv == null and
+        !parsed.boolean("stdin") and
+        parsed.flag("cmd-file") == null and
+        parsed.flag("cmd") == null) parsed.rest else null;
+    const command_argv = argv orelse rest_argv;
+    const text = if (command_argv) |elements|
+        if (elements.len == 0)
+            fail("no command given\n{s}", .{usage})
+        else if (kind == .powershell)
             try Core.shell.renderPowerShell(ctx.arena, elements)
         else
             try Core.shell.render(ctx.arena, elements)
@@ -2530,21 +2545,21 @@ pub fn shapeInvocation(
         .strict = parsed.boolean("strict"),
         .interpreter = parsed.flag("interpreter"),
         .session = session,
-        .from_argv = argv != null,
+        .from_argv = command_argv != null,
         .text = text,
     };
     if (try combinationRefusal(ctx.arena, req)) |why| fail("{s}", .{why});
 
     // Nothing may be staged when there is no shell layer, and nothing needs to
     // be when the command is an argv.
-    const stageable = kind.binary() != null and argv == null;
+    const stageable = kind.binary() != null and command_argv == null;
     return .{
         .kind = kind,
         .login = req.login,
         .strict = req.strict,
         .interpreter_flag = req.interpreter,
         .interpreter = if (stageable) req.interpreter orelse kind.binary().? else null,
-        .argv = argv,
+        .argv = command_argv,
         .text = text,
     };
 }

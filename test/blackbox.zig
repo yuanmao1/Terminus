@@ -932,6 +932,10 @@ fn scratchHomeEnvironment(allocator: std.mem.Allocator, home: []const u8) !std.p
     };
     errdefer map.deinit();
     try map.put("USERPROFILE", home);
+    // Production Windows builds stay on direct SSH because the real daemon's
+    // first libssh2 connection can wedge. These black-box gates deliberately
+    // provide a scripted daemon and opt into that transport.
+    try map.put("TERMINUS_ENABLE_WINDOWS_DAEMON", "1");
     try map.put("HOME", home);
     return map;
 }

@@ -5,17 +5,17 @@
 //! * Single instance: binding the unix socket is the lock. If the address
 //!   is in use, another daemon is already serving — exit immediately.
 //! * Idle suicide: a watchdog thread exits the process after `idle_exit`
-//!   with no requests in flight. The CLI transparently respawns on
-//!   demand, so an idle daemon costs nothing and can never accumulate.
+//!   with no requests in flight. A later CLI uses direct SSH until the operator
+//!   starts pooling again.
 //! * Stale sockets: on startup, an existing-but-dead socket file (bind
 //!   fails, connect also fails) is deleted and rebound.
 //! * The socket file is removed on every exit path.
 //!
 //! Each client connection gets its own thread, so ping/status/stop stay
-//! responsive while a long exec (multi-minute table scans are legitimate)
-//! is in flight. The pooled SSH session is mutex-guarded — libssh2
-//! sessions are not thread-safe — and a request that finds it busy dials
-//! a fresh one-shot connection instead of queueing behind the long one.
+//! responsive while a long exec is in flight. SSH sessions are one-shot:
+//! holding the async-I/O mutex across libssh2's blocking handshake wedged the
+//! first pooled request for minutes on Windows while later one-shot requests
+//! completed normally.
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const Ssh = @import("../ssh/Client.zig");
@@ -36,50 +36,8 @@ fn envNs(environ: *std.process.Environ.Map, name: []const u8, default: i96) i96 
     return @as(i96, secs) * std.time.ns_per_s;
 }
 
-/// Cache one connection per (host, port, username, auth) — in practice an
-/// agent hammers one server at a time, and eviction is trivially correct.
-const Pooled = struct {
-    client: Ssh,
-    key: []u8,
-    gpa: std.mem.Allocator,
-
-    /// What makes two requests able to share one SSH session.
-    ///
-    /// The trust is part of it, and that is not tidiness: **a pooled connection
-    /// carries the authority it was opened under.** Serving a request that
-    /// bears one pin from a session opened under another would authorise a host
-    /// nobody pinned — the check would have happened, against the wrong value,
-    /// and nothing downstream could tell.
-    ///
-    /// The fingerprints are public values, so putting them in the key exposes
-    /// nothing. `{t}` on `auth` is deliberate and pre-existing: it prints the
-    /// union's tag and never the material.
-    fn keyOf(gpa: std.mem.Allocator, req: protocol.Request) ![]u8 {
-        var key: std.ArrayList(u8) = .empty;
-        errdefer key.deinit(gpa);
-        try key.print(gpa, "{s}\x00{d}\x00{s}\x00{t}", .{
-            req.host, req.port, req.username, req.auth,
-        });
-        switch (req.trust) {
-            .none => try key.appendSlice(gpa, "\x00none"),
-            .pins => |pins| for (pins) |pin| {
-                try key.print(gpa, "\x00{s}\x00{s}", .{ pin.key_type, pin.fingerprint });
-            },
-        }
-        return key.toOwnedSlice(gpa);
-    }
-
-    fn deinit(p: *Pooled) void {
-        p.client.deinit();
-        p.gpa.free(p.key);
-        p.* = undefined;
-    }
-};
-
 var last_activity_ns: std.atomic.Value(i64) = .init(0);
 var active_requests: std.atomic.Value(i64) = .init(0);
-var pool_mutex: std.Io.Mutex = .init;
-var pool: ?Pooled = null;
 
 pub fn socketPath(arena: std.mem.Allocator, environ: *std.process.Environ.Map) ![]u8 {
     const home = environ.get("USERPROFILE") orelse environ.get("HOME") orelse
@@ -106,6 +64,10 @@ fn nowNs(io: std.Io) i64 {
 }
 
 pub fn run(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, environ: *std.process.Environ.Map) !void {
+    // libssh2's global initialization is not a per-connection operation. Doing
+    // it before worker threads exist prevents the daemon's first SSH request
+    // from racing process initialization while later requests proceed.
+    try Ssh.initialize();
     const path = try socketPath(arena, environ);
     const pid_path = try pidFilePath(arena, environ);
     std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?) catch {};
@@ -169,7 +131,7 @@ fn watchdogMain(io: std.Io, path: []const u8, pid_path: []const u8, idle_ns: i96
         }
         // In-flight requests hold the daemon open — unless nothing has
         // started or finished for so long that the transport is presumed
-        // wedged (the CLI falls back to direct SSH and respawns).
+        // wedged (later CLIs fall back to direct SSH).
         if (active > 0 and idle > request_max_ns) {
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             std.Io.Dir.cwd().deleteFile(io, pid_path) catch {};
@@ -344,9 +306,8 @@ pub fn refusalText(err: RunError) []const u8 {
     };
 }
 
-/// Runs one exec, preferring the pooled connection. If another thread
-/// holds it (a long-running command), dial a fresh one-shot connection
-/// rather than queue — concurrent CLI calls stay independent.
+/// Runs one exec on an independent SSH connection, so concurrent CLI calls stay
+/// independent and no async-I/O lock spans a blocking libssh2 call.
 ///
 /// `retained` carries the accounting for a `.retained` request and is left at
 /// its zero value for a `.whole` one, which takes no digest.
@@ -357,20 +318,7 @@ fn execRequest(
     retained: *Ssh.Retained,
     sent: *bool,
 ) RunError!Ssh.ExecResult {
-    if (pool_mutex.tryLock()) {
-        defer pool_mutex.unlock(io);
-        const client = acquirePooledLocked(request) catch |err| return err;
-        sent.* = true;
-        return runOn(client, arena, request, retained) catch |err| {
-            // Pooled connection may have died (server restart, network
-            // drop); drop it so the next request reconnects fresh.
-            if (pool) |*p| p.deinit();
-            pool = null;
-            return err;
-        };
-    }
-
-    // Pool busy: independent short-lived connection for this request.
+    _ = io;
     var client = try connectFor(request);
     defer client.deinit();
     sent.* = true;
@@ -400,41 +348,11 @@ fn runOn(
     };
 }
 
-/// Caller holds pool_mutex.
 /// Opens the session a request's authority permits, without running anything.
-///
-/// Prefers the pool so the common case costs no dial. When the pool is busy — a
-/// long command is in flight — it dials a throwaway rather than skipping the
-/// check: a validation that is sometimes skipped is a validation an operator
-/// cannot rely on, and the window where it would be skipped is exactly the window
-/// where somebody is already talking to that host.
 fn authorise(io: std.Io, request: protocol.Request) RunError!void {
-    if (pool_mutex.tryLock()) {
-        defer pool_mutex.unlock(io);
-        _ = try acquirePooledLocked(request);
-        return;
-    }
+    _ = io;
     var client = try connectFor(request);
     client.deinit();
-}
-
-fn acquirePooledLocked(request: protocol.Request) !*Ssh {
-    const gpa = std.heap.smp_allocator;
-    const key = try Pooled.keyOf(gpa, request);
-
-    if (pool) |*p| {
-        if (std.mem.eql(u8, p.key, key)) {
-            gpa.free(key);
-            return &p.client;
-        }
-        p.deinit();
-        pool = null;
-    }
-
-    errdefer gpa.free(key);
-    const client = try connectFor(request);
-    pool = .{ .client = client, .key = key, .gpa = gpa };
-    return &pool.?.client;
 }
 
 fn connectFor(request: protocol.Request) !Ssh {
@@ -526,9 +444,9 @@ fn respondTooLarge(writer: *std.Io.Writer, response: protocol.Response) !void {
     const size = protocol.payloadLen(response) catch 0;
     const message = std.fmt.bufPrint(
         &buffer,
-        "reply of {d} bytes exceeds the {d}-byte daemon protocol frame; rerun with --no-daemon",
+        "reply of {d} bytes exceeds the {d}-byte daemon protocol frame; put --no-daemon after the command target, for example: terminus exec <server> --no-daemon ...",
         .{ size, protocol.max_frame_bytes },
-    ) catch "reply exceeds the daemon protocol frame; rerun with --no-daemon";
+    ) catch "reply exceeds the daemon protocol frame; rerun as terminus exec <server> --no-daemon ...";
     // `true`, and this is the one that matters: this reply is sent after the
     // command ran. A frame that will not fit is not a command that did not run,
     // and saying otherwise would release a scope over work that happened.
@@ -538,7 +456,7 @@ fn respondTooLarge(writer: *std.Io.Writer, response: protocol.Response) !void {
 // --- The daemon's borrowed authority -----------------------------------------
 //
 // These are in this file rather than in `transport_test.zig` because the things
-// under test are private to it: a pool key and a trust-root lookup. Making them
+// under test is private to it: a trust-root lookup. Making it
 // `pub` so a sibling could reach them would widen the surface for the benefit of
 // the gate, which is the trade this tree does not take.
 
@@ -554,45 +472,6 @@ fn requestWith(trust: protocol.Request.Trust) protocol.Request {
         .auth = .{ .password = "hunter2" },
         .trust = trust,
     };
-}
-
-test "gate: a pooled connection is not shared across different authorities" {
-    const gpa = testing.allocator;
-
-    const ed = protocol.Request.Trust.Pin{
-        .key_type = "ssh-ed25519",
-        .fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    };
-    const other = protocol.Request.Trust.Pin{
-        .key_type = "ssh-ed25519",
-        .fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-    };
-
-    const none = try Pooled.keyOf(gpa, requestWith(.none));
-    defer gpa.free(none);
-    const with_ed = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{ed} }));
-    defer gpa.free(with_ed);
-    const with_other = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{other} }));
-    defer gpa.free(with_other);
-    const empty = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{} }));
-    defer gpa.free(empty);
-
-    // The one that matters: same host, same port, same user, same auth, and a
-    // *different fingerprint*. Sharing a session here would serve a request
-    // bearing one pin from a connection opened under another — the check would
-    // have happened, against the wrong value, and nothing downstream could tell.
-    try testing.expect(!std.mem.eql(u8, with_ed, with_other));
-    // "No authority travelled" and "this authority travelled" are not the same
-    // connection either.
-    try testing.expect(!std.mem.eql(u8, none, with_ed));
-    // Nor is "a store that authorises nothing" the same as "no store".
-    try testing.expect(!std.mem.eql(u8, none, empty));
-
-    // And the same authority does still pool, or the field would have cost the
-    // daemon its whole reason for existing.
-    const again = try Pooled.keyOf(gpa, requestWith(.{ .pins = &.{ed} }));
-    defer gpa.free(again);
-    try testing.expectEqualStrings(with_ed, again);
 }
 
 test "gate: the daemon's lookup answers by key type and never invents an authority" {

@@ -102,7 +102,7 @@ const transfers = Store.transfers;
 /// agent and missing from the usage an operator sees is the two audiences being
 /// told different things about the same binary.
 pub const usage =
-    \\usage: terminus push <server> <local-path> <remote-path> [--mode 644] [--via scp|exec] [--resume|--restart] [--no-clobber] [--force] [--json]
+    \\usage: terminus push <server> <local-path> <remote-path> [--mode OCTAL] [--via scp|exec] [--resume|--restart] [--no-clobber] [--force] [--json]
     \\       terminus pull <server> <remote-path> <local-path> [--via scp|exec] [--resume|--restart] [--no-clobber] [--force] [--json]
     \\
     \\Bytes are staged beside the destination and renamed into place only after
@@ -119,6 +119,9 @@ pub const usage =
     \\interrupted transfer from its confirmed offset and discards nothing.
     \\`--restart` releases a *settled failure*'s hold and starts over in the same
     \\transaction. Each refuses what the other is for.
+    \\
+    \\Without `--mode`, recognized executables (ELF, PE, Mach-O, or a `#!`
+    \\script) land as 755; other files land as 644.
     \\
 ;
 
@@ -330,6 +333,8 @@ pub fn run(ctx: *Cli.Ctx, verb: Verb, raw_args: []const []const u8) !void {
         fatal("invalid --via '{s}' (scp|exec)", .{via.?});
     const mode: u32 = if (parsed.flag("mode")) |m|
         std.fmt.parseInt(u32, m, 8) catch fatal("invalid --mode '{s}' (octal, e.g. 644)", .{m})
+    else if (verb == .push)
+        inferredPushMode(ctx, src)
     else
         0o644;
 
@@ -668,6 +673,30 @@ fn statSize(ctx: *Cli.Ctx, path: []const u8) ?u64 {
     return file.length(ctx.io) catch null;
 }
 
+/// Conservative executable-content inference for a cross-platform client.
+/// Explicit `--mode` always wins.
+fn inferredPushMode(ctx: *Cli.Ctx, path: []const u8) u32 {
+    const file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch return 0o644;
+    defer file.close(ctx.io);
+    var buffer: [4]u8 = undefined;
+    var reader = file.reader(ctx.io, &buffer);
+    const prefix = reader.interface.peekGreedy(1) catch return 0o644;
+    return modeForPrefix(prefix);
+}
+
+pub fn modeForPrefix(prefix: []const u8) u32 {
+    if (std.mem.startsWith(u8, prefix, "#!") or
+        std.mem.startsWith(u8, prefix, "\x7fELF") or
+        std.mem.startsWith(u8, prefix, "MZ")) return 0o755;
+    if (prefix.len >= 4) {
+        const magic = std.mem.readInt(u32, prefix[0..4], .big);
+        if (magic == 0xfeedface or magic == 0xfeedfacf or
+            magic == 0xcefaedfe or magic == 0xcffaedfe or
+            magic == 0xcafebabe or magic == 0xbebafeca) return 0o755;
+    }
+    return 0o644;
+}
+
 // --- probing -----------------------------------------------------------------
 
 /// Establishes what the source is, and what the result will be judged by.
@@ -713,6 +742,14 @@ fn probeLocalSource(r: *Run) void {
         r.ctx.now,
     ) catch |err| Cli.receiptFatal(r.requestId(), err, r.execution.status.text());
     r.identified = true;
+
+    Core.transfer.probeRemoteParent(r.executor(), r.ctx.arena, r.dest_path) catch |err| switch (err) {
+        error.RemoteParentMissing => abort(r, "remote parent directory '{s}' does not exist; create it first", .{Core.transfer.remoteParent(r.dest_path)}),
+        error.RemoteParentNotDirectory => abort(r, "remote parent path '{s}' is not a directory", .{Core.transfer.remoteParent(r.dest_path)}),
+        else => abort(r, "cannot inspect remote parent directory '{s}' ({s}: {s})", .{
+            Core.transfer.remoteParent(r.dest_path), @errorName(err), r.client.errorMessage(),
+        }),
+    };
 
     // Asked *before* declaring, and this order is the whole of why the call
     // exists. A push can always hash its own source, so declaring

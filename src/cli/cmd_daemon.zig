@@ -1,7 +1,6 @@
 //! `terminus daemon run/status/stop` — daemon lifecycle management.
 //!
-//! `run` is what the CLI spawns internally; it can also be launched by
-//! hand for debugging (it stays in the foreground of that terminal).
+//! `run` stays in the foreground for debugging.
 const std = @import("std");
 const fatal = Cli.fail;
 const Cli = @import("cli.zig");
@@ -12,9 +11,9 @@ const usage =
     \\
     \\  daemon status [--json]     is a daemon running? (pid)
     \\  daemon stop                ask the daemon to exit now (graceful)
-    \\  daemon restart [--force]   stop then let the next call respawn; --force
+    \\  daemon restart [--force]   stop it; --force
     \\                             hard-kills a wedged daemon via its pidfile
-    \\  daemon run                 serve in the foreground (internal; CLI spawns this)
+    \\  daemon run                 serve in the foreground
     \\
 ;
 
@@ -45,23 +44,21 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             .human => try ctx.out.print("{s}\n", .{if (stopped) "daemon stopped" else "daemon was not running"}),
         }
     } else if (std.mem.eql(u8, verb, "restart")) {
-        // Graceful stop leaves respawn to the next SSH-bearing call (which
-        // carries the auth material the daemon needs). --force hard-kills a
-        // wedged daemon whose socket no longer answers.
+        // --force hard-kills a wedged daemon whose socket no longer answers.
         if (parsed.boolean("force")) {
             const result = Core.DaemonClient.forceKillDaemon(ctx.io, ctx.arena, ctx.environ);
             switch (ctx.out.format) {
                 .json => try ctx.out.json(.{ .ok = true, .forced = true, .killed = result.killed, .pid = result.pid }),
                 .human => if (result.killed)
-                    try ctx.out.print("daemon force-killed (pid {?d}); next command respawns it\n", .{result.pid})
+                    try ctx.out.print("daemon force-killed (pid {?d}); Windows commands use direct SSH\n", .{result.pid})
                 else
-                    try ctx.out.print("no daemon to kill; stale files cleared, next command respawns it\n", .{}),
+                    try ctx.out.print("no daemon to kill; stale files cleared\n", .{}),
             }
         } else {
             const stopped = Core.DaemonClient.stopDaemon(ctx.io, ctx.arena, ctx.environ);
             switch (ctx.out.format) {
                 .json => try ctx.out.json(.{ .ok = true, .forced = false, .stopped = stopped }),
-                .human => try ctx.out.print("{s}; next command respawns it\n", .{if (stopped) "daemon stopped" else "daemon was not running"}),
+                .human => try ctx.out.print("{s}\n", .{if (stopped) "daemon stopped" else "daemon was not running"}),
             }
         }
     } else {

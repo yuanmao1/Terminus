@@ -45,6 +45,7 @@ terminus doctor prod --json
 
 # One-shot command (works on any server, no tmux needed)
 terminus exec prod -- uname -a
+terminus exec prod --read-only --cmd 'psql -c "SELECT now()"'
 
 # Set a default working directory once
 terminus workspace set prod /srv/app
@@ -66,6 +67,7 @@ terminus read prod:dev --from-cursor --json
 
 # Files and directories
 terminus push prod ./app.tar.gz /tmp/app.tar.gz
+# recognized binaries/scripts default to mode 755; other files default to 644
 terminus pull prod /var/log/app.log ./app.log
 terminus sync push prod ./dist /srv/app/dist --exclude node_modules,.git --dry-run
 terminus sync pull prod /etc/nginx ./nginx-backup       # tar + scp + md5 verify
@@ -90,9 +92,15 @@ terminus history prod --limit 20 --json                 # audit trail
 | `doctor` | one-round environment capability probe |
 | `history` | local audit trail (what ran, where, exit code, transport) |
 | `setup` | install the agent skill (Claude Code, Codex, Cursor, Windsurf, AGENTS.md) |
-| `daemon` | connection pool lifecycle (status / stop / run) |
+| `daemon` | local daemon diagnostics (status / stop / restart / run) |
 
-Global flags, any position: `--json`, `--db <path>`. Per-connection: `--no-daemon`.
+Global flags, any position: `--json`, `--db <path>`. Per-connection:
+`--no-daemon`, placed after the command target (for example
+`terminus exec prod --no-daemon --cmd "uname -a"`).
+
+The released Windows build uses direct SSH immediately and does not auto-start
+or route commands through the daemon, avoiding a first-connection stall that
+could last minutes.
 
 ## Agent integration
 

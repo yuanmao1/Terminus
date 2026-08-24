@@ -144,6 +144,7 @@ terminus exec <server> --stdin                      # command from stdin
 terminus exec <server> --cmd-file ./script.sh       # run a local script remotely
 terminus exec <server> --cmd "uname -a"             # single flag value
 terminus exec <server> -- uname -a                  # classic; fine in bash
+terminus exec <server> -- bash -lc 'echo "$0"' x   # argv boundaries preserved
 
 terminus memory add <server> --key gotchas --stdin  # content from stdin
 terminus memory add <server> --key gotchas --content-file notes.txt
@@ -152,7 +153,21 @@ terminus memory add <server> --key gotchas --content "text with ; and *"
 
 For agents: **use `--argv-json` when any argument is a value you did not write
 yourself** (a path, a name, anything with a space or a quote in it), `--cmd` for
-one-liners you wrote, and `--stdin` for multiline scripts.
+one-liners you wrote, and `--stdin` for multiline scripts. A literal `--` is
+also an argv channel: each following local argument remains exactly one remote
+shell word. Shell operators that should execute as syntax belong in `--cmd` or
+`--stdin`, not as separate arguments after `--`.
+
+Arbitrary `exec` is treated as mutating because Terminus cannot prove what a
+shell command does. For a command you know is genuinely read-only, declare it:
+
+```bash
+terminus exec <server> --read-only --cmd 'psql -c "SELECT now()"'
+```
+
+Read-only execs may run alongside overlapping operations and each other. Do not
+use `--read-only` for a command that can write: the declaration is the safety
+boundary, not SQL or shell-text guessing.
 
 Windows CRLF is **not** rewritten for you. Command text from `--stdin` and
 `--cmd-file` is sent as they were read, byte for byte. If it holds a carriage
@@ -412,8 +427,10 @@ terminus exec <server>:<name> --json -- docker compose ps
 terminus session rm <server> <name> --json
 
 # File transfer (SCP) — single files or whole directories
-terminus push <server> ./local-file /remote/path [--mode 755]
+terminus push <server> ./local-file /remote/path [--mode OCTAL]
 terminus pull <server> /remote/file ./local-path
+# Without --mode, ELF/PE/Mach-O binaries and #! scripts land as 755; other files
+# land as 644. The remote parent directory must already exist.
 # No scp binary on the server (minimal images, OpenSSH 9+)? add --via exec
 # — moves bytes over the plain command channel (needs base64 on the host), any
 # size. Downloads are slow (libssh2 read speed; the scp backend is no faster)
@@ -1153,7 +1170,7 @@ unusually long:
 
 ```bash
 terminus daemon status --json           # is it up? which pid?
-terminus daemon restart                 # graceful; next call respawns it
+terminus daemon restart                 # graceful stop; commands continue direct
 terminus daemon restart --force --json  # hard-kill a wedged daemon by pidfile
 ```
 
@@ -1161,7 +1178,10 @@ terminus daemon restart --force --json  # hard-kill a wedged daemon by pidfile
 kills that pid and deletes the socket and pidfile. (The pid kill is implemented
 on Windows only; elsewhere `--force` amounts to the graceful stop plus the file
 cleanup.) Remote tmux jobs are unaffected — they live on the server, not in the
-daemon. Commands always fall back to direct SSH meanwhile.
+daemon. The released Windows build uses direct SSH immediately and does not
+auto-start or route commands through the daemon; this removes the multi-minute
+first-command stall. To request direct mode explicitly on other builds, put the flag after the target:
+`terminus exec <server> --no-daemon --cmd "..."`.
 
 ## File transfer: what a push or a pull leaves behind
 

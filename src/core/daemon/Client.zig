@@ -1,33 +1,23 @@
-//! Daemon client: connects the CLI to the local daemon, spawning it on
-//! demand.
+//! Daemon client: connects the CLI to an explicitly started local daemon.
 //!
 //! Failure policy: acquire() returns a diagnosis instead of silently
 //! returning null — the caller (cli.connect) decides to fall back to
 //! direct SSH but always *reports* which transport served the request and
 //! why the daemon was skipped.
 //!
-//! **A daemon from another build is named, not respawned over.** The CLI
-//! auto-starts the daemon, so a stale one from a previous build can already hold
-//! the socket when a new client arrives. Spawning cannot displace it — the bind
-//! fails, the new process sees a live socket and exits — and its own `stop`
-//! cannot reach it either, because a stop request in this build's protocol is
-//! one the old daemon refuses. So the skew is reported by name, with the command
-//! that clears it, and the CLI falls back to direct SSH loudly. It used to
-//! report "mismatch after respawn", which described a respawn that had not
-//! happened and named no way out.
+//! **A daemon from another build is named, not trusted.** Version skew falls
+//! back to direct SSH with the reason attached to the receipt.
 //!
-//! **Fresh start: every way of finding nothing on the other side is bounded and
-//! named.** The CLI spawns the daemon on demand, so the ordinary first request
-//! of a session arrives at a socket that does not exist yet, or exists and has
-//! nobody behind it, or has a daemon behind it that has not finished starting.
-//! Each of those has to end in a working connection or in a sentence, and none
-//! of them may end in a wait:
+//! **A missing daemon never delays SSH.** On Windows, auto-spawning a detached
+//! daemon and immediately using it could wedge that spawning process's first
+//! SSH connection for minutes. Absence now returns a named direct fallback;
+//! Released Windows commands therefore use direct SSH by default.
+//! Every way of finding nothing on the other side is bounded and named:
 //!
 //!   * **no socket file** — `connectTo` checks for the file before it dials, so
 //!     this is `null` and not a Windows `error.Unexpected` with a stack trace;
 //!   * **a socket file with nothing listening** (the stale file an unclean
-//!     daemon exit leaves) — the connect fails, `null` again, and the daemon
-//!     `Server.run` binds next deletes and rebinds it. On Windows that connect
+//!     daemon exit leaves) — the connect fails and direct SSH is used. On Windows that connect
 //!     fails with a status std does not map — `ConnectionRefused` is not in
 //!     `net.UnixAddress.ConnectError` — so a Debug build prints a trace under
 //!     it on the way past. Noise, not a wrong answer: the branch taken is the
@@ -36,10 +26,7 @@
 //!     is about. `protocol.readFrame` reads a clean close between frames as
 //!     `null`, which is `.broken`, which is a named refusal;
 //!   * **a reply that stopped part-way** — `error.FrameIncomplete`, also
-//!     `.broken`. It was `.skew` until this pass, which named the wrong cause
-//!     and skipped the respawn; see `roundTrip`;
-//!   * **nothing came up within the retry budget** — five tries over ~1.6s and
-//!     then a sentence.
+//!     `.broken`; see `roundTrip`.
 //!
 //! What is *not* bounded is a peer that writes a well-formed header and then
 //! neither writes nor closes: there is no read deadline on this side, and
@@ -78,8 +65,8 @@ pub const AcquireResult = union(enum) {
     refused: []const u8,
 };
 
-/// Tries: connect → (version-check via ping) → spawn + retry. Never
-/// throws; the result says which and why.
+/// Tries connect → version-check → authority-check. Never throws; the result
+/// says which transport is available and why.
 pub fn acquire(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -114,7 +101,7 @@ pub fn acquire(
                 return .{ .unavailable = reason };
             },
             // Connected, then the conversation broke for a reason that is not a
-            // version. Best-effort stop, then respawn below.
+            // version. Best-effort stop, then use direct SSH below.
             .broken => {
                 client.stop() catch {};
                 client.deinit();
@@ -122,42 +109,12 @@ pub fn acquire(
         }
     }
 
-    spawnDaemon(io, environ) catch |err| {
-        return .{ .unavailable = std.fmt.allocPrint(arena, "spawn failed: {s}", .{@errorName(err)}) catch "spawn failed" };
-    };
-
-    // The daemon needs a moment to bind. Total worst-case wait ~1.6s.
-    var delay_ms: u64 = 50;
-    for (0..5) |_| {
-        std.Io.sleep(io, .{ .nanoseconds = @intCast(delay_ms * std.time.ns_per_ms) }, .awake) catch {};
-        if (connectTo(io, path)) |stream| {
-            var client: DaemonClient = .{ .io = io, .arena = arena, .stream = stream, .request = request };
-            switch (client.handshake()) {
-                // The same authority check as the first path. Skipping it here was
-                // a real hole rather than a tidiness point: `daemon restart
-                // --force` sends the next command down this branch, so the check
-                // would have been absent for exactly the command that follows a
-                // restart.
-                .ok => {
-                    if (client.authorise()) |refusal| {
-                        client.deinit();
-                        return .{ .refused = refusal };
-                    }
-                    return .{ .ok = client };
-                },
-                .skew => |reason| {
-                    client.deinit();
-                    return .{ .unavailable = reason };
-                },
-                .broken => {
-                    client.deinit();
-                    return .{ .unavailable = "daemon did not answer a ping after respawn" };
-                },
-            }
-        }
-        delay_ms *= 2;
-    }
-    return .{ .unavailable = "daemon did not come up within 1.6s" };
+    // A detached daemon spawned from this same Windows process can bind its Unix
+    // socket and then wedge the parent's first SSH connection for minutes. A
+    // missing pool is an optimization miss, not a reason to delay the command:
+    // fall back immediately. Operators who want pooling can keep `daemon run`
+    // under their process supervisor; an already-running daemon is still used.
+    return .{ .unavailable = "daemon is not running; used direct SSH immediately" };
 }
 
 pub fn deinit(client: *DaemonClient) void {
@@ -369,10 +326,8 @@ fn roundTrip(client: *DaemonClient, arena: std.mem.Allocator, request: protocol.
         // A header this build could read, and a frame that did not arrive whole:
         // the daemon died, was killed, or had not finished starting. **Not a
         // skew**, and it used to be reported as one — which named a version that
-        // was not the fault, told the operator to run `daemon restart --force`
-        // for a daemon that had already gone, and, because `acquire` does not
-        // spawn past a skew, left the CLI on direct SSH where a respawn would
-        // have worked. See `protocol.FrameError.FrameIncomplete`.
+        // was not the fault and told the operator to restart a daemon that had
+        // already gone. See `protocol.FrameError.FrameIncomplete`.
         error.FrameIncomplete => return .broken,
         else => return .broken,
     }) orelse return .broken;
@@ -390,32 +345,6 @@ fn connectTo(io: std.Io, path: []const u8) ?std.Io.net.Stream {
     std.Io.Dir.cwd().access(io, path, .{}) catch return null;
     const address = std.Io.net.UnixAddress.init(path) catch return null;
     return address.connect(io) catch null;
-}
-
-/// Spawns `terminus daemon run` fully detached: no inherited stdio, no
-/// console window, and no retained handles — the OS owns the daemon.
-///
-/// Windows has no zombie concept: a process with no open handles to it is
-/// fully reaped by the kernel on exit, so closing our handles right after
-/// spawn guarantees nothing is left behind by this CLI. (POSIX arrives in
-/// M5 and will need the double-fork/setsid treatment instead.)
-fn spawnDaemon(io: std.Io, environ: *std.process.Environ.Map) !void {
-    _ = environ;
-    var exe_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_len = try std.process.executablePath(io, &exe_buffer);
-    const exe = exe_buffer[0..exe_len];
-
-    const child = try std.process.spawn(io, .{
-        .argv = &.{ exe, "daemon", "run" },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-        .create_no_window = true,
-    });
-    if (@import("builtin").os.tag == .windows) {
-        if (child.id) |handle| std.os.windows.CloseHandle(handle);
-        std.os.windows.CloseHandle(child.thread_handle);
-    }
 }
 
 /// One-shot stop for `terminus daemon stop`; returns true if acknowledged.
@@ -447,8 +376,8 @@ pub const ForceKill = struct {
 /// Hard-restart path for a wedged daemon whose socket no longer responds:
 /// read the pidfile and terminate that process directly (bypassing the
 /// hung socket protocol), then delete the stale socket + pid files so the
-/// next request spawns a clean daemon. Best-effort — a graceful `stop`
-/// should be tried first; this is the sledgehammer.
+/// an explicit restart can launch a clean daemon. Best-effort — a graceful
+/// `stop` should be tried first; this is the sledgehammer.
 pub fn forceKillDaemon(io: std.Io, arena: std.mem.Allocator, environ: *std.process.Environ.Map) ForceKill {
     // Try a graceful stop first so a *responsive* daemon exits cleanly and
     // removes its own files; only fall through to killing by pid if it's
@@ -460,7 +389,7 @@ pub fn forceKillDaemon(io: std.Io, arena: std.mem.Allocator, environ: *std.proce
     if (pid) |p| killed = terminatePid(p);
 
     // Whether or not a process was killed, clear the stale artifacts so the
-    // next CLI call spawns fresh.
+    // an explicit start/restart can bind fresh.
     if (Server.socketPath(arena, environ)) |sock| std.Io.Dir.cwd().deleteFile(io, sock) catch {} else |_| {}
     if (Server.pidFilePath(arena, environ)) |pf| std.Io.Dir.cwd().deleteFile(io, pf) catch {} else |_| {}
 

@@ -370,7 +370,7 @@ fn runOneShot(
     // direct connection when `--stdin-file` is named, so reaching this means
     // the transport changed under us.
     if (input != null and !executor.carriesInput()) fatal(
-        "this transport has no channel for --stdin-file input; nothing was sent. Re-run with --no-daemon",
+        "this transport has no channel for --stdin-file input; nothing was sent. Put --no-daemon after the command target, for example: terminus exec <server> --no-daemon ...",
         .{},
     );
 
@@ -551,7 +551,7 @@ fn advisoryText(ctx: *Cli.Ctx, advisory: ?Core.execution.Blocker) ?[]const u8 {
 fn reportBlocked(blocker: Core.execution.Blocker) noreturn {
     switch (blocker) {
         .unsettled => |op| fatal(
-            "refused: request {s} is {s} on an overlapping scope, so this change could be applied twice; nothing was sent. Reconcile it ('terminus request reconcile {s}') or pass --force",
+            "refused: request {s} is {s} on an overlapping scope, so this change could be applied twice; nothing was sent. Reconcile it ('terminus request reconcile {s}'), pass --force for a mutation, or declare a genuinely read-only command with --read-only",
             .{ op.request_id, op.status.text(), op.request_id },
         ),
         .lease => |lease| fatal(

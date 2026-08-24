@@ -112,6 +112,24 @@ fn hexOf(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     return Core.digest.hexAlloc(arena, bytes);
 }
 
+test "gate: literal -- preserves every argv boundary including bash -lc script text" {
+    const t = std.testing;
+    var f = try TextFixture.init(t.allocator, "unused");
+    defer f.deinit();
+
+    const want = [_][]const u8{
+        "bash", "-lc", "for id in $IDS; do printf '%s\\n' \"$id\"; done", "sentinel",
+    };
+    const parsed = try args.parse(f.arena, &.{
+        "box", "--", want[0], want[1], want[2], want[3],
+    });
+    const invocation = try Cli.shapeInvocation(&f.ctx, &parsed, null, cmd_exec.usage);
+    try t.expect(invocation.argv != null);
+    const got = try Core.shell.words(f.arena, invocation.text);
+    try t.expectEqual(want.len, got.len);
+    for (&want, got) |expected, actual| try t.expectEqualStrings(expected, actual);
+}
+
 /// A payload with every byte value in it, twice over, plus the sequences a
 /// text-mode channel would damage.
 fn everyByte(arena: std.mem.Allocator) ![]u8 {

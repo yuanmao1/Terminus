@@ -4059,3 +4059,13 @@ test "gate: the CLI no longer refuses the paths this module can now carry" {
     // And an empty path is still not a path.
     try t.expect(std.mem.indexOf(u8, body, "path.len == 0") != null);
 }
+
+test "gate: executable payloads default to 755 and ordinary data to 644" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 0o755), cmd_transfer.modeForPrefix("\x7fELF"));
+    try t.expectEqual(@as(u32, 0o755), cmd_transfer.modeForPrefix("MZ\x90\x00"));
+    try t.expectEqual(@as(u32, 0o755), cmd_transfer.modeForPrefix("#!/b"));
+    try t.expectEqual(@as(u32, 0o755), cmd_transfer.modeForPrefix("\xfe\xed\xfa\xcf"));
+    try t.expectEqual(@as(u32, 0o644), cmd_transfer.modeForPrefix("text"));
+    try t.expectEqual(@as(u32, 0o644), cmd_transfer.modeForPrefix(""));
+}

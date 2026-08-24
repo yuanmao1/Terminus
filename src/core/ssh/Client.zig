@@ -31,6 +31,17 @@ session: *c.LIBSSH2_SESSION,
 /// flag suffices.
 var libssh2_ready = false;
 
+/// Process-wide libssh2/Winsock initialization. The daemon calls this on its
+/// main thread before it accepts concurrent clients; direct CLI processes reach
+/// it lazily from `connect`.
+pub fn initialize() ConnectError!void {
+    if (libssh2_ready) return;
+    var wsa: c.WSADATA = undefined;
+    if (c.WSAStartup((2 << 8) | 2, &wsa) != 0) return error.Libssh2Init;
+    if (c.libssh2_init(0) != 0) return error.Libssh2Init;
+    libssh2_ready = true;
+}
+
 /// Flip to true and rebuild to dump libssh2 protocol trace to stderr.
 const trace_enabled = false;
 
@@ -250,6 +261,45 @@ pub fn refusalFor(v: Verdict) ?ConnectError {
     };
 }
 
+/// Restricts host-key negotiation to key types for which this trust root has
+/// an active pin. A server may own several host keys and libssh2 is otherwise
+/// free to choose a different one on a later handshake; post-handshake checking
+/// would then refuse a healthy host merely because that unpinned type won.
+///
+/// RSA's negotiation names are signature algorithms, while the pin is keyed by
+/// the stable key type `ssh-rsa`, so all three RSA method names are admitted by
+/// that one pin. TOFU deliberately skips this restriction: its job is to
+/// observe the type the server naturally presents.
+fn pinnedHostkeyMethods(trust: TrustRoot, out: *[192:0]u8) ?[:0]const u8 {
+    const pins = switch (trust) {
+        .none => return null,
+        .pins => |p| p,
+    };
+    if (pins.trust_on_first_use) return null;
+
+    const choices = [_]struct { key_type: []const u8, methods: []const u8 }{
+        .{ .key_type = "ssh-ed25519", .methods = "ssh-ed25519" },
+        .{ .key_type = "ecdsa-sha2-nistp521", .methods = "ecdsa-sha2-nistp521" },
+        .{ .key_type = "ecdsa-sha2-nistp384", .methods = "ecdsa-sha2-nistp384" },
+        .{ .key_type = "ecdsa-sha2-nistp256", .methods = "ecdsa-sha2-nistp256" },
+        .{ .key_type = "ssh-rsa", .methods = "rsa-sha2-512,rsa-sha2-256,ssh-rsa" },
+        .{ .key_type = "ssh-dss", .methods = "ssh-dss" },
+    };
+    var used: usize = 0;
+    for (choices) |choice| {
+        if (pins.recorded(pins.context, choice.key_type) == null) continue;
+        if (used != 0) {
+            out[used] = ',';
+            used += 1;
+        }
+        @memcpy(out[used .. used + choice.methods.len], choice.methods);
+        used += choice.methods.len;
+    }
+    if (used == 0) return null;
+    out[used] = 0;
+    return out[0..used :0];
+}
+
 /// The key the far side proved it holds, read after a completed handshake.
 ///
 /// The one part of this section a test cannot reach, and it is two libssh2
@@ -315,12 +365,7 @@ pub fn connect(
     // would still have told whatever is in the path that we are here.
     if (trust == .none) return error.NoTrustRoot;
 
-    if (!libssh2_ready) {
-        var wsa: c.WSADATA = undefined;
-        if (c.WSAStartup((2 << 8) | 2, &wsa) != 0) return error.Libssh2Init;
-        if (c.libssh2_init(0) != 0) return error.Libssh2Init;
-        libssh2_ready = true;
-    }
+    try initialize();
 
     const socket = try tcpConnect(host, port);
     errdefer _ = c.closesocket(socket);
@@ -331,6 +376,12 @@ pub fn connect(
 
     c.libssh2_session_set_blocking(session, 1);
     c.libssh2_session_set_timeout(session, 30_000);
+
+    var hostkey_methods_buf: [192:0]u8 = undefined;
+    if (pinnedHostkeyMethods(trust, &hostkey_methods_buf)) |methods| {
+        if (c.libssh2_session_method_pref(session, c.LIBSSH2_METHOD_HOSTKEY, methods.ptr) != 0)
+            return error.HandshakeFailed;
+    }
 
     if (c.libssh2_session_handshake(session, socket) != 0) {
         var msg: [*c]u8 = undefined;
@@ -1789,4 +1840,33 @@ test "direct tunnel input queue is bounded and preserves ring order" {
     try t.expectEqual(tunnel_buffer_bytes, queue.snapshot().len);
     try t.expectEqual(tunnel_buffer_bytes, queue.peek(&next));
     try t.expectEqualSlices(u8, &appended, &next);
+}
+
+test "host key negotiation is restricted to every pinned key type" {
+    const t = std.testing;
+    const Fake = struct {
+        rsa: bool,
+        ed25519: bool,
+
+        fn recorded(context: *anyopaque, key_type: []const u8) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.rsa and std.mem.eql(u8, key_type, "ssh-rsa")) return "rsa-pin";
+            if (self.ed25519 and std.mem.eql(u8, key_type, "ssh-ed25519")) return "ed-pin";
+            return null;
+        }
+    };
+    var fake: Fake = .{ .rsa = true, .ed25519 = true };
+    const trust: TrustRoot = .{ .pins = .{ .context = &fake, .recorded = Fake.recorded } };
+    var buf: [192:0]u8 = undefined;
+    try t.expectEqualStrings(
+        "ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ssh-rsa",
+        pinnedHostkeyMethods(trust, &buf).?,
+    );
+
+    const tofu: TrustRoot = .{ .pins = .{
+        .context = &fake,
+        .recorded = Fake.recorded,
+        .trust_on_first_use = true,
+    } };
+    try t.expectEqual(@as(?[:0]const u8, null), pinnedHostkeyMethods(tofu, &buf));
 }

@@ -60,6 +60,8 @@ const decoder = std.base64.standard.Decoder;
 
 pub const Error = Ssh.ExecError || Allocator.Error || error{
     RemoteFileMissing,
+    RemoteParentMissing,
+    RemoteParentNotDirectory,
     RemoteWriteFailed,
     ChecksumMismatch,
     RemoteToolMissing,
@@ -114,6 +116,32 @@ pub const Error = Ssh.ExecError || Allocator.Error || error{
     /// continue from. Extending it would fill the gap with zeroes.
     LocalPartialTooShort,
 };
+
+/// The POSIX parent of a remote path. Remote paths are interpreted by the
+/// remote shell, so local platform path rules do not belong here.
+pub fn remoteParent(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return ".";
+    if (slash == 0) return "/";
+    return path[0..slash];
+}
+
+/// Refuses a push before submission when its destination parent cannot hold a
+/// file. This makes a missing directory explicit instead of surfacing SCP's
+/// generic channel-open failure after transfer setup.
+pub fn probeRemoteParent(executor: Executor, arena: Allocator, remote_path: []const u8) Error!void {
+    const parent = shell.word(remoteParent(remote_path));
+    const cmd = try std.fmt.allocPrint(arena,
+        \\[ -e {[parent]f} ] || exit 43
+        \\[ -d {[parent]f} ] || exit 44
+    , .{ .parent = parent });
+    const r = try executor.exec(arena, cmd);
+    switch (r.exit_code) {
+        0 => {},
+        43 => return error.RemoteParentMissing,
+        44 => return error.RemoteParentNotDirectory,
+        else => return error.RemoteWriteFailed,
+    }
+}
 
 // --- Remote readings ---------------------------------------------------------
 
@@ -1021,4 +1049,12 @@ pub fn pullBytes(
     if (!std.ascii.eqlIgnoreCase(digest.hex(data, &local), remote_sha))
         return error.ChecksumMismatch;
     return data;
+}
+
+test "remote parent uses POSIX path rules on every client platform" {
+    const t = std.testing;
+    try t.expectEqualStrings(".", remoteParent("program"));
+    try t.expectEqualStrings("/", remoteParent("/program"));
+    try t.expectEqualStrings("/opt/bin", remoteParent("/opt/bin/program"));
+    try t.expectEqualStrings("relative/bin", remoteParent("relative/bin/program"));
 }
