@@ -1305,8 +1305,8 @@
       "id": "M3.2-restart-not-a-bool-flag",
       "rule": "`--restart` never consumes the argument after it. A flag missing from `bool_flags` is not a compile error: written last it fails with \"a flag is missing its value\", and written before `--json` it eats it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
-      "replace": "\"all\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
+      "replace": "\"all\", \"resume\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1329,8 +1329,8 @@
       "id": "M3.3-resume-not-a-bool-flag",
       "rule": "`--resume` never consumes the argument after it. The sibling of `M3.2-restart-not-a-bool-flag`, and the second time this exact omission would have shipped: a flag missing from `bool_flags` is not a compile error and no helper-level gate sees it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
-      "replace": "\"all\", \"restart\", \"no-clobber\", \"normalize-lf\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
+      "replace": "\"all\", \"restart\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1481,8 +1481,8 @@
       "id": "M3-noclobber-flag-is-registered",
       "rule": "A boolean flag missing from `args.bool_flags` is not a compile error and silently eats the argument after it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
-      "replace": "\"all\", \"restart\", \"resume\", \"normalize-lf\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
+      "replace": "\"all\", \"restart\", \"resume\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
       "expect_gate": "gate: every boolean flag this command takes is registered, so none swallows the next argument"
     },
     {
@@ -1505,8 +1505,8 @@
       "id": "M4-normalize-lf-flag-is-registered",
       "rule": "A boolean flag missing from `args.bool_flags` is not a compile error and silently eats the argument after it.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
-      "replace": "\"all\", \"restart\", \"resume\", \"no-clobber\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
+      "replace": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
       "expect_gate": "gate: every boolean flag exec takes is registered, so none swallows the next argument"
     },
     {
@@ -1929,8 +1929,8 @@
       "id": "G13-shell-flag-registered-as-boolean",
       "rule": "`--shell` takes a value, so it must not be in `bool_flags`. Registered there it stops consuming its argument, the shell's name becomes a positional, and `trailing` sends that name as the command - a run that executes the word `none`.",
       "file": "src/cli/args.zig",
-      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\" };",
-      "replace": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"shell\" };",
+      "find": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\" };",
+      "replace": "\"all\", \"restart\", \"resume\", \"no-clobber\", \"normalize-lf\", \"trust-on-first-use\", \"rotate\", \"revoke\", \"shell\" };",
       "expect_gate": "gate: every boolean flag exec takes is registered, so none swallows the next argument"
     },
     {
