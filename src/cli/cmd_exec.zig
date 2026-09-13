@@ -22,7 +22,7 @@ const Tmux = Core.Tmux;
 /// `pub` so a gate can hold the flags the document publishes against the ones
 /// `--help` prints.
 pub const usage =
-    \\usage: terminus exec <server>[:<session>] [--json] [--timeout <sec>] [--login]
+    \\usage: terminus exec <server>[:<session>] [--json] [--timeout <sec>] [--login] [--detach]
     \\                    [--strict] [--interpreter <bin>] [--shell bash|zsh|none|powershell]
     \\                    <command input>
     \\
@@ -32,6 +32,7 @@ pub const usage =
     \\                       newline or a ; inside one stays data
     \\  --stdin              read the command/script from standard input
     \\  --cmd-file <path>    run a local script file's contents remotely
+    \\  --script <path>      clearer alias for --cmd-file; records script SHA-256
     \\  --cmd "<command>"    a single flag value (survives PowerShell)
     \\  -- <command...>      everything after --
     \\
@@ -60,6 +61,9 @@ pub const usage =
     \\
     \\Exit codes: the remote command's own code, or 75 when the outcome could
     \\not be established (never retry blindly on 75 — reconcile first).
+    \\--detach requires the installed remote helper. It returns after durable
+    \\request state and a remote output spool exist; inspect, tail or cancel the
+    \\request later by its request id.
     \\
 ;
 
@@ -75,6 +79,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // exists.
     const inv = try Cli.shapeInvocation(ctx, &parsed, target.session, usage);
     const raw_command = inv.text;
+    const script_source = parsed.flag("script") orelse parsed.flag("cmd-file");
+    const script_sha256 = if (script_source != null) try Core.digest.hexAlloc(ctx.arena, raw_command) else null;
     // Read straight after the command was, because the next call to
     // `trailingContent` anywhere would replace it.
     const line_endings = Cli.commandLineEndings();
@@ -125,6 +131,13 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // on the explicitly weaker shell capability.
     const use_helper = target.session == null and input == null and inv.kind != .powershell and
         (if (installed_helper) |installed| std.mem.eql(u8, installed, helper_digest) else false);
+    const detach = parsed.boolean("detach");
+    if (detach and target.session != null)
+        fatal("--detach is a one-shot helper execution; persistent session targets already have their own lifetime. Drop ':{s}'", .{target.session.?});
+    if (detach and input != null)
+        fatal("--detach cannot combine with --stdin-file because the helper protocol owns the launch input; push the input file first", .{});
+    if (detach and !use_helper)
+        fatal("--detach requires the verified remote helper on an x86_64 Linux server; install it explicitly with 'terminus server helper {s} --allow-helper-install'", .{target.server});
     // Recall hint: every JSON exec response carries the server's memory
     // keys (a local, zero-network query) so agents see what knowledge
     // exists before they re-discover it over SSH.
@@ -175,6 +188,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             // Falling back to the raw text would write the very secrets the
             // redaction exists to keep out of an append-only ledger.
             fatal("cannot redact the command for the audit record; refusing to store it unredacted", .{}),
+        .argv_sha256 = script_sha256,
         .cwd = working_dir,
         .shell = inv.shellWord(),
         .capability = if (use_helper) Core.supervisor.helper_capability else Core.supervisor.shell_capability,
@@ -223,6 +237,14 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         execution.deinit();
     }
 
+    if (script_source) |path| std.debug.print(
+        "terminus: request {s}; server {s}; script {s}; {d} byte(s); sha256 {s}; interpreter {s}\n",
+        .{ execution.id(), resolved.server.name, path, raw_command.len, script_sha256.?, inv.interpreterWord() },
+    ) else if (use_helper) std.debug.print(
+        "terminus: request {s} on {s}; inspect or cancel it from another terminal with 'terminus request inspect {s}' or 'terminus request cancel {s}'\n",
+        .{ execution.id(), resolved.server.name, execution.id(), execution.id() },
+    );
+
     const started = std.Io.Timestamp.now(ctx.io, .awake);
     execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
 
@@ -247,7 +269,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     const outcome = if (target.session) |session_name|
         try runInSession(ctx, &store, &execution, executor, inv, session_name, timeout_ms)
     else
-        try runOneShot(ctx, &execution, executor, inv, working_dir, input, &accepted);
+        try runOneShot(ctx, &execution, executor, inv, working_dir, input, &accepted, detach);
 
     const duration_ms: i64 = @intCast(@divTrunc(
         started.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).nanoseconds,
@@ -261,6 +283,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             .ok = outcome.status != .indeterminate,
             .requestId = execution.id(),
             .status = outcome.status.text(),
+            .detached = detach,
             .server = resolved.server.name,
             .session = target.session,
             .command = raw_command,
@@ -294,8 +317,12 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             // whether it got it.
             .commandCarriageReturns = line_endings.carriage_returns,
             .commandNormalizedLf = line_endings.normalized,
+            .scriptSha256 = script_sha256,
         }),
         .human => {
+            if (detach) try ctx.out.print("detached request {s} on {s}; inspect with 'terminus request inspect {s}'\n", .{
+                execution.id(), resolved.server.name, execution.id(),
+            });
             try ctx.out.print("{s}", .{outcome.stdout});
             if (outcome.stderr.len != 0) std.debug.print("{s}", .{outcome.stderr});
             // Said out here as well as marked in the stream, because the two
@@ -336,6 +363,7 @@ fn runOneShot(
     working_dir: ?[]const u8,
     input: ?*std.Io.Reader,
     accepted: *Core.Ssh.Accepted,
+    detach: bool,
 ) !Outcome {
     var staged_path: ?[]const u8 = null;
 
@@ -351,7 +379,7 @@ fn runOneShot(
         staged_path = staged.remote_path;
         break :staged staged.command;
     } else try inv.inlineCommand(ctx.arena);
-    defer if (staged_path) |path| Core.script.cleanup(executor, ctx.arena, path);
+    defer if (!detach) if (staged_path) |path| Core.script.cleanup(executor, ctx.arena, path);
 
     // One spelling of "run this somewhere else", shared with
     // `Tmux.jobLaunchLine`. This used to be a second copy of the same
@@ -374,13 +402,16 @@ fn runOneShot(
         .{},
     );
 
-    const result = Core.execution.runCommandAs(
-        execution,
-        executor,
-        effective,
-        if (input) |source| .{ .source = source, .accepted = accepted } else null,
-        inv.kind,
-    ) catch |err|
+    const result = (if (detach)
+        Core.execution.launchDetachedHelperCommand(execution, executor, effective)
+    else
+        Core.execution.runCommandAs(
+            execution,
+            executor,
+            effective,
+            if (input) |source| .{ .source = source, .accepted = accepted } else null,
+            inv.kind,
+        )) catch |err|
         // The command may well have run; what failed is our record of it.
         Cli.receiptFatal(execution.id(), err, execution.status.text());
 

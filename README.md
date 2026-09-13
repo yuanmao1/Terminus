@@ -46,6 +46,11 @@ terminus doctor prod --json
 # One-shot command (works on any server, no tmux needed)
 terminus exec prod -- uname -a
 terminus exec prod --read-only --cmd 'psql -c "SELECT now()"'
+terminus exec prod --script ./deploy.sh              # CRLF-safe local script channel
+terminus exec prod --detach --cmd './long-build.sh'  # durable helper-backed execution
+terminus request inspect <request-id> --json
+terminus request tail <request-id> --follow
+terminus request cancel <request-id> --grace-ms 2000
 
 # Set a default working directory once
 terminus workspace set prod /srv/app
@@ -76,6 +81,13 @@ terminus sync pull prod /etc/nginx ./nginx-backup       # tar + scp + md5 verify
 terminus memory add prod --key services -- "nginx :443 (systemd), api :3000 (docker compose)"
 terminus fact set prod app_root /srv/app                # machine-readable k/v
 terminus history prod --limit 20 --json                 # audit trail
+
+# Read-only disk inspection and manifest-bound cleanup
+terminus audit prod disk --largest 30
+terminus audit prod disk --mounts
+terminus audit prod disk --containers
+terminus cleanup prod --manifest ./cleanup.json --dry-run
+terminus cleanup prod --manifest ./cleanup.json --apply --plan-sha <sha256>
 ```
 
 ## Command surface
@@ -83,7 +95,8 @@ terminus history prod --limit 20 --json                 # audit trail
 | Command | Purpose |
 |---|---|
 | `server` / `key` | server and SSH key resources (SQLite-backed) |
-| `exec` | synchronous remote command; `<server>` or `<server>:<session>` |
+| `exec` / `request` | supervised command execution, detach, inspect, tail, and verified cancellation |
+| `audit` / `cleanup` | closed read-only audits and manifest-bound cleanup with dry-run/apply separation |
 | `run` / `job` | tracked background jobs: start, ls, status, read, kill, rm |
 | `session` / `read` / `write` | persistent tmux sessions with cursor-based output reading |
 | `push` / `pull` / `sync` | file transfer (SCP) and recursive directory sync (tar + md5) |

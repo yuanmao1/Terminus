@@ -6896,6 +6896,8 @@ const HelperRun = struct {
     stdout: []const u8,
     stderr: []const u8,
     failed: ?[]const u8,
+    dropped_stdout: u64,
+    dropped_stderr: u64,
     /// Everything needed to tell a failed *command* from a failed *harness*,
     /// kept because the first version of this reported neither. A gate that says
     /// only "no terminal frame" sends the next reader looking at the supervisor
@@ -7083,9 +7085,12 @@ fn runHelper(
     arena: std.mem.Allocator,
     f: *Fixture,
     argv: []const []const u8,
-    opts: struct { deadline_ms: u64 = 0, grace_ms: u64 = 200, repeat: usize = 1, delay_request_ms: u64 = 0 },
+    opts: struct { deadline_ms: u64 = 0, grace_ms: u64 = 200, repeat: usize = 1, delay_request_ms: u64 = 0, detached: bool = false },
 ) !HelperRun {
-    const request = try Terminus.Core.supervisor.wire.encodeRun(arena, argv, opts.deadline_ms, opts.grace_ms);
+    const request = if (opts.detached)
+        try Terminus.Core.supervisor.wire.encodeDetachedRunFor(arena, "01JQXW8ZK4N0RS7T3VYB2MCDEF", argv, opts.deadline_ms, opts.grace_ms)
+    else
+        try Terminus.Core.supervisor.wire.encodeRun(arena, argv, opts.deadline_ms, opts.grace_ms);
 
     const req_name = try std.fmt.allocPrint(arena, "{s}/helper_req.bin", .{f.dir});
     try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = req_name, .data = request });
@@ -7127,7 +7132,7 @@ fn runHelper(
 
     const result = std.process.run(arena, f.io, .{
         .argv = try linuxArgv(arena, f.dir, script_base),
-        .stdout_limit = .limited(1 << 20),
+        .stdout_limit = .limited(if (opts.detached) 20 << 20 else 1 << 20),
         .stderr_limit = .limited(1 << 16),
         .timeout = subprocess_bound,
     }) catch |err| switch (err) {
@@ -7181,6 +7186,8 @@ fn runHelper(
         .stdout = reply.stdout,
         .stderr = reply.stderr,
         .failed = reply.failed,
+        .dropped_stdout = reply.dropped_stdout,
+        .dropped_stderr = reply.dropped_stderr,
         .diagnosis = .{
             .command = line.items,
             .argv = try std.mem.join(arena, " ", try linuxArgv(arena, f.dir, "<script>")),
@@ -7417,6 +7424,25 @@ test "blackbox: the helper reassembles output larger than its own read buffer, i
         }
     }
     try t.expectEqual(@as(usize, lines), expect_next);
+}
+
+test "blackbox: detached output is drained but bounded and reports dropped bytes" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "helper_detached_bound");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const produced = 9 * 1024 * 1024;
+    const r = try runHelper(arena, &f, &.{
+        "/bin/sh", "-c", "yes x | head -c 9437184",
+    }, .{ .detached = true });
+    try t.expectEqual(HelperExit{ .how = .exited, .status = 0 }, try r.one());
+    try t.expect(r.stdout.len <= 8 * 1024 * 1024);
+    try t.expect(r.dropped_stdout > 0);
+    try t.expectEqual(@as(u64, produced), @as(u64, r.stdout.len) + r.dropped_stdout);
+    try t.expectEqual(@as(u64, 0), r.dropped_stderr);
 }
 
 test "blackbox: the start token the helper reports is the child's, not its own" {

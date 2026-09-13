@@ -2436,15 +2436,9 @@ pub const Request = struct {
 /// refusal an agent cannot act on is a refusal it retries.
 pub fn combinationRefusal(arena: std.mem.Allocator, req: Request) std.mem.Allocator.Error!?[]const u8 {
     if (req.kind == .powershell) {
-        if (req.session != null) return try std.fmt.allocPrint(arena,
-            "--shell powershell is available only for one-shot exec; persistent sessions are tmux/POSIX shells. Nothing was sent",
-            .{});
-        if (req.login) return try std.fmt.allocPrint(arena,
-            "--shell powershell and --login are not combined: the native supervisor uses a deterministic non-profile process. Nothing was sent; put required setup in the command",
-            .{});
-        if (req.interpreter) |interpreter| return try std.fmt.allocPrint(arena,
-            "--shell powershell and --interpreter {s} contradict each other: PowerShell is already the selected interpreter. Nothing was sent",
-            .{interpreter});
+        if (req.session != null) return try std.fmt.allocPrint(arena, "--shell powershell is available only for one-shot exec; persistent sessions are tmux/POSIX shells. Nothing was sent", .{});
+        if (req.login) return try std.fmt.allocPrint(arena, "--shell powershell and --login are not combined: the native supervisor uses a deterministic non-profile process. Nothing was sent; put required setup in the command", .{});
+        if (req.interpreter) |interpreter| return try std.fmt.allocPrint(arena, "--shell powershell and --interpreter {s} contradict each other: PowerShell is already the selected interpreter. Nothing was sent", .{interpreter});
     }
     // `--shell none` is a statement that terminus adds no shell layer of its
     // own. Each of these three flags *is* such a layer, so accepting one
@@ -2525,9 +2519,12 @@ pub fn shapeInvocation(
 
     const rest_argv = if (argv == null and
         !parsed.boolean("stdin") and
+        parsed.flag("script") == null and
         parsed.flag("cmd-file") == null and
         parsed.flag("cmd") == null) parsed.rest else null;
     const command_argv = argv orelse rest_argv;
+    if (parsed.flag("script") != null and parsed.flag("cmd-file") != null)
+        fail("--script and --cmd-file name the same command source; choose one", .{});
     const text = if (command_argv) |elements|
         if (elements.len == 0)
             fail("no command given\n{s}", .{usage})
@@ -2536,7 +2533,10 @@ pub fn shapeInvocation(
         else
             try Core.shell.render(ctx.arena, elements)
     else
-        (try trailingContent(ctx, parsed, "cmd-file", 1)) orelse
+        (if (parsed.flag("script") != null)
+            try trailingContent(ctx, parsed, "script", 1)
+        else
+            try trailingContent(ctx, parsed, "cmd-file", 1)) orelse
             fail("no command given\n{s}", .{usage});
 
     const req: Request = .{
@@ -2572,6 +2572,7 @@ pub fn shapeInvocation(
 /// positionals belong to the verb before the rest of them are the command.
 fn otherCommandSource(parsed: *const Args.Parsed) ?[]const u8 {
     if (parsed.boolean("stdin")) return "--stdin";
+    if (parsed.flag("script") != null) return "--script";
     if (parsed.flag("cmd-file") != null) return "--cmd-file";
     if (parsed.flag("cmd") != null) return "--cmd";
     if (parsed.rest != null) return "--";

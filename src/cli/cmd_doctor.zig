@@ -55,10 +55,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
 
     const server_name = parsed.positional(0) orelse fatal("{s}", .{usage});
     var store = try Cli.openStore(ctx, &parsed);
+    defer store.close();
     const resolved = Cli.resolveServer(ctx, &store, server_name);
     const memory_keys = Core.Store.memories.keys(&store, ctx.arena, resolved.server.id) catch |err|
         Cli.storeFatal(&store, err);
-    store.close();
 
     var conn = Cli.connect(ctx, &parsed, resolved.server, resolved.auth);
     defer conn.deinit();

@@ -164,6 +164,7 @@ pub const TopCommand = enum {
     setup,
     request,
     audit,
+    cleanup,
     plan,
     tunnel,
     daemon,
@@ -187,6 +188,7 @@ const usage =
     \\  job        manage jobs                       (ls/status/read/kill/rm)
     \\  request    inspect and settle operations     (ls/show/receipt/reconcile)
     \\  audit      native helper-enforced read-only checks
+    \\  cleanup    manifest-based remote deletion       (dry-run/apply by plan hash)
     \\  plan       persistent fail-stop plan phases
     \\  tunnel     pinned direct stdio TCP tunnel
     \\  read       read session output by cursor
@@ -265,6 +267,7 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .setup => try @import("cmd_setup.zig").run(ctx, args[1..]),
         .request => try @import("cmd_request.zig").run(ctx, args[1..]),
         .audit => try @import("cmd_audit.zig").run(ctx, args[1..]),
+        .cleanup => try @import("cmd_cleanup.zig").run(ctx, args[1..]),
         .plan => try @import("cmd_plan.zig").run(ctx, args[1..]),
         .tunnel => try @import("cmd_tunnel.zig").run(ctx, args[1..]),
         .daemon => try @import("cmd_daemon.zig").run(ctx, args[1..]),

@@ -51,6 +51,8 @@ const Kind = struct {
     const run: u8 = 0x01;
     const query: u8 = 0x02;
     const cancel: u8 = 0x03;
+    const read: u8 = 0x05;
+    const run_detached: u8 = 0x06;
     const audit_run: u8 = audit.wire.Kind.audit_run;
     // helper -> host
     const started: u8 = 0x81;
@@ -58,6 +60,8 @@ const Kind = struct {
     const stderr: u8 = 0x83;
     const exited: u8 = 0x84;
     const failed: u8 = 0x85;
+    const state: u8 = 0x86;
+    const truncated: u8 = 0x87;
 };
 
 /// How a command ended. The two timeout arms are separate on the wire because
@@ -74,6 +78,16 @@ const How = struct {
 
 /// How much of a stream is carried in one frame.
 const pump_bytes = 32 * 1024;
+/// Each detached stream is bounded independently. The helper continues
+/// draining after the bound and reports dropped byte counts before terminal.
+const detached_stream_limit: u64 = 8 * 1024 * 1024;
+
+var detached_spool = false;
+var spooled_stdout: u64 = 0;
+var spooled_stderr: u64 = 0;
+var dropped_stdout: u64 = 0;
+var dropped_stderr: u64 = 0;
+var truncation_reported = false;
 
 var out_buf: [64 * 1024]u8 = undefined;
 
@@ -138,6 +152,15 @@ fn run() Error!void {
         control(request_id, body[0] == Kind.cancel, grace_ms);
         return;
     }
+    if (body[0] == Kind.read) {
+        const id_len = try p.u8le();
+        const request_id = try p.take(id_len);
+        const offset = try p.u64le();
+        const max_bytes = try p.u32le();
+        if (!validRequestId(request_id) or max_bytes == 0) return error.BadFrame;
+        readDetached(request_id, offset, max_bytes);
+        return;
+    }
     // argv for `execve`: null-terminated strings, null-terminated array.
     var strings: [argv_bytes]u8 = undefined;
     var used: usize = 0;
@@ -163,7 +186,8 @@ fn run() Error!void {
         audit_mode = true;
         auditAccepted(request);
     } else {
-        if (body[0] != Kind.run) return error.BadFrame;
+        if (body[0] != Kind.run and body[0] != Kind.run_detached) return error.BadFrame;
+        detached_spool = body[0] == Kind.run_detached;
         const id_len = try p.u8le();
         request_id = try p.take(id_len);
         if (request_id.len != 0 and !validRequestId(request_id)) return error.BadFrame;
@@ -485,13 +509,18 @@ fn supervise(pid: i32, out_fd: i32, err_fd: i32, deadline_ms: u64, grace_ms: u64
         },
         .started => {},
     };
-    if (request_id.len != 0) writeState(request_id, .{ .terminal = .{
-        .pid = pid,
-        .pgid = pgid,
-        .token = token,
-        .how = payload[0],
-        .status = status,
-    } });
+    if (request_id.len != 0) writeState(request_id, .{
+        .terminal = .{
+            .pid = pid,
+            .pgid = pgid,
+            .token = token,
+            .how = payload[0],
+            // The cancellation race above may replace the waitid signal status
+            // in the outgoing frame. Persist that same verdict byte-for-byte so a
+            // later query and the detached frame log cannot disagree.
+            .status = std.mem.readInt(i32, payload[1..5], .little),
+        },
+    });
     frameOut(Kind.exited, &payload);
     exit(0);
 }
@@ -798,6 +827,64 @@ fn control(request_id: []const u8, cancel: bool, grace_ms: u64) void {
     }
 }
 
+/// Replays complete frames from a detached request's regular-file spool.
+/// A writer may currently be appending the next frame; a partial header/body is
+/// therefore treated as "not available yet" and the returned cursor stays on
+/// the last complete boundary.
+fn readDetached(request_id: []const u8, offset: u64, max_bytes: u32) void {
+    var path_buf: [160]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, ".terminus/operations/{s}.frames", .{request_id}) catch {
+        failFrame("StatePathTooLong");
+        return;
+    };
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (fail(opened)) {
+        failFrame("DetachedLogNotFound");
+        return;
+    }
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+    const seeked = linux.lseek(fd, @intCast(offset), 0);
+    if (fail(seeked) or @as(u64, @intCast(seeked)) != offset) {
+        failFrame("DetachedLogSeekFailed");
+        return;
+    }
+
+    var cursor = offset;
+    var application_bytes: u64 = 0;
+    var frame: [pump_bytes + 5]u8 = undefined;
+    while (application_bytes < max_bytes) {
+        if (!readFdExact(fd, frame[0..4])) break;
+        const body_len = std.mem.readInt(u32, frame[0..4], .little);
+        if (body_len == 0 or body_len > frame.len - 4) {
+            failFrame("DetachedLogFrameInvalid");
+            return;
+        }
+        if (!readFdExact(fd, frame[4..][0..body_len])) break;
+        writeAll(frame[0 .. 4 + body_len]);
+        cursor += 4 + body_len;
+        const kind = frame[4];
+        if (kind == Kind.stdout or kind == Kind.stderr) application_bytes += body_len - 1;
+    }
+    var payload: [8]u8 = undefined;
+    writeU64(&payload, cursor);
+    frameOut(Kind.state, &payload);
+}
+
+fn readFdExact(fd: i32, bytes: []u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.read(fd, bytes[off..].ptr, bytes.len - off);
+        if (fail(rc)) {
+            if (errno(rc) == .INTR) continue;
+            return false;
+        }
+        if (rc == 0) return false;
+        off += rc;
+    }
+    return true;
+}
+
 /// Whether this fd has something waiting, asked without blocking.
 ///
 /// End-of-file counts as something: `pump` then returns false and the caller's
@@ -847,6 +934,28 @@ fn readExact(into: []u8) Error!void {
 /// writes can be interleaved by nothing here but would be by a future second
 /// writer, and a split header is an unrecoverable stream.
 fn frameOut(kind: u8, body: []const u8) void {
+    if (detached_spool and (kind == Kind.stdout or kind == Kind.stderr)) {
+        const kept = if (kind == Kind.stdout) &spooled_stdout else &spooled_stderr;
+        const dropped = if (kind == Kind.stdout) &dropped_stdout else &dropped_stderr;
+        if (kept.* + body.len > detached_stream_limit) {
+            dropped.* += body.len;
+            return;
+        }
+        kept.* += body.len;
+    }
+    if (detached_spool and kind == Kind.exited and !truncation_reported and
+        (dropped_stdout != 0 or dropped_stderr != 0))
+    {
+        truncation_reported = true;
+        var truncation: [16]u8 = undefined;
+        writeU64(truncation[0..8], dropped_stdout);
+        writeU64(truncation[8..16], dropped_stderr);
+        rawFrameOut(Kind.truncated, &truncation);
+    }
+    rawFrameOut(kind, body);
+}
+
+fn rawFrameOut(kind: u8, body: []const u8) void {
     // One frame, never a split. The loop that used to be here could not run:
     // the only large bodies come from `pump`, whose buffer is half this one, so
     // `chunk` was always `body.len` and the second iteration was unreachable. A

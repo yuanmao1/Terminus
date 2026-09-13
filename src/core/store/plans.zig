@@ -494,14 +494,10 @@ test "phase status is exactly the operation projection" {
 
 test "deriveRunStatus preserves indeterminate and fail-stop terminals" {
     try std.testing.expectEqual(RunStatus.indeterminate, deriveRunStatus(&.{
-        .{ .id = 1, .run_id = "r", .phase_index = 0, .phase_id = "a", .attempt_no = 1,
-            .is_mutation = false, .approved_at = null, .approved_by = null, .request_id = null,
-            .status = .indeterminate, .created_at = 0, .updated_at = 0 },
+        .{ .id = 1, .run_id = "r", .phase_index = 0, .phase_id = "a", .attempt_no = 1, .is_mutation = false, .approved_at = null, .approved_by = null, .request_id = null, .status = .indeterminate, .created_at = 0, .updated_at = 0 },
     }));
     try std.testing.expectEqual(RunStatus.failed, deriveRunStatus(&.{
-        .{ .id = 1, .run_id = "r", .phase_index = 0, .phase_id = "a", .attempt_no = 1,
-            .is_mutation = false, .approved_at = null, .approved_by = null, .request_id = null,
-            .status = .failed, .created_at = 0, .updated_at = 0 },
+        .{ .id = 1, .run_id = "r", .phase_index = 0, .phase_id = "a", .attempt_no = 1, .is_mutation = false, .approved_at = null, .approved_by = null, .request_id = null, .status = .failed, .created_at = 0, .updated_at = 0 },
     }));
 }
 

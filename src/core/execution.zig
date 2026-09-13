@@ -117,6 +117,7 @@ pub const Error = Store.Db.Error || receipts.Error || operations.Error ||
     IllegalTransition,
     UnknownOperation,
     UnknownScopeKind,
+    CapabilityNotSatisfied,
     HelperRequiresDirectTransport,
     HelperDoesNotAcceptUserInput,
 };
@@ -2579,6 +2580,87 @@ fn runHelperCommand(
         .stderr = observed.stderr,
         .identity = observed.identity,
         .output = application_output,
+    } };
+}
+
+/// Launches a helper-backed command whose lifetime and output are independent
+/// of this SSH channel. The remote launcher accepts the complete framed request
+/// into a private file, starts the helper under `nohup`, and returns only after
+/// durable helper state exists. The operation deliberately remains live; a
+/// later request inspection/query settles it from that state.
+pub fn launchDetachedHelperCommand(
+    execution: *Execution,
+    executor: Executor,
+    command: []const u8,
+) Error!RunResult {
+    if (execution.capability.supervisor != .helper) return error.CapabilityNotSatisfied;
+    if (!executor.carriesInput()) return error.HelperRequiresDirectTransport;
+
+    const frame = try supervisor.wire.encodeDetachedRunFor(
+        execution.arena,
+        execution.id(),
+        &.{ "/bin/sh", "-lc", command },
+        execution.remote_deadline_ms,
+        execution.deadline_grace_ms,
+    );
+    var reader: std.Io.Reader = .fixed(frame);
+    var accepted: Ssh.Accepted = .{};
+    switch (try execution.submitted()) {
+        .submitted => {},
+        .refused => |blocker| return .{ .refused = blocker },
+    }
+
+    var launcher_output: Ssh.Retained = .{};
+    const result = executor.execRetained(
+        execution.arena,
+        try supervisor.guardedDetachedHelperCommand(execution.arena, execution.id()),
+        .{ .source = &reader, .accepted = &accepted },
+        &launcher_output,
+    ) catch |err| {
+        const why = try std.fmt.allocPrint(
+            execution.arena,
+            "detached helper launch transport failed after accepting {d} protocol byte(s): {s}",
+            .{ accepted.bytes, describe(executor, err) },
+        );
+        _ = try execution.transportLoss(why);
+        return .{ .ran = .{
+            .status = execution.status,
+            .exit_code = null,
+            .stdout = "",
+            .stderr = "",
+            .identity = null,
+            .output = launcher_output,
+        } };
+    };
+
+    if (result.exit_code != 0) {
+        const reason = try std.fmt.allocPrint(
+            execution.arena,
+            "detached helper launcher exited {d} before durable request state was confirmed",
+            .{result.exit_code},
+        );
+        _ = try execution.settle(.{ .indeterminate = .{
+            .reason = reason,
+            .last_observed = execution.status,
+        } }, .{});
+        return .{ .ran = .{
+            .status = execution.status,
+            .exit_code = null,
+            .stdout = "",
+            .stderr = result.stderr,
+            .identity = null,
+            .output = launcher_output,
+        } };
+    }
+
+    try execution.detach("remote helper accepted the request and its durable output log; inspect or cancel it by request id");
+    return .{ .ran = .{
+        .status = execution.status,
+        .exit_code = null,
+        .stdout = "",
+        .stderr = "",
+        .identity = null,
+        .output = launcher_output,
     } };
 }
 

@@ -120,6 +120,9 @@ pub const wire = struct {
         pub const run: u8 = 0x01;
         pub const query: u8 = 0x02;
         pub const cancel: u8 = 0x03;
+        /// Read complete frames from a detached request's durable output log.
+        pub const read: u8 = 0x05;
+        pub const run_detached: u8 = 0x06;
         // helper -> host
         pub const started: u8 = 0x81;
         pub const stdout: u8 = 0x82;
@@ -127,6 +130,7 @@ pub const wire = struct {
         pub const exited: u8 = 0x84;
         pub const failed: u8 = 0x85;
         pub const state: u8 = 0x86;
+        pub const truncated: u8 = 0x87;
     };
 
     /// How a command ended, as the helper measured it.
@@ -176,6 +180,27 @@ pub const wire = struct {
         deadline_ms: u64,
         grace_ms: u64,
     ) EncodeError![]u8 {
+        return encodeRunKind(arena, Kind.run, request_id, argv, deadline_ms, grace_ms);
+    }
+
+    pub fn encodeDetachedRunFor(
+        arena: Allocator,
+        request_id: []const u8,
+        argv: []const []const u8,
+        deadline_ms: u64,
+        grace_ms: u64,
+    ) EncodeError![]u8 {
+        return encodeRunKind(arena, Kind.run_detached, request_id, argv, deadline_ms, grace_ms);
+    }
+
+    fn encodeRunKind(
+        arena: Allocator,
+        kind: u8,
+        request_id: []const u8,
+        argv: []const []const u8,
+        deadline_ms: u64,
+        grace_ms: u64,
+    ) EncodeError![]u8 {
         if (request_id.len > 64) return error.ArgumentsTooLarge;
         if (argv.len > max_argv) return error.TooManyArguments;
         var total: usize = 0;
@@ -202,7 +227,7 @@ pub const wire = struct {
         var frame: std.ArrayList(u8) = .empty;
         std.mem.writeInt(u32, head[0..4], @intCast(body.items.len + 1), .little);
         try frame.appendSlice(arena, head[0..4]);
-        try frame.append(arena, Kind.run);
+        try frame.append(arena, kind);
         try frame.appendSlice(arena, body.items);
         return frame.items;
     }
@@ -246,6 +271,11 @@ pub const wire = struct {
         /// as a helper that reported nothing, and the caller must be able to tell
         /// them apart.
         trailing: usize,
+        /// Byte offset of the next complete frame in a detached output log.
+        /// Present only on a `read` control reply.
+        next_offset: ?u64 = null,
+        dropped_stdout: u64 = 0,
+        dropped_stderr: u64 = 0,
     };
 
     pub const DecodeError = error{
@@ -267,6 +297,9 @@ pub const wire = struct {
         var out: std.ArrayList(u8) = .empty;
         var err_out: std.ArrayList(u8) = .empty;
         var failed: ?[]const u8 = null;
+        var next_offset: ?u64 = null;
+        var dropped_stdout: u64 = 0;
+        var dropped_stderr: u64 = 0;
 
         var at: usize = 0;
         while (at + 4 <= bytes.len) {
@@ -296,6 +329,15 @@ pub const wire = struct {
                 Kind.stdout => try out.appendSlice(arena, payload),
                 Kind.stderr => try err_out.appendSlice(arena, payload),
                 Kind.failed => failed = payload,
+                Kind.state => {
+                    if (payload.len != 8) return error.EndedFrameWrongSize;
+                    next_offset = std.mem.readInt(u64, payload[0..8], .little);
+                },
+                Kind.truncated => {
+                    if (payload.len != 16) return error.EndedFrameWrongSize;
+                    dropped_stdout = std.mem.readInt(u64, payload[0..8], .little);
+                    dropped_stderr = std.mem.readInt(u64, payload[8..16], .little);
+                },
                 else => return error.UnknownFrameKind,
             }
         }
@@ -307,9 +349,62 @@ pub const wire = struct {
             .stderr = err_out.items,
             .failed = failed,
             .trailing = bytes.len - at,
+            .next_offset = next_offset,
+            .dropped_stdout = dropped_stdout,
+            .dropped_stderr = dropped_stderr,
         };
     }
+
+    /// Reads at most `max_bytes` of application payload from a detached
+    /// request log, beginning at a frame-aligned byte offset returned by the
+    /// previous call. The helper may return one complete frame beyond the
+    /// requested amount; it never splits a frame.
+    pub fn encodeRead(
+        arena: Allocator,
+        request_id: []const u8,
+        offset: u64,
+        max_bytes: u32,
+    ) EncodeError![]u8 {
+        if (request_id.len == 0 or request_id.len > 64 or max_bytes == 0)
+            return error.ArgumentsTooLarge;
+        var body: std.ArrayList(u8) = .empty;
+        try body.append(arena, @intCast(request_id.len));
+        try body.appendSlice(arena, request_id);
+        var word: [8]u8 = undefined;
+        std.mem.writeInt(u64, &word, offset, .little);
+        try body.appendSlice(arena, &word);
+        std.mem.writeInt(u32, word[0..4], max_bytes, .little);
+        try body.appendSlice(arena, word[0..4]);
+        var frame: std.ArrayList(u8) = .empty;
+        std.mem.writeInt(u32, word[0..4], @intCast(body.items.len + 1), .little);
+        try frame.appendSlice(arena, word[0..4]);
+        try frame.append(arena, Kind.read);
+        try frame.appendSlice(arena, body.items);
+        return frame.items;
+    }
 };
+
+/// Starts the helper independently of the SSH channel. The complete request is
+/// accepted into a private file before `nohup` is launched, and success is not
+/// returned until the helper has committed durable request state. Its framed
+/// output goes to a request-addressed regular file, so a slow or disconnected
+/// client cannot apply backpressure to the supervised command.
+pub fn guardedDetachedHelperCommand(arena: Allocator, request_id: []const u8) Allocator.Error![]const u8 {
+    const digest = @import("digest.zig");
+    var hex: [digest.hex_len]u8 = undefined;
+    const want = digest.hex(helper_executable, &hex);
+    return std.fmt.allocPrint(
+        arena,
+        "cd \"$HOME\" || exit 126; actual=$(sha256sum \"$HOME/.terminus/bin/terminus-helper\" 2>/dev/null | awk '{{print $1}}') || exit 126; " ++
+            "[ \"$actual\" = \"{s}\" ] || exit 126; base=\"$HOME/.terminus/operations\"; umask 077; mkdir -p \"$base\" || exit 126; " ++
+            "req=\"$base/{s}.request\"; log=\"$base/{s}.frames\"; err=\"$base/{s}.helper-error\"; state=\"$base/{s}.state\"; " ++
+            "cat > \"$req\" || exit 74; : > \"$log\" || exit 74; " ++
+            "nohup \"$HOME/.terminus/bin/terminus-helper\" < \"$req\" > \"$log\" 2> \"$err\" & launcher=$!; " ++
+            "i=0; while [ ! -s \"$state\" ] && kill -0 \"$launcher\" 2>/dev/null && [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i+1)); done; " ++
+            "[ -s \"$state\" ] || exit 70; printf '%s\\n' \"$launcher\"",
+        .{ want, request_id, request_id, request_id, request_id },
+    );
+}
 
 /// What the helper can vouch for, and the one thing it cannot.
 ///
@@ -381,11 +476,15 @@ test "gate: the host's wire constants are the helper's own" {
         .{ .block = kind, .decl = "const run: u8 = ", .want = "0x01" },
         .{ .block = kind, .decl = "const query: u8 = ", .want = "0x02" },
         .{ .block = kind, .decl = "const cancel: u8 = ", .want = "0x03" },
+        .{ .block = kind, .decl = "const read: u8 = ", .want = "0x05" },
+        .{ .block = kind, .decl = "const run_detached: u8 = ", .want = "0x06" },
         .{ .block = kind, .decl = "const started: u8 = ", .want = "0x81" },
         .{ .block = kind, .decl = "const stdout: u8 = ", .want = "0x82" },
         .{ .block = kind, .decl = "const stderr: u8 = ", .want = "0x83" },
         .{ .block = kind, .decl = "const exited: u8 = ", .want = "0x84" },
         .{ .block = kind, .decl = "const failed: u8 = ", .want = "0x85" },
+        .{ .block = kind, .decl = "const state: u8 = ", .want = "0x86" },
+        .{ .block = kind, .decl = "const truncated: u8 = ", .want = "0x87" },
         .{ .block = how, .decl = "const exited: u8 = ", .want = "0" },
         .{ .block = how, .decl = "const signalled: u8 = ", .want = "1" },
         .{ .block = how, .decl = "const timed_out_killed: u8 = ", .want = "2" },
@@ -408,7 +507,7 @@ test "gate: the host's wire constants are the helper's own" {
     }
     // Asserted so that deleting a row above — the way a rule stops being checked
     // without anything failing — is itself a failure.
-    try t.expectEqual(@as(usize, 17), checked);
+    try t.expectEqual(@as(usize, 21), checked);
 
     // And the values the host actually uses, against the same numbers.
     try t.expectEqual(@as(usize, 1 << 20), wire.max_frame);
@@ -418,7 +517,11 @@ test "gate: the host's wire constants are the helper's own" {
     try t.expectEqual(@as(u8, 0x01), wire.Kind.run);
     try t.expectEqual(@as(u8, 0x02), wire.Kind.query);
     try t.expectEqual(@as(u8, 0x03), wire.Kind.cancel);
+    try t.expectEqual(@as(u8, 0x05), wire.Kind.read);
+    try t.expectEqual(@as(u8, 0x06), wire.Kind.run_detached);
     try t.expectEqual(@as(u8, 0x85), wire.Kind.failed);
+    try t.expectEqual(@as(u8, 0x86), wire.Kind.state);
+    try t.expectEqual(@as(u8, 0x87), wire.Kind.truncated);
     try t.expectEqual(@as(u8, 2), @intFromEnum(wire.How.timed_out_killed));
     try t.expectEqual(@as(u8, 3), @intFromEnum(wire.How.timed_out_unconfirmed));
     try t.expectEqual(@as(u8, 4), @intFromEnum(wire.How.cancelled));
@@ -486,6 +589,38 @@ test "gate: a reply that ends mid-frame is not a reply that said nothing" {
     const clean = try wire.decode(arena, whole.items);
     try t.expectEqual(@as(usize, 0), clean.trailing);
     try t.expectEqual(wire.How.timed_out_killed, clean.ended[0].how);
+}
+
+test "detached read requests and cursor metadata are framed exactly" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const request_id = "01JQXW8ZK4N0RS7T3VYB2MCDEF";
+    const request = try wire.encodeRead(arena, request_id, 4096, 65536);
+    try t.expectEqual(wire.Kind.read, request[4]);
+    try t.expectEqual(@as(u8, request_id.len), request[5]);
+    try t.expectEqualStrings(request_id, request[6..][0..request_id.len]);
+    const words = request[6 + request_id.len ..];
+    try t.expectEqual(@as(u64, 4096), std.mem.readInt(u64, words[0..8], .little));
+    try t.expectEqual(@as(u32, 65536), std.mem.readInt(u32, words[8..12], .little));
+
+    var reply_bytes: std.ArrayList(u8) = .empty;
+    var frame: [21]u8 = undefined;
+    std.mem.writeInt(u32, frame[0..4], 9, .little);
+    frame[4] = wire.Kind.state;
+    std.mem.writeInt(u64, frame[5..13], 8192, .little);
+    try reply_bytes.appendSlice(arena, frame[0..13]);
+    std.mem.writeInt(u32, frame[0..4], 17, .little);
+    frame[4] = wire.Kind.truncated;
+    std.mem.writeInt(u64, frame[5..13], 123, .little);
+    std.mem.writeInt(u64, frame[13..21], 456, .little);
+    try reply_bytes.appendSlice(arena, &frame);
+    const reply = try wire.decode(arena, reply_bytes.items);
+    try t.expectEqual(@as(?u64, 8192), reply.next_offset);
+    try t.expectEqual(@as(u64, 123), reply.dropped_stdout);
+    try t.expectEqual(@as(u64, 456), reply.dropped_stderr);
 }
 
 /// Features that must refuse rather than pretend under a weak supervisor.
@@ -704,7 +839,8 @@ pub fn wrapPowerShell(arena: Allocator, command: []const u8, nonce: u64) Allocat
         \\exit $__t_rc
     , .{ nonce, child, nonce });
     const encoded = try powerShellEncoded(arena, wrapper);
-    return std.fmt.allocPrint(arena,
+    return std.fmt.allocPrint(
+        arena,
         "powershell.exe -NoLogo -NoProfile -NonInteractive -InputFormat Text -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {s}",
         .{encoded},
     );
@@ -843,9 +979,9 @@ test "PowerShell wrapper survives child exit and publishes identity and terminal
     const encoded_at = std.mem.lastIndexOfScalar(u8, wrapped, ' ') orelse return error.InvalidWrapper;
     const result = try std.process.run(arena, t.io, .{
         .argv = &.{
-            "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-            "-InputFormat", "Text", "-OutputFormat", "Text",
-            "-ExecutionPolicy", "Bypass", "-EncodedCommand", wrapped[encoded_at + 1 ..],
+            "powershell.exe",   "-NoLogo", "-NoProfile",      "-NonInteractive",
+            "-InputFormat",     "Text",    "-OutputFormat",   "Text",
+            "-ExecutionPolicy", "Bypass",  "-EncodedCommand", wrapped[encoded_at + 1 ..],
         },
         .stdout_limit = .limited(1 << 16),
         .stderr_limit = .limited(1 << 16),

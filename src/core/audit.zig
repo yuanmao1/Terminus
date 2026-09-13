@@ -26,6 +26,9 @@ pub const Check = enum(u8) {
     services,
     containers,
     journal,
+    disk_mounts,
+    disk_usage,
+    disk_containers,
 
     pub fn parse(name: []const u8) error{UnknownCheck}!Check {
         if (std.mem.eql(u8, name, "host")) return .host;
@@ -34,6 +37,9 @@ pub const Check = enum(u8) {
         if (std.mem.eql(u8, name, "services")) return .services;
         if (std.mem.eql(u8, name, "containers")) return .containers;
         if (std.mem.eql(u8, name, "journal")) return .journal;
+        if (std.mem.eql(u8, name, "disk-mounts")) return .disk_mounts;
+        if (std.mem.eql(u8, name, "disk-usage")) return .disk_usage;
+        if (std.mem.eql(u8, name, "disk-containers")) return .disk_containers;
         return error.UnknownCheck;
     }
 
@@ -45,6 +51,9 @@ pub const Check = enum(u8) {
             .services => "services",
             .containers => "containers",
             .journal => "journal",
+            .disk_mounts => "disk-mounts",
+            .disk_usage => "disk-usage",
+            .disk_containers => "disk-containers",
         };
     }
 };
@@ -102,6 +111,30 @@ const journal_argv = [_][]const u8{
     "-n",
     "200",
 };
+const disk_mounts_argv = [_][]const u8{
+    "/usr/bin/findmnt",
+    "--json",
+    "--bytes",
+    "--output",
+    "TARGET,SOURCE,FSTYPE,OPTIONS,SIZE,AVAIL,USE%",
+};
+const disk_usage_argv = [_][]const u8{
+    "/usr/bin/sudo",
+    "-n",
+    "--",
+    "/usr/bin/du",
+    "-x",
+    "-B1",
+    "-d",
+    "2",
+    "/",
+};
+const disk_containers_argv = [_][]const u8{
+    "/usr/bin/docker",
+    "system",
+    "df",
+    "-v",
+};
 
 /// Returns the only argv the helper is allowed to execute for a policy.
 ///
@@ -144,6 +177,24 @@ pub fn spec(check: Check, use_sudo: bool) error{ SudoForbidden, SudoRequired }!S
             .check = check,
             .argv = &journal_argv,
             .sudo = .required,
+            .read_only_wrapper = true,
+        },
+        .disk_mounts => if (use_sudo) error.SudoForbidden else .{
+            .check = check,
+            .argv = &disk_mounts_argv,
+            .sudo = .forbidden,
+            .read_only_wrapper = true,
+        },
+        .disk_usage => if (!use_sudo) error.SudoRequired else .{
+            .check = check,
+            .argv = &disk_usage_argv,
+            .sudo = .required,
+            .read_only_wrapper = true,
+        },
+        .disk_containers => if (use_sudo) error.SudoForbidden else .{
+            .check = check,
+            .argv = &disk_containers_argv,
+            .sudo = .forbidden,
             .read_only_wrapper = true,
         },
     };
@@ -339,7 +390,10 @@ const manifest_text =
     "processes\t/usr/bin/ps\t-eo\tpid=,ppid=,user=,stat=,comm=\tsudo=forbidden\treadonly=direct-null-stdin\n" ++
     "services\t/usr/bin/systemctl\tlist-units\t--type=service\t--state=running,failed\t--no-pager\t--plain\tsudo=forbidden\treadonly=direct-null-stdin\n" ++
     "containers\t/usr/bin/docker\tps\t--all\t--no-trunc\tsudo=forbidden\treadonly=direct-null-stdin\n" ++
-    "journal\t/usr/bin/sudo\t-n\t--\t/usr/bin/journalctl\t--no-pager\t--output=short-iso\t-n\t200\tsudo=required\treadonly=direct-null-stdin\n";
+    "journal\t/usr/bin/sudo\t-n\t--\t/usr/bin/journalctl\t--no-pager\t--output=short-iso\t-n\t200\tsudo=required\treadonly=direct-null-stdin\n" ++
+    "disk-mounts\t/usr/bin/findmnt\t--json\t--bytes\t--output\tTARGET,SOURCE,FSTYPE,OPTIONS,SIZE,AVAIL,USE%\tsudo=forbidden\treadonly=direct-null-stdin\n" ++
+    "disk-usage\t/usr/bin/sudo\t-n\t--\t/usr/bin/du\t-x\t-B1\t-d\t2\t/\tsudo=required\treadonly=direct-null-stdin\n" ++
+    "disk-containers\t/usr/bin/docker\tsystem\tdf\t-v\tsudo=forbidden\treadonly=direct-null-stdin\n";
 
 pub fn manifestDigest() [32]u8 {
     var out: [32]u8 = undefined;
@@ -353,10 +407,10 @@ pub fn manifestText() []const u8 {
 
 test "audit policy is closed and every subject is a read-only direct wrapper" {
     const t = std.testing;
-    const names = [_][]const u8{ "host", "filesystem", "processes", "services", "containers", "journal" };
+    const names = [_][]const u8{ "host", "filesystem", "processes", "services", "containers", "journal", "disk-mounts", "disk-usage", "disk-containers" };
     for (names) |name| {
         const check = try Check.parse(name);
-        const use_sudo = check == .journal;
+        const use_sudo = check == .journal or check == .disk_usage;
         const selected = try spec(check, use_sudo);
         try t.expect(selected.read_only_wrapper);
         try t.expect(selected.argv.len > 0);
@@ -367,6 +421,7 @@ test "audit policy is closed and every subject is a read-only direct wrapper" {
     try t.expectError(error.UnknownCheck, Check.parse("host --version"));
     try t.expectError(error.SudoForbidden, spec(.host, true));
     try t.expectError(error.SudoRequired, spec(.journal, false));
+    try t.expectError(error.SudoRequired, spec(.disk_usage, false));
     const digest = manifestDigest();
     try t.expect(!std.mem.eql(u8, &digest, &([_]u8{0} ** 32)));
 }
@@ -394,7 +449,7 @@ test "audit allowlist has no shell or mutating escape hatch" {
     const t = std.testing;
     const checks = std.enums.values(Check);
     for (checks) |check| {
-        const selected = spec(check, check == .journal) catch unreachable;
+        const selected = spec(check, check == .journal or check == .disk_usage) catch unreachable;
         for (selected.argv) |word| {
             try t.expect(std.mem.indexOfScalar(u8, word, ';') == null);
             try t.expect(std.mem.indexOfScalar(u8, word, '$') == null);

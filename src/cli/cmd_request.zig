@@ -25,9 +25,11 @@ const usage =
     \\  request ls      <server> [--all] [--limit N] [--json]
     \\                          unsettled attempts (what is blocking a scope)
     \\  request show    <request-id> [--json]     status, scope, capability
+    \\  request inspect <request-id> [--json]     local ledger plus live helper state
     \\  request receipt <request-id> [--json]     the full append-only trail
     \\  request query   <request-id> [--json]     ask the remote helper
     \\  request cancel  <request-id> [--grace-ms N] [--json]
+    \\  request tail    <request-id> [--offset N] [--max-bytes N] [--follow] [--json]
     \\  request reconcile <request-id> [--from-log | --from-helper]
     \\                          [--override "<reason>" --by <who> --resolved <status>]
     \\
@@ -64,11 +66,102 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     Store.ids.validate(request_id) catch fatal("'{s}' is not a request id", .{request_id});
 
     if (std.mem.eql(u8, verb, "show")) return showRequest(ctx, &store, request_id);
+    if (std.mem.eql(u8, verb, "inspect")) return inspectRequest(ctx, &store, request_id);
     if (std.mem.eql(u8, verb, "receipt")) return showReceipt(ctx, &store, request_id);
     if (std.mem.eql(u8, verb, "query")) return helperControl(ctx, &store, request_id, &parsed, false);
     if (std.mem.eql(u8, verb, "cancel")) return helperControl(ctx, &store, request_id, &parsed, true);
+    if (std.mem.eql(u8, verb, "tail")) return tailRequest(ctx, &store, request_id, &parsed);
     if (std.mem.eql(u8, verb, "reconcile")) return reconcile(ctx, &store, request_id, &parsed);
     fatal("unknown verb 'request {s}'\n{s}", .{ verb, usage });
+}
+
+fn helperBacked(op: Store.operations.Operation) bool {
+    const capability = op.capability_json orelse return false;
+    return std.mem.indexOf(u8, capability, "\"supervisor\":\"helper\"") != null;
+}
+
+fn inspectRequest(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) !void {
+    var op = (Store.operations.get(store, ctx.arena, request_id) catch |err| Cli.storeFatal(store, err)) orelse
+        fatal("no such request '{s}'", .{request_id});
+    var reading: ?HelperReading = null;
+    if (helperBacked(op)) {
+        reading = try readHelper(ctx, store, op, false, 0);
+        _ = Store.receipts.append(store, .{
+            .request_id = request_id,
+            .kind = .checkpoint,
+            .phase = "helper_inspect",
+            .observed_at = ctx.now,
+            .detail_json = try helperProbeJson(ctx, reading.?, false),
+        }) catch |err| Cli.receiptFatal(request_id, err, op.status.text());
+
+        if (!op.status.isTerminal()) {
+            var execution = (Core.execution.attach(store, ctx.arena, ctx.io, request_id) catch |err|
+                Cli.storeFatal(store, err)) orelse null;
+            if (execution) |*attached| {
+                defer attached.deinit();
+                if (op.status == .submitted) attached.remoteStarted(reading.?.identity) catch |err|
+                    Cli.receiptFatal(request_id, err, op.status.text());
+                if (reading.?.ended != null) {
+                    _ = attached.settleAttached(helperTerminal(ctx, attached.status, reading.?), .{
+                        .source = .reconcile,
+                        .remote_pid = reading.?.identity.pid,
+                        .remote_pgid = reading.?.identity.pgid,
+                        .remote_start_token = reading.?.identity.start_token,
+                    }) catch |err| Cli.receiptFatal(request_id, err, op.status.text());
+                } else {
+                    attached.detach("request inspect confirmed the detached helper process is still running") catch |err|
+                        Cli.receiptFatal(request_id, err, op.status.text());
+                }
+                op = (Store.operations.get(store, ctx.arena, request_id) catch |err| Cli.storeFatal(store, err)).?;
+            }
+        }
+    }
+
+    const running = if (reading) |r| r.ended == null else op.status == .remote_started;
+    const blocks_scope = op.mutating and op.effectiveStatus().blocksScope();
+    const recommendation: []const u8 = if (running and helperBacked(op))
+        "wait, tail the request, or cancel its verified process group"
+    else if (blocks_scope)
+        "reconcile the request before retrying an overlapping mutation"
+    else
+        "no control action is required";
+    const effect: []const u8 = switch (op.status) {
+        .created, .connecting => "no remote process has been confirmed",
+        .submitted, .remote_started => "the command may already have partial side effects; Terminus cannot infer business completion",
+        else => "the recorded terminal describes process outcome, not application-level side effects",
+    };
+
+    switch (ctx.out.format) {
+        .json => try ctx.out.json(.{
+            .ok = true,
+            .requestId = op.request_id,
+            .server = op.server_name,
+            .kind = op.kind,
+            .status = op.status.text(),
+            .effectiveStatus = op.effectiveStatus().text(),
+            .running = running,
+            .pid = if (reading) |r| r.identity.pid else null,
+            .pgid = if (reading) |r| r.identity.pgid else null,
+            .startToken = if (reading) |r| r.identity.start_token else null,
+            .elapsedSeconds = @max(ctx.now - op.created_at, 0),
+            .blocksScope = blocks_scope,
+            .canCancelProcess = running and helperBacked(op),
+            .businessCancellationSafety = if (running) "unknown-partial-side-effects-possible" else "not-applicable",
+            .sideEffectEvidence = effect,
+            .recommendedNext = recommendation,
+        }),
+        .human => {
+            try ctx.out.print("{s}: {s}{s}\n", .{ request_id, op.effectiveStatus().text(), if (running) " (running)" else "" });
+            if (reading) |r| try ctx.out.print("  process : pid {d}, pgid {d}, start {s}\n", .{ r.identity.pid, r.identity.pgid orelse 0, r.identity.start_token orelse "(unknown)" });
+            try ctx.out.print("  elapsed : {d}s\n  blocks  : {s}\n  effects : {s}\n  cancel  : {s}\n  next    : {s}\n", .{
+                @max(ctx.now - op.created_at, 0),
+                if (blocks_scope) "yes" else "no",
+                effect,
+                if (running and helperBacked(op)) "process group is controllable; business safety is unknown" else "not available or not needed",
+                recommendation,
+            });
+        },
+    }
 }
 
 fn listRequests(ctx: *Cli.Ctx, store: *Store, parsed: *const Cli.Args.Parsed) !void {
@@ -249,6 +342,97 @@ fn readHelper(
         },
         .ended = if (reply.ended.len == 1) reply.ended[0] else null,
     };
+}
+
+fn readHelperFrames(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    op: Store.operations.Operation,
+    offset: u64,
+    max_bytes: u32,
+) !Core.supervisor.wire.Reply {
+    if (!helperBacked(op)) fatal("request {s} was not launched by the remote helper, so it has no durable detached output log", .{op.request_id});
+    const resolved = Cli.resolveServer(ctx, store, op.server_name);
+    var conn = Cli.connectDirect(ctx, resolved.server, resolved.auth);
+    defer conn.deinit();
+    const frame = Core.supervisor.wire.encodeRead(ctx.arena, op.request_id, offset, max_bytes) catch |err|
+        fatal("cannot encode helper log request: {s}", .{@errorName(err)});
+    var reader: std.Io.Reader = .fixed(frame);
+    var accepted: Core.Ssh.Accepted = .{};
+    var retained: Core.Ssh.Retained = .{};
+    const executor = conn.executor();
+    const result = executor.execRetained(
+        ctx.arena,
+        try Core.supervisor.guardedRemoteHelperCommand(ctx.arena),
+        .{ .source = &reader, .accepted = &accepted },
+        &retained,
+    ) catch |err| fatal("remote helper log read failed after accepting {d} byte(s): {s} ({s})", .{
+        accepted.bytes, executor.errorMessage(), @errorName(err),
+    });
+    if (result.exit_code != 0) fatal("remote helper log read exited {d}: {s}", .{ result.exit_code, result.stderr });
+    const reply = Core.supervisor.wire.decode(ctx.arena, result.stdout) catch |err|
+        fatal("remote helper returned invalid detached log frames: {s}", .{@errorName(err)});
+    if (reply.trailing != 0) fatal("remote helper detached log reply ended mid-frame", .{});
+    if (reply.failed) |message| fatal("remote helper could not read the detached log: {s}", .{message});
+    if (reply.next_offset == null) fatal("remote helper detached log reply omitted its next offset", .{});
+    return reply;
+}
+
+fn tailRequest(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    request_id: []const u8,
+    parsed: *const Cli.Args.Parsed,
+) !void {
+    const op = (Store.operations.get(store, ctx.arena, request_id) catch |err| Cli.storeFatal(store, err)) orelse
+        fatal("no such request '{s}'", .{request_id});
+    var offset = if (parsed.flag("offset")) |raw|
+        std.fmt.parseInt(u64, raw, 10) catch fatal("invalid --offset '{s}'", .{raw})
+    else
+        0;
+    const max_bytes = if (parsed.flag("max-bytes")) |raw|
+        std.fmt.parseInt(u32, raw, 10) catch fatal("invalid --max-bytes '{s}'", .{raw})
+    else
+        256 * 1024;
+    if (max_bytes == 0 or max_bytes > 512 * 1024)
+        fatal("--max-bytes must be between 1 and 524288 so one reply remains below the transport ceiling", .{});
+
+    while (true) {
+        var iteration_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer iteration_arena.deinit();
+        var iteration_ctx = ctx.*;
+        iteration_ctx.arena = iteration_arena.allocator();
+        const reply = try readHelperFrames(&iteration_ctx, store, op, offset, max_bytes);
+        const next = reply.next_offset.?;
+        switch (ctx.out.format) {
+            .json => try ctx.out.json(.{
+                .ok = true,
+                .requestId = request_id,
+                .offset = offset,
+                .nextOffset = next,
+                .stdout = reply.stdout,
+                .stderr = reply.stderr,
+                .terminal = if (reply.ended.len == 1) @tagName(reply.ended[0].how) else null,
+                .exitCode = if (reply.ended.len == 1 and reply.ended[0].how == .exited) reply.ended[0].status else null,
+                .terminalStatus = if (reply.ended.len == 1) reply.ended[0].status else null,
+                .droppedStdoutBytes = reply.dropped_stdout,
+                .droppedStderrBytes = reply.dropped_stderr,
+            }),
+            .human => {
+                try ctx.out.print("{s}", .{reply.stdout});
+                if (reply.stderr.len != 0) std.debug.print("{s}", .{reply.stderr});
+                if (reply.dropped_stdout != 0 or reply.dropped_stderr != 0) std.debug.print(
+                    "terminus: detached output spool reached its bound; dropped stdout={d} stderr={d} byte(s) while continuing to drain the process\n",
+                    .{ reply.dropped_stdout, reply.dropped_stderr },
+                );
+            },
+        }
+        try ctx.out.flush();
+        offset = next;
+        if (!parsed.boolean("follow")) break;
+        if (reply.ended.len != 0) break;
+        std.Io.sleep(ctx.io, .{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};
+    }
 }
 
 fn helperProbeJson(ctx: *Cli.Ctx, reading: HelperReading, cancelled: bool) ![]u8 {

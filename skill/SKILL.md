@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.2.0.** If a documented flag is rejected, the
+**Requires terminus >= 0.2.1.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -88,6 +88,8 @@ that launched it:
 
 ```bash
 terminus request query <request-id> --json
+terminus request inspect <request-id> --json
+terminus request tail <request-id> --follow
 terminus request cancel <request-id> --grace-ms 2000 --json
 terminus request reconcile <request-id> --from-helper --json
 ```
@@ -96,16 +98,35 @@ The helper binds these answers to request id, PID and process start token.
 Cancellation is reported only after the process group is confirmed gone;
 `--from-helper` settles no operation when that identity does not match.
 
+For a helper-backed one-shot command that must survive the launching SSH
+connection, pass `--detach`. The helper drains stdout/stderr into a private
+request log, limits each stream to 8 MiB while recording dropped-byte counts,
+and keeps enforcing `--timeout` remotely. Use `request inspect`, `request tail`
+and `request cancel`; ordinary helper exec also prints its request id before
+launch so it can be controlled from another terminal.
+
 Native read-only inspection uses the helper's closed policy manifest rather
 than caller-provided command text:
 
 ```bash
 terminus audit <server> host|filesystem|processes|services|containers|journal --json
+terminus audit <server> disk --mounts
+terminus audit <server> disk --containers
+terminus audit <server> disk --largest 30
+terminus audit <server> disk --cleanup-candidates
 ```
 
 The helper acknowledges the exact compiled manifest before the receipt gains
 `auditIsolation:true`. `journal` uses non-interactive sudo; a missing sudo rule
 fails instead of prompting or falling back to an arbitrary command.
+
+Cleanup is a separate two-step command. The manifest is JSON such as
+`{"version":1,"targets":[{"path":"/var/tmp/build-cache"}]}`. First run
+`terminus cleanup <server> --manifest cleanup.json --dry-run`; review the
+canonical targets and returned plan hash, then pass that exact hash to
+`--apply --plan-sha <sha256>`. Apply re-probes path, type, device and inode
+before the first deletion, rejects roots, mount points, symlinks and changed
+targets, and never treats audit candidates as automatically safe to delete.
 
 For a pinned direct TCP byte stream without exporting private-key material:
 
@@ -141,7 +162,8 @@ arguments. Prefer the quote-proof channels, most robust first:
 ```bash
 terminus exec <server> --argv-json '["uname","-a"]'  # argv; one word per element
 terminus exec <server> --stdin                      # command from stdin
-terminus exec <server> --cmd-file ./script.sh       # run a local script remotely
+terminus exec <server> --script ./script.sh         # local script; prints target, size and SHA-256
+terminus exec <server> --cmd-file ./script.sh       # equivalent legacy spelling
 terminus exec <server> --cmd "uname -a"             # single flag value
 terminus exec <server> -- uname -a                  # classic; fine in bash
 terminus exec <server> -- bash -lc 'echo "$0"' x   # argv boundaries preserved

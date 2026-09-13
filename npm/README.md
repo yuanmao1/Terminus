@@ -24,6 +24,11 @@ terminus key add mykey --kind rsa --private-file ~/.ssh/id_rsa
 terminus server add prod --host 1.2.3.4 --user ubuntu --key mykey
 
 terminus exec prod -- uname -a                  # one-shot (no tmux needed)
+terminus exec prod --script ./deploy.sh         # local script, normalized explicitly when requested
+terminus exec prod --detach --cmd './build.sh'  # durable helper-backed request
+terminus request inspect <request-id> --json
+terminus request tail <request-id> --follow
+terminus request cancel <request-id>
 terminus exec prod:work -- cd /srv/app          # persistent session
 terminus exec prod:work -- docker compose ps    # same cwd as previous call
 
@@ -32,6 +37,9 @@ terminus read prod:work --from-cursor --json    # collect new output later
 
 terminus memory add prod --key deploy_dir -- "app lives in /srv/app"
 terminus memory ls prod --json                  # recall before acting
+
+terminus audit prod disk --largest 30           # read-only disk inventory
+terminus cleanup prod --manifest cleanup.json --dry-run
 ```
 
 ## Agent integration
