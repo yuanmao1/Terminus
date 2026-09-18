@@ -167,6 +167,8 @@ pub const TopCommand = enum {
     cleanup,
     plan,
     tunnel,
+    shell,
+    attach,
     daemon,
     help,
     version,
@@ -191,6 +193,8 @@ const usage =
     \\  cleanup    manifest-based remote deletion       (dry-run/apply by plan hash)
     \\  plan       persistent fail-stop plan phases
     \\  tunnel     pinned direct stdio TCP tunnel
+    \\  shell      interactive remote login shell   (real TTY; not persistent)
+    \\  attach     attach to a remote tmux session  (persistent; agent-visible)
     \\  read       read session output by cursor
     \\  write      write input into a session
     \\  push       upload a file over SCP
@@ -270,6 +274,8 @@ pub fn dispatchCommand(ctx: *Cli.Ctx, args: []const []const u8) !void {
         .cleanup => try @import("cmd_cleanup.zig").run(ctx, args[1..]),
         .plan => try @import("cmd_plan.zig").run(ctx, args[1..]),
         .tunnel => try @import("cmd_tunnel.zig").run(ctx, args[1..]),
+        .shell => try @import("cmd_attach.zig").run(ctx, .shell, args[1..]),
+        .attach => try @import("cmd_attach.zig").run(ctx, .attach, args[1..]),
         .daemon => try @import("cmd_daemon.zig").run(ctx, args[1..]),
     }
 }
@@ -300,6 +306,7 @@ test {
     _ = @import("cmd_memory.zig");
     _ = @import("cmd_read_write.zig");
     _ = @import("cmd_request.zig");
+    _ = @import("cmd_attach.zig");
     _ = @import("cmd_audit.zig");
     _ = @import("cmd_plan.zig");
     _ = @import("cmd_tunnel.zig");
