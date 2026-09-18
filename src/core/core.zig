@@ -34,6 +34,7 @@ pub const tty = struct {
     pub const modes = @import("tty/modes.zig");
     pub const Console = @import("tty/Console.zig");
     pub const InputQueue = @import("tty/InputQueue.zig");
+    pub const Pump = @import("tty/Pump.zig");
 };
 pub const Scripted = @import("exec.zig").Scripted;
 
@@ -42,4 +43,11 @@ test {
     // a module that nothing references yet (execution.zig before the CLI is
     // rewired onto it) silently contributes zero tests.
     @import("std").testing.refAllDecls(@This());
+    // `refAllDecls` is not recursive: it reaches `tty` the namespace and stops,
+    // so the modules inside it would contribute zero tests until something
+    // imported them by name. Named here for that reason.
+    _ = tty.modes;
+    _ = tty.Console;
+    _ = tty.InputQueue;
+    _ = tty.Pump;
 }
