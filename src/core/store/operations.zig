@@ -73,6 +73,17 @@ pub const Kind = enum {
     plan_phase,
     audit,
     cleanup,
+    /// A human sitting at a terminal on the far side.
+    ///
+    /// The difference from `exec` is not scale but observability: an `exec`
+    /// hands over one command and gets its exit status back, while this hands
+    /// over a byte stream and what happens inside it is something this side
+    /// never learns. So `argv_redacted` records the act ("interactive session")
+    /// and does not pretend to know the content.
+    ///
+    /// Adding the variant costs no migration — `operations.kind` is bare TEXT,
+    /// see `control`'s note. What stops the build is `capabilities()` below.
+    attach,
 
     pub fn parse(text: []const u8) error{UnknownKind}!Kind {
         return std.meta.stringToEnum(Kind, text) orelse error.UnknownKind;
@@ -317,7 +328,32 @@ pub const Kind = enum {
                 .wrapper_documents_exit = false,
                 .judgement_undeclared = false,
             },
-            .tunnel, .plan_phase, .cleanup => .{
+            // `attach` joins these three as work whose *content* this side never
+            // judges, and each axis below is its answer too.
+            //
+            // `runs_our_command = false`: what is handed over is a byte stream,
+            // and there is no command of ours to name. `tmux attach` is the
+            // vehicle, not the work — the work is whatever the human types.
+            //
+            // `judgement_undeclared = true` is the axis that keeps `.exited`
+            // admissible: `receipts.terminalDescribes` reads
+            // `.exited => can.runs_our_command or can.judgement_undeclared`, and
+            // its note gives the reason — "a kind nothing knows anything about
+            // must not be born unsettleable". An ordinary detach has to be able
+            // to record a terminal.
+            //
+            // `supervises_another_subject` stays false even though `attach`
+            // holds a lease on the session. Holding a lease is not supervision:
+            // it does nothing *to* that session, and the axis is about being
+            // judged by somebody else's subject the way a control act is.
+            //
+            // Note what this does *not* buy. `remote_cancel_confirmed` is
+            // admissible here anyway, because `judgement_undeclared` reaches it
+            // on its own — `tunnel` has carried the same wide permit since it was
+            // written. Nothing in this tree produces that terminal for an
+            // interactive session, and no rule stops one; narrowing it would take
+            // a new axis, not a different answer on this one.
+            .tunnel, .plan_phase, .cleanup, .attach => .{
                 .judgement_undeclared = true,
                 .runs_our_command = false,
                 .supervised_deadline = false,

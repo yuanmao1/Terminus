@@ -277,6 +277,9 @@ PATH="$HOME/.terminus/bin:$PATH"
 | 重连耗尽上限后放弃(`attach`) | `remote_started` | `.indeterminate` |
 | 传输丢失且不重连(`shell`) | `remote_started` | `.indeterminate` |
 
+
+**一条实现中被证伪的要求。** 本节草稿曾写"特别地 `.remote_cancel_confirmed` 必须不可采纳:没有人能证明一个交互会话被取消了"。在现有能力模型里**做不到** —— `terminalDescribes` 的规则是 `.remote_cancel_confirmed => runs_our_command or supervises_another_subject or judgement_undeclared`,而 `judgement_undeclared` 正是让 `.exited` 可采纳的那一位,它同时也就放行了这一个。`tunnel` 自诞生起就带着同样的宽许可。真实状态是:这棵树里没有任何代码为交互会话产出那个终态,也没有规则拦它;要拦得加一条新轴,而不是在现有某条轴上换个答案。
+
 后两行不能用 `local_abandon`:`canSettle` 只允许它从 `created`/`connecting` 落,因为"放弃"只在尚未交出任何东西时才成立。而这正是语义上对的结果 —— 我们并不知道那个 tmux 会话或那个登录 shell 现在怎么样了,只知道**自己不再看着它了**。`reason` 写明这一点,`last_observed` 记 `remote_started`。
 
 不给新动词任何权威,会重演 [cmd_session.zig](../../../src/cli/cmd_session.zig) 文件头自己记录的那个错误 —— 那里明确写了 `session rm` 曾是"树里唯一一个没有任何权威的破坏性远端动词"。

@@ -161,7 +161,7 @@ fn pinnedCapabilities(kind: Store.operations.Kind) Store.operations.Capabilities
             .wrapper_documents_exit = false,
             .judgement_undeclared = false,
         },
-        .tunnel, .plan_phase, .cleanup => .{
+        .tunnel, .plan_phase, .cleanup, .attach => .{
             .judgement_undeclared = true,
             .runs_our_command = false,
             .supervised_deadline = false,
@@ -502,11 +502,11 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         // asking the store, so that widening a rule in `receipts.zig` has to be
         // argued for twice. Exhaustive, so a new kind stops the build here too.
         const judged_by_a_command_it_asked_for = switch (kind) {
-            .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .exec, .job, .tunnel, .plan_phase, .audit, .cleanup, .attach => true,
             .session_write, .control, .transfer_push, .transfer_pull, .fetch => false,
         };
         const stops_a_remote_thing = switch (kind) {
-            .exec, .job, .control, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .exec, .job, .control, .tunnel, .plan_phase, .audit, .cleanup, .attach => true,
             .session_write, .transfer_push, .transfer_pull, .fetch => false,
         };
         const judged_by_somebody_elses_subject = switch (kind) {
@@ -521,6 +521,7 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
             .plan_phase,
             .audit,
             .cleanup,
+            .attach,
             => false,
         };
         try t.expectEqual(
@@ -580,7 +581,7 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         // the reading that established it, rather than as a `completed` nothing
         // judged. Both refusals cost a word, not an outcome.
         const reaches_completed = switch (kind) {
-            .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .exec, .job, .session_write, .tunnel, .plan_phase, .audit, .cleanup, .attach => true,
             .control, .transfer_push, .transfer_pull, .fetch => false,
         };
         try t.expectEqual(reaches_completed, reachable.contains(.completed));
@@ -590,7 +591,7 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
         // local deadline expiring is `indeterminate` (`op_state` rule 2), which
         // is admitted above.
         const judged_by_a_command_it_asked_for = switch (kind) {
-            .exec, .job, .tunnel, .plan_phase, .audit, .cleanup => true,
+            .exec, .job, .tunnel, .plan_phase, .audit, .cleanup, .attach => true,
             .session_write, .control, .transfer_push, .transfer_pull, .fetch => false,
         };
         try t.expectEqual(judged_by_a_command_it_asked_for, reachable.contains(.timed_out));
