@@ -21,6 +21,14 @@ const stillOurs = Control.stillOurs;
 
 const fatal = Cli.fail;
 
+/// 挡路者的 request id,两种挡法一个说法。
+fn blockerId(blocker: Core.execution.Blocker) []const u8 {
+    return switch (blocker) {
+        .unsettled => |op| op.request_id,
+        .lease => |lease| lease.owner_request_id,
+    };
+}
+
 pub const Mode = enum { shell, attach };
 
 pub const shell_usage = "usage: terminus shell <server>\n" ++
@@ -114,6 +122,23 @@ fn chooseSession(
     fatal("该服务器上有 {d} 个会话,指明要接哪个:\n{s}", .{ sessions.len, listing.items });
 }
 
+/// 上一次交互会话的操作行还未结清,而它的进程已经不在了 —— 把它结清。
+///
+/// **为什么需要这个,以及为什么它不是猜。** 交互会话最常见的离开方式是关掉
+/// 终端窗口,而 ConPTY 下 `CTRL_CLOSE_EVENT` 根本送不到进程(实测三次),
+/// 所以没有任何一条本地路径能保证收据写得进去。留下的那条 `submitted` 行
+/// 以整台服务器为范围一直挡着,下一次 attach 只能靠人工 reconcile。
+///
+/// 证据是**租约失效**,不是超时也不是猜测。`control.zig` 自己写着:"A claim
+/// that outlives its holder is released by lapsing, which is the only thing a
+/// dead process can do."活着的会话每 30s 续租一次;查不到它的活租约,它的
+/// 持有者就是死的。
+///
+/// 只对 `attach` 这一种 kind 成立,而且理由是这种工作**活不过自己的进程**:
+/// 它是一条绑在本进程连接上的字节流,连接没了,那头的 shell 就收到 EOF。
+/// 一条未结的 `exec` 完全不同 —— 那个命令可能还在远端跑着,所以它的屏障
+/// 必须留着。
+///
 pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
     const usage = switch (mode) {
         .shell => shell_usage,
@@ -165,7 +190,7 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
     };
 
     const start_ms = Core.control.wallClockSeconds(ctx.io) * std.time.ms_per_s;
-    const begun = Core.execution.begin(&store, ctx.arena, ctx.io, .{
+    const begin_options: Core.execution.BeginOptions = .{
         .server_id = resolved.server.id,
         .server_name = resolved.server.name,
         .kind = .attach,
@@ -183,15 +208,18 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
         },
         .owner_token = owner_token,
         .now = ctx.now,
-    }) catch |err| Cli.storeFatal(&store, err);
+    };
+    const begun = Core.execution.begin(&store, ctx.arena, ctx.io, begin_options) catch |err|
+        Cli.storeFatal(&store, err);
     var execution = switch (begun) {
         .ready => |ready| ready,
+        // 交互会话自己不再持有这道屏障(`Kind.holdsScopeWhileUnsettled`),
+        // 所以挡在这里的一定是别的东西 —— 一条可能还在远端跑着的 exec、
+        // 一个 job,或者别人的租约。那些该挡,而且只能由人来判断。
         .blocked => |blocker| fatal(
-            "交互会话被 request {s} 挡住;先把它对账掉",
-            .{switch (blocker) {
-                .unsettled => |op| op.request_id,
-                .lease => |lease| lease.owner_request_id,
-            }},
+            "交互会话被 request {s} 挡住;先把它对账掉:\n" ++
+                "  terminus request reconcile {s} --override \"<原因>\" --by <谁> --resolved cancelled",
+            .{ blockerId(blocker), blockerId(blocker) },
         ),
     };
     Cli.registerExecution(&execution);
@@ -226,17 +254,27 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
         .refused => fatal("交互会话在提交时被拒绝;对账 request {s}", .{execution.id()}),
     }
 
-    // 租约,在会话真正开始之前取得。`attach` 持它的效果是:人在里面时
-    // `session rm` 与 `job kill` 会被拒绝。`--no-lease` 退出这个行为。
+    // 租约,在会话真正开始之前取得,**两种模式都取,而且不可关闭**。
+    //
+    // 它有两个作用,第二个是后加的、也是更要紧的那个:
+    //
+    // 一,活着的互斥:人在里面时 `session rm` 与 `job kill` 会被拒绝。
+    //
+    // 二,**活性记录**。交互会话的进程随时可能被关窗口杀掉(ConPTY 下
+    // `CTRL_CLOSE_EVENT` 送不到,实测三次),留下一条未结的操作行挡住下一
+    // 次。`healLapsedSession` 用"查不到这条 request 的活租约"作为它已经死
+    // 了的证据 —— 所以租约必须**总是**存在,否则一个活着的会话会被误判成
+    // 死的并被结清。`--no-lease` 因此被删掉了:一个能关掉活性证据的开关,
+    // 会让上面那条推理不成立。
     var lease_tick: ?LeaseTick = null;
-    if (mode == .attach and !parsed.boolean("no-lease")) {
-        const name = session_name.?;
+    {
+        const label = session_name orelse resolved.server.name;
         const claim: Claim = .{
             .store = &store,
             .server_id = resolved.server.id,
-            .scope = contentionScope(name),
+            .scope = begin_options.scope,
             .owner_request_id = execution.id(),
-            .subject = .{ .session = name },
+            .subject = if (session_name) |n| .{ .session = n } else .{ .job = label },
         };
         // 活时钟,不是 `ctx.now`。`ctx.now` 是进程启动时间,用它计时的 TTL
         // 在 store 打开之前就开始走了 —— `cmd_session.zig` 的 `claimScope`
@@ -246,15 +284,15 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             .scope = claim.scope,
             .owner_request_id = execution.id(),
             .profile_token = owner_token,
-            .owner_label = name,
+            .owner_label = label,
             .ttl_secs = Claim.ttl_secs,
             .now = Control.wallClockSeconds(ctx.io),
-        }) catch |err| fatal("无法为会话 '{s}' 取得租约: {s}", .{ name, @errorName(err) });
+        }) catch |err| fatal("无法为 '{s}' 取得租约: {s}", .{ label, @errorName(err) });
         switch (taken) {
             .acquired, .renewed => {},
             .conflict => |peer| fatal(
-                "会话 '{s}' 的范围被 request {s} 持有;它结束后再 attach",
-                .{ name, peer.owner_request_id },
+                "'{s}' 的范围被 request {s} 持有;它结束后再来",
+                .{ label, peer.owner_request_id },
             ),
         }
         lease_tick = .{

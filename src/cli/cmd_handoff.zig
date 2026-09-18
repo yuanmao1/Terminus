@@ -499,7 +499,7 @@ fn readLedger(
             .status = op.status.text(),
             .resolvedStatus = if (op.resolved_status) |r| @tagName(r) else null,
             .effectiveStatus = op.effectiveStatus().text(),
-            .blocksScope = op.status.blocksScope() and op.resolved_status == null,
+            .blocksScope = op.holdsScopeNow(),
             .mutating = op.mutating,
             .scopeKind = op.scope_kind,
             .scopeKey = try scrubOpt(arena, op.scope_key),

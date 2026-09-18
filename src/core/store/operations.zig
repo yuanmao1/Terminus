@@ -94,6 +94,75 @@ pub const Kind = enum {
     ///
     /// Exhaustive with no `else`: a new kind stops the build here until somebody
     /// says what it does, which is the one question adding a kind should cost.
+    /// Whether an unsettled attempt of this kind still holds the scope barrier.
+    ///
+    /// The barrier exists because an unsettled attempt **might still be
+    /// affecting the host**. For an exec, a job, a transfer, that is true: the
+    /// command runs on the far side and outlives this process, so a later
+    /// change could race it.
+    ///
+    /// An interactive session is the one kind where it is not. Its work is a
+    /// byte stream bound to this process's connection: when the process is
+    /// gone the connection is gone, the far side reads EOF, and whatever the
+    /// operator did is finished. Unrecorded, yes — the terminal is
+    /// `indeterminate` and stays that way, because nothing here ever learns
+    /// what was typed — but finished.
+    ///
+    /// **Why this had to become its own question.** Closing the terminal window
+    /// is how a human normally leaves an interactive session, and under ConPTY
+    /// `CTRL_CLOSE_EVENT` never reaches the process, so no local path can
+    /// guarantee a receipt. Every such exit left a row that blocked the whole
+    /// server until somebody reconciled by hand — three times in one evening
+    /// while this was being built. Settling it automatically is not available
+    /// either: from `submitted` the only admissible terminal is
+    /// `indeterminate`, and an `indeterminate` goes on blocking until a
+    /// *resolution* is recorded, which is a human's decision to make.
+    ///
+    /// So the fix belongs here, in *what the barrier is for*, and not in
+    /// pretending an interactive session changed nothing (`mutating` stays
+    /// true, and `handoff` publishes it) nor in inventing evidence.
+    ///
+    /// Live exclusion for these attempts is the lease, which lapses on its own
+    /// — "the only thing a dead process can do" (`control.zig`).
+    ///
+    /// Exhaustive with no `else`: a new kind answers this on purpose.
+    pub fn holdsScopeWhileUnsettled(k: Kind) bool {
+        return switch (k) {
+            .exec,
+            .job,
+            .session_write,
+            .control,
+            .transfer_push,
+            .transfer_pull,
+            .fetch,
+            .tunnel,
+            .plan_phase,
+            .audit,
+            .cleanup,
+            => true,
+            .attach => false,
+        };
+    }
+
+    /// The kinds above, as a SQL list. Same shape as `op_state.sqlList`, and
+    /// for the same reason: one statement of the rule, rendered rather than
+    /// retyped.
+    pub fn sqlListHoldingScope() []const u8 {
+        comptime {
+            var out: []const u8 = "";
+            var n: usize = 0;
+            for (std.meta.tags(Kind)) |k| {
+                if (!holdsScopeWhileUnsettled(k)) continue;
+                out = out ++ (if (n == 0) "" else ",") ++ "'" ++ @tagName(k) ++ "'";
+                n += 1;
+            }
+            if (n == 0) @compileError(
+                "an empty kind list matches no operation, which is never what a guard means",
+            );
+            return out;
+        }
+    }
+
     pub fn capabilities(k: Kind) Capabilities {
         return switch (k) {
             // One supervised remote command of the caller's, judged by its exit
@@ -500,6 +569,29 @@ pub const Operation = struct {
         return .{ .kind = kind, .key = op.scope_key orelse "" };
     }
 
+    /// Whether this row is holding the scope barrier **right now**.
+    ///
+    /// Four facts, and every reporter in the tree used to compute its own
+    /// subset of them: the status may still be open, a resolution may have
+    /// closed it, the attempt may be read-only, and — since interactive
+    /// sessions — the kind may not hold the barrier at all.
+    /// `holds_scope_predicate` ANDs exactly these; this is the Zig reading of
+    /// the same rule, so a report and a refusal cannot disagree.
+    ///
+    /// It exists because they did disagree: `request show` went on printing
+    /// `blocksScope: true` for an interactive row the guard had already
+    /// stopped blocking on, which is the kind of answer an operator acts on.
+    ///
+    /// An unparseable kind — a row written by a newer build — is treated as
+    /// holding. The conservative direction: reporting a barrier that is not
+    /// there costs a question, missing one costs a refusal nobody expected.
+    pub fn holdsScopeNow(op: Operation) bool {
+        if (!op.mutating) return false;
+        if (!op.effectiveStatus().blocksScope()) return false;
+        const kind = Kind.parse(op.kind) catch return true;
+        return kind.holdsScopeWhileUnsettled();
+    }
+
     /// What the caller should act on: the proven truth if we have one, else
     /// what we last observed.
     pub fn effectiveStatus(op: Operation) Status {
@@ -702,7 +794,9 @@ const unsettled_predicate = std.fmt.comptimePrint(
 /// because whatever it did or did not do, it did not change anything. Holding
 /// the barrier for one would also be inconsistent with the same attempt while
 /// it ran, which was allowed to proceed alongside a mutation.
-const holds_scope_predicate = unsettled_predicate ++ " AND mutating = 1";
+const holds_scope_predicate = unsettled_predicate ++
+    " AND mutating = 1" ++
+    std.fmt.comptimePrint(" AND kind IN ({s})", .{Kind.sqlListHoldingScope()});
 
 /// Which set of attempts a barrier query is about: one host, or — when null —
 /// this machine.

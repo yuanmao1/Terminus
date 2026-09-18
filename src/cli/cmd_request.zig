@@ -118,7 +118,7 @@ fn inspectRequest(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) !void {
     }
 
     const running = if (reading) |r| r.ended == null else op.status == .remote_started;
-    const blocks_scope = op.mutating and op.effectiveStatus().blocksScope();
+    const blocks_scope = op.holdsScopeNow();
     const recommendation: []const u8 = if (running and helperBacked(op))
         "wait, tail the request, or cancel its verified process group"
     else if (blocks_scope)
@@ -224,7 +224,7 @@ fn summarize(ctx: *Cli.Ctx, list: []const Store.operations.Operation) ![]Summary
             .scopeKind = op.scope_kind,
             .scopeKey = op.scope_key,
             .alias = op.alias,
-            .blocksScope = op.effectiveStatus().blocksScope(),
+            .blocksScope = op.holdsScopeNow(),
             .createdAt = op.created_at,
         });
     }
@@ -249,7 +249,7 @@ fn showRequest(ctx: *Cli.Ctx, store: *Store, request_id: []const u8) !void {
             .resolvedStatus = if (op.resolved_status) |r| r.text() else null,
             .reconciledAt = op.reconciled_at,
             .resolutionEvidence = op.resolution_evidence,
-            .blocksScope = op.effectiveStatus().blocksScope(),
+            .blocksScope = op.holdsScopeNow(),
             .scopeKind = op.scope_kind,
             .scopeKey = op.scope_key,
             .command = op.argv_redacted,
