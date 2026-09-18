@@ -115,6 +115,12 @@ pub fn closeDaemonSocket() void {
 /// hold a claim. Publishing at each of them is seventeen chances to forget;
 /// publishing here is none.
 fn refusalCleanup() ClaimRelease {
+    // The terminal first, before anything below writes a sentence. In raw mode
+    // a diagnostic does not wrap and does not return the carriage, so a refusal
+    // printed before this runs is a refusal the operator cannot read. This line
+    // must stay at the top; moving it below the receipt would order the two
+    // wrong for every fatal path in the tree.
+    Core.tty.Console.restoreActive();
     closeDaemonSocket();
     settleActiveExecution("command failed before recording an outcome");
     releaseReservation();

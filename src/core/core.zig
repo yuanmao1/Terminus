@@ -27,6 +27,14 @@ pub const audit = @import("audit.zig");
 pub const execution = @import("execution.zig");
 /// The lease-renewal barrier every destructive verb renews through.
 pub const control = @import("control.zig");
+/// The local terminal: raw mode, its restoration guarantee, and the pump that
+/// carries an interactive session. Windows-only by construction — the console
+/// half has no POSIX implementation in this tree.
+pub const tty = struct {
+    pub const modes = @import("tty/modes.zig");
+    pub const Console = @import("tty/Console.zig");
+    pub const InputQueue = @import("tty/InputQueue.zig");
+};
 pub const Scripted = @import("exec.zig").Scripted;
 
 test {
