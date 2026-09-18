@@ -1475,3 +1475,81 @@ git commit -m "attach: 命令面的三条源码门禁"
 - spec §12 测试 —— 可自动化部分在 Task 1/3/12;不可自动化部分是 Task 9 与 Task 13 的验收表
 
 **一处已知的计划内欠账**:Task 8 先写一个与 `shell_usage` 相同的 `attach_usage` 占位,Task 10 替换它。这是为了让 Task 8 能独立编译通过并提交;Task 10 必须真的替换,不能留着。
+
+---
+
+# 执行记录(2026-09-19)
+
+分支 `feat/interactive-tty`,12 个提交。**自动化部分全部完成,621/621,11/11 步骤,`zig fmt` 干净。**
+
+| Task | 状态 | 备注 |
+|---|---|---|
+| 1 模式纯函数 | ✅ | 6 条测试 |
+| 2 InputQueue 搬出 | ✅ | 纯搬移,608/608 与搬前一致 |
+| 3 Console.zig | ✅ | 2 条测试;撞到 `windows.BOOL` 是 enum |
+| 4 接进 refusalCleanup | ✅ | 616/616 |
+| 5 PTY 通道 | ✅ | |
+| 6 Pump.zig | ✅ | 强制分析抓到 `std.time.milliTimestamp` 不存在 |
+| 7 attach kind | ✅ | 门禁逼出我一条写错的论证,见下 |
+| 8 + 10 两个动词 | ✅ | 合并执行,消除了计划自己标记的占位欠账 |
+| 9 M1 手工验收 | ⏸ **待人工** | 见下表 |
+| 11 租约与 `--no-lease` | ✅ | `args.zig` 双向门禁通过 |
+| 12 源码门禁 | ✅ | 4 条(比计划多一条) |
+| 13 M2 手工验收 | ⏸ **待人工** | 见下表 |
+
+## 计划/spec 在实现中被证伪的地方
+
+1. **`windows.BOOL` 不是整数**,是 `enum(c_int){FALSE=0,_}`。已补进"实现前必读" 2b。
+2. **`std.time.milliTimestamp` 在 0.16 不存在。** 已补进 5b,并改用 `Io.Timestamp` 的 `.awake` 单调时钟。
+3. **"编译通过"对没有调用方的新函数是假保证** —— Zig 惰性分析 + `refAllDecls` 非递归。已补进 5c,并给 `Pump.zig` 加了 `test { _ = &run; }`,正是它当场抓到了第 2 条。
+4. **我给 `attach` 写的一条能力论证是错的。** 原文说"`supervises_another_subject` 设成 true 会顺带让 `remote_cancel_confirmed` 可采纳"。假的:规则是 `runs_our_command or supervises_another_subject or judgement_undeclared`,而 `judgement_undeclared` 独自就放行了它。`tunnel` 自诞生起带着同样的宽许可。注释已改成事实,spec 第 10 节那条"必须不可采纳"的要求也记为**在现有能力模型下做不到**(要加新轴)。
+
+## 已对真实服务器验过的部分
+
+用 `pageflux-test` 的真实连接(数据库只用副本,用后立即删除;原库时间戳未变):
+
+- 连接 + host key 钉验 ✅
+- 账本写入:`kind = attach`、`scopeKind = server`、`command = "interactive login shell"` ✅
+- 非 TTY(stdout 是管道)被拒绝,exit 1,句子正确 ✅
+- 拒绝路径**结清了**操作行:`status = failed`(来自 `never_submitted` —— 什么都没交出去),`blocksScope = false`,没有留下悬空行 ✅
+
+**没验到的**:PTY 本身、raw 模式、resize、Ctrl-C —— 这些必须在真终端上由人做,即下面两张表。
+
+## Task 9 — M1 手工验收(待人工)
+
+二进制:`zig-out/bin/Terminus.exe`(ReleaseSafe 已构建)。
+
+⚠ **跑之前把 `USERPROFILE` 和 `HOME` 指到 scratch 目录**,否则它会用仓库的 `SKILL.md` 覆盖 `~/.claude/skills/terminus/SKILL.md` 和 `~/.codex/` 里的副本。
+
+| | 检查项 | 通过标准 | 结果 |
+|---|---|---|---|
+| 1 | `vim` 方向键 | 光标移动,不出现 `^[[A` | |
+| 2 | `htop` | 正常刷新,颜色正确 | |
+| 3 | `Ctrl-C` | 中断**远端**进程,terminus 不退出 | |
+| 4 | 中文 | `echo 你好` 正确显示 | |
+| 5 | 拉伸窗口后 `tput cols` | 报出新宽度 | |
+| 6 | `exit` 退出 | 回到本地 shell,回显与换行正常 | |
+| 7 | 关闭窗口再开新终端 | 新终端正常(Ctrl 处理器还原生效) | |
+| 8 | `Ctrl-Break` | 退出且终端正常 | |
+
+第 9 项(管道输入被拒绝)已自动验过,见上。
+
+## Task 13 — M2 手工验收(待人工)
+
+| | 检查项 | 通过标准 | 结果 |
+|---|---|---|---|
+| 1 | `attach <server>` 恰好一个会话 | 直接接入 | |
+| 2 | `attach <server>` 多个会话 | 列出并要求指名,不自动选 | |
+| 3 | `attach <server>:<name>` | 接入指定会话 | |
+| 4 | 会话里跑东西后 `Ctrl-B d` | detach 回本地,终端正常 | |
+| 5 | detach 后 `terminus read <server>:<name>` | 读得到刚才交互期间的输出 | |
+| 6 | attach 时另开窗口 `terminus session rm` | **被租约拒绝** | |
+| 7 | `--no-lease` 下重复第 6 条 | 不被拒绝 | |
+| 8 | 首次连接 | 打印 pane 日志提示 | |
+| 9 | 远端无 tmux | 明确拒绝并指向 `terminus doctor` | |
+
+## 非阻塞发现(既有,未修)
+
+- **`transport_test.zig:613` 的 daemon 门禁偶发崩溃。** `d8f5bbe`(0.2.1 发布提交)上即可复现,与本次改动无关。`acquire` 现在做两次往返(上个会话加的 `authorise` 预检),而 `Stub.serve` 只服务一次请求就关连接;客户端读回复时撞上 CONNECTION_RESET,`readFrame` 抛出未处理的 `error.Unexpected`,整个测试二进制 panic。**不是必现**(与测试顺序/seed 有关),多数运行是 11/11 全绿。讽刺的是那条测试的名字正是 "never a hang and never a wrong cause"。
+- 五条漂移的 mutation 锚点(`W6-undeclared-kind-declares-nothing`、`M18-redaction-fast-path`、`G17d-pool-ignores-the-authority` 匹配不到;`M16-phase-status-image`、`G13-argv-word-separator` 匹配两次),HEAD 上即已漂移。
+- 本次新增第 12 种 operation kind(`.attach`),与其余 11 种一样不带机械对账。
