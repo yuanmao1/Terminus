@@ -221,8 +221,7 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
     defer Console.restoreActive();
 
     switch (execution.submitted() catch |err|
-        Cli.receiptFatal(execution.id(), err, "connecting"))
-    {
+        Cli.receiptFatal(execution.id(), err, "connecting")) {
         .submitted => {},
         .refused => fatal("交互会话在提交时被拒绝;对账 request {s}", .{execution.id()}),
     }

@@ -579,7 +579,6 @@ pub const TunnelError = error{
     OutOfMemory,
 };
 
-
 /// Stream local stdin/stdout through a pinned SSH direct-tcpip channel.
 ///
 /// The caller must have authenticated `client` through `connect`, which is the
