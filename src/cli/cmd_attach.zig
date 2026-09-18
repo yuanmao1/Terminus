@@ -273,19 +273,32 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
         .{ target.server, @errorName(err) },
     );
 
+    // --- 收尾 -----------------------------------------------------------------
+    //
+    // **收据先落盘,网络收尾在后。** 这个顺序是被真机打回来一次才写对的:
+    // `pty.close()` 会调 `libssh2_channel_wait_closed` 等远端确认通道关闭,
+    // 而关窗口时远端的 shell 还没退出,这一等就是几十秒(session 超时 30s)。
+    // Ctrl 处理器只等三秒就放行让进程死 —— 于是收据永远写不成,那条以整台
+    // 服务器为范围的操作行留在账本里挡住下一次 attach。
+    //
+    // 所以只有正常收尾那条路走「先 close 取退出码、再写收据」:它不赶时间。
+    // 中止和断线两条都反过来。
+
+    const duration = Core.control.wallClockSeconds(ctx.io) * std.time.ms_per_s - start_ms;
+
     const outcome = Pump.run(ctx.io, &pty, tick) catch |err| {
-        _ = pty.close();
+        _ = execution.abandon("the interactive session's local pump failed") catch {};
+        Console.abortHandled();
         Console.restoreActive();
         fatal("交互会话失败: {s}", .{@errorName(err)});
     };
-    const status = pty.close();
-    // 还原**在写收据之前**:下面的句子要能被读到。`restoreActive` 是幂等的,
-    // 所以上面的 defer 再跑一次无害。
-    Console.restoreActive();
 
-    const duration = Core.control.wallClockSeconds(ctx.io) * std.time.ms_per_s - start_ms;
     switch (outcome) {
         .remote_exit, .local_eof => {
+            const status = pty.close();
+            // 还原在写收据之前:下面的句子要能被读到。`restoreActive` 是
+            // 幂等的,所以上面的 defer 再跑一次无害。
+            Console.restoreActive();
             _ = execution.settle(
                 .{ .exited = .{ .exit_code = status } },
                 .{ .connected = true, .duration_ms = duration },
@@ -308,9 +321,15 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             execution.abandon(
                 "the operator closed the terminal window; nothing watched the session to completion",
             ) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
-            // 收据落盘了,放 Ctrl 处理器走 —— 它正在等这一声,等满三秒就
-            // 自己还原终端并让进程结束。
+            // 收据落盘了,放 Ctrl 处理器走 —— 它正在等这一声。
+            //
+            // **这里不做通道关闭。** 进程马上就要被结束,而关闭要等远端
+            // 确认;在处理器的三秒钟里做这件事只有坏处。放手让进程退出,
+            // 操作系统会丢掉那个 socket,远端自然读到 EOF。
+            //
+            // (下面那条门禁扫这一段,所以这里不能拼出那个函数名。)
             Console.abortHandled();
+            Console.restoreActive();
             return;
         },
         .transport_failed => {
@@ -323,6 +342,10 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             };
             _ = execution.transportLoss(why) catch |err|
                 Cli.receiptFatal(execution.id(), err, execution.status.text());
+            // 同样不做通道关闭:传输已经没了,等一个死通道的关闭确认只会
+            // 让用户在看到错误之前先干等三十秒(session 超时)。
+            Console.abortHandled();
+            Console.restoreActive();
             switch (mode) {
                 .shell => fatal("连接中断;裸登录 shell 不持久,远端进程已经结束", .{}),
                 .attach => fatal(

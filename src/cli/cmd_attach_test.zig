@@ -46,3 +46,25 @@ test "nothing is drawn to the terminal after it enters raw mode and before it le
     const window = source[enter_at..restore_at];
     try std.testing.expect(std.mem.indexOf(u8, window, "ctx.out.print") == null);
 }
+
+test "the receipt is written before any network teardown on the paths that are racing a dying process" {
+    // 被真机打回来一次才写对的顺序,所以钉住它。
+    //
+    // `pty.close()` 会等远端确认通道关闭。关窗口时远端的 shell 还没退出,
+    // 那一等就是几十秒;而 Ctrl 处理器只等三秒就放行让进程死。收据排在
+    // 它后面就永远写不成,于是一条以整台服务器为范围的操作行留在账本里,
+    // 挡住下一次 attach —— 真的发生了两次。
+    //
+    // 正常收尾那条路不在此列:它要关闭的返回值当退出码,而且不赶时间。
+    //
+    // **被检查的名字不许出现在被扫描区域的散文里。** 第一版把两条分支注释
+    // 里写出的那个名字读成了违规——这棵树里扫描器自证有罪的第七次。
+    const source = @embedFile("cmd_attach.zig");
+    const abort_at = std.mem.indexOf(u8, source, ".aborted => {").?;
+    const tail = source[abort_at..];
+    const settle_at = std.mem.indexOf(u8, tail, "execution.abandon(").?;
+    // 中止分支之后不得再有通道关闭 —— 现在一次都没有。
+    try std.testing.expect(std.mem.indexOf(u8, tail, "pty.close()") == null);
+    // 而收据确实在这条分支里写。
+    try std.testing.expect(settle_at < tail.len);
+}
