@@ -260,10 +260,12 @@ PATH="$HOME/.terminus/bin:$PATH"
 
 ## 10. 账本集成
 
-新增 operation kind `.attach`(schema v13 → v14)。
+新增 operation kind `.attach`。
+
+**不需要 schema 迁移。** [operations.zig:29](../../../src/core/store/operations.zig#L29) 中 `control` 变体的注释已经记录了这一点:`operations.kind` 是裸 `TEXT NOT NULL`,不像 `status` 和 `resolved_status` 带 CHECK 约束。真正的代价在别处 —— [receipts.zig](../../../src/core/store/receipts.zig) 中两张**双向穷举**的可采纳性矩阵会停住构建,直到新 kind 的每一格都被有意地回答。这是编译器强制的,漏不掉。
 
 - `argv_redacted`:`attach` 为 `"interactive session"`,`shell` 为 `"interactive login shell"`
-- `attach` 取 `.session` scope 的租约,每 10s 续租,TTL 30s。**效果是人在会话里时 `session rm` 与 `job kill` 会被拒绝 —— 这是有意的。** `--no-lease` 可退出这个行为。
+- `attach` 取会话的争用范围租约。**那个范围是 `.job`,不是 `.session`** —— [cmd_session.zig:1774](../../../src/cli/cmd_session.zig#L1774) 的 `contentionScope` 把 `job-deploy` 映射成 `.{ .kind = .job, .key = "deploy" }`,其测试写明理由:"the session a running job lives in contends with the job, because it *is* the job's shell"。照抄这个映射,`attach` 就天然与 `job kill` 争同一个东西,不需要第二套机制。TTL 用既有的 `Control.Claim.ttl_secs`(120s,全树共用,本次不改),**每 30s 续一次** —— 续租是一次 store 写,挂在 200ms 的空闲 tick 上会变成每秒五次写。**效果是人在会话里时 `session rm` 与 `job kill` 会被拒绝 —— 这是有意的。** `--no-lease` 可退出这个行为。
 - `shell` 走 `.server` scope,`mutating = false`,**不取租约** —— 裸登录 shell 不声明任何东西,也不该挡住别人。但仍记 operation 行。
 
 终态取值受 [op_state.zig:458](../../../src/core/store/op_state.zig#L458) 的 `canSettle` 约束,已逐条核对:
