@@ -21,12 +21,29 @@ const stillOurs = Control.stillOurs;
 
 const fatal = Cli.fail;
 
-/// 挡路者的 request id,两种挡法一个说法。
-fn blockerId(blocker: Core.execution.Blocker) []const u8 {
-    return switch (blocker) {
-        .unsettled => |op| op.request_id,
-        .lease => |lease| lease.owner_request_id,
-    };
+/// 被挡住时说什么。
+///
+/// **两种挡法解法完全不同,所以不能共用一句话。** 未结的操作行要人去对账;
+/// 活租约不需要,它自己会过期,而 `reconcile` 对它毫无作用 —— 那条把两者
+/// 混为一谈的消息让人对着一个两分钟后自己消失的东西反复跑 reconcile。
+fn refuseBlocked(ctx: *Cli.Ctx, blocker: Core.execution.Blocker) noreturn {
+    switch (blocker) {
+        .unsettled => |op| fatal(
+            "交互会话被未结的 request {s} 挡住 —— 它可能还在远端跑着。" ++
+                "确认之后对账掉它:\n" ++
+                "  terminus request reconcile {s} --override \"<原因>\" --by <谁> --resolved cancelled",
+            .{ op.request_id, op.request_id },
+        ),
+        .lease => |lease| {
+            const left = lease.expires_at - Control.wallClockSeconds(ctx.io);
+            fatal(
+                "这个范围的租约被 request {s} 占着,还有 {d} 秒到期。\n" ++
+                    "如果那是一个已经关掉的交互会话,等它过期就行 —— " ++
+                    "reconcile 对租约没有作用。",
+                .{ lease.owner_request_id, if (left > 0) left else 0 },
+            );
+        },
+    }
 }
 
 pub const Mode = enum { shell, attach };
@@ -216,11 +233,7 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
         // 交互会话自己不再持有这道屏障(`Kind.holdsScopeWhileUnsettled`),
         // 所以挡在这里的一定是别的东西 —— 一条可能还在远端跑着的 exec、
         // 一个 job,或者别人的租约。那些该挡,而且只能由人来判断。
-        .blocked => |blocker| fatal(
-            "交互会话被 request {s} 挡住;先把它对账掉:\n" ++
-                "  terminus request reconcile {s} --override \"<原因>\" --by <谁> --resolved cancelled",
-            .{ blockerId(blocker), blockerId(blocker) },
-        ),
+        .blocked => |blocker| refuseBlocked(ctx, blocker),
     };
     Cli.registerExecution(&execution);
     defer {
@@ -254,27 +267,25 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
         .refused => fatal("交互会话在提交时被拒绝;对账 request {s}", .{execution.id()}),
     }
 
-    // 租约,在会话真正开始之前取得,**两种模式都取,而且不可关闭**。
+    // 租约,**只有 `attach` 取**,范围是会话的争用范围。
     //
-    // 它有两个作用,第二个是后加的、也是更要紧的那个:
+    // 作用只有一个:人在会话里时 `session rm` 与 `job kill` 会被拒绝。
     //
-    // 一,活着的互斥:人在里面时 `session rm` 与 `job kill` 会被拒绝。
+    // **`shell` 不取,而且这是被真机打回来的。** 它一度也取,范围是整台
+    // 服务器 —— 于是一个关掉窗口的 shell 会把那台机器上的一切挡住两分钟
+    // (TTL),包括第二个 shell。裸登录 shell 不声明任何东西,它和 `ssh`
+    // 一样,既不挡别人也不被别人挡。
     //
-    // 二,**活性记录**。交互会话的进程随时可能被关窗口杀掉(ConPTY 下
-    // `CTRL_CLOSE_EVENT` 送不到,实测三次),留下一条未结的操作行挡住下一
-    // 次。`healLapsedSession` 用"查不到这条 request 的活租约"作为它已经死
-    // 了的证据 —— 所以租约必须**总是**存在,否则一个活着的会话会被误判成
-    // 死的并被结清。`--no-lease` 因此被删掉了:一个能关掉活性证据的开关,
-    // 会让上面那条推理不成立。
+    // 租约会自己过期,这正是它相对未结操作行的好处:进程被硬杀之后,
+    // 没有人需要做任何事 —— "the only thing a dead process can do"。
     var lease_tick: ?LeaseTick = null;
-    {
-        const label = session_name orelse resolved.server.name;
+    if (session_name) |label| {
         const claim: Claim = .{
             .store = &store,
             .server_id = resolved.server.id,
             .scope = begin_options.scope,
             .owner_request_id = execution.id(),
-            .subject = if (session_name) |n| .{ .session = n } else .{ .job = label },
+            .subject = .{ .session = label },
         };
         // 活时钟,不是 `ctx.now`。`ctx.now` 是进程启动时间,用它计时的 TTL
         // 在 store 打开之前就开始走了 —— `cmd_session.zig` 的 `claimScope`
