@@ -105,19 +105,36 @@ pub const InputQueue = struct {
     }
 };
 
+/// Move local stdin into the queue, one underlying read at a time.
+///
+/// **`readVec` and not `readSliceShort`, and the difference is the whole of
+/// whether a human can type.** `readSliceShort` is documented to return short
+/// "if and only if the stream reached the end" — it loops until the destination
+/// is full. With a 16 KiB destination that means a keystroke sits in the buffer
+/// until 16384 more arrive, so an interactive session renders the remote's
+/// banner perfectly and then accepts nothing. `readVec` returns what one read
+/// produced, which for a console is the keystroke.
+///
+/// `tunnel` had the same latency and nobody saw it: piped stdin reaches EOF,
+/// and EOF is the other way `readSliceShort` returns.
+///
+/// The reader's own buffer and the destination are separate arrays on purpose.
+/// They used to be the same one — the reader filled it and then copied it onto
+/// itself.
 pub fn inputPump(queue: *InputQueue, input: std.Io.File) void {
-    var buffer: [tunnel_buffer_bytes]u8 = undefined;
-    var reader = input.readerStreaming(queue.io, &buffer);
+    var read_buffer: [tunnel_buffer_bytes]u8 = undefined;
+    var chunk: [tunnel_buffer_bytes]u8 = undefined;
+    var reader = input.readerStreaming(queue.io, &read_buffer);
     while (true) {
-        const n = reader.interface.readSliceShort(&buffer) catch {
-            queue.finish(true);
+        var data: [1][]u8 = .{&chunk};
+        const n = reader.interface.readVec(&data) catch |err| {
+            // End of stream is an ordinary finish; anything else is a failure
+            // the consumer has to be able to tell apart from it.
+            queue.finish(err != error.EndOfStream);
             return;
         };
-        if (n == 0) {
-            queue.finish(false);
-            return;
-        }
-        if (!queue.put(buffer[0..n])) return;
+        if (n == 0) continue;
+        if (!queue.put(chunk[0..n])) return;
     }
 }
 
@@ -131,4 +148,32 @@ pub fn cancelInputRead(thread: *std.Thread) void {
         var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
         _ = std.os.windows.ntdll.NtCancelSynchronousIoFile(thread.getHandle(), null, &iosb);
     }
+}
+
+test "the input pump never waits for a full buffer" {
+    // 源码契约,不是行为测试 —— 说清它能证明什么:
+    //
+    // 这个队列真正的行为要一个管道夹具才测得到(std 没有 pipe API,要自己
+    // extern `CreatePipe`),而缺陷本身不需要那么重的东西就能锁住:它只是
+    // 用错了一个读函数。用错的那个会一直循环到把目的缓冲区填满,而目的
+    // 缓冲区是 16 KiB —— 于是一次按键要等后面 16383 个字节才离开本地。
+    // 在真终端上的样子是:远端 banner 一字不差地画出来,然后一个字也打
+    // 不进去。
+    //
+    // **扫描范围必须收敛到函数体。** 第一版从函数开头一直看到文件末尾,
+    // 于是它读到了这段解释里写出来的那个名字,并把自己报成了缺陷 ——
+    // 这棵树里同类事故已经发生过五次,`args.zig` 的注释逐条记着。所以
+    // 上面这段刻意不拼写任何一个被检查的标识符。
+    const source = @embedFile("InputQueue.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn " ++ "inputPump").?;
+    // 函数体在第一个顶格 `}` 处结束。
+    const end = start + std.mem.indexOf(u8, source[start..], "\n}\n").?;
+    const body = source[start..end];
+
+    const forbidden = "readSlice" ++ "Short";
+    const required = "read" ++ "Vec";
+    try std.testing.expect(std.mem.indexOf(u8, body, forbidden) == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, required) != null);
+    // 范围真的收住了:否则上面两条会在整份文件上求值,而那是无意义的。
+    try std.testing.expect(body.len < 1200);
 }
