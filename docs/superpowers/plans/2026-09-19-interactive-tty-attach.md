@@ -59,9 +59,12 @@
 
 1. **Zig 0.16 的 `std.os.windows` 不提供任何控制台模式绑定。** `SetConsoleMode` / `GetConsoleMode` / `GetConsoleScreenBufferInfo` / `SetConsoleCtrlHandler` / `SetConsoleCP` 全都没有,必须自己 `extern "kernel32"` 声明。树里的既有风格见 [src/core/windows_supervisor.zig:138](../../../src/core/windows_supervisor.zig#L138)。
 2. **`windows.UINT` 存在**(= `c_uint`),**`windows.COORD` 存在**(字段 `X`/`Y`,类型 `SHORT`),**`windows.SMALL_RECT` 不存在** —— 必须自己声明。
+2b. **`windows.BOOL` 不是整数。** 它是 `Bool(c_int)`,一个 `enum(c_int){ FALSE = 0, _ }`,带 `toBool()` 与 `fromBool()`。所以 `== 0` 不编译 —— 写 `if (!Win32Call(...).toBool())`,传真值写 `.fromBool(true)`,返回假值写 `.FALSE`。std 的注释还写明"comparisons against TRUE are always a bug",别拿 `== .TRUE` 比。(实现 Task 3 时撞到并已验证。)
 3. **新增 operation kind 不需要 schema 迁移。** `operations.kind` 是裸 `TEXT NOT NULL`。停住构建的**不是**那两张可采纳性矩阵 —— 它们刻意只按 `operations.Capabilities` 分支,`appliesTo` 的注释写明"a kind is **not in scope** while the rules are being decided",所以矩阵里写不出针对某个 kind 的例外。真正会停住构建的是 [operations.zig:86](../../../src/core/store/operations.zig#L86) 的 `Kind.capabilities()`,它对 `Kind` 穷举。回答那 8 条轴,矩阵自动得出结论。
 4. **`libssh2_channel_shell` 和 `libssh2_channel_request_pty` 都是 C 宏**,translate-c 拿不到。用底层函数:`libssh2_channel_process_startup(ch, "shell", 5, null, 0)` 和 `libssh2_channel_request_pty_ex(ch, term, term_len, modes, modes_len, width, height, width_px, height_px)`。
 5. **`std.Io.File` 有 `handle` 字段**,所以 `std.Io.File.stdin().handle` 就是控制台句柄,不需要 `GetStdHandle`(std 也没有它)。
+5b. **`std.time.milliTimestamp` 在 Zig 0.16 里不存在。** 取时钟用 `std.Io.Timestamp.now(io, clock)`,`Clock` 的取值是 `real` / `awake` / `boot` / `cpu_process` / `cpu_thread`。间隔计时用 **`.awake`**(单调),不要用 `.real` —— NTP 回拨会让间隔算成负数。树里 `Control.wallClockSeconds` 用 `.real` 是对的,因为它要的是墙钟。(实现 Task 6 时撞到并已验证。)
+5c. **Zig 惰性分析函数体,`refAllDecls` 非递归 —— "编译通过"不代表新函数被类型检查过。** 一个没有调用方的新函数,`zig build` 会放它过去。每个新模块加一条 `test { _ = &theFunction; }` 强制分析;本计划的 Task 6 正是靠这条立刻抓到了上面 5b 那个错误。
 6. **`op_state.canSettle` 不允许 `local_abandon` 从 `submitted`/`remote_started` 落** —— 见 [op_state.zig:473](../../../src/core/store/op_state.zig#L473)。交互会话中途失去连接只能落 `indeterminate`。
 7. **`Cli.sshConnect` 是直连构造器**,签名 `fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh`。按 spec 决策一,两个动词都用它,不用 `Cli.connect`。
 
@@ -1315,7 +1318,9 @@ const LeaseTick = struct {
 
     fn call(context: *anyopaque) bool {
         const self: *LeaseTick = @ptrCast(@alignCast(context));
-        const now = std.time.milliTimestamp();
+        // `.awake` 单调时钟，理由见"实现前必读"5b：std.time.milliTimestamp
+        // 在 0.16 不存在，而墙钟回拨会让续租间隔算成负数。
+        const now = nowMs(self.io);
         if (now - self.last_renewed_ms < renew_every_ms) return true;
         self.last_renewed_ms = now;
         // 续不上就结束会话:租约被别人接管后继续打字,会让两个所有者
@@ -1354,7 +1359,7 @@ const LeaseTick = struct {
         lease_tick = .{
             .claim = claim,
             .io = ctx.io,
-            .last_renewed_ms = std.time.milliTimestamp(),
+            .last_renewed_ms = nowMs(ctx.io),
         };
     }
 
