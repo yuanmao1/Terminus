@@ -711,6 +711,155 @@ pub fn tunnel(
     return stats;
 }
 
+// --- the interactive channel -------------------------------------------------
+//
+// A pseudo-terminal, which is the one thing `exec` cannot give a human: without
+// a pty the remote shell has no job control, no line editing, and every curses
+// program refuses to draw. The channel is otherwise an ordinary session channel
+// and is opened the same way.
+
+pub const PtyError = error{
+    ChannelOpenFailed,
+    PtyRequestFailed,
+    StartupFailed,
+};
+
+/// One read's outcome.
+///
+/// Named rather than a `?usize` or a negative sentinel: the caller has to tell
+/// "nothing has arrived yet" from "the far end is finished", and collapsing them
+/// into one value is exactly the mistake that reads a dropped connection as a
+/// clean exit.
+pub const PtyRead = union(enum) {
+    bytes: usize,
+    /// No data right now. Not an error.
+    again,
+    /// The far end closed the stream.
+    eof,
+    failed,
+};
+
+pub const PtyWrite = union(enum) {
+    bytes: usize,
+    again,
+    failed,
+};
+
+/// What to start on the far side.
+pub const PtyStart = union(enum) {
+    /// The user's login shell.
+    login_shell,
+    /// One command, e.g. `tmux attach -t =t-web`.
+    command: []const u8,
+};
+
+/// A session channel with a pseudo-terminal on it.
+pub const Pty = struct {
+    session: *c.LIBSSH2_SESSION,
+    channel: *c.LIBSSH2_CHANNEL,
+
+    /// The window changed size. Failure is harmless — the far side simply keeps
+    /// the old size — so this reports nothing.
+    pub fn resize(p: *Pty, cols: u16, rows: u16) void {
+        _ = c.libssh2_channel_request_pty_size_ex(
+            p.channel,
+            @intCast(cols),
+            @intCast(rows),
+            0,
+            0,
+        );
+    }
+
+    pub fn read(p: *Pty, out: []u8) PtyRead {
+        const n = c.libssh2_channel_read_ex(p.channel, 0, out.ptr, out.len);
+        if (n > 0) return .{ .bytes = @intCast(n) };
+        if (n == 0) return if (c.libssh2_channel_eof(p.channel) != 0) .eof else .again;
+        if (n == c.LIBSSH2_ERROR_EAGAIN) return .again;
+        return .failed;
+    }
+
+    pub fn write(p: *Pty, bytes: []const u8) PtyWrite {
+        const n = c.libssh2_channel_write_ex(p.channel, 0, bytes.ptr, bytes.len);
+        if (n > 0) return .{ .bytes = @intCast(n) };
+        if (n == c.LIBSSH2_ERROR_EAGAIN) return .again;
+        return .failed;
+    }
+
+    /// Close and hand back the exit status.
+    ///
+    /// Blocking is restored first: a nonblocking `wait_closed` only ever returns
+    /// EAGAIN and would leave an otherwise clean session half-open. `tunnel`'s
+    /// teardown records the same fact for the same reason.
+    pub fn close(p: *Pty) i32 {
+        c.libssh2_session_set_blocking(p.session, 1);
+        _ = c.libssh2_channel_close(p.channel);
+        _ = c.libssh2_channel_wait_closed(p.channel);
+        const status = c.libssh2_channel_get_exit_status(p.channel);
+        _ = c.libssh2_channel_free(p.channel);
+        return status;
+    }
+};
+
+/// Open a session channel carrying a pseudo-terminal.
+///
+/// The session is put into nonblocking mode and left there: the interactive
+/// pump has to keep feeding local input while the far side is silent. Restoring
+/// blocking is `Pty.close`'s job.
+///
+/// `libssh2_channel_request_pty` and `libssh2_channel_shell` are both C macros,
+/// which translate-c does not surface, so this calls the underlying `_ex` and
+/// `process_startup` entry points directly — as `exec` already does.
+pub fn openPty(
+    client: *Client,
+    term: []const u8,
+    cols: u16,
+    rows: u16,
+    start: PtyStart,
+) PtyError!Pty {
+    const channel = c.libssh2_channel_open_ex(
+        client.session,
+        "session",
+        "session".len,
+        c.LIBSSH2_CHANNEL_WINDOW_DEFAULT,
+        c.LIBSSH2_CHANNEL_PACKET_DEFAULT,
+        null,
+        0,
+    ) orelse return error.ChannelOpenFailed;
+    errdefer _ = c.libssh2_channel_free(channel);
+
+    if (c.libssh2_channel_request_pty_ex(
+        channel,
+        term.ptr,
+        @intCast(term.len),
+        null,
+        0,
+        @intCast(cols),
+        @intCast(rows),
+        0,
+        0,
+    ) != 0) return error.PtyRequestFailed;
+
+    switch (start) {
+        .login_shell => if (c.libssh2_channel_process_startup(
+            channel,
+            "shell",
+            "shell".len,
+            null,
+            0,
+        ) != 0) return error.StartupFailed,
+        .command => |cmd| if (c.libssh2_channel_process_startup(
+            channel,
+            "exec",
+            "exec".len,
+            cmd.ptr,
+            @intCast(cmd.len),
+        ) != 0) return error.StartupFailed,
+    }
+
+    c.libssh2_session_set_blocking(client.session, 0);
+    return .{ .session = client.session, .channel = channel };
+}
+
 /// Runs one command over a fresh session channel and drains stdout/stderr
 /// to completion, **keeping the whole of both**.
 ///
