@@ -14,6 +14,11 @@ const Store = Core.Store;
 const Console = Core.tty.Console;
 const Pump = Core.tty.Pump;
 
+const Control = @import("../core/control.zig");
+const Claim = Control.Claim;
+const Authority = Control.Authority;
+const stillOurs = Control.stillOurs;
+
 const fatal = Cli.fail;
 
 pub const Mode = enum { shell, attach };
@@ -26,6 +31,38 @@ pub const attach_usage = "usage: terminus attach <server>[:<session>]\n" ++
     "\n接入远端 tmux 会话。detach 后会话在远端继续存活,agent 可用\n" ++
     "'terminus read' 读到这期间的输出。不给会话名时列出现有会话。\n" ++
     "\n需要远端已安装 tmux;用 'terminus doctor <server>' 确认。\n";
+
+/// 续租的节拍器。
+///
+/// 泵每 200ms 调一次 tick,但续租是一次 store 写 —— 每秒五次写既无必要
+/// 也会把 WAL 撑大。`Claim.ttl_secs` 是 120s,30s 续一次留了四倍余量。
+const renew_every_ms: i64 = 30_000;
+
+/// 单调毫秒,与 `Pump` 用同一个时钟。`.real` 会被 NTP 回拨,让间隔算成负数。
+fn nowMs(io: std.Io) i64 {
+    const ts = std.Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+/// 挂在泵空闲节拍上的租约续租。
+const LeaseTick = struct {
+    claim: Claim,
+    io: std.Io,
+    authority: Authority = .held,
+    last_renewed_ms: i64,
+
+    /// 返回 false 让泵结束会话。
+    ///
+    /// 续不上就停:租约被别人接管后继续打字,会让两个所有者同时以为自己
+    /// 持有这个会话 —— 那正是这层屏障存在的理由。
+    fn call(context: *anyopaque) bool {
+        const self: *LeaseTick = @ptrCast(@alignCast(context));
+        const now = nowMs(self.io);
+        if (now - self.last_renewed_ms < renew_every_ms) return true;
+        self.last_renewed_ms = now;
+        return stillOurs(self.claim, self.io, &self.authority);
+    }
+};
 
 /// 远端的 TERM。
 ///
@@ -190,12 +227,54 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
         .refused => fatal("交互会话在提交时被拒绝;对账 request {s}", .{execution.id()}),
     }
 
+    // 租约,在会话真正开始之前取得。`attach` 持它的效果是:人在里面时
+    // `session rm` 与 `job kill` 会被拒绝。`--no-lease` 退出这个行为。
+    var lease_tick: ?LeaseTick = null;
+    if (mode == .attach and !parsed.boolean("no-lease")) {
+        const name = session_name.?;
+        const claim: Claim = .{
+            .store = &store,
+            .server_id = resolved.server.id,
+            .scope = contentionScope(name),
+            .owner_request_id = execution.id(),
+            .subject = .{ .session = name },
+        };
+        // 活时钟,不是 `ctx.now`。`ctx.now` 是进程启动时间,用它计时的 TTL
+        // 在 store 打开之前就开始走了 —— `cmd_session.zig` 的 `claimScope`
+        // 记录了同一件事。
+        const taken = Store.leases.acquire(&store, ctx.arena, .{
+            .server_id = resolved.server.id,
+            .scope = claim.scope,
+            .owner_request_id = execution.id(),
+            .profile_token = owner_token,
+            .owner_label = name,
+            .ttl_secs = Claim.ttl_secs,
+            .now = Control.wallClockSeconds(ctx.io),
+        }) catch |err| fatal("无法为会话 '{s}' 取得租约: {s}", .{ name, @errorName(err) });
+        switch (taken) {
+            .acquired, .renewed => {},
+            .conflict => |peer| fatal(
+                "会话 '{s}' 的范围被 request {s} 持有;它结束后再 attach",
+                .{ name, peer.owner_request_id },
+            ),
+        }
+        lease_tick = .{
+            .claim = claim,
+            .io = ctx.io,
+            .last_renewed_ms = nowMs(ctx.io),
+        };
+    }
+    const tick: ?Pump.Tick = if (lease_tick) |*lt|
+        .{ .context = lt, .call = LeaseTick.call }
+    else
+        null;
+
     var pty = client.openPty(remote_term, size.cols, size.rows, start) catch |err| fatal(
         "无法在 '{s}' 上打开伪终端: {s}",
         .{ target.server, @errorName(err) },
     );
 
-    const outcome = Pump.run(ctx.io, &pty, null) catch |err| {
+    const outcome = Pump.run(ctx.io, &pty, tick) catch |err| {
         _ = pty.close();
         Console.restoreActive();
         fatal("交互会话失败: {s}", .{@errorName(err)});
