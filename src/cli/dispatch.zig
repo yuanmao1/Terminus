@@ -307,6 +307,7 @@ test {
     _ = @import("cmd_read_write.zig");
     _ = @import("cmd_request.zig");
     _ = @import("cmd_attach.zig");
+    _ = @import("cmd_attach_test.zig");
     _ = @import("cmd_audit.zig");
     _ = @import("cmd_plan.zig");
     _ = @import("cmd_tunnel.zig");
