@@ -23,6 +23,11 @@ pub const Outcome = union(enum) {
     local_eof,
     /// 传输中断;远端的下场不可知。
     transport_failed,
+    /// 本地终端被关掉了(关窗口、Ctrl-Break)。远端没被通知,下场不可知。
+    ///
+    /// 和 `local_eof` 分开,因为它们要落的收据不同:stdin 到了 EOF 是一次
+    /// 有序收尾,而窗口被关是人走了、没人再看着那一头。
+    aborted,
 };
 
 pub const Error = error{
@@ -73,6 +78,13 @@ pub fn run(io: std.Io, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome {
     var remote_buffer: [Queue.tunnel_buffer_bytes]u8 = undefined;
 
     loop: while (true) {
+        // 每轮都问,不是每 200ms 问一次:关窗口时操作系统只给几秒,而这
+        // 条循环在有数据时一轮只要几微秒。
+        if (Console.abortRequested()) {
+            outcome = .aborted;
+            break :loop;
+        }
+
         var progressed = false;
 
         // 本地 → 远端

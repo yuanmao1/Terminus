@@ -61,14 +61,43 @@ pub fn restoreActive() void {
     _ = SetConsoleOutputCP(s.out_cp);
 }
 
+/// 关窗口时,会话循环有没有收完尾。
+///
+/// 两个标志而不是一个:处理器要能分辨"还没轮到"和"已经收好了",否则它
+/// 只能盲等满超时。
+var abort_flag: std.atomic.Value(bool) = .init(false);
+var abort_done: std.atomic.Value(bool) = .init(false);
+
+/// 会话循环每轮问一次。
+pub fn abortRequested() bool {
+    return abort_flag.load(.acquire);
+}
+
+/// 会话循环收完尾之后说一声,放处理器走。
+pub fn abortHandled() void {
+    abort_done.store(true, .release);
+}
+
 /// Ctrl-Break、关窗口、注销、关机。
 ///
 /// Ctrl-C **不**走这里:进入 raw 模式后 `ENABLE_PROCESSED_INPUT` 已被清除,
 /// Ctrl-C 是字节 0x03,要原样送去远端。
 ///
-/// 返回 FALSE 让默认处理器接着跑(它会结束进程),我们只负责在那之前把
-/// 终端还原回去。
+/// **这里不碰数据库。** 处理器跑在操作系统注入的另一个线程上,而主线程
+/// 可能正握着 store;在这里写收据是拿一个正确性问题换另一个。所以它只
+/// 置标志,让会话循环自己结清那条操作行 —— 主线程本来就知道怎么做,而且
+/// 它此刻只在泵字节,腾得出手。
+///
+/// 等待是有必要的:返回 FALSE 会让默认处理器结束进程。关窗口时 Windows
+/// 大约给五秒,三秒在里面,而且足够一次 SQLite 写。等不到就还原终端走人 ——
+/// 留下一条待对账的操作行,总好过留下一个 raw 模式的终端。
 fn ctrlHandler(_: windows.DWORD) callconv(.winapi) windows.BOOL {
+    abort_flag.store(true, .release);
+    var waited: u32 = 0;
+    while (waited < 3000 and !abort_done.load(.acquire)) {
+        Sleep(10);
+        waited += 10;
+    }
     restoreActive();
     return .FALSE;
 }
@@ -143,6 +172,8 @@ const ConsoleScreenBufferInfo = extern struct {
     srWindow: SmallRect,
     dwMaximumWindowSize: windows.COORD,
 };
+
+extern "kernel32" fn Sleep(dwMilliseconds: windows.DWORD) callconv(.winapi) void;
 
 extern "kernel32" fn GetConsoleMode(
     hConsoleHandle: windows.HANDLE,

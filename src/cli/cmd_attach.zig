@@ -295,6 +295,24 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
                 else => try ctx.out.print("本地输入结束,会话已关闭\n", .{}),
             }
         },
+        .aborted => {
+            // 人关掉了窗口。远端没被通知过,所以这一侧不知道它现在怎么样 ——
+            // `abandon` 会从当前状态挑出诚实的那个终态(`submitted` 之后是
+            // `indeterminate`,因为 `local_abandon` 只从 `created`/`connecting`
+            // 可达)。
+            //
+            // 这一步存在的全部理由:不结清的话,这条操作行会以整台服务器为
+            // 范围一直挡着,而下一次 attach 会撞上"被 request X 挡住"。对
+            // 交互会话来说关窗口是人**正常**的离开方式,不是异常,所以让它
+            // 需要人工对账是不可接受的。
+            execution.abandon(
+                "the operator closed the terminal window; nothing watched the session to completion",
+            ) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
+            // 收据落盘了,放 Ctrl 处理器走 —— 它正在等这一声,等满三秒就
+            // 自己还原终端并让进程结束。
+            Console.abortHandled();
+            return;
+        },
         .transport_failed => {
             // 连接没了,远端的下场不可知 —— `local_abandon` 在 `submitted`
             // 之后不可采纳(`op_state.canSettle`),而那恰好也是语义上对的:
