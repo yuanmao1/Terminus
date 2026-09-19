@@ -191,7 +191,7 @@ pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             writeRefusal(ctx, std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt, null, lease, false);
-            std.process.exit(exit_code.failure);
+            exitProcess(exit_code.failure);
         }
     }
     std.process.fatal(fmt, args);
@@ -213,7 +213,7 @@ pub fn failWithCode(code: []const u8, comptime fmt: []const u8, args: anytype) n
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             writeRefusal(ctx, std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt, code, lease, false);
-            std.process.exit(exit_code.failure);
+            exitProcess(exit_code.failure);
         }
     }
     std.process.fatal(fmt ++ "\n  code: {s}", args ++ .{code});
@@ -247,7 +247,7 @@ pub fn failReportingClaim(comptime fmt: []const u8, args: anytype) noreturn {
     if (active_ctx) |ctx| {
         if (ctx.out.format == .json) {
             writeRefusal(ctx, std.fmt.allocPrint(ctx.arena, fmt, args) catch fmt, null, lease, true);
-            std.process.exit(exit_code.failure);
+            exitProcess(exit_code.failure);
         }
     }
     // Human mode needs no extra line: `releaseClaimReporting` has already written
@@ -574,7 +574,7 @@ pub fn releaseClaim() void {
 /// path that did not fail. See `active_daemon_socket`.
 pub fn exitNow(code: u8) noreturn {
     closeDaemonSocket();
-    std.process.exit(code);
+    exitProcess(code);
 }
 
 /// Process exit codes with a defined meaning to callers.
@@ -631,7 +631,7 @@ pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observ
                 }) catch {};
             }
             ctx.out.flush() catch {};
-            std.process.exit(exit_code.indeterminate);
+            exitProcess(exit_code.indeterminate);
         }
         ctx.out.print(
             "indeterminate: {s}\n  request: {s}\n  last observed: {s}\n  reconcile before retrying: terminus request reconcile {s}\n",
@@ -639,7 +639,7 @@ pub fn failIndeterminate(request_id: []const u8, reason: []const u8, last_observ
         ) catch {};
         ctx.out.flush() catch {};
     }
-    std.process.exit(exit_code.indeterminate);
+    exitProcess(exit_code.indeterminate);
 }
 
 const indeterminate_hint = "the remote outcome is unknown; reconcile with 'terminus request reconcile <request-id>' before retrying";
@@ -663,7 +663,7 @@ pub fn failIndeterminateAfterOutput(request_id: []const u8) noreturn {
         }
         ctx.out.flush() catch {};
     }
-    std.process.exit(exit_code.indeterminate);
+    exitProcess(exit_code.indeterminate);
 }
 
 /// The tree-wide receipt-failure envelope. No defaults, so a branch that omits a
@@ -783,7 +783,7 @@ fn writeReceiptFatal(
                 }) catch {};
             }
             ctx.out.flush() catch {};
-            std.process.exit(exit_code.receipt_persist_failed);
+            exitProcess(exit_code.receipt_persist_failed);
         }
         ctx.out.print(
             "RECEIPT_PERSIST_FAILED: {s}\n  request: {s}\n  remote status: {s}\n  the remote action may have taken effect; the local ledger is incomplete\n",
@@ -792,7 +792,7 @@ fn writeReceiptFatal(
         if (lease.detail) |text| ctx.out.print("  {s}\n", .{text}) catch {};
         ctx.out.flush() catch {};
     }
-    std.process.exit(exit_code.receipt_persist_failed);
+    exitProcess(exit_code.receipt_persist_failed);
 }
 
 // The claim-reporting envelope is the shared one plus exactly the two lease keys,
@@ -872,7 +872,7 @@ pub fn auditFatal(
         writeAuditFatal(ctx, action, server, effect, err);
         ctx.out.flush() catch {};
     }
-    std.process.exit(exit_code.receipt_persist_failed);
+    exitProcess(exit_code.receipt_persist_failed);
 }
 
 /// The document, split from the exit so a gate can read it.
@@ -1443,6 +1443,20 @@ pub fn resolveServer(ctx: *Ctx, store: *Store, name: []const u8) struct {
             fail("key '{s}' is in an unsupported format.\n{s}", .{ key_name, Ssh.KeyFormat.adviceFor(format) });
     }
     return .{ .server = server, .auth = auth };
+}
+
+/// 结束进程,**知道交互会话可能留下了一个停不住的线程**。
+///
+/// 普通的退出(`std.c.exit` 最后走 `ExitProcess`)会等其他线程结束。而交互
+/// 会话的读线程此刻很可能正停在一次控制台读上,那次读取消不掉 —— 于是进程
+/// 一直不退,直到用户随手按了一个键。实测对照:`exec`(不开读线程)立刻
+/// 返回,`shell` 不返回,两者的收尾代码完全相同。
+///
+/// 所以开过读线程时走硬退出。它跳过 CRT 收尾,而这条路径上要落的盘 ——
+/// 收据和数据库 —— 在更早就已经完成。
+pub fn exitProcess(code: u8) noreturn {
+    if (Core.tty.Pump.hasOutstandingReader()) Core.tty.Console.exitNow(code);
+    std.process.exit(code);
 }
 
 /// What a connection this command could not open means to the caller.
@@ -2951,8 +2965,24 @@ test "gate: a refusal publishes the lease answer exactly when there was a lease"
     }
 }
 
-// The other half, and the one that answers "what stops the eighteenth site".
-//
+test "every exit from this file knows about the reader thread that cannot be stopped" {
+    // 交互会话的读线程停在一次控制台读上,而那次读取消不掉。普通的退出
+    // (`ExitProcess`)会等所有线程结束,于是进程要等到用户随手按一个键。
+    //
+    // 实测对照钉住了成因:`exec`(不开读线程)立刻返回,`shell` 不返回,
+    // 而两者的收尾代码完全相同。
+    //
+    // 所以这个文件里所有退出都必须经过那一个知道这件事的函数。新加一处
+    // 直接退出不会编译失败、也不会有任何测试变红 —— 只会让某一条失败路径
+    // 重新开始挂住终端。
+    const source = @embedFile("cli.zig");
+    const direct = "std.process." ++ "exit(";
+    // 恰好一处:那个函数自己的兜底分支。
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, direct));
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn exit" ++ "Process(") != null);
+}
+
+// The other half, and the one that answers "what stops the eighteenth site".//
 // Nothing in Zig's type system can stop a function from calling a `void` one: there
 // is no effect on a signature to check, and a local shadow of a container-level
 // declaration is itself a compile error, so the void form cannot be made

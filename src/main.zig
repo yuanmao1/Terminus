@@ -68,6 +68,13 @@ pub fn main(init: std.process.Init) !void {
 
     try Cli.Dispatch.dispatchCommand(&ctx, args.items);
     try out.flush();
+
+    // 交互会话留下的读线程停在一次取消不掉的控制台读上,而从 `main` 正常
+    // 返回会走 CRT 的 `exit` → `ExitProcess`,那会**等所有线程结束** ——
+    // 于是进程要等到用户随手按一个键才真的退出。见 `Cli.exitProcess`。
+    //
+    // 非交互命令照常从这里返回,收尾一步不少。
+    if (Terminus.Core.tty.Pump.hasOutstandingReader()) Terminus.Core.tty.Console.exitNow(0);
 }
 
 fn nowSeconds(io: std.Io) i64 {

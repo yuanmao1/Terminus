@@ -151,6 +151,24 @@ pub fn enter() Error!void {
 // 备用屏不是栈,谁也没办法从本地知道自己是不是已经在里面。正确的做法在
 // `Pump.forceRedraw`:让画那一屏的那一头重画。
 
+/// 立刻结束进程,**不等任何线程**。
+///
+/// 普通的进程退出(`ExitProcess`,`std.c.exit` 最后走的也是它)会等其他线程
+/// 结束。交互会话留下的读线程停在一次控制台读上,而那次读取消不掉 ——
+/// `NtCancelSynchronousIoFile` 对管道有效,对控制台无效。于是进程一直不退,
+/// 直到用户随手按了一个键把那次读喂饱。
+///
+/// **实测对照**:`exec`(不开读线程)立刻返回,`shell` 不返回,而两者的
+/// 收尾代码完全相同 —— 差的只有那个线程。
+///
+/// 代价是跳过 CRT 的收尾(atexit、stdio flush),所以调用方必须自己先把
+/// 该刷的都刷了。这条路径上要落的盘 —— 收据和数据库 —— 在更早就已经完成。
+pub fn exitNow(code: u8) noreturn {
+    if (comptime builtin.os.tag != .windows) std.process.exit(code);
+    _ = TerminateProcess(GetCurrentProcess(), code);
+    unreachable; // TerminateProcess 不会返回给自己
+}
+
 /// 直接写到 stdout,绕开 `Cli.Ctx.out`。
 ///
 /// **在 raw 模式下不能用 `ctx.out`。** 那条路径按行缓冲、会自己补换行,而
@@ -199,6 +217,12 @@ const ConsoleScreenBufferInfo = extern struct {
 };
 
 extern "kernel32" fn Sleep(dwMilliseconds: windows.DWORD) callconv(.winapi) void;
+
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) windows.HANDLE;
+extern "kernel32" fn TerminateProcess(
+    hProcess: windows.HANDLE,
+    uExitCode: windows.UINT,
+) callconv(.winapi) windows.BOOL;
 
 extern "kernel32" fn GetConsoleMode(
     hConsoleHandle: windows.HANDLE,

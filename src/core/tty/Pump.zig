@@ -85,6 +85,17 @@ pub fn nowMs(io: std.Io) i64 {
 /// 栈帧长,理由见 `stopLocal`:我们不等那个线程结束。
 var session_queue: Queue.InputQueue = undefined;
 
+/// 这个进程有没有开过读线程。
+///
+/// **开过就再也不算清零**,因为 `stopLocal` 不等那个线程结束 —— 它此刻很
+/// 可能正停在一次取消不掉的控制台读上。谁想结束这个进程,都得知道这件事:
+/// 见 `Console.exitNow`。
+var reader_started: bool = false;
+
+pub fn hasOutstandingReader() bool {
+    return reader_started;
+}
+
 /// 会话级的本地终端读取。整个会话开一次、关一次,跨重连不动。
 pub const Local = struct {
     queue: *Queue.InputQueue,
@@ -100,6 +111,7 @@ pub fn startLocal(io: std.Io) Error!Local {
     const queue = &session_queue;
     const thread = std.Thread.spawn(.{}, Queue.inputPump, .{ queue, std.Io.File.stdin() }) catch
         return error.InputThreadFailed;
+    reader_started = true;
     return .{ .queue = queue, .thread = thread };
 }
 
