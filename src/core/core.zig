@@ -36,6 +36,7 @@ pub const tty = struct {
     pub const InputQueue = @import("tty/InputQueue.zig");
     pub const Pump = @import("tty/Pump.zig");
     pub const reconnect = @import("tty/reconnect.zig");
+    pub const escape = @import("tty/escape.zig");
 };
 pub const Scripted = @import("exec.zig").Scripted;
 
@@ -52,4 +53,5 @@ test {
     _ = tty.InputQueue;
     _ = tty.Pump;
     _ = tty.reconnect;
+    _ = tty.escape;
 }

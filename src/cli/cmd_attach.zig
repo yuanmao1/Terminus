@@ -13,6 +13,7 @@ const Core = @import("../core/core.zig");
 const Store = Core.Store;
 const Console = Core.tty.Console;
 const Pump = Core.tty.Pump;
+const Escape = Core.tty.escape;
 
 const Control = @import("../core/control.zig");
 const Claim = Control.Claim;
@@ -50,11 +51,14 @@ pub const Mode = enum { shell, attach };
 
 pub const shell_usage = "usage: terminus shell <server>\n" ++
     "\n打开远端登录 shell。本地终端进入 raw 模式,退出后自动还原。\n" ++
-    "裸登录 shell 不持久:连接断开时远端进程随之结束。\n";
+    "裸登录 shell 不持久:连接断开时远端进程随之结束。\n" ++
+    "\n会话中按 Ctrl-] 再按 ? 看本地命令(detach / 传文件 / 强制断开)。\n";
 
 pub const attach_usage = "usage: terminus attach <server>[:<session>]\n" ++
     "\n接入远端 tmux 会话。detach 后会话在远端继续存活,agent 可用\n" ++
     "'terminus read' 读到这期间的输出。不给会话名时列出现有会话。\n" ++
+    "\n断线会自动重连(退避至多五分钟);会话在断线期间消失时不会替你新建。\n" ++
+    "会话中按 Ctrl-] 再按 ? 看本地命令(detach / 传文件 / 强制断开)。\n" ++
     "\n需要远端已安装 tmux;用 'terminus doctor <server>' 确认。\n";
 
 /// 续租的节拍器。
@@ -150,6 +154,15 @@ const Ending = union(enum) {
     pump: Pump.Outcome,
     /// 停摆期间结束的,没有通道。
     outage: Outage,
+    /// 人从 `Ctrl-]` 命令层结束了会话。通道还活着。
+    local: LocalEnd,
+};
+
+const LocalEnd = enum {
+    /// `Ctrl-] d` —— 干净地关掉通道,会话在远端继续。
+    detached,
+    /// `Ctrl-] .` —— 不等远端确认,直接走。
+    force_disconnected,
 };
 
 const Outage = enum {
@@ -176,6 +189,225 @@ const Reconnected = union(enum) {
     /// 没连回去,会话到此为止。
     over: Outage,
 };
+
+// --- `Ctrl-]` 命令层 ----------------------------------------------------------
+//
+// **菜单期间不读远端,而且不需要缓冲。** 设计第 6 节写了一个 1 MiB 环形区
+// 加一句"菜单期间丢弃了 N 字节" —— 那是在解决一个不存在的问题。SSH 通道
+// 自带窗口流控:我们不读,窗口耗尽,远端就阻塞在写上。**一个字节都不会
+// 丢**,这比丢弃最旧的那段好,而且少一个缓冲区和一条提示。
+
+/// 菜单做完之后,会话该怎么办。
+const MenuEnd = enum {
+    /// 回到会话。
+    resume_session,
+    /// 菜单期间窗口被关了。
+    aborted,
+    /// 菜单期间本地 stdin 结束了。
+    local_eof,
+    /// 菜单期间租约被别人接管了。
+    lost,
+};
+
+/// 一次取键的三种去向。
+fn menuEndFor(key: Pump.Key) ?MenuEnd {
+    return switch (key) {
+        .byte => null,
+        .aborted => .aborted,
+        .local_eof => .local_eof,
+        .lost => .lost,
+    };
+}
+
+const help_screen =
+    "Terminus 会话命令\r\n" ++
+    "\r\n" ++
+    "  Ctrl-] 之后按:\r\n" ++
+    "\r\n" ++
+    "    d        detach —— 断开,会话在远端继续\r\n" ++
+    "    .        强制断开 —— 不等远端确认\r\n" ++
+    "    p        推一个文件到远端\r\n" ++
+    "    g        从远端拉一个文件\r\n" ++
+    "    ?        这份键位表\r\n" ++
+    "    Ctrl-]   给远端送一个字面的 Ctrl-]\r\n" ++
+    "\r\n" ++
+    "  其他键:响铃,而且那两个字节一个都不会送到远端\r\n" ++
+    "\r\n" ++
+    "按任意键返回会话\r\n";
+
+fn showHelp(ctx: *Cli.Ctx, local: *Pump.Local, tick: ?Pump.Tick) MenuEnd {
+    Console.writeDirect(ctx.io, Console.alt_screen_enter);
+    defer Console.writeDirect(ctx.io, Console.alt_screen_leave);
+    Console.writeDirect(ctx.io, Console.clear);
+    Console.writeDirect(ctx.io, help_screen);
+    return menuEndFor(Pump.readKey(ctx.io, local, tick)) orelse .resume_session;
+}
+
+/// 打完一行之后发生了什么。行本身留在调用方的 `editor` 里。
+const Typed = union(enum) {
+    submitted,
+    cancelled,
+    ended: MenuEnd,
+};
+
+/// 在备用屏上读一行。回显、退格、Enter 提交、ESC 取消,没别的。
+fn promptLine(
+    ctx: *Cli.Ctx,
+    local: *Pump.Local,
+    tick: ?Pump.Tick,
+    title: []const u8,
+    hint: []const u8,
+    editor: *Escape.LineEdit,
+) Typed {
+    Console.writeDirect(ctx.io, Console.clear);
+    Console.writeDirect(ctx.io, title);
+    Console.writeDirect(ctx.io, "\r\n\r\n  ");
+    Console.writeDirect(ctx.io, hint);
+    Console.writeDirect(ctx.io, "\r\n  ESC 取消\r\n\r\n> ");
+    while (true) {
+        const key = Pump.readKey(ctx.io, local, tick);
+        if (menuEndFor(key)) |end| return .{ .ended = end };
+        const byte = key.byte;
+        switch (editor.feed(byte)) {
+            .echo => Console.writeDirect(ctx.io, &[_]u8{byte}),
+            // 退一格、擦掉、再退一格 —— 光标左移本身不删字符。
+            .erase => Console.writeDirect(ctx.io, "\x08 \x08"),
+            .bell => Console.writeDirect(ctx.io, "\x07"),
+            .submit => return .submitted,
+            .cancel => return .cancelled,
+        }
+    }
+}
+
+/// 等一个按键,给那些"看完再走"的屏用。
+fn pause(ctx: *Cli.Ctx, local: *Pump.Local, tick: ?Pump.Tick) MenuEnd {
+    Console.writeDirect(ctx.io, "\r\n按任意键继续\r\n");
+    return menuEndFor(Pump.readKey(ctx.io, local, tick)) orelse .resume_session;
+}
+
+/// 本进程的可执行文件路径。
+///
+/// **`std.fs.selfExePath` 在 Zig 0.16 里整个被删了**(0.14 还有),所以这里
+/// 直接问 Win32。走 PATH 找 `terminus` 不行:npm 装的那份可能是另一个版本,
+/// 而这次传输必须由**正在跑的这个二进制**完成。
+fn selfExePath(buf: []u8) ?[]const u8 {
+    if (comptime @import("builtin").os.tag != .windows) return null;
+    var wide: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
+    const len = GetModuleFileNameW(null, &wide, wide.len);
+    if (len == 0 or len >= wide.len) return null;
+    const written = std.unicode.utf16LeToUtf8(buf, wide[0..len]) catch return null;
+    return buf[0..written];
+}
+
+extern "kernel32" fn GetModuleFileNameW(
+    hModule: ?std.os.windows.HMODULE,
+    lpFilename: [*]u16,
+    nSize: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
+
+/// `p` 与 `g`:提示两个路径,然后**作为子进程**跑 `terminus push/pull`。
+///
+/// **子进程而不是进程内直接调那个传输命令,而这不是风格选择。**
+/// `Cli.registerExecution` 写的是一个**单槽**进程级全局([cli.zig:259]);
+/// 在会话里调它会把 attach 自己的登记覆盖掉,再在它的 defer 里清空,于是
+/// 此后任何 `fatal` 都不会结清 attach 那条操作行 —— 正是 M1/M2 花了四轮
+/// 才修好的那类缺陷。
+///
+/// 子进程还顺带给对了别的东西:传输拿到自己的 request id、自己的收据、
+/// 自己的连接,和人在另一个窗口敲出来的完全一样。
+///
+/// (有一条门禁扫这个文件里有没有那个模块的名字,所以这段话不拼它。)
+fn runTransfer(
+    ctx: *Cli.Ctx,
+    local: *Pump.Local,
+    tick: ?Pump.Tick,
+    server_name: []const u8,
+    action: Escape.Action,
+) MenuEnd {
+    const pushing = action == .push;
+    var editor: Escape.LineEdit = .{};
+    switch (promptLine(
+        ctx,
+        local,
+        tick,
+        if (pushing) "推一个文件到远端" else "从远端拉一个文件",
+        if (pushing) "<本地路径> <远端路径>" else "<远端路径> <本地路径>",
+        &editor,
+    )) {
+        .cancelled => return .resume_session,
+        .ended => |end| return end,
+        .submitted => {},
+    }
+
+    const paths = Escape.splitPaths(editor.text()) orelse {
+        Console.writeDirect(ctx.io, "\r\n\r\n要两个路径,中间一个空格。带空格的路径这里不支持。\r\n");
+        return pause(ctx, local, tick);
+    };
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = selfExePath(&exe_buf) orelse {
+        Console.writeDirect(ctx.io, "\r\n\r\n找不到本程序的路径,无法启动传输。\r\n");
+        return pause(ctx, local, tick);
+    };
+    const argv = [_][]const u8{
+        exe,
+        if (pushing) "push" else "pull",
+        server_name,
+        paths.first,
+        paths.second,
+    };
+
+    // **把终端整个还给子进程。** 它是个普通命令,按行输出;在 raw 模式下
+    // (`DISABLE_NEWLINE_AUTO_RETURN` 开着)它画出来的东西会往右下角爬。
+    Console.writeDirect(ctx.io, Console.alt_screen_leave);
+    Console.restoreActive();
+
+    var child = std.process.spawn(ctx.io, .{ .argv = &argv }) catch |err| {
+        var msg: [160]u8 = undefined;
+        Console.writeDirect(ctx.io, std.fmt.bufPrint(
+            &msg,
+            "无法启动传输子进程: {s}\r\n",
+            .{@errorName(err)},
+        ) catch "无法启动传输子进程\r\n");
+        reenterOrDie(ctx);
+        return pause(ctx, local, tick);
+    };
+    const term = child.wait(ctx.io) catch |err| {
+        var msg: [160]u8 = undefined;
+        Console.writeDirect(ctx.io, std.fmt.bufPrint(
+            &msg,
+            "等待传输子进程失败: {s}\r\n",
+            .{@errorName(err)},
+        ) catch "等待传输子进程失败\r\n");
+        reenterOrDie(ctx);
+        return pause(ctx, local, tick);
+    };
+    const code: u32 = switch (term) {
+        .exited => |c| c,
+        else => 1,
+    };
+    reenterOrDie(ctx);
+    var line: [96]u8 = undefined;
+    const text = std.fmt.bufPrint(
+        &line,
+        "\r\n传输结束(退出码 {d})\r\n",
+        .{code},
+    ) catch "\r\n传输结束\r\n";
+    Console.writeDirect(ctx.io, text);
+    return pause(ctx, local, tick);
+}
+
+/// 子进程跑完之后回到 raw 模式。
+///
+/// 回不去就必须停:一个回不到 raw 模式的会话,方向键会变成三个字符、
+/// `Ctrl-C` 会杀掉 Terminus 而不是远端进程。带着这个继续,比停下糟。
+fn reenterOrDie(ctx: *Cli.Ctx) void {
+    _ = ctx;
+    Console.enter() catch fatal(
+        "传输结束后无法让终端回到 raw 模式;会话到此为止,远端会话未受影响",
+        .{},
+    );
+}
 
 /// 断线之后一直试到连回去、或者放弃为止。
 ///
@@ -461,27 +693,54 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             Console.restoreActive();
             fatal("交互会话失败: {s}", .{@errorName(err)});
         };
-        if (outcome != .transport_failed or mode == .shell)
-            break :session .{ .pump = outcome };
+        switch (outcome) {
+            // 人按了 `Ctrl-]` 加一个命令键。
+            .escape => |action| switch (action) {
+                .detach => break :session .{ .local = .detached },
+                .force_disconnect => break :session .{ .local = .force_disconnected },
+                .help => switch (showHelp(ctx, &local, tick)) {
+                    .resume_session => continue :session,
+                    .aborted => break :session .{ .pump = .aborted },
+                    .local_eof => break :session .{ .pump = .local_eof },
+                    .lost => break :session .{ .pump = .lost },
+                },
+                .push, .pull => switch (runTransfer(
+                    ctx,
+                    &local,
+                    tick,
+                    resolved.server.name,
+                    action,
+                )) {
+                    .resume_session => continue :session,
+                    .aborted => break :session .{ .pump = .aborted },
+                    .local_eof => break :session .{ .pump = .local_eof },
+                    .lost => break :session .{ .pump = .lost },
+                },
+            },
+            .transport_failed => {
+                if (mode == .shell) break :session .{ .pump = outcome };
 
-        // 传输没了。**这里不关通道** —— 等一个死连接的关闭确认就是干等到
-        // 会话超时。整个连接就地释放,里面那条通道跟着一起走。
-        client.deinit();
-        client_live = false;
+                // 传输没了。**这里不关通道** —— 等一个死连接的关闭确认就是
+                // 干等到会话超时。整个连接就地释放,里面那条通道跟着一起走。
+                client.deinit();
+                client_live = false;
 
-        switch (reconnect(
-            ctx,
-            resolved.server,
-            resolved.auth,
-            session_name.?,
-            start,
-            &local,
-            tick,
-            &client,
-            &client_live,
-        )) {
-            .pty => |fresh| pty = fresh,
-            .over => |over| break :session .{ .outage = over },
+                switch (reconnect(
+                    ctx,
+                    resolved.server,
+                    resolved.auth,
+                    session_name.?,
+                    start,
+                    &local,
+                    tick,
+                    &client,
+                    &client_live,
+                )) {
+                    .pty => |fresh| pty = fresh,
+                    .over => |over| break :session .{ .outage = over },
+                }
+            },
+            else => break :session .{ .pump = outcome },
         }
     };
 
@@ -502,8 +761,49 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
     const duration = Core.control.wallClockSeconds(ctx.io) * std.time.ms_per_s - start_ms;
 
     switch (ending) {
+        // **这一支排在最前面是有理由的。** 它里面有一次通道关闭,而下面那条
+        // 门禁扫的是中止分支之后的正文 —— 不赶时间的关闭必须待在中止分支
+        // 之前。
+        //
+        // 两种走法的区别就是要不要等远端确认,那正是 `.` 相对 `d` 的全部
+        // 意思。
+        .local => |how| switch (how) {
+            .detached => {
+                const status = pty.close();
+                Console.restoreActive();
+                _ = execution.settle(
+                    .{ .exited = .{ .exit_code = status } },
+                    .{ .connected = true, .duration_ms = duration },
+                ) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
+                switch (mode) {
+                    .attach => try ctx.out.print(
+                        "已 detach;会话 '{s}' 在远端继续运行\n",
+                        .{session_name.?},
+                    ),
+                    .shell => try ctx.out.print("已断开(退出码 {d})\n", .{status}),
+                }
+            },
+            .force_disconnected => {
+                // 「强制」的全部意思就是不等,所以这里不做通道关闭:收据先
+                // 落盘,然后放手让进程退出,操作系统会丢掉那个 socket。
+                execution.abandon(
+                    "the operator forced the connection down without waiting for the far end",
+                ) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
+                Console.restoreActive();
+                switch (mode) {
+                    .attach => try ctx.out.print(
+                        "已强制断开;会话 '{s}' 仍在远端运行\n",
+                        .{session_name.?},
+                    ),
+                    .shell => try ctx.out.print("已强制断开;远端登录 shell 的下场不可知\n", .{}),
+                }
+            },
+        },
         .pump => |outcome| switch (outcome) {
-            .remote_exit, .local_eof => {
+            // `.escape` 到不了这里:会话循环把每一个都消化掉了。把它并进这
+            // 一支而不是写 `unreachable` —— 一条不会说谎的收尾路径,好过一
+            // 句关于控制流的断言。
+            .remote_exit, .local_eof, .escape => {
                 const status = pty.close();
                 // 还原在写收据之前:下面的句子要能被读到。`restoreActive` 是
                 // 幂等的,所以上面的 defer 再跑一次无害。

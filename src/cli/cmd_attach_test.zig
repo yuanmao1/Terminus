@@ -40,11 +40,16 @@ test "nothing is drawn to the terminal after it enters raw mode and before it le
     //
     // 机械检查:第一个 `Console.enter()` 与其后第一个 `restoreActive()`
     // 之间不得出现 `ctx.out.print`。
+    //
+    // **锚点必须先收敛到 `run` 的函数体。** 传输子进程跑完之后也要回一次
+    // raw 模式,而那个函数排在前面 —— 拿整份文件量的话,这条门禁会从一个
+    // 与它无关的锚点开始,把 `run` 里排在还原之后的正常输出算成违规。
     const source = @embedFile("cmd_attach.zig");
-    const enter_at = std.mem.indexOf(u8, source, "Console.enter()").?;
+    const body = source[std.mem.indexOf(u8, source, "pub fn run(ctx:").?..];
+    const enter_at = std.mem.indexOf(u8, body, "Console.enter()").?;
     const restore = "restore" ++ "Active()";
-    const restore_at = std.mem.indexOfPos(u8, source, enter_at, restore).?;
-    const window = source[enter_at..restore_at];
+    const restore_at = std.mem.indexOfPos(u8, body, enter_at, restore).?;
+    const window = body[enter_at..restore_at];
     try std.testing.expect(std.mem.indexOf(u8, window, "ctx.out.print") == null);
 }
 
@@ -119,5 +124,19 @@ test "the bare login shell does not reconnect" {
     // 裸登录 shell 的远端进程已经随连接死了,重连只会得到一个全新的
     // shell。把它当成原来那个是撒谎,而这句守卫是唯一拦着它的东西。
     const source = @embedFile("cmd_attach.zig");
-    try std.testing.expect(std.mem.indexOf(u8, source, "or mode == ." ++ "shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (mode == ." ++ "shell) break") != null);
+}
+
+test "the escape layer's local actions never leak to the remote" {
+    // `Ctrl-]` 后面那个键是**本地**命令。三条性质一起才成立:
+    //
+    //  * 命令层的每一次绘制都走直写,不走 `ctx.out`(raw 模式下不换行);
+    //  * 传输走子进程,不走进程内调用(`active_execution` 是单槽的);
+    //  * 帮助屏和提示行都画在备用屏上,退出时终端自己还主屏。
+    const source = @embedFile("cmd_attach.zig");
+    // 传输必须是子进程。进程内调那个命令会覆盖 attach 自己的账本登记。
+    try std.testing.expect(std.mem.indexOf(u8, source, "cmd_trans" ++ "fer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "process." ++ "spawn(") != null);
+    // 菜单画在备用屏。
+    try std.testing.expect(std.mem.count(u8, source, "alt_screen_" ++ "enter") >= 2);
 }

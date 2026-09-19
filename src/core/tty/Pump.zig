@@ -16,6 +16,7 @@ const std = @import("std");
 const Ssh = @import("../ssh/Client.zig");
 const Console = @import("Console.zig");
 const Queue = @import("InputQueue.zig");
+const Escape = @import("escape.zig");
 
 /// 尺寸轮询间隔。人感觉不到 200ms,而换来的是不必把事件读取和字节读取
 /// 混在同一个句柄上 —— 输入线程在做阻塞 `ReadFile`,读不到窗口事件记录。
@@ -46,6 +47,9 @@ pub const Outcome = union(enum) {
     aborted,
     /// tick 说这个会话已经不归我们了(租约被接管)。
     lost,
+    /// 人按了 `Ctrl-]` 加一个命令键。通道还好好的,调用方处理完这个动作
+    /// 之后可以拿同一条通道再进来。
+    escape: Escape.Action,
 };
 
 pub const Error = error{
@@ -85,6 +89,10 @@ var session_queue: Queue.InputQueue = undefined;
 pub const Local = struct {
     queue: *Queue.InputQueue,
     thread: std.Thread,
+    /// 转义键状态机,**也是会话级的**。转义键和它后面那个命令键几乎不会
+    /// 落在同一次读里,更不会落在同一条通道里 —— 断线重连换了通道之后,
+    /// 它必须还记得自己在待命。
+    escape: Escape.Machine = .{},
 };
 
 pub fn startLocal(io: std.Io) Error!Local {
@@ -129,6 +137,15 @@ pub fn run(io: std.Io, local: *Local, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome 
     var input_buffer: [Queue.tunnel_buffer_bytes]u8 = undefined;
     var remote_buffer: [Queue.tunnel_buffer_bytes]u8 = undefined;
 
+    // 已经过了状态机、还没被通道收下的字节。
+    //
+    // 转发出去的字节永远不会比读进来的多(状态机只会吃掉字节,不会造出
+    // 字节),所以和输入缓冲一样大就够。
+    var pending: [Queue.tunnel_buffer_bytes]u8 = undefined;
+    var pending_len: usize = 0;
+    var pending_off: usize = 0;
+    var fired: ?Escape.Action = null;
+
     loop: while (true) {
         // 每轮都问,不是每 200ms 问一次:关窗口时操作系统只给几秒,而这
         // 条循环在有数据时一轮只要几微秒。
@@ -139,12 +156,59 @@ pub fn run(io: std.Io, local: *Local, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome 
 
         var progressed = false;
 
-        // 本地 → 远端
-        const queued = queue.peek(&input_buffer);
-        if (queued != 0) {
-            switch (pty.write(input_buffer[0..queued])) {
+        // 本地 → 远端,**中间过一遍转义状态机**。
+        //
+        // 两段缓冲而不是把队列里的字节直接交给通道:状态机会吃掉一些字节
+        // (转义键本身),于是"从队列消耗了多少"和"该往通道写多少"不再
+        // 相等;而通道是非阻塞的,一次只肯收一部分。`pending` 就是这两个
+        // 数字之间的那个缓冲。
+        if (pending_off == pending_len) {
+            // **动作要等到这一刻才交出去。** 人在按 `Ctrl-]` 之前打的字
+            // 必须先真的到远端 —— 否则一次 detach 会顺手吞掉最后半行命令。
+            if (fired) |action| {
+                outcome = .{ .escape = action };
+                break :loop;
+            }
+            pending_off = 0;
+            pending_len = 0;
+            const queued = queue.peek(&input_buffer);
+            if (queued != 0) {
+                var taken: usize = 0;
+                for (input_buffer[0..queued]) |byte| {
+                    taken += 1;
+                    switch (local.escape.feed(byte)) {
+                        .forward => |out| {
+                            pending[pending_len] = out;
+                            pending_len += 1;
+                        },
+                        .swallow => {},
+                        .bell => {
+                            writer.interface.writeAll("\x07") catch
+                                return error.OutputWriteFailed;
+                            writer.interface.flush() catch return error.OutputWriteFailed;
+                        },
+                        // 这一批剩下的字节留在队列里,下一轮再说 —— 动作
+                        // 后面的按键属于动作处理完之后的那个会话。
+                        .action => |action| {
+                            fired = action;
+                            break;
+                        },
+                    }
+                }
+                queue.consume(taken);
+                progressed = true;
+            } else {
+                const state = queue.snapshot();
+                if (state.done) {
+                    outcome = if (state.failed) .transport_failed else .local_eof;
+                    break :loop;
+                }
+            }
+        }
+        if (pending_off < pending_len) {
+            switch (pty.write(pending[pending_off..pending_len])) {
                 .bytes => |n| {
-                    queue.consume(n);
+                    pending_off += n;
                     progressed = true;
                 },
                 .again => {},
@@ -152,12 +216,6 @@ pub fn run(io: std.Io, local: *Local, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome 
                     outcome = .transport_failed;
                     break :loop;
                 },
-            }
-        } else {
-            const state = queue.snapshot();
-            if (state.done) {
-                outcome = if (state.failed) .transport_failed else .local_eof;
-                break :loop;
             }
         }
 
@@ -261,6 +319,45 @@ pub fn waitForRetry(io: std.Io, local: *Local, ms: i64, tick: ?Tick) Wait {
     }
 }
 
+/// 菜单要的一个按键。
+pub const Key = union(enum) {
+    byte: u8,
+    aborted,
+    local_eof,
+    lost,
+};
+
+/// 取一个本地按键。菜单和提示行的输入原语。
+///
+/// **不过转义状态机**,而且这是对的:菜单开着的时候,按键属于菜单,不属于
+/// 会话。设计里那个 `menu` 状态想表达的就是这件事 —— 这里用"根本不喂它"
+/// 来表达,比用一条状态转移可靠。
+///
+/// **照调 tick。** 租约 TTL 是 120s,一个开着菜单去接电话的人会让它过期,
+/// 和重连停摆期间同一个问题、同一个解法。
+pub fn readKey(io: std.Io, local: *Local, tick: ?Tick) Key {
+    const queue = local.queue;
+    var one: [1]u8 = undefined;
+    var last_tick = nowMs(io);
+    while (true) {
+        if (Console.abortRequested()) return .aborted;
+        if (queue.peek(&one) != 0) {
+            queue.consume(1);
+            return .{ .byte = one[0] };
+        }
+        if (queue.snapshot().done) return .local_eof;
+
+        const now = nowMs(io);
+        if (now - last_tick >= resize_poll_ms) {
+            last_tick = now;
+            if (tick) |t| {
+                if (!t.call(t.context)) return .lost;
+            }
+        }
+        std.Io.sleep(io, .{ .nanoseconds = abandon_poll_ms * std.time.ns_per_ms }, .awake) catch {};
+    }
+}
+
 test "the pump's body is analysed even before a caller exists" {
     // Zig analyses function bodies lazily, and `refAllDecls` is not recursive —
     // so without taking this address, `run` type checks for the first time
@@ -269,8 +366,29 @@ test "the pump's body is analysed even before a caller exists" {
     // compiler to the signature and the body.
     _ = &run;
     _ = &waitForRetry;
+    _ = &readKey;
     _ = &startLocal;
     _ = &stopLocal;
+}
+
+test "本地输入永远不会绕过转义状态机直接到远端" {
+    // 源码契约。真行为要一个控制台夹具才测得到,而缺陷本身不需要那么重的
+    // 东西就能锁住:它只是把队列缓冲直接交给了通道。那样写不会编译失败、
+    // 也不会有任何测试变红 —— 只会让 `Ctrl-]` 一次也不触发,而远端收到
+    // 一个它不认识的 0x1D。
+    //
+    // 扫描范围收敛到函数体,且上面这段散文刻意不拼出被检查的那个片段。
+    const source = @embedFile("Pump.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn " ++ "run(io").?;
+    const end = start + std.mem.indexOf(u8, source[start..], "\n}\n").?;
+    const body = source[start..end];
+
+    // 通道只从 `pending` 拿字节,而 `pending` 只有状态机填得进去。
+    try std.testing.expect(std.mem.indexOf(u8, body, "pty.write(input" ++ "_buffer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "pty.write(pend" ++ "ing[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "local.escape." ++ "feed(") != null);
+    // 范围真的收住了。
+    try std.testing.expect(body.len < 6000);
 }
 
 test "重连等待会把读到的字节丢掉,不会攒起来重放" {
