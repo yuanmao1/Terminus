@@ -53,18 +53,19 @@ fn nowMs(io: std.Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
+/// 读线程的队列,**进程级而不是栈上**。
+///
+/// 一个进程至多开一个交互会话,所以这是安全的;而它必须活得比 `run` 的
+/// 栈帧长,理由见下面收尾处的注释:我们不等那个线程结束。
+var session_queue: Queue.InputQueue = undefined;
+
 pub fn run(io: std.Io, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome {
-    var queue = Queue.InputQueue.init(io);
-    var input_thread = std.Thread.spawn(.{}, Queue.inputPump, .{ &queue, std.Io.File.stdin() }) catch
+    session_queue = Queue.InputQueue.init(io);
+    const queue = &session_queue;
+    var input_thread = std.Thread.spawn(.{}, Queue.inputPump, .{ queue, std.Io.File.stdin() }) catch
         return error.InputThreadFailed;
-    var joined = false;
-    defer {
-        if (!joined) {
-            queue.requestStop();
-            Queue.cancelInputRead(&input_thread);
-            input_thread.join();
-        }
-    }
+    var released = false;
+    defer if (!released) release(queue, &input_thread);
 
     var out_buffer: [Queue.tunnel_buffer_bytes]u8 = undefined;
     var writer = std.Io.File.stdout().writerStreaming(io, &out_buffer);
@@ -156,11 +157,26 @@ pub fn run(io: std.Io, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome {
     }
 
     writer.interface.flush() catch return error.OutputWriteFailed;
-    queue.requestStop();
-    Queue.cancelInputRead(&input_thread);
-    input_thread.join();
-    joined = true;
+    release(queue, &input_thread);
+    released = true;
     return outcome;
+}
+
+/// 放开读线程,**不等它**。
+///
+/// **为什么不 join。** `cancelInputRead` 是给管道写的 —— `tunnel` 的 stdin
+/// 通常是管道,`NtCancelSynchronousIoFile` 在那上面管用。**控制台句柄上的
+/// 同步读取消不掉**,所以 join 会一直阻塞到用户下一次按键。真机上的样子
+/// 是:远端已经退出了,屏幕却卡住,要连按几次 Ctrl-C 才看到"会话结束"。
+///
+/// 取消仍然照发:它对管道有效(`tunnel` 走同一条路),对控制台无害。
+///
+/// 不 join 就意味着那个线程可能活过这个栈帧,所以队列是进程级的 ——
+/// 它写进去的地方一直有效。进程随后就退出,线程被操作系统收掉。
+fn release(queue: *Queue.InputQueue, thread: *std.Thread) void {
+    queue.requestStop();
+    Queue.cancelInputRead(thread);
+    thread.detach();
 }
 
 test "the pump's body is analysed even before a caller exists" {
