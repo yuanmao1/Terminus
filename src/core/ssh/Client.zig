@@ -410,6 +410,10 @@ pub fn connect(
 }
 
 pub fn deinit(client: *Client) void {
+    // Same deadline, same reason as `Pty.close`: the default is to wait
+    // forever, and a disconnect handshake with a peer that has already gone is
+    // exactly the case where that shows up.
+    c.libssh2_session_set_timeout(client.session, teardown_timeout_ms);
     _ = c.libssh2_session_disconnect_ex(client.session, c.SSH_DISCONNECT_BY_APPLICATION, "bye", "");
     _ = c.libssh2_session_free(client.session);
     _ = c.closesocket(client.socket);
@@ -789,8 +793,20 @@ pub const Pty = struct {
     /// Blocking is restored first: a nonblocking `wait_closed` only ever returns
     /// EAGAIN and would leave an otherwise clean session half-open. `tunnel`'s
     /// teardown records the same fact for the same reason.
+    ///
+    /// **And it is given a deadline, because libssh2's default is no deadline
+    /// at all.** `libssh2_session_set_timeout(0)` means wait forever, and
+    /// `wait_closed` waits for the far side to confirm the channel is closed —
+    /// which, when the far side has already gone, is forever. On a real host
+    /// that hung the whole process after `logout`, intermittently, according to
+    /// whether sshd tore the channel down before we asked it to.
+    ///
+    /// Two seconds is the whole budget for a courtesy. The exit status we want
+    /// arrives in its own packet *before* the close, so a timed-out wait costs
+    /// us nothing we were going to read.
     pub fn close(p: *Pty) i32 {
         c.libssh2_session_set_blocking(p.session, 1);
+        c.libssh2_session_set_timeout(p.session, teardown_timeout_ms);
         _ = c.libssh2_channel_close(p.channel);
         _ = c.libssh2_channel_wait_closed(p.channel);
         const status = c.libssh2_channel_get_exit_status(p.channel);
@@ -798,6 +814,9 @@ pub const Pty = struct {
         return status;
     }
 };
+
+/// How long any one teardown call may block. See `Pty.close`.
+const teardown_timeout_ms: c_long = 2000;
 
 /// Open a session channel carrying a pseudo-terminal.
 ///

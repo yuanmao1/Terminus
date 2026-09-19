@@ -816,6 +816,7 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
                     ),
                     .shell => try ctx.out.print("已断开(退出码 {d})\n", .{status}),
                 }
+                try ctx.out.flush();
             },
             .force_disconnected => {
                 // 「强制」的全部意思就是不等,所以这里不做通道关闭:收据先
@@ -831,6 +832,7 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
                     ),
                     .shell => try ctx.out.print("已强制断开;远端登录 shell 的下场不可知\n", .{}),
                 }
+                try ctx.out.flush();
             },
         },
         .pump => |outcome| switch (outcome) {
@@ -850,6 +852,10 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
                     .remote_exit => try ctx.out.print("会话结束(退出码 {d})\n", .{status}),
                     else => try ctx.out.print("本地输入结束,会话已关闭\n", .{}),
                 }
+                // **就地刷。** `Output.print` 只写进缓冲,而缓冲要到 `main`
+                // 的最后才刷 —— 也就是排在连接与数据库的收尾之后。那几步
+                // 慢一秒,这句话就晚一秒,而它正是用户在等的那一句。
+                try ctx.out.flush();
             },
             .lost => {
                 // 租约被别人接管了。这是我们**主动**收的尾,所以通道照关、
