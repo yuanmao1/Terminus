@@ -48,7 +48,7 @@
 | `src/core/store/operations.zig` | `Kind` 新增 `attach` |
 | `src/core/store/receipts.zig` | 两张矩阵为 `attach` 补格 |
 | `src/cli/dispatch.zig` | `TopCommand` 新增两个动词、usage、switch 分支、test 导入 |
-| `src/cli/args.zig` | `bool_flags` 新增 `no-lease` |
+| `src/cli/args.zig` | (计划中要新增 `no-lease`;实现中该 flag 被删除,见执行记录) |
 | `build.zig` | 无需改动(新文件在既有模块树内) |
 
 ---
@@ -1450,7 +1450,6 @@ git commit -m "attach: 命令面的三条源码门禁"
 | 4 | 在会话里跑东西,`Ctrl-B d` | detach 回本地,终端正常 |
 | 5 | detach 后 `terminus read <server>:<name>` | 读得到刚才交互期间的输出 |
 | 6 | attach 时另开窗口 `terminus session rm` | **被租约拒绝** |
-| 7 | `--no-lease` 下重复第 6 条 | 不被拒绝 |
 | 8 | 首次连接 | 打印 pane 日志提示 |
 | 9 | 远端无 tmux | 明确拒绝并指向 `terminus doctor` |
 
@@ -1493,7 +1492,7 @@ git commit -m "attach: 命令面的三条源码门禁"
 | 7 attach kind | ✅ | 门禁逼出我一条写错的论证,见下 |
 | 8 + 10 两个动词 | ✅ | 合并执行,消除了计划自己标记的占位欠账 |
 | 9 M1 手工验收 | ⏸ **待人工** | 见下表 |
-| 11 租约与 `--no-lease` | ✅ | `args.zig` 双向门禁通过 |
+| 11 租约 | ✅ | `--no-lease` 实现中删除,见下 |
 | 12 源码门禁 | ✅ | 4 条(比计划多一条) |
 | 13 M2 手工验收 | ⏸ **待人工** | 见下表 |
 
@@ -1544,7 +1543,6 @@ git commit -m "attach: 命令面的三条源码门禁"
 | 4 | 会话里跑东西后 `Ctrl-B d` | detach 回本地,终端正常 | |
 | 5 | detach 后 `terminus read <server>:<name>` | 读得到刚才交互期间的输出 | |
 | 6 | attach 时另开窗口 `terminus session rm` | **被租约拒绝** | |
-| 7 | `--no-lease` 下重复第 6 条 | 不被拒绝 | |
 | 8 | 首次连接 | 打印 pane 日志提示 | |
 | 9 | 远端无 tmux | 明确拒绝并指向 `terminus doctor` | |
 
@@ -1553,3 +1551,38 @@ git commit -m "attach: 命令面的三条源码门禁"
 - **`transport_test.zig:613` 的 daemon 门禁偶发崩溃。** `d8f5bbe`(0.2.1 发布提交)上即可复现,与本次改动无关。`acquire` 现在做两次往返(上个会话加的 `authorise` 预检),而 `Stub.serve` 只服务一次请求就关连接;客户端读回复时撞上 CONNECTION_RESET,`readFrame` 抛出未处理的 `error.Unexpected`,整个测试二进制 panic。**不是必现**(与测试顺序/seed 有关),多数运行是 11/11 全绿。讽刺的是那条测试的名字正是 "never a hang and never a wrong cause"。
 - 五条漂移的 mutation 锚点(`W6-undeclared-kind-declares-nothing`、`M18-redaction-fast-path`、`G17d-pool-ignores-the-authority` 匹配不到;`M16-phase-status-image`、`G13-argv-word-separator` 匹配两次),HEAD 上即已漂移。
 - 本次新增第 12 种 operation kind(`.attach`),与其余 11 种一样不带机械对账。
+
+---
+
+# 追记:M1 手工验收通过,以及它打回来的四轮修复
+
+**Task 9 的八条全部通过**(2026-09-19,pageflux-test,Windows Terminal + PowerShell 7.6.6)。
+
+前六条一次就过:`vim` 方向键、`htop`、`Ctrl-C` 打断远端而不杀 terminus、中文、resize、`exit` 干净退出。第七条(关窗口)修了**四轮**,前三轮都修在错的地方 —— 每一轮都是真终端把我的假设打回来的,没有一轮是靠推理发现的。
+
+## 打回来的问题,按发现顺序
+
+**一、输入泵等满 16 KiB 才交付。**`readSliceShort` 的文档写死了:返回值短于请求长度"if and only if the stream reached the end"。目的缓冲区是 16 KiB,于是一次按键要等后面 16383 个字节才离开本地。真终端上的样子是:远端 banner 一字不差地画出来,然后一个字也打不进去。改用 `readVec`。`tunnel` 一直带着同样的毛病,没人看见 —— 管道输入会 EOF,而 EOF 是短读的另一条路。
+
+**二、关窗口留下悬空操作行,挡住整台服务器。**这一条修了四轮:
+
+1. *协作式中止*(处理器置标志、主循环收尾)—— **事件根本不来**,ConPTY 下 `CTRL_CLOSE_EVENT` 送不到进程。
+2. *收据先于网络收尾落盘* —— 改动本身是对的并保留了(`pty.close()` 会等远端确认,关窗口时那一等就是几十秒),但治不了病,因为压根没有代码在跑。
+3. *用租约失效作证据自动结清* —— 跑通了但没用:从 `submitted` 出发唯一可采纳的终态是 `indeterminate`,而它在没有 resolution 之前照样挡路,而 resolution 按定义是人的判断。
+4. **真正的位置是屏障的含义本身。**`holds_scope_predicate` 给只读工作放行的理由是"whatever it did or did not do, it did not change anything";交互会话是另一个理由、同一个结论:它改了东西,但它的工作活不过自己的进程。新增 `Kind.holdsScopeWhileUnsettled`(穷举),照 `op_state.sqlList` 的现成写法渲染进谓词。`mutating` 保持 `true` —— `handoff` 会把它发布出去。
+
+**三、`shell` 不该持有整台服务器的租约。**上一条修好后仍被挡,但挡路的换成了租约:我给 `shell` 发了 `.server` 范围的租约,于是一个关掉窗口的 shell 会把那台机器挡住两分钟,包括第二个 shell。当初加它是为了给第 3 轮的自愈提供活性证据,自愈删了理由也没了。现在只有 `attach` 取租约。
+
+**四、拒绝消息把两种挡法混成一句话。**未结操作行要人去对账;活租约自己会过期,而 `reconcile` 对它毫无作用。共用一句"先把它对账掉"让人对着一个两分钟后自己消失的东西反复 reconcile —— 这条误导实打实浪费了一轮。现在分开说,租约那条直接报还剩几秒。
+
+## 顺带修正的既有问题
+
+- **四个地方各算各的 `blocksScope`**,屏障变成 kind 敏感之后其中几个会撒谎。收进 `Operation.holdsScopeNow`,与 SQL 谓词同一条规则。
+- **`tunnel` 的交互延迟**(同第一条根因)。
+- `InputQueue` 里 reader 缓冲区与目的缓冲区是同一个数组,读进去再拷回自己。
+
+## 纪律
+
+扫描器自证有罪又发生了**两次**(第六、第七次):一次是源码门禁读到自己注释里写的函数名,一次是新门禁读到分支注释里写的 `pty.close()`。**规则:被检查的标识符不许出现在被扫描区域的任何散文里,而且扫描范围要收敛到函数体、并断言收敛生效。**
+
+`Pump.zig` 的 `test { _ = &run; }` 立刻抓到了 `std.time.milliTimestamp` 不存在 —— 没有它,"编译通过"对一个还没有调用方的新函数是假保证。

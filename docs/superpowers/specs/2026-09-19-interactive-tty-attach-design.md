@@ -55,7 +55,7 @@ daemon 的热连接省下的是一次 SSH 握手(约 300ms),而交互式会话�
 ## 3. 命令面
 
 ```
-terminus attach <server>[:<session>] [--allow-tmux-install] [--no-lease] [--json]
+terminus attach <server>[:<session>] [--allow-tmux-install] [--json]
 terminus shell  <server> [--json]
 terminus server tmux <name> --allow-tmux-install [--json]
 terminus server tmux <name>            # 只报告状态,不装
@@ -254,7 +254,7 @@ PATH="$HOME/.terminus/bin:$PATH"
 
 ### 新增布尔 flag
 
-`--allow-tmux-install` 与 `--no-lease` 两个都必须同时进入 [args.zig](../../../src/cli/args.zig) 的 `bool_flags` **并**被生产代码读取;该文件的双向门禁会强制这一点。漏登记不是编译错误 —— 它会让这个读取永远为 `false`,并把后面那个参数当成它的值吞掉。
+`--allow-tmux-install` 必须同时进入 [args.zig](../../../src/cli/args.zig) 的 `bool_flags` **并**被生产代码读取;该文件的双向门禁会强制这一点。漏登记不是编译错误 —— 它会让这个读取永远为 `false`,并把后面那个参数当成它的值吞掉。
 
 ---
 
@@ -265,7 +265,7 @@ PATH="$HOME/.terminus/bin:$PATH"
 **不需要 schema 迁移。** [operations.zig:29](../../../src/core/store/operations.zig#L29) 中 `control` 变体的注释已经记录了这一点:`operations.kind` 是裸 `TEXT NOT NULL`,不像 `status` 和 `resolved_status` 带 CHECK 约束。真正的代价在别处 —— [receipts.zig](../../../src/core/store/receipts.zig) 中两张**双向穷举**的可采纳性矩阵会停住构建,直到新 kind 的每一格都被有意地回答。这是编译器强制的,漏不掉。
 
 - `argv_redacted`:`attach` 为 `"interactive session"`,`shell` 为 `"interactive login shell"`
-- `attach` 取会话的争用范围租约。**那个范围是 `.job`,不是 `.session`** —— [cmd_session.zig:1774](../../../src/cli/cmd_session.zig#L1774) 的 `contentionScope` 把 `job-deploy` 映射成 `.{ .kind = .job, .key = "deploy" }`,其测试写明理由:"the session a running job lives in contends with the job, because it *is* the job's shell"。照抄这个映射,`attach` 就天然与 `job kill` 争同一个东西,不需要第二套机制。TTL 用既有的 `Control.Claim.ttl_secs`(120s,全树共用,本次不改),**每 30s 续一次** —— 续租是一次 store 写,挂在 200ms 的空闲 tick 上会变成每秒五次写。**效果是人在会话里时 `session rm` 与 `job kill` 会被拒绝 —— 这是有意的。** `--no-lease` 可退出这个行为。
+- `attach` 取会话的争用范围租约。**那个范围是 `.job`,不是 `.session`** —— [cmd_session.zig:1774](../../../src/cli/cmd_session.zig#L1774) 的 `contentionScope` 把 `job-deploy` 映射成 `.{ .kind = .job, .key = "deploy" }`,其测试写明理由:"the session a running job lives in contends with the job, because it *is* the job's shell"。照抄这个映射,`attach` 就天然与 `job kill` 争同一个东西,不需要第二套机制。TTL 用既有的 `Control.Claim.ttl_secs`(120s,全树共用,本次不改),**每 30s 续一次** —— 续租是一次 store 写,挂在 200ms 的空闲 tick 上会变成每秒五次写。**效果是人在会话里时 `session rm` 与 `job kill` 会被拒绝 —— 这是有意的。** **`--no-lease` 在实现中被删掉了**:一个能关掉互斥的开关,在一个人正坐在会话里的时候没有可辩护的用途,而它让"谁持有这个会话"多出一个答案。
 - `shell` 走 `.server` scope,`mutating = false`,**不取租约** —— 裸登录 shell 不声明任何东西,也不该挡住别人。但仍记 operation 行。
 
 终态取值受 [op_state.zig:458](../../../src/core/store/op_state.zig#L458) 的 `canSettle` 约束,已逐条核对:
