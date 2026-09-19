@@ -121,6 +121,10 @@ fn refusalCleanup() ClaimRelease {
     // must stay at the top; moving it below the receipt would order the two
     // wrong for every fatal path in the tree.
     Core.tty.Console.restoreActive();
+    // 会话已经收完尾了,放 Ctrl 处理器走。它设计成最多等三秒 `abortHandled`
+    // 再让进程死 —— 那三秒是为"关窗口时还来得及写收据"留的,而此刻收据
+    // 的事已经结束。不说这一声,后面每一次 Ctrl-C 都要先干等三秒。
+    Core.tty.Console.abortHandled();
     closeDaemonSocket();
     settleActiveExecution("command failed before recording an outcome");
     releaseReservation();

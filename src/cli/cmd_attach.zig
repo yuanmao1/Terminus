@@ -632,6 +632,11 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
         ),
     };
     defer Console.restoreActive();
+    // 正常收尾时也要放 Ctrl 处理器走。它最多等三秒 `abortHandled` 才让进程
+    // 死,而那三秒是为"关窗口时还来得及写收据"留的;会话已经结束之后再等
+    // 三秒,只会让每一次 Ctrl-C 都先僵住。`fatal` 那些路径由 `refusalCleanup`
+    // 说这一声。
+    defer Console.abortHandled();
 
     switch (execution.submitted() catch |err|
         Cli.receiptFatal(execution.id(), err, "connecting")) {
