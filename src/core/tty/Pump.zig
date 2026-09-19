@@ -6,6 +6,11 @@
 //! 本地输入来自 `InputQueue` 的后台线程,因为 Windows 上没有办法把控制台
 //! 句柄和一个 socket 一起等;远端读写是 libssh2 非阻塞调用。两边都不阻塞,
 //! 所以没有进展时才睡 1ms。
+//!
+//! **本地终端是会话级的,PTY 通道不是。** 一次 `attach` 可能换好几条通道
+//! (每次重连一条),但从头到尾只有一个终端和一个读它的线程。所以
+//! `startLocal`/`stopLocal` 由调用方在整个会话的两端各调一次,`run` 只负责
+//! 把一条通道泵到它结束为止。
 
 const std = @import("std");
 const Ssh = @import("../ssh/Client.zig");
@@ -15,6 +20,17 @@ const Queue = @import("InputQueue.zig");
 /// 尺寸轮询间隔。人感觉不到 200ms,而换来的是不必把事件读取和字节读取
 /// 混在同一个句柄上 —— 输入线程在做阻塞 `ReadFile`,读不到窗口事件记录。
 const resize_poll_ms: i64 = 200;
+
+/// 重连等待期间多久看一次本地输入。比 `resize_poll_ms` 密,因为这段时间里
+/// 本地输入的唯一用途就是让人打断,而一次"放弃"按下去要立刻有反应。
+const abandon_poll_ms: i64 = 20;
+
+/// 重连等待中读到它就是放弃。
+///
+/// 进了 raw 模式之后 `ENABLE_PROCESSED_INPUT` 已被清除,所以 Ctrl-C 到达
+/// 时是字节 0x03 而不是信号。**这是整个会话期间 0x03 唯一一次不被送往
+/// 远端** —— 此刻没有通道可送。
+const abandon_key: u8 = 0x03;
 
 pub const Outcome = union(enum) {
     /// 远端结束了会话。真正的退出码由 `Pty.close` 取回。
@@ -28,6 +44,8 @@ pub const Outcome = union(enum) {
     /// 和 `local_eof` 分开,因为它们要落的收据不同:stdin 到了 EOF 是一次
     /// 有序收尾,而窗口被关是人走了、没人再看着那一头。
     aborted,
+    /// tick 说这个会话已经不归我们了(租约被接管)。
+    lost,
 };
 
 pub const Error = error{
@@ -35,10 +53,14 @@ pub const Error = error{
     OutputWriteFailed,
 };
 
-/// 每个空闲 tick 调一次(与尺寸检查同一节拍,约 200ms)。
+/// 每个空闲 tick 调一次(约 200ms),**包括重连等待期间**。
 ///
 /// 返回 false 表示会话应当结束 —— 租约被别人接管时就是这样:继续打字会
 /// 让两个所有者同时以为自己持有这个会话。
+///
+/// 停摆期间照调是必需的而不是顺便:租约 TTL 是 120s,而重连预算是 300s。
+/// 不续租的话,一次三分钟的断线之后别人可以合法接管,而我们会带着一个
+/// 已经失效的租约重连回去。
 pub const Tick = struct {
     context: *anyopaque,
     call: *const fn (context: *anyopaque) bool,
@@ -48,24 +70,53 @@ pub const Tick = struct {
 ///
 /// `.awake` 而不是 `.real`:这是一个间隔计时器,NTP 把墙钟往回拨一秒不该
 /// 让尺寸轮询停上一秒。泵末尾的 `std.Io.sleep` 用的也是这个时钟。
-fn nowMs(io: std.Io) i64 {
+pub fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .awake);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
 /// 读线程的队列,**进程级而不是栈上**。
 ///
-/// 一个进程至多开一个交互会话,所以这是安全的;而它必须活得比 `run` 的
-/// 栈帧长,理由见下面收尾处的注释:我们不等那个线程结束。
+/// 一个进程至多开一个交互会话,所以这是安全的;而它必须活得比任何一个
+/// 栈帧长,理由见 `stopLocal`:我们不等那个线程结束。
 var session_queue: Queue.InputQueue = undefined;
 
-pub fn run(io: std.Io, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome {
+/// 会话级的本地终端读取。整个会话开一次、关一次,跨重连不动。
+pub const Local = struct {
+    queue: *Queue.InputQueue,
+    thread: std.Thread,
+};
+
+pub fn startLocal(io: std.Io) Error!Local {
     session_queue = Queue.InputQueue.init(io);
     const queue = &session_queue;
-    var input_thread = std.Thread.spawn(.{}, Queue.inputPump, .{ queue, std.Io.File.stdin() }) catch
+    const thread = std.Thread.spawn(.{}, Queue.inputPump, .{ queue, std.Io.File.stdin() }) catch
         return error.InputThreadFailed;
-    var released = false;
-    defer if (!released) release(queue, &input_thread);
+    return .{ .queue = queue, .thread = thread };
+}
+
+/// 放开读线程,**不等它**。
+///
+/// **为什么不 join。** `cancelInputRead` 是给管道写的 —— `tunnel` 的 stdin
+/// 通常是管道,`NtCancelSynchronousIoFile` 在那上面管用。**控制台句柄上的
+/// 同步读取消不掉**,所以 join 会一直阻塞到用户下一次按键。真机上的样子
+/// 是:远端已经退出了,屏幕却卡住,要连按几次 Ctrl-C 才看到"会话结束"。
+///
+/// 取消仍然照发:它对管道有效(`tunnel` 走同一条路),对控制台无害。
+///
+/// 不 join 就意味着那个线程可能活过调用方的栈帧,所以队列是进程级的 ——
+/// 它写进去的地方一直有效。进程随后就退出,线程被操作系统收掉。
+pub fn stopLocal(local: *Local) void {
+    local.queue.requestStop();
+    Queue.cancelInputRead(&local.thread);
+    local.thread.detach();
+}
+
+/// 把一条 PTY 通道泵到它结束为止。
+///
+/// 结束之后 `local` 仍然可用:传输中断时调用方会重连并拿一条新通道再进来。
+pub fn run(io: std.Io, local: *Local, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome {
+    const queue = local.queue;
 
     var out_buffer: [Queue.tunnel_buffer_bytes]u8 = undefined;
     var writer = std.Io.File.stdout().writerStreaming(io, &out_buffer);
@@ -146,7 +197,7 @@ pub fn run(io: std.Io, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome {
             }
             if (tick) |t| {
                 if (!t.call(t.context)) {
-                    outcome = .remote_exit;
+                    outcome = .lost;
                     break :loop;
                 }
             }
@@ -157,26 +208,57 @@ pub fn run(io: std.Io, pty: *Ssh.Pty, tick: ?Tick) Error!Outcome {
     }
 
     writer.interface.flush() catch return error.OutputWriteFailed;
-    release(queue, &input_thread);
-    released = true;
     return outcome;
 }
 
-/// 放开读线程,**不等它**。
+/// 重连退避期间发生了什么。
+pub const Wait = enum {
+    /// 等满了,可以再试一次连接。
+    elapsed,
+    /// 用户按了 Ctrl-C。
+    abandoned,
+    /// 窗口被关了。
+    aborted,
+    /// 本地 stdin 结束了。
+    local_eof,
+    /// tick 说这个会话已经不归我们了。
+    lost,
+};
+
+/// 等 `ms` 毫秒,期间盯着本地输入和关窗口。
 ///
-/// **为什么不 join。** `cancelInputRead` 是给管道写的 —— `tunnel` 的 stdin
-/// 通常是管道,`NtCancelSynchronousIoFile` 在那上面管用。**控制台句柄上的
-/// 同步读取消不掉**,所以 join 会一直阻塞到用户下一次按键。真机上的样子
-/// 是:远端已经退出了,屏幕却卡住,要连按几次 Ctrl-C 才看到"会话结束"。
-///
-/// 取消仍然照发:它对管道有效(`tunnel` 走同一条路),对控制台无害。
-///
-/// 不 join 就意味着那个线程可能活过这个栈帧,所以队列是进程级的 ——
-/// 它写进去的地方一直有效。进程随后就退出,线程被操作系统收掉。
-fn release(queue: *Queue.InputQueue, thread: *std.Thread) void {
-    queue.requestStop();
-    Queue.cancelInputRead(thread);
-    thread.detach();
+/// **等待中必须排空输入队列**,而不只是看一眼:队列是有界的,塞满之后读
+/// 线程会阻塞在 `put` 里,于是放弃键排在前面几千个字节后面永远轮不到。
+/// 排空掉的字节直接丢弃 —— 此刻没有通道可以转发它们,而攒着它们等重连
+/// 成功后再发,等于把断线期间的盲打送进一个已经换了上下文的 shell。
+pub fn waitForRetry(io: std.Io, local: *Local, ms: i64, tick: ?Tick) Wait {
+    const queue = local.queue;
+    const started = nowMs(io);
+    var last_tick = started;
+    var drain: [Queue.tunnel_buffer_bytes]u8 = undefined;
+
+    while (true) {
+        if (Console.abortRequested()) return .aborted;
+
+        const n = queue.peek(&drain);
+        if (n != 0) {
+            queue.consume(n);
+            if (std.mem.indexOfScalar(u8, drain[0..n], abandon_key) != null) return .abandoned;
+        } else if (queue.snapshot().done) {
+            return .local_eof;
+        }
+
+        const now = nowMs(io);
+        if (now - last_tick >= resize_poll_ms) {
+            last_tick = now;
+            if (tick) |t| {
+                if (!t.call(t.context)) return .lost;
+            }
+        }
+        if (now - started >= ms) return .elapsed;
+
+        std.Io.sleep(io, .{ .nanoseconds = abandon_poll_ms * std.time.ns_per_ms }, .awake) catch {};
+    }
 }
 
 test "the pump's body is analysed even before a caller exists" {
@@ -186,4 +268,25 @@ test "the pump's body is analysed even before a caller exists" {
     // loop (it needs a live channel and a real console); this only holds the
     // compiler to the signature and the body.
     _ = &run;
+    _ = &waitForRetry;
+    _ = &startLocal;
+    _ = &stopLocal;
+}
+
+test "重连等待会把读到的字节丢掉,不会攒起来重放" {
+    // 源码契约。真行为要一个管道夹具才测得到,而这里要锁住的是一个决定
+    // 而不是一段算法:排空的字节必须被 `consume` 掉,并且这个函数体里
+    // 不存在任何把它们送走的路径。
+    //
+    // 扫描范围收敛到函数体 —— 这棵树里"扫描器读到自己的散文"已经发生过
+    // 七次。上面的散文刻意不拼出被检查的标识符。
+    const source = @embedFile("Pump.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn wait" ++ "ForRetry").?;
+    const end = start + std.mem.indexOf(u8, source[start..], "\n}\n").?;
+    const body = source[start..end];
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "queue.con" ++ "sume") != null);
+    // 没有任何一条写往远端的路径:那正是"此刻没有通道"的意思。
+    try std.testing.expect(std.mem.indexOf(u8, body, "pty.") == null);
+    try std.testing.expect(body.len < 1400);
 }

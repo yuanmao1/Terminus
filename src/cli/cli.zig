@@ -1452,6 +1452,15 @@ pub const OnConnectFailure = enum {
     /// The connection was worth trying but is not required: say why on stderr,
     /// return null, and let the caller carry on with what it already knows.
     report_and_continue,
+    /// `report_and_continue` without the sentence, for a caller that owns the
+    /// screen: return null and say nothing.
+    ///
+    /// This exists for reconnect. A failed attempt during an outage is the
+    /// expected case — it may happen twenty times — and each one would be
+    /// scribbled across the banner being drawn under it, in raw mode, where
+    /// `std.debug.print`'s newlines do not return the carriage. The caller
+    /// reports the outage once, itself, and reports it where it can be read.
+    silent,
 };
 
 /// `fail` or `failReportingClaim`, according to what the caller was holding.
@@ -1694,6 +1703,15 @@ pub fn sshConnect(server: Store.servers.Server, auth: Ssh.Auth) Ssh {
     return sshOpen(server, auth, .fatal).?;
 }
 
+/// One reconnect attempt: null means "not this time", with nothing printed.
+///
+/// Deliberately not `sshConnect` with a caught error — `sshConnect` exits the
+/// process, and an outage is not a reason to exit. See `OnConnectFailure.silent`
+/// for why it also must not print.
+pub fn sshReconnect(server: Store.servers.Server, auth: Ssh.Auth) ?Ssh {
+    return sshOpen(server, auth, .silent);
+}
+
 fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFailure) ?Ssh {
     const reporting_claim = on_failure == .fatal_reporting_claim;
     var lookup = pinLookup(server);
@@ -1707,9 +1725,11 @@ fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFa
                 std.debug.print("terminus: {s}\n", .{sentence});
                 return null;
             },
+            .silent => return null,
             .fatal, .fatal_reporting_claim => connectFatal(reporting_claim, "{s}", .{sentence}),
         };
         switch (on_failure) {
+            .silent => return null,
             // Reported rather than swallowed, and reported as its own kind of
             // failure: "we never reached the host" and "the host turned us away"
             // send the caller to different places, and an optional probe that
@@ -1726,6 +1746,10 @@ fn sshOpen(server: Store.servers.Server, auth: Ssh.Auth, on_failure: OnConnectFa
         }
     };
     client.authenticate(server.username, auth) catch |err| {
+        if (on_failure == .silent) {
+            client.deinit();
+            return null;
+        }
         if (on_failure == .report_and_continue) {
             // Worth saying loudly even though this call was optional: the
             // credentials for this server are broken, and every later command

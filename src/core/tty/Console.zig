@@ -140,6 +140,30 @@ pub fn enter() Error!void {
     }
 }
 
+/// 备用屏。
+///
+/// 重连横幅(M4)和转义命令层的菜单(M5)都画在这里,所以它们在物理上
+/// 不可能污染远端全屏程序的画面,也不需要保存/恢复光标:退出备用屏时
+/// 终端自己把主屏原样还回来。
+pub const alt_screen_enter = "\x1b[?1049h";
+pub const alt_screen_leave = "\x1b[?1049l";
+/// 清屏并把光标打回左上角。备用屏是复用的,不清会看到上一次的残留。
+pub const clear = "\x1b[H\x1b[2J";
+
+/// 直接写到 stdout,绕开 `Cli.Ctx.out`。
+///
+/// **在 raw 模式下不能用 `ctx.out`。** 那条路径按行缓冲、会自己补换行,而
+/// 此刻 `DISABLE_NEWLINE_AUTO_RETURN` 是开着的 —— 它画出来的东西会呈阶梯状
+/// 往右下角爬。`cmd_attach_test.zig` 有一条门禁盯着这件事。
+///
+/// 写失败就算了:这是画给人看的东西,为它中断一次重连是本末倒置。
+pub fn writeDirect(io: std.Io, bytes: []const u8) void {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
+    w.interface.writeAll(bytes) catch return;
+    w.interface.flush() catch return;
+}
+
 /// 当前窗口的字符尺寸,不可读时返回 null。
 ///
 /// 取的是 `srWindow`(可见窗口)而不是 `dwSize`(缓冲区):远端 PTY 要的是
