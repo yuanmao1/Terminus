@@ -25,10 +25,11 @@ test "the console is restored on the way out" {
 }
 
 test "attach matches the tmux session exactly" {
-    // `-t <name>` 是前缀匹配,`web` 会接上 `web-old`;`-t =<name>` 才是
-    // 精确匹配。丢掉那个等号的后果是接错会话,而且看起来完全正常。
+    // 两层都要:`=` 是 tmux 的精确匹配(没有它 `web` 会接上 `web-old`),
+    // 引号是给 zsh 的(它默认把词首的 `=word` 展开成命令路径,于是
+    // `-t =t-x` 变成 "t-x not found")。丢掉任何一层都会在真机上炸。
     const source = @embedFile("cmd_attach.zig");
-    try std.testing.expect(std.mem.indexOf(u8, source, "tmux attach -t =") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "tmux attach -t " ++ "'={s}'") != null);
 }
 
 test "nothing is drawn to the terminal after it enters raw mode and before it leaves" {

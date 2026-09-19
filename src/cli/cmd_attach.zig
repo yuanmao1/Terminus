@@ -139,23 +139,6 @@ fn chooseSession(
     fatal("该服务器上有 {d} 个会话,指明要接哪个:\n{s}", .{ sessions.len, listing.items });
 }
 
-/// 上一次交互会话的操作行还未结清,而它的进程已经不在了 —— 把它结清。
-///
-/// **为什么需要这个,以及为什么它不是猜。** 交互会话最常见的离开方式是关掉
-/// 终端窗口,而 ConPTY 下 `CTRL_CLOSE_EVENT` 根本送不到进程(实测三次),
-/// 所以没有任何一条本地路径能保证收据写得进去。留下的那条 `submitted` 行
-/// 以整台服务器为范围一直挡着,下一次 attach 只能靠人工 reconcile。
-///
-/// 证据是**租约失效**,不是超时也不是猜测。`control.zig` 自己写着:"A claim
-/// that outlives its holder is released by lapsing, which is the only thing a
-/// dead process can do."活着的会话每 30s 续租一次;查不到它的活租约,它的
-/// 持有者就是死的。
-///
-/// 只对 `attach` 这一种 kind 成立,而且理由是这种工作**活不过自己的进程**:
-/// 它是一条绑在本进程连接上的字节流,连接没了,那头的 shell 就收到 EOF。
-/// 一条未结的 `exec` 完全不同 —— 那个命令可能还在远端跑着,所以它的屏障
-/// 必须留着。
-///
 pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
     const usage = switch (mode) {
         .shell => shell_usage,
@@ -196,11 +179,19 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             const chosen = chooseSession(ctx, executor, target.session);
             session_name = chosen;
             const tname = try Core.Tmux.targetName(ctx.arena, chosen);
-            // `-t =<name>` 是精确匹配;不加 `=` 时 tmux 做前缀匹配,
-            // `web` 会接上 `web-old`。
+            // `-t '=<name>'` —— 两层意思,少一层都错。
+            //
+            // `=` 是 tmux 的精确匹配;不加它 tmux 做前缀匹配,`web` 会接上
+            // `web-old`。
+            //
+            // **引号是给 zsh 的。** zsh 默认开着 `EQUALS` 选项,词首的
+            // `=word` 会被展开成命令 `word` 的路径,于是 `-t =t-scratch`
+            // 变成 `zsh:1: t-scratch not found`。远端脚本由用户的登录
+            // shell 执行,而这台测试机的登录 shell 就是 zsh —— 这条让
+            // `session new` 在 zsh 主机上完全不可用,实测确认。
             break :blk .{ .command = try std.fmt.allocPrint(
                 ctx.arena,
-                "tmux attach -t ={s}",
+                "tmux attach -t '={s}'",
                 .{tname},
             ) };
         },

@@ -83,6 +83,23 @@ fn logPath(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
     return std.fmt.allocPrint(arena, "{s}/{s}.log", .{ log_dir, name });
 }
 
+// Every `-t` target below is written `-t '=<name>'`, and **both halves are
+// load-bearing**.
+//
+// `=` is tmux's exact match. Without it tmux prefix-matches, so `web` attaches
+// to `web-old`.
+//
+// The quotes are for zsh. zsh has the `EQUALS` option on by default: a word
+// starting with `=` expands to the path of the command named after it, so a
+// bare `-t =t-build` becomes `zsh:1: t-build not found` and the script exits 1.
+// These scripts are run by the *user's login shell* over ssh exec, so on any
+// host whose shell is zsh this made `session new`, `session rm`, `write`, and
+// every job verb fail with an error that named no cause — the caller only saw
+// `RemoteFailed`. Found by running it against a real zsh host.
+//
+// Session names are validated (no spaces, no quotes), so single-quoting them is
+// safe as well as necessary.
+
 /// The real tmux session name for a Terminus session: the `t-` prefixed form.
 ///
 /// tmux session names get the prefix to keep Terminus-managed sessions
@@ -604,7 +621,7 @@ pub fn ensure(executor: Executor, arena: Allocator, name: []const u8) Error!void
     const script = try std.fmt.allocPrint(arena,
         \\command -v tmux >/dev/null || exit 41
         \\mkdir -p {s}
-        \\tmux has-session -t ={s} 2>/dev/null && exit 0
+        \\tmux has-session -t '={s}' 2>/dev/null && exit 0
         \\tmux new-session -d -s {s} ';' pipe-pane -o 'cat >> {s}/{s}.log' || exit 42
     , .{ log_dir, tname, tname, log_dir, name });
     const result = try run(executor, arena, script);
@@ -671,8 +688,8 @@ pub fn killSession(executor: Executor, arena: Allocator, name: []const u8) Error
     const tname = try targetName(arena, name);
     const script = try std.fmt.allocPrint(arena,
         \\command -v tmux >/dev/null || exit 41
-        \\tmux kill-session -t ={s} 2>/dev/null
-        \\tmux has-session -t ={s} 2>/dev/null && exit 1
+        \\tmux kill-session -t '={s}' 2>/dev/null
+        \\tmux has-session -t '={s}' 2>/dev/null && exit 1
         \\exit 0
     , .{ tname, tname });
     const result = try run(executor, arena, script);
@@ -748,10 +765,10 @@ pub fn sendKeys(executor: Executor, arena: Allocator, name: []const u8, input: [
     // Pane targets need the trailing ':' (exact session, default window):
     // a bare '=name' is rejected as a pane target by some tmux versions.
     const script = try std.fmt.allocPrint(arena,
-        \\tmux has-session -t ={s} 2>/dev/null || exit 43
-        \\tmux send-keys -t ={s}: -l -- {s} || exit 42
+        \\tmux has-session -t '={s}' 2>/dev/null || exit 43
+        \\tmux send-keys -t '={s}:' -l -- {s} || exit 42
         \\{s}
-    , .{ tname, tname, quoted, if (no_enter) "" else try std.fmt.allocPrint(arena, "tmux send-keys -t ={s}: Enter", .{tname}) });
+    , .{ tname, tname, quoted, if (no_enter) "" else try std.fmt.allocPrint(arena, "tmux send-keys -t '={s}:' Enter", .{tname}) });
     const result = try run(executor, arena, script);
     switch (result.exit_code) {
         0 => {},
@@ -771,8 +788,8 @@ pub fn sendKeys(executor: Executor, arena: Allocator, name: []const u8, input: [
 pub fn pauseLog(executor: Executor, arena: Allocator, name: []const u8) Error!void {
     const tname = try targetName(arena, name);
     const script = try std.fmt.allocPrint(arena,
-        \\tmux has-session -t ={s} 2>/dev/null || exit 43
-        \\tmux pipe-pane -t ={s}: || exit 42
+        \\tmux has-session -t '={s}' 2>/dev/null || exit 43
+        \\tmux pipe-pane -t '={s}:' || exit 42
     , .{ tname, tname });
     const result = try run(executor, arena, script);
     switch (result.exit_code) {
@@ -788,9 +805,9 @@ pub fn pauseLog(executor: Executor, arena: Allocator, name: []const u8) Error!vo
 pub fn resumeLog(executor: Executor, arena: Allocator, name: []const u8) Error!void {
     const tname = try targetName(arena, name);
     const script = try std.fmt.allocPrint(arena,
-        \\tmux has-session -t ={s} 2>/dev/null || exit 43
+        \\tmux has-session -t '={s}' 2>/dev/null || exit 43
         \\mkdir -p {s}
-        \\tmux pipe-pane -o -t ={s}: 'cat >> {s}/{s}.log' || exit 42
+        \\tmux pipe-pane -o -t '={s}:' 'cat >> {s}/{s}.log' || exit 42
     , .{ tname, log_dir, tname, log_dir, name });
     const result = try run(executor, arena, script);
     switch (result.exit_code) {
@@ -815,9 +832,9 @@ test "secret gate: pane logging can be paused and only resumed prospectively" {
     try resumeLog(scripted.executor(), arena, "shell");
 
     try t.expectEqual(@as(usize, 2), scripted.seen.items.len);
-    try t.expect(std.mem.indexOf(u8, scripted.seen.items[0], "pipe-pane -t =t-shell:") != null);
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[0], "pipe-pane -t '=t-shell:'") != null);
     try t.expect(std.mem.indexOf(u8, scripted.seen.items[0], "cat >>") == null);
-    try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "pipe-pane -o -t =t-shell:") != null);
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "pipe-pane -o -t '=t-shell:'") != null);
     try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "cat >> $HOME/.terminus/logs/shell.log") != null);
 }
 
@@ -1570,7 +1587,7 @@ pub fn panePid(executor: Executor, arena: Allocator, name: []const u8) Error!?i6
     const tname = try targetName(arena, name);
     const script = try std.fmt.allocPrint(
         arena,
-        "tmux list-panes -t ={s} -F '#{{pane_pid}}' 2>/dev/null | head -1",
+        "tmux list-panes -t '={s}' -F '#{{pane_pid}}' 2>/dev/null | head -1",
         .{tname},
     );
     const result = try run(executor, arena, script);
@@ -1589,7 +1606,7 @@ pub fn isAlive(executor: Executor, arena: Allocator, name: []const u8) Error!boo
     const tname = try targetName(arena, name);
     const script = try std.fmt.allocPrint(arena,
         \\command -v tmux >/dev/null || exit 41
-        \\tmux has-session -t ={s} 2>/dev/null
+        \\tmux has-session -t '={s}' 2>/dev/null
     , .{tname});
     const result = try run(executor, arena, script);
     if (result.exit_code == 41) return error.TmuxMissing;

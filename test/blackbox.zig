@@ -3032,9 +3032,9 @@ fn probeFailureAfterTheKill(
         // the command starts is the pre-kill probe's business, and it ends at
         // `fatalTmux` without stopping anything. This gate is about the window
         // *after* the kill.
-        .{ .needle = "has-session -t =t-job-deploy", .exit_code = 0, .uses = 1 },
+        .{ .needle = "has-session -t '=t-job-deploy'", .exit_code = 0, .uses = 1 },
         // 41 is `isAlive`'s own `command -v tmux` exit.
-        .{ .needle = "has-session -t =t-job-deploy", .exit_code = 41 },
+        .{ .needle = "has-session -t '=t-job-deploy'", .exit_code = 41 },
         .{ .needle = "job-salvage.log", .stdout = running, .uses = 1 },
         .{ .needle = "job-salvage.log", .exit_code = 44 },
         .{ .needle = "job-verify.log", .stdout = running },
@@ -5452,8 +5452,8 @@ test "blackbox: `session rm` reports 75 and the full document when the kill gets
     var rules = [_]FakeHost.Rule{
         // Keyed on the target, because both legs' kill scripts carry
         // `kill-session` and this gate needs them answered differently.
-        .{ .needle = "kill-session -t =t-shell", .refuse = true },
-        .{ .needle = "kill-session -t =t-other", .exit_code = 0 },
+        .{ .needle = "kill-session -t '=t-shell'", .refuse = true },
+        .{ .needle = "kill-session -t '=t-other'", .exit_code = 0 },
         .{ .needle = "rm -f", .exit_code = 0 },
     };
     var host = try FakeHost.start(&f, &rules);
@@ -5469,7 +5469,7 @@ test "blackbox: `session rm` reports 75 and the full document when the kill gets
     // The kill really was sent — this is not a withheld one — and nothing after it
     // was. Named before the exit code, because the regression that matters is "it
     // deleted the log anyway", not "the number was wrong".
-    try host.expectSent("kill-session -t =t-shell");
+    try host.expectSent("kill-session -t '=t-shell'");
     try host.expectNeverSent("rm -f");
     // 75, not 1: the ledger holds `indeterminate` and that bars this session's
     // scope, so "plain failure, retry" would walk a caller into a refusal.
@@ -5534,7 +5534,7 @@ test "blackbox: `session rm` reports 75 and the full document when the kill gets
     }, &environ);
     defer fine.deinit(f.allocator);
 
-    try host.expectSent("kill-session -t =t-other");
+    try host.expectSent("kill-session -t '=t-other'");
     try host.expectSent("rm -f");
     try host.expectFullyScripted();
     try fine.expectCode(0);
@@ -5570,8 +5570,8 @@ test "blackbox: `session rm` proves the kill never ran when the host has no tmux
     var rules = [_]FakeHost.Rule{
         // 41 is `command -v tmux` failing. Keyed on the target for the reason the
         // unanswered gate keys on it: both legs' scripts carry `kill-session`.
-        .{ .needle = "kill-session -t =t-shell", .exit_code = 41 },
-        .{ .needle = "kill-session -t =t-other", .exit_code = 0 },
+        .{ .needle = "kill-session -t '=t-shell'", .exit_code = 41 },
+        .{ .needle = "kill-session -t '=t-other'", .exit_code = 0 },
         .{ .needle = "rm -f", .exit_code = 0 },
     };
     var host = try FakeHost.start(&f, &rules);
@@ -5586,7 +5586,7 @@ test "blackbox: `session rm` proves the kill never ran when the host has no tmux
 
     // The script was delivered and nothing after it was. Named before the exit
     // code, because the regression that matters is "it deleted the log anyway".
-    try host.expectSent("kill-session -t =t-shell");
+    try host.expectSent("kill-session -t '=t-shell'");
     try host.expectNeverSent("rm -f");
     // 1, not 75. The host answered, so there is nothing to reconcile, and nothing
     // was touched, so a retry is safe — it will fail the same way until tmux is
@@ -5652,7 +5652,7 @@ test "blackbox: `session rm` proves the kill never ran when the host has no tmux
     }, &environ);
     defer fine.deinit(f.allocator);
 
-    try host.expectSent("kill-session -t =t-other");
+    try host.expectSent("kill-session -t '=t-other'");
     try host.expectSent("rm -f");
     try host.expectFullyScripted();
     try fine.expectCode(0);
