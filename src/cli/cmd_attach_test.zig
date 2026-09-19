@@ -128,15 +128,27 @@ test "the bare login shell does not reconnect" {
 }
 
 test "the escape layer's local actions never leak to the remote" {
-    // `Ctrl-]` 后面那个键是**本地**命令。三条性质一起才成立:
-    //
-    //  * 命令层的每一次绘制都走直写,不走 `ctx.out`(raw 模式下不换行);
-    //  * 传输走子进程,不走进程内调用(`active_execution` 是单槽的);
-    //  * 帮助屏和提示行都画在备用屏上,退出时终端自己还主屏。
+    // `Ctrl-]` 后面那个键是**本地**命令,而传输必须是子进程:进程内调那个
+    // 命令会覆盖 attach 自己的账本登记(`registerExecution` 是单槽的),于是
+    // 此后任何 fatal 都不会结清 attach 那条操作行。
     const source = @embedFile("cmd_attach.zig");
-    // 传输必须是子进程。进程内调那个命令会覆盖 attach 自己的账本登记。
     try std.testing.expect(std.mem.indexOf(u8, source, "cmd_trans" ++ "fer") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "process." ++ "spawn(") != null);
-    // 菜单画在备用屏。
-    try std.testing.expect(std.mem.count(u8, source, "alt_screen_" ++ "enter") >= 2);
+}
+
+test "returning from the command layer asks the far end to repaint" {
+    // **被真机打回来的一条。** 命令层在屏幕上打了几行字,而那几行可能正落在
+    // 远端 `vim` 画的东西上。本地没有办法把它找回来 —— 只有画它的那一头能,
+    // 而唯一通用的触发器是改一下 PTY 尺寸再改回去。
+    //
+    // 一度用的是"切到备用屏、画、再切回来"。那是错的,而且错得很安静:
+    // 终端只有**一块**备用缓冲区,远端的 vim 早就自己切进去了;我们的进入
+    // 是空操作,我们的退出把终端退回**主屏**。屏幕上于是出现登录时的 MOTD,
+    // 而 vim 还在远端好好跑着。所以这个文件里不许再出现那个模式号。
+    const source = @embedFile("cmd_attach.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "10" ++ "49") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "force" ++ "Redraw") != null);
+    // 排空也一起钉住:"按任意键"只取一个字节,而 Alt-A、方向键是两三个
+    // 字节的序列,剩下的会漏进会话。
+    try std.testing.expect(std.mem.indexOf(u8, source, "drain" ++ "Input") != null);
 }

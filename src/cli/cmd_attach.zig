@@ -192,10 +192,18 @@ const Reconnected = union(enum) {
 
 // --- `Ctrl-]` 命令层 ----------------------------------------------------------
 //
-// **菜单期间不读远端,而且不需要缓冲。** 设计第 6 节写了一个 1 MiB 环形区
-// 加一句"菜单期间丢弃了 N 字节" —— 那是在解决一个不存在的问题。SSH 通道
-// 自带窗口流控:我们不读,窗口耗尽,远端就阻塞在写上。**一个字节都不会
-// 丢**,这比丢弃最旧的那段好,而且少一个缓冲区和一条提示。
+// **就地打印,不抢屏,像 `ssh` 的 `~?`。** 设计第 6 节要求画在备用屏上,
+// 理由是"这样在物理上不可能污染远端全屏程序的画面" —— 那句话是错的,而且
+// 是被真机打回来的:终端只有一块备用缓冲区,远端的 `vim` 早就自己切进去
+// 了,我们的退出把终端退回主屏,于是 vim 还在跑、画面却没了。
+//
+// 就地打印的代价是会盖住几行远端画面,而那个代价由 `Pump.forceRedraw`
+// 付掉:返回会话时让远端重画整屏。顺带还有个好处 —— 在普通 shell 里
+// (没人拥有屏幕)这些字就是正常滚上去的输出,你的历史一行都不丢。
+//
+// **菜单期间不读远端,也不需要缓冲。** 设计里那个 1 MiB 环形区加"丢弃了
+// N 字节"的提示是在解决一个不存在的问题:SSH 通道自带窗口流控,我们不读,
+// 窗口耗尽,远端就阻塞在写上,一个字节都不会丢。
 
 /// 菜单做完之后,会话该怎么办。
 const MenuEnd = enum {
@@ -219,26 +227,23 @@ fn menuEndFor(key: Pump.Key) ?MenuEnd {
     };
 }
 
+/// `\r\n` 而不是 `\n`:raw 模式下 `DISABLE_NEWLINE_AUTO_RETURN` 开着,光标
+/// 不会自己回到行首,只用 `\n` 画出来的东西会往右下角爬。
 const help_screen =
-    "Terminus 会话命令\r\n" ++
     "\r\n" ++
+    "── Terminus 会话命令 ─────────────────\r\n" ++
     "  Ctrl-] 之后按:\r\n" ++
-    "\r\n" ++
     "    d        detach —— 断开,会话在远端继续\r\n" ++
     "    .        强制断开 —— 不等远端确认\r\n" ++
     "    p        推一个文件到远端\r\n" ++
     "    g        从远端拉一个文件\r\n" ++
     "    ?        这份键位表\r\n" ++
     "    Ctrl-]   给远端送一个字面的 Ctrl-]\r\n" ++
-    "\r\n" ++
     "  其他键:响铃,而且那两个字节一个都不会送到远端\r\n" ++
-    "\r\n" ++
+    "──────────────────────────────────────\r\n" ++
     "按任意键返回会话\r\n";
 
 fn showHelp(ctx: *Cli.Ctx, local: *Pump.Local, tick: ?Pump.Tick) MenuEnd {
-    Console.writeDirect(ctx.io, Console.alt_screen_enter);
-    defer Console.writeDirect(ctx.io, Console.alt_screen_leave);
-    Console.writeDirect(ctx.io, Console.clear);
     Console.writeDirect(ctx.io, help_screen);
     return menuEndFor(Pump.readKey(ctx.io, local, tick)) orelse .resume_session;
 }
@@ -250,7 +255,7 @@ const Typed = union(enum) {
     ended: MenuEnd,
 };
 
-/// 在备用屏上读一行。回显、退格、Enter 提交、ESC 取消,没别的。
+/// 就地读一行。回显、退格、Enter 提交、ESC 取消,没别的。
 fn promptLine(
     ctx: *Cli.Ctx,
     local: *Pump.Local,
@@ -259,11 +264,11 @@ fn promptLine(
     hint: []const u8,
     editor: *Escape.LineEdit,
 ) Typed {
-    Console.writeDirect(ctx.io, Console.clear);
+    Console.writeDirect(ctx.io, "\r\n── ");
     Console.writeDirect(ctx.io, title);
-    Console.writeDirect(ctx.io, "\r\n\r\n  ");
+    Console.writeDirect(ctx.io, " ──\r\n  ");
     Console.writeDirect(ctx.io, hint);
-    Console.writeDirect(ctx.io, "\r\n  ESC 取消\r\n\r\n> ");
+    Console.writeDirect(ctx.io, "    (ESC 取消)\r\n> ");
     while (true) {
         const key = Pump.readKey(ctx.io, local, tick);
         if (menuEndFor(key)) |end| return .{ .ended = end };
@@ -279,7 +284,21 @@ fn promptLine(
     }
 }
 
-/// 等一个按键,给那些"看完再走"的屏用。
+/// 从命令层回到会话:把远端的画面要回来,并丢掉命令层吃剩的字节。
+///
+/// 两件事都是被真机打回来的。
+///
+/// **重画**:命令层在屏幕上打了几行字,而那几行可能正落在远端 `vim` 画的
+/// 东西上。本地没有办法把它找回来 —— 只有画它的那一头能。
+///
+/// **排空**:"按任意键"只取走一个字节,而 Alt-A、方向键这些是两三个字节
+/// 的序列。剩下的会漏进会话,在远端变成一次莫名其妙的按键。
+fn resumeSession(local: *Pump.Local, pty: *Core.Ssh.Pty) void {
+    Pump.drainInput(local);
+    Pump.forceRedraw(pty);
+}
+
+/// 等一个按键,给那些"看完再走"的提示用。
 fn pause(ctx: *Cli.Ctx, local: *Pump.Local, tick: ?Pump.Tick) MenuEnd {
     Console.writeDirect(ctx.io, "\r\n按任意键继续\r\n");
     return menuEndFor(Pump.readKey(ctx.io, local, tick)) orelse .resume_session;
@@ -359,7 +378,6 @@ fn runTransfer(
 
     // **把终端整个还给子进程。** 它是个普通命令,按行输出;在 raw 模式下
     // (`DISABLE_NEWLINE_AUTO_RETURN` 开着)它画出来的东西会往右下角爬。
-    Console.writeDirect(ctx.io, Console.alt_screen_leave);
     Console.restoreActive();
 
     var child = std.process.spawn(ctx.io, .{ .argv = &argv }) catch |err| {
@@ -411,8 +429,10 @@ fn reenterOrDie(ctx: *Cli.Ctx) void {
 
 /// 断线之后一直试到连回去、或者放弃为止。
 ///
-/// 横幅画在备用屏上,所以恢复之后 tmux 重绘的整屏不会叠在它上面 ——
-/// 退出备用屏时终端自己把主屏还回来。
+/// 横幅就地打印,每次尝试一行 —— 于是它顺带成了一份可以往回翻的记录。
+/// **不用备用屏**,理由和命令层完全相同(见那一段):远端的全屏程序可能
+/// 已经占着那块缓冲区,我们退出时会把终端退回主屏。连回去之后
+/// `tmux attach` 本来就会重画整屏,所以这里不需要 `forceRedraw`。
 ///
 /// 进来时 `client` 里的那个连接已经被调用方 deinit 掉了(`client_live` 为
 /// false);连回去时这里把新的写进去并置回 true。
@@ -427,9 +447,7 @@ fn reconnect(
     client: *Core.Ssh,
     client_live: *bool,
 ) Reconnected {
-    Console.writeDirect(ctx.io, Console.alt_screen_enter);
-    defer Console.writeDirect(ctx.io, Console.alt_screen_leave);
-
+    var announced = false;
     const started = Pump.nowMs(ctx.io);
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
@@ -438,16 +456,21 @@ fn reconnect(
             .retry => |ms| ms,
         };
 
-        // `\r\n` 而不是 `\n`:raw 模式下 `DISABLE_NEWLINE_AUTO_RETURN` 开着,
-        // 光标不会自己回到行首,只用 `\n` 画出来的东西会往右下角爬。
-        var line: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(
+        if (!announced) {
+            announced = true;
+            var head: [192]u8 = undefined;
+            Console.writeDirect(ctx.io, std.fmt.bufPrint(
+                &head,
+                "\r\n\r\n── 连接中断,正在重连 '{s}'(Ctrl-C 放弃)──\r\n",
+                .{session},
+            ) catch "\r\n\r\n── 连接中断,正在重连(Ctrl-C 放弃)──\r\n");
+        }
+        var line: [128]u8 = undefined;
+        Console.writeDirect(ctx.io, std.fmt.bufPrint(
             &line,
-            Console.clear ++ "连接中断,正在重连 '{s}'…\r\n\r\n" ++
-                "  第 {d} 次尝试,下次 {d}s 后\r\n  Ctrl-C 放弃\r\n",
-            .{ session, attempt, @divTrunc(delay_ms, std.time.ms_per_s) },
-        ) catch Console.clear ++ "连接中断,正在重连…\r\n";
-        Console.writeDirect(ctx.io, text);
+            "  第 {d} 次尝试,{d}s 后\r\n",
+            .{ attempt, @divTrunc(delay_ms, std.time.ms_per_s) },
+        ) catch "  重试中\r\n");
 
         switch (Pump.waitForRetry(ctx.io, local, delay_ms, tick)) {
             .elapsed => {},
@@ -699,7 +722,10 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
                 .detach => break :session .{ .local = .detached },
                 .force_disconnect => break :session .{ .local = .force_disconnected },
                 .help => switch (showHelp(ctx, &local, tick)) {
-                    .resume_session => continue :session,
+                    .resume_session => {
+                        resumeSession(&local, &pty);
+                        continue :session;
+                    },
                     .aborted => break :session .{ .pump = .aborted },
                     .local_eof => break :session .{ .pump = .local_eof },
                     .lost => break :session .{ .pump = .lost },
@@ -711,7 +737,10 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
                     resolved.server.name,
                     action,
                 )) {
-                    .resume_session => continue :session,
+                    .resume_session => {
+                        resumeSession(&local, &pty);
+                        continue :session;
+                    },
                     .aborted => break :session .{ .pump = .aborted },
                     .local_eof => break :session .{ .pump = .local_eof },
                     .lost => break :session .{ .pump = .lost },

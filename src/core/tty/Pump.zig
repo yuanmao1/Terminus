@@ -358,6 +358,41 @@ pub fn readKey(io: std.Io, local: *Local, tick: ?Tick) Key {
     }
 }
 
+/// 让远端把整屏重画一遍。
+///
+/// **本地没有办法把被覆盖的画面找回来。** 命令层在屏幕上打了几行字,而那
+/// 几行可能正落在远端 `vim` 画的东西上;能修复它的只有 vim 自己。
+///
+/// 通用的触发器只有一个:改一下 PTY 尺寸再改回去。远端的前台进程组会收到
+/// SIGWINCH,而 `vim`、`htop`、`less`、`tmux` 全都在那上面重画整屏。这不是
+/// 取巧,这正是终端复用器自己用的办法。
+///
+/// **不用备用屏,而这是被真机打回来的。** 那个方案的假设是"进去再出来,
+/// 终端把原样还回来" —— 但终端只有一块备用缓冲区,远端的 vim 早就在里面
+/// 了。我们的进入是空操作,我们的退出把终端退回了主屏。
+pub fn forceRedraw(pty: *Ssh.Pty) void {
+    const size = Console.size() orelse return;
+    // 尺寸必须真的变一下,否则有些程序会认出"没变"然后什么都不做。
+    if (size.cols < 2) return;
+    pty.resize(size.cols - 1, size.rows);
+    pty.resize(size.cols, size.rows);
+}
+
+/// 丢掉此刻排在队列里的本地输入。
+///
+/// 给"按任意键返回"用的:一个 Alt-A 或者方向键是**两三个字节**,而那里
+/// 只取走一个。剩下的会漏进会话,在远端变成一次莫名其妙的按键 —— 真机上
+/// 的样子是 vim 忽然进了插入模式。
+pub fn drainInput(local: *Local) void {
+    const queue = local.queue;
+    var scratch: [Queue.tunnel_buffer_bytes]u8 = undefined;
+    while (true) {
+        const n = queue.peek(&scratch);
+        if (n == 0) return;
+        queue.consume(n);
+    }
+}
+
 test "the pump's body is analysed even before a caller exists" {
     // Zig analyses function bodies lazily, and `refAllDecls` is not recursive —
     // so without taking this address, `run` type checks for the first time
