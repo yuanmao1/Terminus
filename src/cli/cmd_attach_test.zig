@@ -185,3 +185,20 @@ test "a named session is checked for existence before anything else happens" {
     try std.testing.expect(std.mem.indexOf(u8, body, "Tmux.is" ++ "Alive(") != null);
     try std.testing.expect(body.len < 2400);
 }
+
+test "the session lease is handed back when the session ends, not left to its TTL" {
+    // 验收实测:detach 之后马上再 attach,被自己上一次留下的租约挡了两分钟。
+    // 登记进 registerClaim,fatal 路径由 refusalCleanup 还;正常返回由 defer 还。
+    const body = fnBody("pub fn " ++ "run(ctx");
+    try std.testing.expect(std.mem.indexOf(u8, body, "Cli.register" ++ "Claim(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "defer _ = Cli.releaseClaim" ++ "Reporting()") != null);
+}
+
+test "attach reconnects the pane log before a human types into the session" {
+    // `write` 停掉的日志只等下一次 `read` 接回;不在这里接,人在 attach 里
+    // 敲的一切都不进日志,而进入时那句"会写入远端 pane 日志"是假话。
+    const body = fnBody("pub fn " ++ "run(ctx");
+    const resume_at = std.mem.indexOf(u8, body, "Tmux.resume" ++ "Log(").?;
+    const pty_at = std.mem.indexOf(u8, body, "client.open" ++ "Pty(").?;
+    try std.testing.expect(resume_at < pty_at);
+}

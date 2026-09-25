@@ -626,6 +626,12 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
                 try installTmuxIfMissing(ctx, &store, &parsed, executor, resolved.server.name);
             const chosen = chooseSession(ctx, executor, resolved.server.name, target.session);
             session_name = chosen;
+            // 把 pane 日志接回来,理由和 `read` 那边完全相同。`write` 为了不让
+            // 输入的回显进日志,会把它停掉,并且只等下一次 `read` 接回;人在
+            // 那之前 attach 进来,他敲的一切就都不在日志里 —— 而下面那句
+            // "本会话输出会写入远端 pane 日志"成了假话。验收实测。
+            Core.Tmux.resumeLog(executor, ctx.arena, chosen) catch |err|
+                fatal("无法恢复会话 '{s}' 的 pane 日志: {s}", .{ chosen, @errorName(err) });
             const tname = try Core.Tmux.targetName(ctx.arena, chosen);
             // `-t '=<name>'` —— 两层意思,少一层都错。
             //
@@ -758,7 +764,17 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             .io = ctx.io,
             .last_renewed_ms = nowMs(ctx.io),
         };
+        // **会话结束就还回去,而这是被验收打回来的。** 原先只靠 TTL 过期:
+        // 人 detach 之后马上再 attach,会被自己上一次留下的租约挡两分钟,
+        // 那两分钟里 `session rm` 和 `job kill` 也被挡着 —— 可人已经不在
+        // 里面了,这层屏障此刻挡的是空气。
+        //
+        // 登记进 `Cli.registerClaim`,于是 `fatal` 那些路径由 `refusalCleanup`
+        // 还;正常返回的路径由下面这个 defer 还。进程被硬杀时两条都走不到,
+        // 那时才轮到 TTL。
+        Cli.registerClaim(&store, resolved.server.id, claim.scope, execution.id(), label);
     }
+    defer _ = Cli.releaseClaimReporting();
     const tick: ?Pump.Tick = if (lease_tick) |*lt|
         .{ .context = lt, .call = LeaseTick.call }
     else
