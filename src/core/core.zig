@@ -15,6 +15,10 @@ pub const transfer = @import("transfer.zig");
 pub const digest = @import("digest.zig");
 pub const proc = @import("proc.zig");
 pub const supervisor = @import("supervisor.zig");
+/// The static tmux `server tmux` installs.
+pub const tmux_dist = @import("tmux_dist.zig");
+/// The remote install script shared by the helper and tmux.
+pub const embedded_install = @import("embedded_install.zig");
 /// Native Windows process-tree supervisor for local PowerShell execution.
 /// The module is kept separate so POSIX/remote paths cannot accidentally
 /// claim Windows Job Object semantics.

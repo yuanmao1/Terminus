@@ -155,6 +155,15 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("terminus_helper", .{
         .root_source_file = helper.getEmittedBin(),
     });
+    // The tmux `terminus server tmux` installs, embedded the same way and for
+    // the same reason as the helper. How it is built is in its own file.
+    const tmux = @import("vendor/tmux_build.zig").add(b);
+    mod.addAnonymousImport("terminus_tmux", .{
+        .root_source_file = tmux.getEmittedBin(),
+    });
+    // `zig build tmux` puts the Linux binary in zig-out/bin for poking at it
+    // from WSL; nothing else needs it on disk.
+    b.step("tmux", "Build the embedded static Linux tmux").dependOn(&b.addInstallArtifact(tmux, .{}).step);
 
     const exe = b.addExecutable(.{
         .name = "Terminus",
@@ -289,6 +298,7 @@ pub fn build(b: *std.Build) void {
     // build root and defeat the PATH lookup the default relies on.
     blackbox_options.addOption([]const u8, "posix_sh", posix_sh);
     blackbox_options.addOptionPath("helper_exe", helper.getEmittedBin());
+    blackbox_options.addOptionPath("tmux_exe", tmux.getEmittedBin());
     blackbox_options.addOption([]const u8, "linux_runner", linux_runner);
     // The helper gates hand a Linux process a path to a file they just wrote, so
     // that path has to be absolute. Zig 0.16 has no `getCwd`-style call to build

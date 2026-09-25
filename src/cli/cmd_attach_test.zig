@@ -30,6 +30,10 @@ test "attach matches the tmux session exactly" {
     // `-t =t-x` 变成 "t-x not found")。丢掉任何一层都会在真机上炸。
     const source = @embedFile("cmd_attach.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "tmux attach -t " ++ "'={s}'") != null);
+    // 而且和其他会话动词找的是同一个 tmux:`server tmux` 装的那份只在
+    // PATH 前缀之后才找得到。
+    try std.testing.expect(std.mem.indexOf(u8, source, "\"{s}" ++ "tmux attach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "Core.Tmux.path_" ++ "prefix, tname") != null);
 }
 
 test "nothing is drawn to the terminal after it enters raw mode and before it leaves" {

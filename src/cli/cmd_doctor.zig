@@ -31,7 +31,9 @@ const usage =
     \\
 ;
 
-const probe_script =
+// Behind `Tmux.path_prefix`, so a tmux installed by `server tmux` is the one
+// reported — it is the one every session verb will use.
+const probe_script = Core.Tmux.path_prefix ++
     \\echo "shell=$SHELL"
     \\echo "os=$(uname -s 2>/dev/null || echo unknown)"
     \\echo "kernel=$(uname -r 2>/dev/null || echo unknown)"

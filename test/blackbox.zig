@@ -7671,3 +7671,119 @@ test "blackbox: a daemon that will not open a session refuses before an operatio
     // server refuse until somebody reconciles an attempt that never ran.
     if (blocking != 0) return error.RefusedConnectionHeldTheScope;
 }
+
+// --- The embedded tmux ------------------------------------------------------
+//
+// Both gates run on a real Linux kernel through the same runner as the helper
+// gates, and for the same reason they are not skipped when it is missing.
+
+const tmux_exe = build_options.tmux_exe;
+
+/// Run `body` on the Linux side with `$TMUX_BIN` naming the embedded tmux and
+/// `$INSTALL` naming the production install script, in a fresh `$HOME`.
+fn runTmuxProbe(arena: std.mem.Allocator, f: *Fixture, body: []const u8) !std.process.RunResult {
+    const shell = Terminus.Core.shell;
+    const install_name = try std.fmt.allocPrint(arena, "{s}/tmux_install.sh", .{f.dir});
+    try std.Io.Dir.cwd().writeFile(f.io, .{
+        .sub_path = install_name,
+        .data = Terminus.Core.embedded_install.script("tmux"),
+    });
+    const text = try std.fmt.allocPrint(arena,
+        \\TMUX_BIN={f}
+        \\INSTALL={f}
+        \\HOME=$(mktemp -d); export HOME
+        \\{s}
+    , .{
+        shell.word(try linuxPath(arena, tmux_exe)),
+        shell.word(try linuxPath(arena, install_name)),
+        body,
+    });
+    const script_name = try std.fmt.allocPrint(arena, "{s}/tmux_probe.sh", .{f.dir});
+    try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = script_name, .data = text });
+    return std.process.run(arena, f.io, .{
+        .argv = try linuxArgv(arena, f.dir, "tmux_probe.sh"),
+        .stdout_limit = .limited(1 << 16),
+        .stderr_limit = .limited(1 << 16),
+        .timeout = subprocess_bound,
+    });
+}
+
+test "blackbox: the tmux install refuses bytes that are not the ones it was told to expect" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "tmux_install_digest");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A digest of all zeros is one no upload can match. 74 is the contract
+    // `server tmux` reports on, and nothing may be left where a later session
+    // verb would find and run it.
+    const r = try runTmuxProbe(arena, &f,
+        \\TERMINUS_INSTALL_SHA256=0000000000000000000000000000000000000000000000000000000000000000 sh "$INSTALL" < "$TMUX_BIN" >/dev/null 2>&1
+        \\echo "exit=$?"
+        \\ls -A "$HOME/.terminus/bin" | tr '\n' ' '; echo "|"
+    );
+    std.testing.expect(std.mem.indexOf(u8, r.stdout, "exit=74") != null and
+        std.mem.indexOf(u8, r.stdout, "\n|") != null) catch |err| {
+        std.debug.print("install probe said:\n{s}\nstderr:\n{s}\n", .{ r.stdout, r.stderr });
+        return err;
+    };
+}
+
+test "blackbox: the installed tmux starts and draws a session on a host with no terminfo at all" {
+    const t = std.testing;
+    var f = try Fixture.init(t.allocator, "tmux_no_terminfo");
+    defer f.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var digest_buf: [Terminus.Core.digest.hex_len]u8 = undefined;
+    const sha = Terminus.Core.digest.hex(Terminus.Core.tmux_dist.executable, &digest_buf);
+
+    // The embedded bytes are the ones the build produced for this gate.
+    // Asserted, not assumed: the gate installs `tmux_exe`, and what ships is
+    // `executable`.
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(f.io, tmux_exe, arena, .limited(64 << 20));
+    try t.expectEqualSlices(u8, Terminus.Core.tmux_dist.executable, on_disk);
+
+    // Installed by the production script, then run inside a private mount
+    // namespace in which every terminfo directory is an empty tmpfs — the
+    // container without `/usr/share/terminfo` the design names. Attaching is
+    // the step that needs terminfo (a detached server does not), and the
+    // status line is what only a working attach draws. `rxvt-unicode` is the
+    // control: it is not in the compiled-in set, so it must fail, which proves
+    // the tmpfs really hid the system database.
+    const body = try std.fmt.allocPrint(arena,
+        \\TERMINUS_INSTALL_SHA256={s} sh "$INSTALL" < "$TMUX_BIN" >/dev/null || {{ echo "install failed $?"; exit 1; }}
+        \\cat > "$HOME/probe.sh" <<'EOF'
+        \\for d in /usr/share/terminfo /lib/terminfo /etc/terminfo /usr/lib/terminfo; do [ -d $d ] && mount -t tmpfs none $d; done
+        \\echo "terminfo_entries=$(ls -A /usr/share/terminfo 2>/dev/null | wc -l)"
+        \\T="$HOME/.terminus/bin/tmux"
+        \\TERM=xterm-256color "$T" -L gate -f /dev/null new-session -d -s probe "sleep 30"
+        \\for term in xterm-256color rxvt-unicode; do
+        \\  TERM=$term script -qc "timeout 2 $T -L gate attach -t probe" /dev/null > "$HOME/$term.out" 2>&1
+        \\  echo "$term drew=$(grep -c '\[probe\]' "$HOME/$term.out") unsuitable=$(grep -c 'missing or unsuitable' "$HOME/$term.out")"
+        \\done
+        \\"$T" -L gate kill-server
+        \\EOF
+        \\unshare -rm sh "$HOME/probe.sh"
+    , .{sha});
+    const r = try runTmuxProbe(arena, &f, body);
+    const out = r.stdout;
+    // The status line may be drawn more than once in two seconds, so the xterm
+    // line is judged as "drew something, refused nothing".
+    const xterm_ok = if (std.mem.indexOf(u8, out, "xterm-256color drew=")) |at| blk: {
+        const line_end = std.mem.indexOfScalarPos(u8, out, at, '\n') orelse out.len;
+        const line = out[at..line_end];
+        break :blk std.mem.indexOf(u8, line, "drew=0 ") == null and
+            std.mem.endsWith(u8, line, " unsuitable=0");
+    } else false;
+    std.testing.expect(std.mem.indexOf(u8, out, "terminfo_entries=0\n") != null and
+        xterm_ok and
+        std.mem.indexOf(u8, out, "rxvt-unicode drew=0 unsuitable=1") != null) catch |err| {
+        std.debug.print("probe said:\n{s}\nstderr:\n{s}\n", .{ out, r.stderr });
+        return err;
+    };
+}

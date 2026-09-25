@@ -1900,6 +1900,8 @@ fn daemonCannotCarry(parsed: *const Args.Parsed) ?[]const u8 {
         return "the daemon protocol has no channel for --stdin-file input; used direct SSH";
     if (parsed.boolean("allow-helper-install"))
         return "helper installation streams the embedded binary over stdin; used direct SSH";
+    if (parsed.boolean("allow-tmux-install"))
+        return "tmux installation streams the embedded binary over stdin; used direct SSH";
     return null;
 }
 

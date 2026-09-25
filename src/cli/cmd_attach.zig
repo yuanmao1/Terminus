@@ -14,6 +14,7 @@ const Store = Core.Store;
 const Console = Core.tty.Console;
 const Pump = Core.tty.Pump;
 const Escape = Core.tty.escape;
+const cmd_server = @import("cmd_server.zig");
 
 const Control = @import("../core/control.zig");
 const Claim = Control.Claim;
@@ -54,12 +55,13 @@ pub const shell_usage = "usage: terminus shell <server>\n" ++
     "裸登录 shell 不持久:连接断开时远端进程随之结束。\n" ++
     "\n会话中按 Ctrl-] 再按 ? 看本地命令(detach / 传文件 / 强制断开)。\n";
 
-pub const attach_usage = "usage: terminus attach <server>[:<session>]\n" ++
+pub const attach_usage = "usage: terminus attach <server>[:<session>] [--allow-tmux-install]\n" ++
     "\n接入远端 tmux 会话。detach 后会话在远端继续存活,agent 可用\n" ++
     "'terminus read' 读到这期间的输出。不给会话名时列出现有会话。\n" ++
     "\n断线会自动重连(退避至多五分钟);会话在断线期间消失时不会替你新建。\n" ++
     "会话中按 Ctrl-] 再按 ? 看本地命令(detach / 传文件 / 强制断开)。\n" ++
-    "\n需要远端已安装 tmux;用 'terminus doctor <server>' 确认。\n";
+    "\n需要远端有 tmux。没有的话,--allow-tmux-install 会先装上 Terminus 自带的\n" ++
+    "那份(静态编译,装进 $HOME/.terminus/bin,不需要 root 也不需要远端联网)。\n";
 
 /// 续租的节拍器。
 ///
@@ -112,9 +114,35 @@ fn contentionScope(name: []const u8) Core.execution.Scope {
 
 fn refuseNoTmux(server_name: []const u8) noreturn {
     fatal(
-        "远端没有 tmux;交互会话需要它。用 'terminus doctor {s}' 确认",
+        "远端没有 tmux;交互会话需要它。Terminus 自带一份,不需要 root 也不需要远端联网:\n" ++
+            "  terminus server tmux {s} --allow-tmux-install\n" ++
+            "或者给 attach 加上 --allow-tmux-install",
         .{server_name},
     );
+}
+
+/// `attach --allow-tmux-install`:远端没有 tmux 就先装上自带的那份。
+///
+/// 只在"确实没有"时装 —— 有 tmux 的主机(不管是谁装的)不动。装的过程有
+/// 它自己的操作行和收据,并且在 attach 开自己那条之前就结清了。
+fn installTmuxIfMissing(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    parsed: *const Cli.Args.Parsed,
+    executor: Core.Executor,
+    server_name: []const u8,
+) !void {
+    _ = Core.Tmux.list(executor, ctx.arena) catch |err| switch (err) {
+        error.TmuxMissing => {
+            try ctx.out.print("'{s}' 上没有 tmux,先安装 Terminus 自带的那份\n", .{server_name});
+            try ctx.out.flush();
+            try cmd_server.installEmbedded(ctx, store, parsed, server_name, cmd_server.tmux_install);
+            try ctx.out.flush();
+            return;
+        },
+        // 别的错误留给会话选择去报,那里有完整的句子。
+        else => return,
+    };
 }
 
 /// 选出要接入的会话名(Terminus 名,不带 `t-` 前缀)。
@@ -594,6 +622,8 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             // `Executor` 是个 union,直连客户端就是 `.direct` 那一支。这里
             // 没有 connection 包装可以问 `.executor()`。
             const executor: Core.Executor = .{ .direct = &client };
+            if (parsed.boolean("allow-tmux-install"))
+                try installTmuxIfMissing(ctx, &store, &parsed, executor, resolved.server.name);
             const chosen = chooseSession(ctx, executor, resolved.server.name, target.session);
             session_name = chosen;
             const tname = try Core.Tmux.targetName(ctx.arena, chosen);
@@ -607,10 +637,13 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             // 变成 `zsh:1: t-scratch not found`。远端脚本由用户的登录
             // shell 执行,而这台测试机的登录 shell 就是 zsh —— 这条让
             // `session new` 在 zsh 主机上完全不可用,实测确认。
+            //
+            // 前缀让 `server tmux` 装的那份优先,和其他会话动词找到的是同一个
+            // tmux(`Tmux.path_prefix`)。
             break :blk .{ .command = try std.fmt.allocPrint(
                 ctx.arena,
-                "tmux attach -t '={s}'",
-                .{tname},
+                "{s}tmux attach -t '={s}'",
+                .{ Core.Tmux.path_prefix, tname },
             ) };
         },
     };

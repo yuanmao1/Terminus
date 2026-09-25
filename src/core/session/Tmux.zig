@@ -111,8 +111,22 @@ pub fn targetName(arena: Allocator, name: []const u8) Allocator.Error![]u8 {
     return std.fmt.allocPrint(arena, "t-{s}", .{name});
 }
 
+/// Put the tmux `terminus server tmux` installs ahead of the system's.
+///
+/// Prepended to every script `run` sends, which is why this file's tmux
+/// literals needed no change: `command -v tmux` and every bare `tmux` below
+/// find the installed copy first when there is one, and the system's when
+/// there is not. A plain assignment on its own line, so it cannot fail and
+/// cannot change which line of a script an exit code comes from.
+///
+/// Public for the two remote tmux calls that do not go through `run`:
+/// `attach`'s PTY start command and `doctor`'s probe.
+pub const path_prefix = "PATH=\"$HOME/.terminus/bin:$PATH\"; export PATH\n";
+
+/// The only way a script in this file reaches the host. See `path_prefix`.
 fn run(executor: Executor, arena: Allocator, command: []const u8) Error!Ssh.ExecResult {
-    return executor.exec(arena, command);
+    const script = try std.mem.concat(arena, u8, &.{ path_prefix, command });
+    return executor.exec(arena, script);
 }
 
 /// A job's durable terminal result, as the remote wrapper recorded it.
@@ -2523,4 +2537,23 @@ test findSentinel {
     // bogus line cannot hide the real one behind it.
     const mixed = "__X__:900\nreal output\n__X__:3\n";
     try t.expectEqual(3, findSentinel(mixed, "__X__").?.exit_code);
+}
+
+test "gate: every script in this file reaches the host through run, behind the PATH prefix" {
+    // The installed tmux is found only because `run` prepends `path_prefix`.
+    // A second call on the executor would send a script without it, and on a
+    // host whose only tmux is the one `server tmux` installed, that script
+    // would report tmux missing while every other verb works.
+    const t = std.testing;
+    const source = @embedFile("Tmux.zig");
+    const needle = "executor" ++ ".";
+    var calls: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, source, i, needle)) |at| : (i = at + 1) calls += 1;
+    try t.expectEqual(@as(usize, 1), calls);
+
+    const body_at = std.mem.indexOf(u8, source, "fn " ++ "run(executor").?;
+    const body = source[body_at .. body_at + std.mem.indexOf(u8, source[body_at..], "\n}\n").?];
+    try t.expect(std.mem.indexOf(u8, body, "path_" ++ "prefix, command") != null);
+    try t.expect(std.mem.indexOf(u8, body, needle) != null);
 }

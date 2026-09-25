@@ -36,6 +36,11 @@ const usage =
     \\  server helper <name> --allow-helper-install [--json]
     \\                       install/upgrade the embedded helper after architecture,
     \\                       executable-mount and SHA-256 checks; records local consent
+    \\  server tmux   <name> [--allow-tmux-install] [--json]
+    \\                       without the flag: report whether this build's tmux is
+    \\                       installed there. With it: install the embedded static
+    \\                       tmux into $HOME/.terminus/bin — no root, no network on
+    \\                       the host; same checks as `server helper`
     \\  server pin    <name> [--json]     what this machine trusts for the host
     \\                <name> --key-type <t> --fingerprint <fp>
     \\                       record a pin you checked somewhere other than this
@@ -154,6 +159,8 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
         try runPin(ctx, &store, &parsed);
     } else if (std.mem.eql(u8, verb, "helper")) {
         try runHelperInstall(ctx, &store, &parsed);
+    } else if (std.mem.eql(u8, verb, "tmux")) {
+        try runTmux(ctx, &store, &parsed);
     } else if (std.mem.eql(u8, verb, "rename")) {
         const old_name = parsed.positional(0) orelse fatal("{s}", .{usage});
         const new_name = parsed.positional(1) orelse fatal("{s}", .{usage});
@@ -251,30 +258,38 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     }
 }
 
-const helper_install_script =
-    \\set -eu
-    \\[ "$(uname -m)" = x86_64 ] || { echo "unsupported architecture: $(uname -m)" >&2; exit 78; }
-    \\command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; exit 69; }
-    \\command -v findmnt >/dev/null 2>&1 || { echo "findmnt is required" >&2; exit 69; }
-    \\base="$HOME/.terminus/bin"
-    \\final="$base/terminus-helper"
-    \\umask 077
-    \\mkdir -p "$base"
-    \\chmod 700 "$HOME/.terminus" "$base" 2>/dev/null || true
-    \\mount_opts=$(findmnt -n -o OPTIONS -T "$base")
-    \\case ",$mount_opts," in *,noexec,*) echo "helper directory filesystem is mounted noexec" >&2; exit 77;; esac
-    \\tmp=$(mktemp "$base/.terminus-helper.new.XXXXXX")
-    \\trap 'rm -f "$tmp"' EXIT HUP INT TERM
-    \\cat >"$tmp"
-    \\actual=$(sha256sum "$tmp" | awk '{print $1}')
-    \\[ "$actual" = "$TERMINUS_HELPER_SHA256" ] || { echo "uploaded helper digest mismatch" >&2; exit 74; }
-    \\chmod 700 "$tmp"
-    \\if [ -e "$final" ]; then cp -p "$final" "$base/terminus-helper.previous"; fi
-    \\mv -f "$tmp" "$final"
-    \\trap - EXIT HUP INT TERM
-    \\[ "$(sha256sum "$final" | awk '{print $1}')" = "$TERMINUS_HELPER_SHA256" ]
-    \\printf '%s\\n' "$actual"
-;
+/// A binary this CLI carries and can put on a host: the helper and tmux.
+/// Everything that differs between them is here; the install itself — the
+/// ledger row, the upload, the receipt, the fact — is one path.
+pub const Embedded = struct {
+    bytes: []const u8,
+    /// The file under `$HOME/.terminus/bin`.
+    file: []const u8,
+    script: []const u8,
+    fact_key: []const u8,
+    /// What the ledger row says was run.
+    argv_redacted: []const u8,
+    /// The noun in sentences to the operator.
+    noun: []const u8,
+};
+
+pub const helper_install: Embedded = .{
+    .bytes = Core.supervisor.helper_executable,
+    .file = "terminus-helper",
+    .script = Core.embedded_install.script("terminus-helper"),
+    .fact_key = Core.supervisor.helper_fact_key,
+    .argv_redacted = "install embedded terminus helper",
+    .noun = "helper",
+};
+
+pub const tmux_install: Embedded = .{
+    .bytes = Core.tmux_dist.executable,
+    .file = "tmux",
+    .script = Core.embedded_install.script("tmux"),
+    .fact_key = Core.tmux_dist.fact_key,
+    .argv_redacted = "install embedded tmux",
+    .noun = "tmux",
+};
 
 fn runHelperInstall(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.zig").Parsed) !void {
     const name = parsed.positional(0) orelse fatal("{s}", .{usage});
@@ -282,15 +297,70 @@ fn runHelperInstall(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.z
         "helper installation changes the remote host; pass --allow-helper-install to authorize this server once",
         .{},
     );
+    try installEmbedded(ctx, store, parsed, name, helper_install);
+}
+
+/// `server tmux <name>`: without the flag, say what this machine knows and
+/// change nothing; with it, install.
+///
+/// The report is local on purpose. It compares the fact the last install left
+/// with the embedded digest — no remote call, so this file keeps its one
+/// untracked exec (see the gate at the bottom). What the host actually runs is
+/// `terminus doctor`'s question.
+fn runTmux(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.zig").Parsed) !void {
+    const name = parsed.positional(0) orelse fatal("{s}", .{usage});
+    if (parsed.boolean("allow-tmux-install"))
+        return installEmbedded(ctx, store, parsed, name, tmux_install);
+
+    const resolved = Cli.resolveServer(ctx, store, name);
+    var digest_buf: [Core.digest.hex_len]u8 = undefined;
+    const embedded_sha = Core.digest.hex(tmux_install.bytes, &digest_buf);
+    const recorded = Store.facts.get(store, ctx.arena, resolved.server.id, tmux_install.fact_key) catch |err|
+        Cli.storeFatal(store, err);
+    const current = if (recorded) |sha| std.mem.eql(u8, sha, embedded_sha) else false;
+    switch (ctx.out.format) {
+        .json => try ctx.out.json(.{
+            .server = name,
+            .embeddedSha256 = embedded_sha,
+            .installedSha256 = recorded,
+            .current = current,
+        }),
+        .human => {
+            if (recorded) |sha| {
+                if (current)
+                    try ctx.out.print("'{s}' has this build's tmux (sha256 {s})\n", .{ name, sha })
+                else
+                    try ctx.out.print("'{s}' has an older tmux from this machine (sha256 {s}); this build carries {s}\n", .{ name, sha, embedded_sha });
+            } else try ctx.out.print("no tmux installed on '{s}' by this machine\n", .{name});
+            if (!current) try ctx.out.print(
+                "install it with: terminus server tmux {s} --allow-tmux-install  (no root, no network needed on the host)\n",
+                .{name},
+            );
+        },
+    }
+}
+
+/// Upload `what` to `$HOME/.terminus/bin` on `name`, under a ledger row.
+///
+/// Public for `attach --allow-tmux-install`, which installs before it opens
+/// its own row. The two never overlap: this one registers, settles and clears
+/// its execution before returning, and `registerExecution` is a single slot.
+pub fn installEmbedded(
+    ctx: *Cli.Ctx,
+    store: *Store,
+    parsed: *const @import("args.zig").Parsed,
+    name: []const u8,
+    comptime what: Embedded,
+) !void {
     const resolved = Cli.resolveServer(ctx, store, name);
     const owner_token = Store.policy.ownerToken(store, ctx.arena, ctx.io, ctx.now) catch |err|
         Cli.storeFatal(store, err);
     var digest_buf: [Core.digest.hex_len]u8 = undefined;
-    const helper_sha = Core.digest.hex(Core.supervisor.helper_executable, &digest_buf);
+    const sha = Core.digest.hex(what.bytes, &digest_buf);
     const command = try std.fmt.allocPrint(
         ctx.arena,
-        "TERMINUS_HELPER_SHA256={s} /bin/sh -c {s}",
-        .{ helper_sha, try Core.shell.quote(ctx.arena, helper_install_script) },
+        "TERMINUS_INSTALL_SHA256={s} /bin/sh -c {s}",
+        .{ sha, try Core.shell.quote(ctx.arena, what.script) },
     );
     const start = Core.execution.begin(store, ctx.arena, ctx.io, .{
         .server_id = resolved.server.id,
@@ -298,17 +368,17 @@ fn runHelperInstall(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.z
         .kind = .exec,
         .scope = .{ .kind = .server },
         .mutating = true,
-        .argv_redacted = "install embedded terminus helper",
+        .argv_redacted = what.argv_redacted,
         .shell = "sh",
         .owner_token = owner_token,
         .now = ctx.now,
     }) catch |err| Cli.storeFatal(store, err);
     var execution = switch (start) {
         .ready => |ready| ready,
-        .blocked => |blocker| fatal("helper install is blocked by request {s}; reconcile it first", .{switch (blocker) {
+        .blocked => |blocker| fatal("{s} install is blocked by request {s}; reconcile it first", .{ what.noun, switch (blocker) {
             .unsettled => |op| op.request_id,
             .lease => |lease| lease.owner_request_id,
-        }}),
+        } }),
     };
     Cli.registerExecution(&execution);
     defer {
@@ -318,11 +388,11 @@ fn runHelperInstall(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.z
     execution.connecting() catch |err| Cli.receiptFatal(execution.id(), err, "created");
     var conn = Cli.connect(ctx, parsed, resolved.server, resolved.auth);
     defer conn.deinit();
-    var reader: std.Io.Reader = .fixed(Core.supervisor.helper_executable);
+    var reader: std.Io.Reader = .fixed(what.bytes);
     var accepted: Core.Ssh.Accepted = .{};
     switch (execution.submitted() catch |err| Cli.receiptFatal(execution.id(), err, "connecting")) {
         .submitted => {},
-        .refused => fatal("helper install was refused at submission; reconcile request {s}", .{execution.id()}),
+        .refused => fatal("{s} install was refused at submission; reconcile request {s}", .{ what.noun, execution.id() }),
     }
     var retained: Core.Ssh.Retained = .{};
     const executor = conn.executor();
@@ -332,8 +402,8 @@ fn runHelperInstall(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.z
         .{ .source = &reader, .accepted = &accepted },
         &retained,
     ) catch |err| {
-        const why = try std.fmt.allocPrint(ctx.arena, "helper install transport failed after accepting {d} byte(s): {s} ({s})", .{
-            accepted.bytes, executor.errorMessage(), @errorName(err),
+        const why = try std.fmt.allocPrint(ctx.arena, "{s} install transport failed after accepting {d} byte(s): {s} ({s})", .{
+            what.noun, accepted.bytes, executor.errorMessage(), @errorName(err),
         });
         _ = execution.transportLoss(why) catch |receipt_err|
             Cli.receiptFatal(execution.id(), receipt_err, execution.status.text());
@@ -346,22 +416,32 @@ fn runHelperInstall(ctx: *Cli.Ctx, store: *Store, parsed: *const @import("args.z
         .stderr = .{ .bytes = @intCast(retained.stderr.bytes), .sha256 = retained.stderr.sha256[0..], .truncated = retained.stderr.truncated },
     }) catch |err| Cli.receiptFatal(execution.id(), err, execution.status.text());
     if (outcome.exit_code != 0) fatal(
-        "helper install failed on '{s}' (exit {d}): {s}",
-        .{ name, outcome.exit_code, outcome.stderr },
+        "{s} install failed on '{s}' (exit {d}): {s}",
+        .{ what.noun, name, outcome.exit_code, outcome.stderr },
     );
-    Store.facts.set(store, resolved.server.id, Core.supervisor.helper_fact_key, helper_sha, ctx.now) catch |err|
+    Store.facts.set(store, resolved.server.id, what.fact_key, sha, ctx.now) catch |err|
         Cli.storeFatal(store, err);
+    const rollback = "$HOME/.terminus/bin/" ++ what.file ++ ".previous";
     switch (ctx.out.format) {
-        .json => try ctx.out.json(.{
+        // The helper's JSON shape predates tmux and agents read it; it stays.
+        .json => if (comptime std.mem.eql(u8, what.noun, "helper")) try ctx.out.json(.{
             .ok = true,
             .server = name,
             .requestId = execution.id(),
-            .helperSha256 = helper_sha,
+            .helperSha256 = sha,
             .bytesAccepted = accepted.bytes,
             .transport = conn.transport,
-            .rollback = "$HOME/.terminus/bin/terminus-helper.previous",
+            .rollback = rollback,
+        }) else try ctx.out.json(.{
+            .ok = true,
+            .server = name,
+            .requestId = execution.id(),
+            .tmuxSha256 = sha,
+            .bytesAccepted = accepted.bytes,
+            .transport = conn.transport,
+            .rollback = rollback,
         }),
-        .human => try ctx.out.print("installed helper on '{s}' (sha256 {s}, request {s}); previous copy retained when present\n", .{ name, helper_sha, execution.id() }),
+        .human => try ctx.out.print("installed {s} on '{s}' (sha256 {s}, request {s}); previous copy retained when present\n", .{ what.noun, name, sha, execution.id() }),
     }
 }
 
