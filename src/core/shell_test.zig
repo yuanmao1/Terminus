@@ -165,8 +165,8 @@ const tmux_exemptions = [_]shell.Exemption{
     },
     .{
         .header = "\npub fn resumeLog(",
-        .placeholders = 5,
-        .why = "the validated session name three times as an exact tmux target and log_dir twice as the fixed $HOME-relative transcript directory",
+        .placeholders = 6,
+        .why = "the validated session name four times (three exact tmux targets, one of them for the pane_pipe query, and the log file name) and log_dir twice as the fixed $HOME-relative transcript directory",
     },
     .{
         .header = "\npub fn probeScript(",
@@ -210,7 +210,7 @@ test "gate: every raw value Tmux.zig sends to a host is exempted by name and rea
 
     // The number the old blanket exemption never had to state. Pinned, so an
     // entry that is silently dropped from the table takes the total with it.
-    try t.expectEqual(@as(usize, 47), accounted);
+    try t.expectEqual(@as(usize, 48), accounted);
     try t.expectEqual(@as(usize, 16), tmux_exemptions.len);
 
     // And nothing outside those sixteen functions splices a raw value into

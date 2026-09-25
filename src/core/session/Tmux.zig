@@ -816,13 +816,19 @@ pub fn pauseLog(executor: Executor, arena: Allocator, name: []const u8) Error!vo
 /// Reattaches pane logging after a deliberate secret-safe gap made by
 /// `pauseLog`. It never reconstructs the missing interval from scrollback:
 /// doing so would copy the input that was deliberately kept out.
+///
+/// **Asks first, and does not use `pipe-pane -o`.** `-o` is tmux's toggle: on a
+/// pane that already has a pipe it closes that pipe and opens nothing. So every
+/// `read` of a session that was logging turned its logging *off*, and the next
+/// one turned it back on — found by reading one session three times in a row
+/// and watching `#{pane_pipe}` go 1, 0, 1, 0.
 pub fn resumeLog(executor: Executor, arena: Allocator, name: []const u8) Error!void {
     const tname = try targetName(arena, name);
     const script = try std.fmt.allocPrint(arena,
         \\tmux has-session -t '={s}' 2>/dev/null || exit 43
         \\mkdir -p {s}
-        \\tmux pipe-pane -o -t '={s}:' 'cat >> {s}/{s}.log' || exit 42
-    , .{ tname, log_dir, tname, log_dir, name });
+        \\[ "$(tmux display -p -t '={s}:' '#{{pane_pipe}}')" = 1 ] || tmux pipe-pane -t '={s}:' 'cat >> {s}/{s}.log' || exit 42
+    , .{ tname, log_dir, tname, tname, log_dir, name });
     const result = try run(executor, arena, script);
     switch (result.exit_code) {
         0 => {},
@@ -848,7 +854,9 @@ test "secret gate: pane logging can be paused and only resumed prospectively" {
     try t.expectEqual(@as(usize, 2), scripted.seen.items.len);
     try t.expect(std.mem.indexOf(u8, scripted.seen.items[0], "pipe-pane -t '=t-shell:'") != null);
     try t.expect(std.mem.indexOf(u8, scripted.seen.items[0], "cat >>") == null);
-    try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "pipe-pane -o -t '=t-shell:'") != null);
+    // Only when no pipe is open, and never through `-o`, which would close one.
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "#{pane_pipe}')\" = 1 ] || tmux pipe-pane -t '=t-shell:'") != null);
+    try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "pipe-pane -o") == null);
     try t.expect(std.mem.indexOf(u8, scripted.seen.items[1], "cat >> $HOME/.terminus/logs/shell.log") != null);
 }
 
