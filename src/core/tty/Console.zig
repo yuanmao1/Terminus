@@ -68,6 +68,19 @@ pub fn restoreActive() void {
 var abort_flag: std.atomic.Value(bool) = .init(false);
 var abort_done: std.atomic.Value(bool) = .init(false);
 
+/// 一个前台子进程正占着终端,Ctrl-C 归它。
+///
+/// 命令层的传输子进程跑的时候,控制台已经还原成普通模式,Ctrl-C 重新是
+/// 信号,同时投给我们和子进程。那一下的意思是"取消这次传输",不是"关窗口";
+/// 当成后者会让会话收不了尾就被结束。
+var child_owns_ctrl_c: std.atomic.Value(bool) = .init(false);
+
+pub fn setChildOwnsCtrlC(on: bool) void {
+    child_owns_ctrl_c.store(on, .release);
+}
+
+const ctrl_c_event: windows.DWORD = 0;
+
 /// 会话循环每轮问一次。
 pub fn abortRequested() bool {
     return abort_flag.load(.acquire);
@@ -91,7 +104,9 @@ pub fn abortHandled() void {
 /// 等待是有必要的:返回 FALSE 会让默认处理器结束进程。关窗口时 Windows
 /// 大约给五秒,三秒在里面,而且足够一次 SQLite 写。等不到就还原终端走人 ——
 /// 留下一条待对账的操作行,总好过留下一个 raw 模式的终端。
-fn ctrlHandler(_: windows.DWORD) callconv(.winapi) windows.BOOL {
+fn ctrlHandler(ctrl_type: windows.DWORD) callconv(.winapi) windows.BOOL {
+    // 子进程自己会收到这一下并中断;我们这边什么都不做,会话照常。
+    if (ctrl_type == ctrl_c_event and child_owns_ctrl_c.load(.acquire)) return .TRUE;
     abort_flag.store(true, .release);
     var waited: u32 = 0;
     while (waited < 3000 and !abort_done.load(.acquire)) {

@@ -324,6 +324,13 @@ extern "kernel32" fn GetModuleFileNameW(
     nSize: std.os.windows.DWORD,
 ) callconv(.winapi) std.os.windows.DWORD;
 
+extern "kernel32" fn WaitForSingleObject(
+    hHandle: std.os.windows.HANDLE,
+    dwMilliseconds: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
+
+const wait_timeout: std.os.windows.DWORD = 0x102;
+
 /// `p` 与 `g`:提示两个路径,然后**作为子进程**跑 `terminus push/pull`。
 ///
 /// **子进程而不是进程内直接调那个传输命令,而这不是风格选择。**
@@ -379,6 +386,9 @@ fn runTransfer(
     // **把终端整个还给子进程。** 它是个普通命令,按行输出;在 raw 模式下
     // (`DISABLE_NEWLINE_AUTO_RETURN` 开着)它画出来的东西会往右下角爬。
     Console.restoreActive();
+    // 此刻的 Ctrl-C 是"取消这次传输",归子进程。
+    Console.setChildOwnsCtrlC(true);
+    defer Console.setChildOwnsCtrlC(false);
 
     var child = std.process.spawn(ctx.io, .{ .argv = &argv }) catch |err| {
         var msg: [160]u8 = undefined;
@@ -390,6 +400,14 @@ fn runTransfer(
         reenterOrDie(ctx);
         return pause(ctx, local, tick);
     };
+    // **边等边续租。** 一次大文件传输可以远超租约的 120s TTL;直接阻塞在
+    // `wait` 上,回来时租约可能已经归了别人。续不上的结果不在这里处理:
+    // `stillOurs` 会记住,下面 `pause` 里的下一次 tick 就会报 `.lost`。
+    if (comptime @import("builtin").os.tag == .windows) {
+        while (WaitForSingleObject(child.id.?, 200) == wait_timeout) {
+            if (tick) |t| _ = t.call(t.context);
+        }
+    }
     const term = child.wait(ctx.io) catch |err| {
         var msg: [160]u8 = undefined;
         Console.writeDirect(ctx.io, std.fmt.bufPrint(
@@ -405,6 +423,8 @@ fn runTransfer(
         else => 1,
     };
     reenterOrDie(ctx);
+    // 传输期间按下的键还排在队列里,不丢掉就会直接答掉下面的"按任意键"。
+    Pump.drainInput(local);
     var line: [96]u8 = undefined;
     const text = std.fmt.bufPrint(
         &line,

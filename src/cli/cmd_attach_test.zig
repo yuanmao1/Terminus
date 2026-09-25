@@ -152,3 +152,24 @@ test "returning from the command layer asks the far end to repaint" {
     // 字节的序列,剩下的会漏进会话。
     try std.testing.expect(std.mem.indexOf(u8, source, "drain" ++ "Input") != null);
 }
+
+/// 某个函数的函数体,供只看它的门禁用。
+fn fnBody(comptime head: []const u8) []const u8 {
+    const source = @embedFile("cmd_attach.zig");
+    const start = std.mem.indexOf(u8, source, head).?;
+    const end = start + std.mem.indexOf(u8, source[start..], "\n}\n").?;
+    return source[start..end];
+}
+
+test "Ctrl-C during a command-layer transfer belongs to the transfer" {
+    // 传输子进程跑的时候控制台是普通模式,Ctrl-C 是信号。处理器把它当成
+    // 关窗口的话,会话等不到收尾就被结束,收据不落盘,租约悬两分钟。
+    const body = fnBody("fn run" ++ "Transfer(");
+    try std.testing.expect(std.mem.indexOf(u8, body, "setChildOwns" ++ "CtrlC(true)") != null);
+    // 等子进程的同时续租:大文件传输可以远超租约 TTL。
+    try std.testing.expect(std.mem.indexOf(u8, body, "t.call(t." ++ "context)") != null);
+    try std.testing.expect(body.len < 4000);
+
+    const console = @embedFile("../core/tty/Console.zig");
+    try std.testing.expect(std.mem.indexOf(u8, console, "ctrl_type == ctrl_c_" ++ "event and child_owns") != null);
+}
