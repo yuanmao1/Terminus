@@ -70,6 +70,17 @@ terminus exec prod:dev -- docker compose ps
 terminus write prod:dev -- "journalctl -f"
 terminus read prod:dev --from-cursor --json
 
+# A human at the keyboard: real TTY (vim, htop, Ctrl-C, resize all work)
+terminus shell prod                      # login shell; not persistent
+terminus attach prod:dev                 # the agent's tmux session; survives detach,
+                                         # reconnects by itself after a network drop
+# In either, Ctrl-] then ? lists local commands: d detach, . force disconnect,
+# p push a file, g pull a file, Ctrl-] Ctrl-] sends a literal Ctrl-].
+
+# No tmux on the host? Install the one Terminus carries (static, no root,
+# no network needed on the host), or pass --allow-tmux-install to attach.
+terminus server tmux prod --allow-tmux-install
+
 # Files and directories
 terminus push prod ./app.tar.gz /tmp/app.tar.gz
 # recognized binaries/scripts default to mode 755; other files default to 644
@@ -171,7 +182,7 @@ Planned: DPAPI key encryption, known-hosts pinning, destructive-command policies
 
 ## Roadmap
 
-- **M4** — Windows ConPTY local sessions, `attach` for human takeover, key encryption
+- **M4** — Windows ConPTY local sessions, key encryption (`shell` / `attach` for human takeover have landed)
 - **M5** — Linux/macOS (OpenSSL/wolfSSL backend for ed25519), MCP server adapter
 
 ## License
