@@ -122,13 +122,19 @@ pub fn startLocal(io: std.Io) Error!Local {
 /// 同步读取消不掉**,所以 join 会一直阻塞到用户下一次按键。真机上的样子
 /// 是:远端已经退出了,屏幕却卡住,要连按几次 Ctrl-C 才看到"会话结束"。
 ///
-/// 取消仍然照发:它对管道有效(`tunnel` 走同一条路),对控制台无害。
+/// **取消也不发,而这是被验收打回来的。** 这里曾经照发 `cancelInputRead`,
+/// 理由是"对管道有效,对控制台无害"。后半句是错的:对一次进行中的控制台
+/// 同步读发 `NtCancelSynchronousIoFile`,**这个调用本身**会阻塞到下一次
+/// 输入 —— 于是远端已经退出、"会话结束"已经打出来,进程却停在这里,
+/// 大约每两次就有一次。这里的 stdin 一定是控制台(`Console.enter` 已经
+/// 拒绝了别的),所以那次取消在这里从来没有用处。管道上的取消是
+/// `tunnel` 的事,它自己调。
 ///
 /// 不 join 就意味着那个线程可能活过调用方的栈帧,所以队列是进程级的 ——
-/// 它写进去的地方一直有效。进程随后就退出,线程被操作系统收掉。
+/// 它写进去的地方一直有效。进程随后就退出(`Console.exitNow`),线程被
+/// 操作系统收掉。
 pub fn stopLocal(local: *Local) void {
     local.queue.requestStop();
-    Queue.cancelInputRead(&local.thread);
     local.thread.detach();
 }
 
@@ -436,6 +442,18 @@ test "本地输入永远不会绕过转义状态机直接到远端" {
     try std.testing.expect(std.mem.indexOf(u8, body, "local.escape." ++ "feed(") != null);
     // 范围真的收住了。
     try std.testing.expect(body.len < 6000);
+}
+
+test "放开读线程时不对控制台读发取消" {
+    // 对进行中的控制台同步读发取消,这个调用自己会阻塞到下一次输入 ——
+    // 进程停在"会话结束"之后不退,约每两次一次。ConPTY 实测。
+    const source = @embedFile("Pump.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn " ++ "stopLocal(").?;
+    const end = start + std.mem.indexOf(u8, source[start..], "\n}\n").?;
+    const body = source[start..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "cancel" ++ "InputRead") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "detach()") != null);
+    try std.testing.expect(body.len < 400);
 }
 
 test "重连等待会把读到的字节丢掉,不会攒起来重放" {
