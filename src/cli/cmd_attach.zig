@@ -110,6 +110,13 @@ fn contentionScope(name: []const u8) Core.execution.Scope {
     return .{ .kind = .job, .key = name };
 }
 
+fn refuseNoTmux(server_name: []const u8) noreturn {
+    fatal(
+        "远端没有 tmux;交互会话需要它。用 'terminus doctor {s}' 确认",
+        .{server_name},
+    );
+}
+
 /// 选出要接入的会话名(Terminus 名,不带 `t-` 前缀)。
 ///
 /// 不给名字时:恰好一个就用它,多个则列出并要求指名,一个都没有则要求
@@ -118,14 +125,24 @@ fn contentionScope(name: []const u8) Core.execution.Scope {
 fn chooseSession(
     ctx: *Cli.Ctx,
     executor: Core.Executor,
+    server_name: []const u8,
     explicit: ?[]const u8,
 ) []const u8 {
-    if (explicit) |name| return name;
+    // 指了名也要先问一声在不在。不问的话,错会在 raw 模式里由远端 tmux
+    // 报出来:一行不换行的错误一闪而过,然后是"会话结束(退出码 1)"。
+    if (explicit) |name| {
+        const alive = Core.Tmux.isAlive(executor, ctx.arena, name) catch |err| switch (err) {
+            error.TmuxMissing => refuseNoTmux(server_name),
+            else => fatal("无法确认会话 '{s}' 是否存在: {s}", .{ name, @errorName(err) }),
+        };
+        if (!alive) fatal(
+            "会话 '{s}' 不存在;没有替你新建 —— 要新开一个:terminus session new {s} {s}",
+            .{ name, server_name, name },
+        );
+        return name;
+    }
     const sessions = Core.Tmux.list(executor, ctx.arena) catch |err| switch (err) {
-        error.TmuxMissing => fatal(
-            "远端没有 tmux;交互会话需要它。用 'terminus doctor <server>' 确认",
-            .{},
-        ),
+        error.TmuxMissing => refuseNoTmux(server_name),
         else => fatal("无法列出远端会话: {s}", .{@errorName(err)}),
     };
     if (sessions.len == 0) fatal(
@@ -577,7 +594,7 @@ pub fn run(ctx: *Cli.Ctx, mode: Mode, raw_args: []const []const u8) !void {
             // `Executor` 是个 union,直连客户端就是 `.direct` 那一支。这里
             // 没有 connection 包装可以问 `.executor()`。
             const executor: Core.Executor = .{ .direct = &client };
-            const chosen = chooseSession(ctx, executor, target.session);
+            const chosen = chooseSession(ctx, executor, resolved.server.name, target.session);
             session_name = chosen;
             const tname = try Core.Tmux.targetName(ctx.arena, chosen);
             // `-t '=<name>'` —— 两层意思,少一层都错。

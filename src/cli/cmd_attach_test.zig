@@ -173,3 +173,11 @@ test "Ctrl-C during a command-layer transfer belongs to the transfer" {
     const console = @embedFile("../core/tty/Console.zig");
     try std.testing.expect(std.mem.indexOf(u8, console, "ctrl_type == ctrl_c_" ++ "event and child_owns") != null);
 }
+
+test "a named session is checked for existence before anything else happens" {
+    // 不查的话,错由远端 tmux 在 raw 模式里报出来:一行不换行的错误一闪
+    // 而过,然后是"会话结束(退出码 1)",人得自己猜发生了什么。
+    const body = fnBody("fn choose" ++ "Session(");
+    try std.testing.expect(std.mem.indexOf(u8, body, "Tmux.is" ++ "Alive(") != null);
+    try std.testing.expect(body.len < 2400);
+}
