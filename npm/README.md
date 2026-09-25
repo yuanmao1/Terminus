@@ -42,6 +42,18 @@ terminus audit prod disk --largest 30           # read-only disk inventory
 terminus cleanup prod --manifest cleanup.json --dry-run
 ```
 
+## A human at the keyboard
+
+```bash
+terminus shell prod          # real TTY login shell: vim, htop, Ctrl-C, resize all work
+terminus attach prod:work    # step into the agent's tmux session; survives detach,
+                             # reconnects by itself after a network drop
+terminus server tmux prod --allow-tmux-install   # no tmux on the host? install the bundled
+                                                 # static one — no root, no network needed
+```
+
+Inside either, `Ctrl-]` then `?` lists local commands: detach, force disconnect, push / pull a file.
+
 ## Agent integration
 
 `terminus setup` installs the skill for Claude Code and Codex (user-wide). Project-local targets:
