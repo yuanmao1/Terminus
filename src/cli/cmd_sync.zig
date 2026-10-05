@@ -589,7 +589,7 @@ fn push(
     // reads nothing of the destination, so a failure here settles a proven
     // failure through `Cli.fail`'s hook rather than an unknown.
     const remote_tmp = try stagingPath(ctx.arena, execution.id());
-    const remote_tmp_z = try ctx.arena.dupeZ(u8, remote_tmp);
+    const remote_tmp_z = try ctx.arena.dupeSentinel(u8, remote_tmp, 0);
     var moved: Core.Ssh.Moved = .{};
     _ = client.scpSend(ctx.io, local_tmp, remote_tmp_z, 0o600, null, &moved) catch {
         _ = Core.transfer.pushFile(executor, ctx.arena, ctx.io, local_tmp, remote_tmp, 0, 0o600, null, &moved) catch |err|
@@ -676,7 +676,7 @@ fn pull(
 
     const local_tmp = try localStagingPath(ctx.arena, ctx.environ, execution.id());
     defer std.Io.Dir.cwd().deleteFile(ctx.io, local_tmp) catch {};
-    const remote_tmp_z = try ctx.arena.dupeZ(u8, remote_tmp);
+    const remote_tmp_z = try ctx.arena.dupeSentinel(u8, remote_tmp, 0);
     var moved: Core.Ssh.Moved = .{};
     _ = client.scpRecv(ctx.io, remote_tmp_z, local_tmp, null, &moved) catch {
         const remote = Core.transfer.probeRemoteFile(executor, ctx.arena, remote_tmp) catch |err|

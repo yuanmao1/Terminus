@@ -603,7 +603,7 @@ pub fn tunnel(
     if (std.mem.indexOfScalar(u8, destination_host, 0) != null)
         return error.DestinationContainsNul;
     var host_buffer: [256]u8 = undefined;
-    const host_z = std.fmt.bufPrintZ(&host_buffer, "{s}", .{destination_host}) catch
+    const host_z = std.mem.printSentinel(&host_buffer, "{s}", .{destination_host}, 0) catch
         return error.DestinationHostTooLong;
     if (destination_port == 0) return error.DestinationPortInvalid;
 
@@ -1316,7 +1316,7 @@ pub const gap_line_max = std.fmt.comptimePrint(gap_line_format, .{
     std.math.maxInt(usize),
     std.math.maxInt(usize),
     std.math.maxInt(u64),
-    "f" ** digest.hex_len,
+    &@as([digest.hex_len]u8, @splat('f')),
 }).len;
 
 const gap_line_format = "\n" ++ gap_marker ++
@@ -1828,9 +1828,9 @@ pub fn scpRecv(
 fn tcpConnect(host: []const u8, port: u16) ConnectError!c.libssh2_socket_t {
     var host_buf: [256]u8 = undefined;
     if (host.len >= host_buf.len) return error.HostNameTooLong;
-    const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{host}) catch unreachable;
+    const host_z = std.mem.printSentinel(&host_buf, "{s}", .{host}, 0) catch unreachable;
     var port_buf: [8]u8 = undefined;
-    const port_z = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch unreachable;
+    const port_z = std.mem.printSentinel(&port_buf, "{d}", .{port}, 0) catch unreachable;
 
     const hints: c.addrinfo = .{
         .ai_family = c.AF_UNSPEC,

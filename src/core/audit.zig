@@ -245,7 +245,7 @@ pub const wire = struct {
         std.mem.writeInt(u32, frame[0..4], @intCast(frame.len - 4), .little);
         frame[4] = Kind.audit_run;
         frame[5] = version;
-        frame[6] = @intFromEnum(request.check);
+        frame[6] = @backingInt(request.check);
         frame[7] = @intFromBool(request.use_sudo);
         frame[8] = 0;
         frame[9] = @intCast(request.request_id.len);
@@ -272,7 +272,7 @@ pub const wire = struct {
         std.mem.writeInt(u32, frame[0..4], 36, .little);
         frame[4] = Kind.audit_accepted;
         frame[5] = version;
-        frame[6] = @intFromEnum(request.check);
+        frame[6] = @backingInt(request.check);
         frame[7] = @intFromBool(request.use_sudo);
         const digest = manifestDigest();
         @memcpy(frame[8..40], &digest);
@@ -284,7 +284,7 @@ pub const wire = struct {
         std.mem.writeInt(u32, frame[0..4], 3, .little);
         frame[4] = Kind.audit_rejected;
         frame[5] = version;
-        frame[6] = @intFromEnum(reason);
+        frame[6] = @backingInt(reason);
         return arena.dupe(u8, &frame);
     }
 
@@ -423,7 +423,7 @@ test "audit policy is closed and every subject is a read-only direct wrapper" {
     try t.expectError(error.SudoRequired, spec(.journal, false));
     try t.expectError(error.SudoRequired, spec(.disk_usage, false));
     const digest = manifestDigest();
-    try t.expect(!std.mem.eql(u8, &digest, &([_]u8{0} ** 32)));
+    try t.expect(!std.mem.eql(u8, &digest, &@as([32]u8, @splat(0))));
 }
 
 test "audit request contains policy id only, never caller argv or shell text" {
@@ -439,7 +439,7 @@ test "audit request contains policy id only, never caller argv or shell text" {
     });
     try t.expectEqual(@as(usize, 52), frame.len);
     try t.expectEqual(wire.Kind.audit_run, frame[4]);
-    try t.expectEqual(@as(u8, @intFromEnum(Check.journal)), frame[6]);
+    try t.expectEqual(@as(u8, @backingInt(Check.journal)), frame[6]);
     try t.expectEqual(@as(u8, 1), frame[7]);
     try t.expect(std.mem.indexOf(u8, frame, "/bin/sh") == null);
     try t.expect(std.mem.indexOf(u8, frame, "sudo") == null);
@@ -477,7 +477,7 @@ test "audit acceptance requires the remote policy manifest, not a local string c
     std.mem.writeInt(u32, good[0..4], 36, .little);
     good[4] = wire.Kind.audit_accepted;
     good[5] = version;
-    good[6] = @intFromEnum(Check.host);
+    good[6] = @backingInt(Check.host);
     good[7] = 0;
     const digest = manifestDigest();
     @memcpy(good[8..40], &digest);

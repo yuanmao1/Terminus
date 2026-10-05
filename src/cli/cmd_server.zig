@@ -806,7 +806,7 @@ test "gate: `server pin`'s flags decide one of five things or refuse by name" {
         .revoke = true,
     });
     try t.expectEqualStrings("ssh-rsa", revoked.revoke);
-    try t.expectEqual(@as(usize, 5), @typeInfo(PinPlan).@"union".fields.len);
+    try t.expectEqual(@as(usize, 5), @typeInfo(PinPlan).@"union".field_names.len);
 
     // **Rotation without a supplied fingerprint is refused.** The contract's
     // third rule, and the one a helpful implementation breaks first: taking the
@@ -899,11 +899,11 @@ test "gate: `server pin`'s flags decide one of five things or refuse by name" {
     // Every refusal has a sentence, and each sentence names a flag. A member
     // added to the error set without one would print an empty line.
     var worded: usize = 0;
-    inline for (@typeInfo(PinPlanError).error_set.?) |e| {
+    inline for (@typeInfo(PinPlanError).error_set.error_names.?) |e_name| {
         worded += 1;
-        const sentence = pinPlanRefusal(@field(PinPlanError, e.name));
+        const sentence = pinPlanRefusal(@field(PinPlanError, e_name));
         if (sentence.len < 40 or std.mem.indexOf(u8, sentence, "--") == null) {
-            std.debug.print("\n`{s}`'s refusal names no flag: \"{s}\"\n", .{ e.name, sentence });
+            std.debug.print("\n`{s}`'s refusal names no flag: \"{s}\"\n", .{ e_name, sentence });
             return error.PinRefusalNamesNoFlag;
         }
     }
@@ -966,9 +966,9 @@ const cascade_not_confirmed =
     "pattern guessing. Re-run with --force";
 
 test "gate: the cascade refusal has a slot for every counted table" {
-    const fields = @typeInfo(Store.servers.CascadeCounts).@"struct".fields;
+    const fields = @typeInfo(Store.servers.CascadeCounts).@"struct";
     const slots = std.mem.count(u8, cascade_not_confirmed, "{d}");
-    if (slots != fields.len) {
+    if (slots != fields.field_names.len) {
         std.debug.print(
             \\
             \\`cascade_not_confirmed` has {d} `{{d}}` slot(s) and `CascadeCounts` has {d} field(s).
@@ -976,7 +976,7 @@ test "gate: the cascade refusal has a slot for every counted table" {
             \\named: `--force` is asked for on the strength of a total that now includes it,
             \\and the operator is shown the other {d}.
             \\
-        , .{ slots, fields.len, slots });
+        , .{ slots, fields.field_names.len, slots });
         return error.CascadeSentenceIncomplete;
     }
 }

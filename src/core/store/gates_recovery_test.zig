@@ -1403,8 +1403,8 @@ test "gate: a checkpoint is taken only from an attempt that cannot still be runn
     // An heir could take a partial away from an attempt that may still be
     // streaming into it — the exact failure the incumbent clause exists to
     // prevent, admitted by the predicate meant to prevent it.
-    inline for (@typeInfo(op_state.Status).@"enum".fields) |field| {
-        const status: op_state.Status = @enumFromInt(field.value);
+    inline for (@typeInfo(op_state.Status).@"enum".field_values) |field_value| {
+        const status: op_state.Status = @fromBackingInt(@intCast(field_value));
         const owner = testId("own" ++ @tagName(status));
         const owner_id: []const u8 = &owner;
         const cp = try seedCheckpoint(

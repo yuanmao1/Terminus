@@ -484,12 +484,12 @@ test "canSubmit enforces fail-stop ordering and approval" {
 
 test "phase status is exactly the operation projection" {
     const t = std.testing;
-    const fields = @typeInfo(PhaseStatus).@"enum".fields;
-    var produced = [_]bool{false} ** fields.len;
-    inline for (@typeInfo(op_state.Status).@"enum".fields) |f| {
-        produced[@intFromEnum(PhaseStatus.fromOperation(@field(op_state.Status, f.name)))] = true;
+    const fields = @typeInfo(PhaseStatus).@"enum";
+    var produced: [fields.field_names.len]bool = @splat(false);
+    inline for (@typeInfo(op_state.Status).@"enum".field_names) |f_name| {
+        produced[@backingInt(PhaseStatus.fromOperation(@field(op_state.Status, f_name)))] = true;
     }
-    inline for (fields, 0..) |f, idx| try t.expect(produced[idx] or std.mem.eql(u8, f.name, "pending"));
+    inline for (fields.field_names, 0..) |f_name, idx| try t.expect(produced[idx] or std.mem.eql(u8, f_name, "pending"));
 }
 
 test "deriveRunStatus preserves indeterminate and fail-stop terminals" {

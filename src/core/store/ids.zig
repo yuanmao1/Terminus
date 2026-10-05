@@ -94,8 +94,8 @@ test "timestamp prefix advances across milliseconds" {
 test validate {
     const t = std.testing;
     try t.expectError(error.InvalidRequestId, validate("too-short"));
-    try t.expectError(error.InvalidRequestId, validate("0" ** 27));
+    try t.expectError(error.InvalidRequestId, validate(&@as([27]u8, @splat('0'))));
     // I, L, O, U are not in the alphabet.
-    try t.expectError(error.InvalidRequestId, validate("0" ** 25 ++ "I"));
-    try validate("0" ** 26);
+    try t.expectError(error.InvalidRequestId, validate(@as([25]u8, @splat('0')) ++ "I"));
+    try validate(&@as([26]u8, @splat('0')));
 }

@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
                 .os_tag = .linux,
                 .abi = .musl,
             }),
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
     });
     helper.root_module.addImport("audit", b.createModule(.{
@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
             .os_tag = .linux,
             .abi = .musl,
         }),
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     }));
 
     // SQLite: translate-c the amalgamation header into an importable module,
@@ -186,9 +186,7 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
@@ -278,7 +276,8 @@ pub fn build(b: *std.Build) void {
         "linux-runner",
         "Windows command that runs a Linux program, e.g. `C:\\Windows\\System32\\wsl.exe -e` (default: discovered `wsl.exe`; empty on a Linux host)",
     ) orelse if (builtin.os.tag == .windows)
-        b.fmt("{s} -e", .{b.findProgram(&.{"wsl"}, &.{"C:\\Windows\\System32"}) catch
+        b.fmt("{s} -e", .{b.findProgram(.{ .names = &.{"wsl"} }) orelse
+            b.findProgram(.{ .names = &.{"C:\\Windows\\System32\\wsl"} }) orelse
             "C:\\Windows\\System32\\wsl.exe"})
     else
         "";
@@ -287,10 +286,10 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "posix-sh",
         "Path to a POSIX shell for the black-box gates that execute generated shell text (default: `sh` from PATH, else Git for Windows)",
-    ) orelse b.findProgram(&.{"sh"}, &.{
-        "C:\\Program Files\\Git\\usr\\bin",
-        "C:\\Program Files\\Git\\bin",
-    }) catch "sh";
+    ) orelse b.findProgram(.{ .names = &.{"sh"} }) orelse b.findProgram(.{ .names = &.{
+        "C:\\Program Files\\Git\\usr\\bin\\sh",
+        "C:\\Program Files\\Git\\bin\\sh",
+    } }) orelse "sh";
 
     const blackbox_options = b.addOptions();
     blackbox_options.addOptionPath("terminus_exe", exe.getEmittedBin());
@@ -301,11 +300,15 @@ pub fn build(b: *std.Build) void {
     blackbox_options.addOptionPath("tmux_exe", tmux.getEmittedBin());
     blackbox_options.addOption([]const u8, "linux_runner", linux_runner);
     // The helper gates hand a Linux process a path to a file they just wrote, so
-    // that path has to be absolute. Zig 0.16 has no `getCwd`-style call to build
+    // that path has to be absolute. Zig has no `getCwd`-style call to build
     // one at test time, and relying on the runner translating an inherited
     // working directory would make the gates depend on something invisible from
     // the test — so the build states it.
-    blackbox_options.addOption([]const u8, "build_root", b.build_root.path orelse ".");
+    blackbox_options.addOption([]const u8, "build_root", b.root.root_dir.handle.realPathFileAlloc(
+        b.graph.io,
+        if (b.root.sub_path.len == 0) "." else b.root.sub_path,
+        b.allocator,
+    ) catch |err| std.debug.panic("cannot resolve the build root: {t}", .{err}));
 
     const blackbox_tests = b.addTest(.{
         .root_module = b.createModule(.{

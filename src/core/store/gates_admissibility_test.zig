@@ -237,16 +237,16 @@ test "gate: every kind × evidence cell is decided, and none of them by default"
     // admitted every kind of evidence, and every kind added later inherited
     // that. Widening a cell is a decision about what may release the scope
     // barrier, so it has to be made twice, out loud — here and in the store.
-    inline for (@typeInfo(Store.operations.Kind).@"enum".fields) |kind_field| {
-        const kind: Store.operations.Kind = @field(Store.operations.Kind, kind_field.name);
-        inline for (@typeInfo(EvidenceTag).@"enum".fields) |evidence_field| {
-            const tag: EvidenceTag = @field(EvidenceTag, evidence_field.name);
+    inline for (@typeInfo(Store.operations.Kind).@"enum".field_names) |kind_field_name| {
+        const kind: Store.operations.Kind = @field(Store.operations.Kind, kind_field_name);
+        inline for (@typeInfo(EvidenceTag).@"enum".field_names) |evidence_field_name| {
+            const tag: EvidenceTag = @field(EvidenceTag, evidence_field_name);
             const got = sampleEvidence(tag).appliesToKind(kind);
             const pinned = pinnedCell(kind, tag);
             if (got != pinned) {
                 std.debug.print(
                     "cell {s} x {s}: the store says {}, the pinned matrix says {}\n",
-                    .{ kind_field.name, evidence_field.name, got, pinned },
+                    .{ kind_field_name, evidence_field_name, got, pinned },
                 );
                 return error.MatrixCellChanged;
             }
@@ -306,8 +306,8 @@ test "gate: every kind × evidence cell is decided, and none of them by default"
     // been built yet" — it is that neither of the two records anything a later
     // mechanism could be a reading of, and the only attempts of either kind that
     // ever reach a reconcile are the ones whose answer was lost.
-    inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
-        const tag: EvidenceTag = @field(EvidenceTag, field.name);
+    inline for (@typeInfo(EvidenceTag).@"enum".field_names) |field_name| {
+        const tag: EvidenceTag = @field(EvidenceTag, field_name);
         try t.expectEqual(tag == .operator_override, sampleEvidence(tag).appliesToKind(.session_write));
         try t.expectEqual(tag == .operator_override, sampleEvidence(tag).appliesToKind(.control));
     }
@@ -425,16 +425,16 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
     // sole terminal writer, `op_state.Terminal` has no operator variant, and an
     // attempt whose only route to an outcome is refused stays live, holds its
     // scope, and never reaches `indeterminate` for a reconcile to act on.
-    inline for (@typeInfo(Store.operations.Kind).@"enum".fields) |kind_field| {
-        const kind: Store.operations.Kind = @field(Store.operations.Kind, kind_field.name);
-        inline for (@typeInfo(TerminalTag).@"enum".fields) |terminal_field| {
-            const tag: TerminalTag = @field(TerminalTag, terminal_field.name);
+    inline for (@typeInfo(Store.operations.Kind).@"enum".field_names) |kind_field_name| {
+        const kind: Store.operations.Kind = @field(Store.operations.Kind, kind_field_name);
+        inline for (@typeInfo(TerminalTag).@"enum".field_names) |terminal_field_name| {
+            const tag: TerminalTag = @field(TerminalTag, terminal_field_name);
             const got = Store.receipts.terminalDescribesKind(sampleTerminal(tag), kind);
             const pinned = pinnedTerminalCell(kind, tag);
             if (got != pinned) {
                 std.debug.print(
                     "cell {s} x {s}: the store says {}, the pinned matrix says {}\n",
-                    .{ kind_field.name, terminal_field.name, got, pinned },
+                    .{ kind_field_name, terminal_field_name, got, pinned },
                 );
                 return error.TerminalMatrixCellChanged;
             }
@@ -564,9 +564,9 @@ test "gate: every kind × terminal cell is decided, and none of them by default"
     // `resolve` is the route, and `transfers` reads `resolved_status` beside
     // `status`.
     for (std.enums.values(Store.operations.Kind)) |kind| {
-        var reachable = std.EnumSet(op_state.Status).initEmpty();
-        inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
-            const tag: TerminalTag = @field(TerminalTag, field.name);
+        var reachable = std.EnumSet(op_state.Status).empty;
+        inline for (@typeInfo(TerminalTag).@"enum".field_names) |field_name| {
+            const tag: TerminalTag = @field(TerminalTag, field_name);
             const terminal = sampleTerminal(tag);
             if (Store.receipts.terminalDescribesKind(terminal, kind)) reachable.insert(terminal.status());
         }
@@ -602,7 +602,7 @@ test "gate: admissibility follows declared capability, not kind identity" {
     const t = std.testing;
     const Kind = Store.operations.Kind;
     const Capabilities = Store.operations.Capabilities;
-    const axes = @typeInfo(Capabilities).@"struct".fields;
+    const axes = @typeInfo(Capabilities).@"struct";
 
     // The two matrices used to be 187 hand-decided cells with an independently
     // transcribed mirror each, and six of the eleven kinds — the ones nothing in
@@ -614,15 +614,15 @@ test "gate: admissibility follows declared capability, not kind identity" {
     // 1. The table itself, stated twice. This is the double entry the cell tables
     //    had, moved to the unit that actually carries a decision: eight booleans
     //    per kind rather than seventeen cells.
-    inline for (@typeInfo(Kind).@"enum".fields) |kind_field| {
-        const kind: Kind = @field(Kind, kind_field.name);
+    inline for (@typeInfo(Kind).@"enum".field_names) |kind_field_name| {
+        const kind: Kind = @field(Kind, kind_field_name);
         const got = kind.capabilities();
         const pinned = pinnedCapabilities(kind);
-        inline for (axes) |axis| {
-            if (@field(got, axis.name) != @field(pinned, axis.name)) {
+        inline for (axes.field_names) |axis_name| {
+            if (@field(got, axis_name) != @field(pinned, axis_name)) {
                 std.debug.print(
                     "capability {s}.{s}: the store says {}, this file says {}\n",
-                    .{ kind_field.name, axis.name, @field(got, axis.name), @field(pinned, axis.name) },
+                    .{ kind_field_name, axis_name, @field(got, axis_name), @field(pinned, axis_name) },
                 );
                 return error.CapabilityChanged;
             }
@@ -637,16 +637,16 @@ test "gate: admissibility follows declared capability, not kind identity" {
     //    is known about it and that it publishes an artifact would be asking for
     //    both readings at once, and the answer to which one wins would be an
     //    accident of rule order.
-    inline for (@typeInfo(Kind).@"enum".fields) |kind_field| {
-        const kind: Kind = @field(Kind, kind_field.name);
+    inline for (@typeInfo(Kind).@"enum".field_names) |kind_field_name| {
+        const kind: Kind = @field(Kind, kind_field_name);
         const can = kind.capabilities();
         if (can.judgement_undeclared) {
-            inline for (axes) |axis| {
-                const is_the_flag = comptime std.mem.eql(u8, axis.name, "judgement_undeclared");
-                if (!is_the_flag and @field(can, axis.name)) {
+            inline for (axes.field_names) |axis_name| {
+                const is_the_flag = comptime std.mem.eql(u8, axis_name, "judgement_undeclared");
+                if (!is_the_flag and @field(can, axis_name)) {
                     std.debug.print(
                         "kind {s} declares nothing is known about it and also declares {s}\n",
-                        .{ kind_field.name, axis.name },
+                        .{ kind_field_name, axis_name },
                     );
                     return error.UndeclaredKindDeclaresSomething;
                 }
@@ -664,15 +664,15 @@ test "gate: admissibility follows declared capability, not kind identity" {
     for (std.enums.values(Kind)) |a| {
         for (std.enums.values(Kind)) |b| {
             if (!std.meta.eql(a.capabilities(), b.capabilities())) continue;
-            inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
-                const tag: TerminalTag = @field(TerminalTag, field.name);
+            inline for (@typeInfo(TerminalTag).@"enum".field_names) |field_name| {
+                const tag: TerminalTag = @field(TerminalTag, field_name);
                 try t.expectEqual(
                     Store.receipts.terminalDescribesKind(sampleTerminal(tag), a),
                     Store.receipts.terminalDescribesKind(sampleTerminal(tag), b),
                 );
             }
-            inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
-                const tag: EvidenceTag = @field(EvidenceTag, field.name);
+            inline for (@typeInfo(EvidenceTag).@"enum".field_names) |field_name| {
+                const tag: EvidenceTag = @field(EvidenceTag, field_name);
                 try t.expectEqual(
                     sampleEvidence(tag).appliesToKind(a),
                     sampleEvidence(tag).appliesToKind(b),
@@ -688,23 +688,23 @@ test "gate: admissibility follows declared capability, not kind identity" {
     //    that nothing reads, which is worse than no axis at all: it reads as a
     //    guarantee.
     var nothing: Capabilities = undefined;
-    inline for (axes) |axis| @field(nothing, axis.name) = false;
-    inline for (axes) |axis| {
+    inline for (axes.field_names) |axis_name| @field(nothing, axis_name) = false;
+    inline for (axes.field_names) |axis_name| {
         var only: Capabilities = nothing;
-        @field(only, axis.name) = true;
+        @field(only, axis_name) = true;
         var decides = false;
-        inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
-            const tag: TerminalTag = @field(TerminalTag, field.name);
+        inline for (@typeInfo(TerminalTag).@"enum".field_names) |field_name| {
+            const tag: TerminalTag = @field(TerminalTag, field_name);
             if (Store.receipts.terminalDescribes(sampleTerminal(tag), only) !=
                 Store.receipts.terminalDescribes(sampleTerminal(tag), nothing)) decides = true;
         }
-        inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
-            const tag: EvidenceTag = @field(EvidenceTag, field.name);
+        inline for (@typeInfo(EvidenceTag).@"enum".field_names) |field_name| {
+            const tag: EvidenceTag = @field(EvidenceTag, field_name);
             if (sampleEvidence(tag).appliesTo(only) != sampleEvidence(tag).appliesTo(nothing))
                 decides = true;
         }
         if (!decides) {
-            std.debug.print("capability axis {s} changes no cell in either matrix\n", .{axis.name});
+            std.debug.print("capability axis {s} changes no cell in either matrix\n", .{axis_name});
             return error.CapabilityDecidesNothing;
         }
     }
@@ -716,16 +716,16 @@ test "gate: admissibility follows declared capability, not kind identity" {
     //    is not wedged — and it can claim no exit status, no deadline, no verified
     //    absence, no proven failure and no reading of a file, because it declared
     //    nothing that would make one of those a statement about it.
-    inline for (@typeInfo(TerminalTag).@"enum".fields) |field| {
-        const tag: TerminalTag = @field(TerminalTag, field.name);
+    inline for (@typeInfo(TerminalTag).@"enum".field_names) |field_name| {
+        const tag: TerminalTag = @field(TerminalTag, field_name);
         const attempt_level = switch (tag) {
             .never_submitted, .local_abandon, .indeterminate => true,
             .exited, .remote_deadline, .remote_cancel_confirmed, .proven_failure, .input_accepted, .input_refused => false,
         };
         try t.expectEqual(attempt_level, Store.receipts.terminalDescribes(sampleTerminal(tag), nothing));
     }
-    inline for (@typeInfo(EvidenceTag).@"enum".fields) |field| {
-        const tag: EvidenceTag = @field(EvidenceTag, field.name);
+    inline for (@typeInfo(EvidenceTag).@"enum".field_names) |field_name| {
+        const tag: EvidenceTag = @field(EvidenceTag, field_name);
         try t.expectEqual(tag == .operator_override, sampleEvidence(tag).appliesTo(nothing));
     }
 }

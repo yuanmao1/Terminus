@@ -822,8 +822,8 @@ test "gate: a hash of the destination cannot settle a transfer that recorded it 
     // refused the same way, and the three are refused nothing — asserted
     // against the predicate rather than by listing states here, so a new
     // checkpoint state is classified in one place and checked in this one.
-    inline for (@typeInfo(Store.transfers.State).@"enum".fields) |field| {
-        const s: Store.transfers.State = @enumFromInt(field.value);
+    inline for (@typeInfo(Store.transfers.State).@"enum".field_values) |field_value| {
+        const s: Store.transfers.State = @fromBackingInt(@intCast(field_value));
         switch (s) {
             .published, .completed_unverified, .indeterminate_publish => try t.expect(s.renameMayHaveLanded()),
             else => try t.expect(!s.renameMayHaveLanded()),

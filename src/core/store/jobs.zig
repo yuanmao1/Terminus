@@ -81,12 +81,12 @@ comptime {
     // keeps it so. A fifth status that is not live has to appear here, or the
     // settlement route would silently stop being able to reach it while
     // `live()` went on promising that it could.
-    for (@typeInfo(Status).@"enum".fields) |field| {
-        const s: Status = @enumFromInt(field.value);
-        const listed = std.meta.stringToEnum(Settled, field.name) != null;
+    for (@typeInfo(Status).@"enum".field_names, @typeInfo(Status).@"enum".field_values) |field_name, field_value| {
+        const s: Status = @fromBackingInt(@intCast(field_value));
+        const listed = std.meta.stringToEnum(Settled, field_name) != null;
         if (s.live() == listed) @compileError(
             "Settled must be exactly the non-live members of Status; '" ++
-                field.name ++ "' is in one and not the other",
+                field_name ++ "' is in one and not the other",
         );
     }
 }
@@ -212,8 +212,8 @@ fn sqlList(comptime E: type, comptime members: []const E) []const u8 {
 fn membersWhere(comptime E: type, comptime role: fn (E) bool) []const E {
     comptime {
         var out: []const E = &[_]E{};
-        for (@typeInfo(E).@"enum".fields) |field| {
-            const member: E = @enumFromInt(field.value);
+        for (@typeInfo(E).@"enum".field_values) |field_value| {
+            const member: E = @fromBackingInt(@intCast(field_value));
             if (role(member)) out = out ++ &[_]E{member};
         }
         return out;
@@ -471,8 +471,8 @@ pub const Warrant = enum {
 fn removableList(comptime g: RemovalGrounds) []const u8 {
     comptime {
         var out: []const Status = &[_]Status{};
-        for (@typeInfo(Status).@"enum".fields) |field| {
-            const s: Status = @enumFromInt(field.value);
+        for (@typeInfo(Status).@"enum".field_values) |field_value| {
+            const s: Status = @fromBackingInt(@intCast(field_value));
             if (g.admits(s)) out = out ++ &[_]Status{s};
         }
         return sqlList(Status, out);
@@ -969,8 +969,8 @@ test "the two routes partition the transition graph" {
     // would make a state unreachable; one that shared an edge would put back
     // the rule this partition exists to remove — a settlement able to walk the
     // promotion.
-    inline for (@typeInfo(Status).@"enum".fields) |to_field| {
-        const to: Status = @enumFromInt(to_field.value);
+    inline for (@typeInfo(Status).@"enum".field_values) |to_field_value| {
+        const to: Status = @fromBackingInt(@intCast(to_field_value));
         for (predecessors(to)) |from| {
             const by_promotion = routeAllows(.promotion, from, to);
             const by_settlement = routeAllows(.settlement, from, to);
@@ -1035,8 +1035,8 @@ test "the short route admits exactly the grounds that need no claim" {
     // second one across would make `jobs.remove(row, .session_proven_gone)`
     // writable again, and it fails here first.
     var short_route: usize = 0;
-    inline for (@typeInfo(RemovalGrounds).@"enum".fields) |field| {
-        const g: RemovalGrounds = @enumFromInt(field.value);
+    inline for (@typeInfo(RemovalGrounds).@"enum".field_values) |field_value| {
+        const g: RemovalGrounds = @fromBackingInt(@intCast(field_value));
         // Exhaustive by construction — `warrant` is a total switch — so this
         // counts rather than tolerates.
         switch (g.warrant()) {
@@ -1054,8 +1054,8 @@ test "the short route admits exactly the grounds that need no claim" {
     // and `warrant` is a per-route one, and asserting the correspondence here
     // is what keeps a later variant from being given the short route while
     // quietly admitting `running`.
-    inline for (@typeInfo(RemovalGrounds).@"enum".fields) |field| {
-        const g: RemovalGrounds = @enumFromInt(field.value);
+    inline for (@typeInfo(RemovalGrounds).@"enum".field_values) |field_value| {
+        const g: RemovalGrounds = @fromBackingInt(@intCast(field_value));
         try t.expectEqual(g.admits(.running), g.warrant() == .reread_claim);
     }
 }

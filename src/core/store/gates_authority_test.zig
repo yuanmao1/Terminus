@@ -744,9 +744,9 @@ test "gate: every claim state `leases` can report has a column in the authority 
     // The property the column list used to get by spelling `@tagName`: a state
     // added to `leases.ClaimState` and not answered here would leave a row of the
     // table untested and nothing would say so.
-    inline for (@typeInfo(Store.leases.ClaimState).@"union".fields) |field| {
-        if (!@hasField(ClaimScenario, field.name)) {
-            std.debug.print("\nleases.ClaimState.{s} has no column in ClaimScenario\n", .{field.name});
+    inline for (@typeInfo(Store.leases.ClaimState).@"union".field_names) |field_name| {
+        if (!@hasField(ClaimScenario, field_name)) {
+            std.debug.print("\nleases.ClaimState.{s} has no column in ClaimScenario\n", .{field_name});
             return error.ClaimStateHasNoColumn;
         }
     }
@@ -755,8 +755,8 @@ test "gate: every claim state `leases` can report has a column in the authority 
     for (std.enums.values(ClaimScenario)) |claim| {
         const want = claimCode(claim);
         var found = false;
-        inline for (@typeInfo(Store.leases.ClaimState).@"union".fields) |field| {
-            if (std.mem.eql(u8, field.name, want)) found = true;
+        inline for (@typeInfo(Store.leases.ClaimState).@"union".field_names) |field_name| {
+            if (std.mem.eql(u8, field_name, want)) found = true;
         }
         if (!found) {
             std.debug.print("\nClaimScenario.{s} maps to \"{s}\", which is not a ClaimState\n", .{ @tagName(claim), want });
@@ -1142,10 +1142,11 @@ const ClockCrossesTheTtl = struct {
         const clock = io orelse return error.NoIoForTheClockProbe;
         const expires_at = (try Store.leases.clockSeconds(db)) + 1;
         var buf: [128]u8 = undefined;
-        try db.db.exec(try std.fmt.bufPrintZ(
+        try db.db.exec(try std.mem.printSentinel(
             &buf,
             "UPDATE leases SET expires_at = {d} WHERE released_at IS NULL",
             .{expires_at},
+            0,
         ));
         while ((try Store.leases.clockSeconds(db)) < expires_at)
             std.Io.sleep(clock, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake) catch {};
@@ -1555,18 +1556,18 @@ test "gate: a `job rm` whose compare-and-swap is refused leaves no terminal clai
 // to destroy rows through a route with no authority in it.
 test "gate: the settlement `job kill` writes cannot express a destruction" {
     const t = std.testing;
-    const fields = @typeInfo(execution.JobCacheSync).@"union".fields;
-    try t.expectEqual(@as(usize, 2), fields.len);
-    try t.expectEqualStrings("none", fields[0].name);
-    try t.expectEqualStrings("finish", fields[1].name);
+    const fields = @typeInfo(execution.JobCacheSync).@"union";
+    try t.expectEqual(@as(usize, 2), fields.field_names.len);
+    try t.expectEqualStrings("none", fields.field_names[0]);
+    try t.expectEqualStrings("finish", fields.field_names[1]);
 
     // And the destructive contract's own vocabulary, for the other direction: two
     // destructions, both of which name a subject. A third arm added here without a
     // row in the matrix above fails this count.
-    const destructions = @typeInfo(execution.Destruction).@"union".fields;
-    try t.expectEqual(@as(usize, 2), destructions.len);
-    try t.expectEqualStrings("session_row", destructions[0].name);
-    try t.expectEqualStrings("job_row", destructions[1].name);
+    const destructions = @typeInfo(execution.Destruction).@"union";
+    try t.expectEqual(@as(usize, 2), destructions.field_names.len);
+    try t.expectEqualStrings("session_row", destructions.field_names[0]);
+    try t.expectEqualStrings("job_row", destructions.field_names[1]);
 }
 
 // --- A cascading delete has one writer, and one route to it ------------------

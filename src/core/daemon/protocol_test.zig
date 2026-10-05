@@ -246,7 +246,7 @@ test "gate: the frame's header is the length of the payload that follows it" {
     const rendered = try Ssh.retain(arena, .{
         .exit_code = 3,
         .stdout = raw,
-        .stderr = try arena.dupe(u8, "e" ** 33),
+        .stderr = try arena.dupe(u8, &@as([33]u8, @splat('e'))),
     }, &retained, Ssh.read_bytes);
     const response = protocol.execResponse(rendered, retained);
 
@@ -438,7 +438,7 @@ test "gate: a reply with no accounting is refused rather than read as zeros" {
         "{{\"v\":{d},\"ok\":true,\"passed\":{{" ++
             "\"stdout\":{{\"bytes\":1,\"sha256\":\"abc\",\"truncated\":false}}," ++
             "\"stderr\":{{\"bytes\":0,\"sha256\":\"{s}\",\"truncated\":false}}}}}}",
-        .{ protocol.version, "0" ** Core.digest.hex_len },
+        .{ protocol.version, &@as([Core.digest.hex_len]u8, @splat('0')) },
     );
     try t.expectError(
         error.MalformedMessage,
@@ -451,7 +451,7 @@ test "gate: a reply with no accounting is refused rather than read as zeros" {
         "{{\"v\":{d},\"ok\":true,\"passed\":{{" ++
             "\"stdout\":{{\"bytes\":1,\"sha256\":\"{s}\",\"truncated\":false}}," ++
             "\"stderr\":{{\"bytes\":0,\"sha256\":\"{s}\",\"truncated\":false}}}}}}",
-        .{ protocol.version, "1" ** Core.digest.hex_len, "0" ** Core.digest.hex_len },
+        .{ protocol.version, &@as([Core.digest.hex_len]u8, @splat('1')), &@as([Core.digest.hex_len]u8, @splat('0')) },
     );
     const parsed = try protocol.parseMessage(protocol.Response, arena, full);
     try t.expectEqual(@as(u64, 1), parsed.passed.?.stdout.bytes);

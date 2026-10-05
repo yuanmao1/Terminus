@@ -28,7 +28,7 @@ pub fn add(b: *std.Build) *std.Build.Step.Compile {
         .target = target,
         // Small for the same reason as the helper: it is embedded in the CLI
         // and sent over the network. Stripped for the same reason.
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
         .link_libc = true,
         .strip = true,
     });

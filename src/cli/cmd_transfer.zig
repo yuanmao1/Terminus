@@ -1247,7 +1247,7 @@ fn stream(r: *Run, via: ?[]const u8, mode: u32) Streamed {
 fn scpAttempt(r: *Run, progress: *Progress, moved: *Core.Ssh.Moved, mode: u32) Core.Ssh.TransferError!u64 {
     switch (r.verb) {
         .push => {
-            const partial_z = r.ctx.arena.dupeZ(u8, r.partial_path) catch fatal("out of memory", .{});
+            const partial_z = r.ctx.arena.dupeSentinel(u8, r.partial_path, 0) catch fatal("out of memory", .{});
             return r.client.scpSend(
                 r.ctx.io,
                 r.source_path,
@@ -1258,7 +1258,7 @@ fn scpAttempt(r: *Run, progress: *Progress, moved: *Core.Ssh.Moved, mode: u32) C
             );
         },
         .pull => {
-            const src_z = r.ctx.arena.dupeZ(u8, r.source_path) catch fatal("out of memory", .{});
+            const src_z = r.ctx.arena.dupeSentinel(u8, r.source_path, 0) catch fatal("out of memory", .{});
             return r.client.scpRecv(
                 r.ctx.io,
                 src_z,

@@ -1459,8 +1459,8 @@ test "gate: every failure keeps its destination until something supersedes it" {
     // dropped from `holdsDestination` is still visited here and still asked to
     // refuse a rival.
     var seq: usize = 0;
-    inline for (@typeInfo(Store.transfers.State).@"enum".fields) |field| {
-        const failed: Store.transfers.State = @enumFromInt(field.value);
+    inline for (@typeInfo(Store.transfers.State).@"enum".field_values) |field_value| {
+        const failed: Store.transfers.State = @fromBackingInt(@intCast(field_value));
         if (comptime failed.isSupersedable()) {
             seq += 1;
             var dest_buf: [64]u8 = undefined;

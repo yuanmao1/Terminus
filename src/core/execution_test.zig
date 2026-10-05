@@ -125,8 +125,8 @@ const Harness = struct {
             .owner_token = "owner-a",
             .now = 1000,
         };
-        inline for (@typeInfo(@TypeOf(opts)).@"struct".fields) |field| {
-            @field(options, field.name) = @field(opts, field.name);
+        inline for (@typeInfo(@TypeOf(opts)).@"struct".field_names) |field_name| {
+            @field(options, field_name) = @field(opts, field_name);
         }
         return execution.begin(&h.store, h.arena, h.io, options);
     }

@@ -923,8 +923,8 @@ test "gate: the undetermined-adjudication refusal names every reading that would
     const E = Store.receipts.ResolutionEvidence;
 
     var named: usize = 0;
-    inline for (@typeInfo(E).@"union".fields) |field| {
-        const tag = @field(std.meta.Tag(E), field.name);
+    inline for (@typeInfo(E).@"union".field_names) |field_name| {
+        const tag = @field(std.meta.Tag(E), field_name);
         const phrase = adjudicatingPhrase(tag);
         // The table and the store have to agree about which readings can settle
         // a parked publish. A phrase for one that cannot would send an operator
@@ -935,7 +935,7 @@ test "gate: the undetermined-adjudication refusal names every reading that would
             if (std.mem.indexOf(u8, detail, needle) == null) {
                 std.debug.print(
                     "the undetermined-adjudication sentence does not name {s}: it should contain \"{s}\"\n",
-                    .{ field.name, needle },
+                    .{ field_name, needle },
                 );
                 return error.UndeterminedSentenceOmitsAReading;
             }

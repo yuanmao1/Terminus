@@ -159,7 +159,7 @@ test "gate: a short pull is an error naming what was expected and what arrived" 
     // The host announces 900 bytes and hands back 400. Under the shape this
     // replaces, `pullFile` returned 400 and the caller printed "400 bytes" as a
     // success — the staged partial was two fifths of a file and nothing said so.
-    const body = "x" ** 400;
+    const body: *const [400]u8 = &@splat('x');
     var steps: std.ArrayList(Core.Scripted.Step) = .empty;
     try steps.append(arena, try rangeReply(arena, body));
     var script = Core.Scripted.init(arena, try steps.toOwnedSlice(arena));
@@ -201,7 +201,7 @@ test "gate: a short exec push is an error, and the count is not the answer" {
     // constructible from here without racing the filesystem, so the injection is
     // the *host* refusing a slice partway. Either way the property under test is
     // the same: the loop may not leave early and report the bytes it managed.
-    const body = "y" ** (40 * 1024);
+    const body: *const [40 * 1024]u8 = &@splat('y');
     const source = try scratch.write("shortpush", body);
 
     var steps = [_]Core.Scripted.Step{
@@ -1288,7 +1288,7 @@ test "gate: what verifying concludes from the two readings it holds" {
 
     // Every verdict is reachable from the rows above, so none of them is dead.
     var seen: [4]bool = @splat(false);
-    for (cases) |c| seen[@intFromEnum(c.want)] = true;
+    for (cases) |c| seen[@backingInt(c.want)] = true;
     for (seen) |hit| try t.expect(hit);
 }
 
@@ -1322,8 +1322,8 @@ test "gate: completed_unverified is not success, and every outcome says what it 
     // hint. Counted, so an outcome added without either is not waved through.
     var seen: usize = 0;
     var texts: [16][]const u8 = undefined;
-    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
-        const o: cmd_transfer.Outcome = @enumFromInt(field.value);
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".field_values) |field_value| {
+        const o: cmd_transfer.Outcome = @fromBackingInt(@intCast(field_value));
         try t.expect(o.proves().len > 0);
         try t.expectEqual(o == .published, o.hint() == null);
         for (texts[0..seen]) |prior| try t.expect(!std.mem.eql(u8, prior, o.proves()));
@@ -1337,10 +1337,10 @@ test "gate: completed_unverified is not success, and every outcome says what it 
     // Counted for the same reason: a member whose name stopped being a state
     // would make `Outcome.naming` return null on a path that cannot report it.
     var named: usize = 0;
-    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
-        const state = try transfers.State.parse(field.name);
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".field_names, @typeInfo(cmd_transfer.Outcome).@"enum".field_values) |field_name, field_value| {
+        const state = try transfers.State.parse(field_name);
         try t.expectEqual(
-            @as(?cmd_transfer.Outcome, @enumFromInt(field.value)),
+            @as(?cmd_transfer.Outcome, @fromBackingInt(@intCast(field_value))),
             cmd_transfer.Outcome.naming(state),
         );
         named += 1;
@@ -1728,9 +1728,9 @@ test "gate: --restart and --resume divide the driver's outcomes, and neither rea
     var releasable: usize = 0;
     var resumable: usize = 0;
     var both: usize = 0;
-    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".field_names) |field_name| {
         outcomes += 1;
-        const state = transfers.State.parse(field.name) catch
+        const state = transfers.State.parse(field_name) catch
             return error.OutcomeNamesNoCheckpointState;
         if (state.holdsDestination()) {
             holders += 1;
@@ -1774,8 +1774,8 @@ test "gate: --restart and --resume divide the driver's outcomes, and neither rea
     var with_resume: usize = 0;
     var with_restart: usize = 0;
     var with_neither: usize = 0;
-    inline for (@typeInfo(transfers.State).@"enum".fields) |field| {
-        const state: transfers.State = @enumFromInt(field.value);
+    inline for (@typeInfo(transfers.State).@"enum".field_values) |field_value| {
+        const state: transfers.State = @fromBackingInt(@intCast(field_value));
         if (state.holdsDestination()) {
             const verb = cmd_transfer.verbFor(state);
             if (verb) |v| {
@@ -2350,8 +2350,8 @@ test "gate: SKILL.md publishes an exit code for every transfer outcome, and it i
     // an agent is told to branch on, so they are read off the document and
     // compared with `Outcome.exitCode` rather than trusted.
     var documented: usize = 0;
-    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
-        const bullet = "- `" ++ field.name ++ "` — exit **";
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".field_names, @typeInfo(cmd_transfer.Outcome).@"enum".field_values) |field_name, field_value| {
+        const bullet = "- `" ++ field_name ++ "` — exit **";
         const at = std.mem.indexOf(u8, section, bullet) orelse {
             std.debug.print(
                 \\
@@ -2361,7 +2361,7 @@ test "gate: SKILL.md publishes an exit code for every transfer outcome, and it i
                 \\Every `cmd_transfer.Outcome` has to appear there with the code it really
                 \\exits with, because that list is what an agent branches on.
                 \\
-            , .{ field.name, bullet });
+            , .{ field_name, bullet });
             return error.SkillTransferOutcomeMissing;
         };
         // Once. A second bullet for the same outcome would let the two disagree
@@ -2374,7 +2374,7 @@ test "gate: SKILL.md publishes an exit code for every transfer outcome, and it i
         const close = std.mem.indexOf(u8, rest, "**") orelse return error.SkillTransferExitCodeUnterminated;
         const claimed = std.fmt.parseInt(u8, rest[0..close], 10) catch
             return error.SkillTransferExitCodeUnreadable;
-        const outcome: cmd_transfer.Outcome = @enumFromInt(field.value);
+        const outcome: cmd_transfer.Outcome = @fromBackingInt(@intCast(field_value));
         try t.expectEqual(outcome.exitCode(), claimed);
         documented += 1;
     }
@@ -2394,8 +2394,8 @@ test "gate: SKILL.md publishes how many transfer verdicts --restart can release"
     // 5 and would hand a resumable transfer's path to a rival; this is where
     // that is noticed.
     var releasable: usize = 0;
-    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".fields) |field| {
-        const state = transfers.State.parse(field.name) catch
+    inline for (@typeInfo(cmd_transfer.Outcome).@"enum".field_names) |field_name| {
+        const state = transfers.State.parse(field_name) catch
             return error.OutcomeNamesNoCheckpointState;
         if (state.holdsDestination() and state.isSupersedable()) releasable += 1;
     }
@@ -3496,8 +3496,8 @@ test "gate: --resume reaches exactly the adoptable states, and the statement ref
     // four of them. Counted from the predicate, so a fifth added without a
     // sentence for it fails here.
     var adoptable: usize = 0;
-    inline for (@typeInfo(transfers.State).@"enum".fields) |field| {
-        const state: transfers.State = @enumFromInt(field.value);
+    inline for (@typeInfo(transfers.State).@"enum".field_values) |field_value| {
+        const state: transfers.State = @fromBackingInt(@intCast(field_value));
         if (state.isAdoptable()) {
             adoptable += 1;
             try t.expectEqualStrings("--resume", cmd_transfer.verbFor(state).?);

@@ -1373,18 +1373,18 @@ test "gate: SKILL.md's resultRecord codes are SidecarReading's own tag names" {
     defer ordinary.deinit(gpa);
     var unusable: std.ArrayList([]const u8) = .empty;
     defer unusable.deinit(gpa);
-    inline for (@typeInfo(Tmux.SidecarReading).@"union".fields) |f| {
+    inline for (@typeInfo(Tmux.SidecarReading).@"union".field_names, @typeInfo(Tmux.SidecarReading).@"union".field_types) |f_name, f_type| {
         // A sample payload, only so `anomalous()` can be asked about the tag.
-        const payload: f.type = switch (@typeInfo(f.type)) {
+        const payload: f_type = switch (@typeInfo(f_type)) {
             .void => {},
             .int => 0,
             .pointer => "",
             else => @compileError(
-                "SidecarReading." ++ f.name ++ " carries a payload this gate cannot" ++
+                "SidecarReading." ++ f_name ++ " carries a payload this gate cannot" ++
                     " sample; teach it one rather than dropping the variant from the check",
             ),
         };
-        const reading: Tmux.SidecarReading = @unionInit(Tmux.SidecarReading, f.name, payload);
+        const reading: Tmux.SidecarReading = @unionInit(Tmux.SidecarReading, f_name, payload);
         const bucket = if (reading.anomalous()) &unusable else &ordinary;
         try bucket.append(gpa, reading.code());
     }
@@ -1429,9 +1429,9 @@ test "gate: SKILL.md's resultRecord codes are SidecarReading's own tag names" {
 test "gate: SKILL.md publishes the resultRecord values that are not readings" {
     const gpa = std.testing.allocator;
 
-    inline for (@typeInfo(Tmux.SidecarReading).@"union".fields) |f| {
+    inline for (@typeInfo(Tmux.SidecarReading).@"union".field_names) |f_name| {
         for (result_record_non_readings) |word| {
-            if (std.mem.eql(u8, f.name, word)) {
+            if (std.mem.eql(u8, f_name, word)) {
                 std.debug.print(
                     \\
                     \\`SidecarReading` now has a variant named `{s}`, which is a value
@@ -1439,7 +1439,7 @@ test "gate: SKILL.md publishes the resultRecord values that are not readings" {
                     \\branching on that word can no longer tell an observation of the address
                     \\from a failure to make one. Rename one of the two.
                     \\
-                , .{f.name});
+                , .{f_name});
                 return error.NonReadingCollidesWithAReading;
             }
         }
@@ -1567,8 +1567,8 @@ test "gate: SKILL.md publishes exactly the leaseRelease vocabulary, everywhere i
 
     var actual: std.ArrayList([]const u8) = .empty;
     defer actual.deinit(gpa);
-    inline for (@typeInfo(Cli.ClaimRelease.codes).@"struct".decls) |decl| {
-        try actual.append(gpa, @field(Cli.ClaimRelease.codes, decl.name));
+    inline for (@typeInfo(Cli.ClaimRelease.codes).@"struct".decl_names) |decl_name| {
+        try actual.append(gpa, @field(Cli.ClaimRelease.codes, decl_name));
     }
     try expectPublishedVocabulary(gpa, "leaseRelease", actual.items, shared_vocabulary_paragraphs);
 }
@@ -1583,17 +1583,17 @@ test "gate: SKILL.md publishes exactly the authority vocabulary, everywhere it p
 
     var actual: std.ArrayList([]const u8) = .empty;
     defer actual.deinit(gpa);
-    inline for (@typeInfo(Authority).@"union".fields) |f| {
+    inline for (@typeInfo(Authority).@"union".field_names, @typeInfo(Authority).@"union".field_types) |f_name, f_type| {
         // A sample payload, only so `code()` can be asked about the tag.
-        const payload: f.type = switch (@typeInfo(f.type)) {
+        const payload: f_type = switch (@typeInfo(f_type)) {
             .void => {},
             .pointer => "",
             else => @compileError(
-                "Authority." ++ f.name ++ " carries a payload this gate cannot sample;" ++
+                "Authority." ++ f_name ++ " carries a payload this gate cannot sample;" ++
                     " teach it one rather than dropping the variant from the check",
             ),
         };
-        const value: Authority = @unionInit(Authority, f.name, payload);
+        const value: Authority = @unionInit(Authority, f_name, payload);
         try actual.append(gpa, value.code());
     }
     try expectPublishedVocabulary(gpa, "authority", actual.items, shared_vocabulary_paragraphs);
@@ -6583,13 +6583,13 @@ test "gate: a job mutation takes the scope before it reaches the host, and --for
     // producer of. A refusal here is therefore a refusal with no dial, no
     // probe and no `kill-session`.
     comptime {
-        for (@typeInfo(@TypeOf(claimJobScope)).@"fn".params) |param| {
-            if (param.type) |ty| if (ty == Core.Executor) @compileError(
+        for (@typeInfo(@TypeOf(claimJobScope)).@"fn".param_types) |param_type| {
+            if (param_type) |ty| if (ty == Core.Executor) @compileError(
                 "claimJobScope must not be able to reach the host: it decides before the connection exists",
             );
         }
-        for (@typeInfo(@TypeOf(killJob)).@"fn".params) |param| {
-            if (param.type) |ty| if (ty == Claim) break;
+        for (@typeInfo(@TypeOf(killJob)).@"fn".param_types) |param_type| {
+            if (param_type) |ty| if (ty == Claim) break;
         } else @compileError("killJob must be unreachable without a held Claim");
     }
     // The peer still holds it, so the refusal took nothing away either.
@@ -9508,33 +9508,33 @@ test "gate: job receipt carries no secret, and its --json key set is pinned" {
         "terminal", "command",        "commandSha256", "cwd",
         "alias",    "resolvedStatus", "reconciledAt",  "resolutionEvidence",
     };
-    const fields = @typeInfo(ReceiptJson).@"struct".fields;
-    try t.expectEqual(never_null.len + nullable.len, fields.len);
+    const fields = @typeInfo(ReceiptJson).@"struct";
+    try t.expectEqual(never_null.len + nullable.len, fields.field_names.len);
     var matched: usize = 0;
-    inline for (fields) |f| {
-        const optional = @typeInfo(f.type) == .optional;
+    inline for (fields.field_names, fields.field_types) |f_name, f_type| {
+        const optional = @typeInfo(f_type) == .optional;
         const wanted: []const []const u8 = if (optional) &nullable else &never_null;
         for (wanted) |name| {
-            if (std.mem.eql(u8, name, f.name)) {
+            if (std.mem.eql(u8, name, f_name)) {
                 matched += 1;
                 break;
             }
         } else {
             std.debug.print(
                 "\n`{s}` is {s} in ReceiptJson and is not in the pinned {s} list\n",
-                .{ f.name, if (optional) "nullable" else "never null", if (optional) "nullable" else "never-null" },
+                .{ f_name, if (optional) "nullable" else "never null", if (optional) "nullable" else "never-null" },
             );
             return error.ReceiptKeySetDrifted;
         }
     }
-    try t.expectEqual(fields.len, matched);
+    try t.expectEqual(fields.field_names.len, matched);
     // And every key really is in the document, which a `@typeInfo` walk alone
     // cannot say: the struct could be right and the emitter could be somewhere
     // else entirely.
-    inline for (fields) |f| {
-        const needle = "\"" ++ f.name ++ "\":";
+    inline for (fields.field_names) |f_name| {
+        const needle = "\"" ++ f_name ++ "\":";
         std.testing.expect(std.mem.indexOf(u8, document, needle) != null) catch |err| {
-            std.debug.print("\n`{s}` is in ReceiptJson and not in the document\n", .{f.name});
+            std.debug.print("\n`{s}` is in ReceiptJson and not in the document\n", .{f_name});
             return err;
         };
     }

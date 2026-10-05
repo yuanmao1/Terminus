@@ -7,7 +7,7 @@ npm install -g terminus-shell
 terminus setup          # install the agent skill into Claude Code / Codex
 ```
 
-Written in Zig 0.16. Single ~3 MB binary, zero runtime dependencies — SQLite and libssh2 (WinCNG backend) are compiled in. Windows x64 today; Linux/macOS planned.
+Written in Zig 0.17. Single ~3 MB binary, zero runtime dependencies — SQLite and libssh2 (WinCNG backend) are compiled in. Windows x64 today; Linux/macOS planned.
 
 ---
 
@@ -160,7 +160,7 @@ agent / human
 
 ## Building from source
 
-Requires Zig 0.16.0 on Windows. All C dependencies are vendored:
+Requires Zig 0.17.0 on Windows. All C dependencies are vendored:
 
 ```bash
 zig build              # debug

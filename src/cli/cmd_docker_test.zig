@@ -226,7 +226,7 @@ test "gate: each distinguishable failure is reported as itself and not as anothe
     // Every arm of the union, or this gate is checking a subset of the
     // vocabulary it claims to hold apart. `@typeInfo` counts them; the list
     // above supplies the answers. An arm added without a case fails here.
-    try t.expectEqual(@typeInfo(docker.Reading).@"union".fields.len, cases.len);
+    try t.expectEqual(@typeInfo(docker.Reading).@"union".field_names.len, cases.len);
 
     var seen: std.ArrayList([]const u8) = .empty;
     for (cases) |case| {
@@ -356,12 +356,12 @@ test "gate: docker's vocabulary and this build's enums are the same list" {
     // that is not one of docker's. A member added to the enum without a word to
     // read it from — or a word added with no member — lands here.
     try t.expectEqual(
-        @typeInfo(docker.Lifecycle).@"enum".fields.len,
+        @typeInfo(docker.Lifecycle).@"enum".field_names.len,
         docker.docker_status_words_len + 1,
     );
     // `Health` has two of ours: `none` (no HEALTHCHECK) and `unrecognised`.
     try t.expectEqual(
-        @typeInfo(docker.Health).@"enum".fields.len,
+        @typeInfo(docker.Health).@"enum".field_names.len,
         docker.docker_health_words_len + 2,
     );
 }
@@ -379,9 +379,9 @@ test "gate: no combination reports the target reached except the target itself" 
 
     // Exhaustive by construction: a member added to any of the three unions
     // fails here before it can be silently left out of the sweep.
-    try t.expectEqual(@typeInfo(docker.Target).@"enum".fields.len, targets.len);
-    try t.expectEqual(@typeInfo(docker.Lifecycle).@"enum".fields.len, lifecycles.len);
-    try t.expectEqual(@typeInfo(docker.Health).@"enum".fields.len, healths.len);
+    try t.expectEqual(@typeInfo(docker.Target).@"enum".field_names.len, targets.len);
+    try t.expectEqual(@typeInfo(docker.Lifecycle).@"enum".field_names.len, lifecycles.len);
+    try t.expectEqual(@typeInfo(docker.Health).@"enum".field_names.len, healths.len);
 
     var combinations: usize = 0;
     var reached: usize = 0;
@@ -455,7 +455,7 @@ test "gate: no combination reports the target reached except the target itself" 
         .{ .unparseable = "SyntaxError" },
         .{ .unknown_probe_status = 127 },
     };
-    try t.expectEqual(@typeInfo(docker.Reading).@"union".fields.len - 1, absences.len);
+    try t.expectEqual(@typeInfo(docker.Reading).@"union".field_names.len - 1, absences.len);
     for (targets) |target| {
         for (absences) |reading| {
             switch (docker.verdictOf(target, reading)) {
@@ -661,7 +661,7 @@ test "gate: a wait against a host with no docker is undetermined, not a timeout"
 test "gate: the four wait outcomes are four words, and only one of them is ok" {
     const t = std.testing;
     const kinds = [_]docker.WaitOutcome.Kind{ .reached, .timed_out, .cannot_reach, .undetermined };
-    try t.expectEqual(@typeInfo(docker.WaitOutcome.Kind).@"enum".fields.len, kinds.len);
+    try t.expectEqual(@typeInfo(docker.WaitOutcome.Kind).@"enum".field_names.len, kinds.len);
 
     var ok_count: usize = 0;
     for (kinds, 0..) |kind, i| {
@@ -686,33 +686,33 @@ test "gate: the four wait outcomes are four words, and only one of them is ok" {
 
 test "gate: both documents carry the shared state keys, with the same types" {
     const t = std.testing;
-    const shared = @typeInfo(docker.StateKeys).@"struct".fields;
-    const inspect_fields = @typeInfo(docker.InspectJson).@"struct".fields;
-    const wait_fields = @typeInfo(docker.WaitJson).@"struct".fields;
+    const shared = @typeInfo(docker.StateKeys).@"struct";
+    const inspect_fields = @typeInfo(docker.InspectJson).@"struct";
+    const wait_fields = @typeInfo(docker.WaitJson).@"struct";
 
-    try t.expectEqual(@as(usize, 7), shared.len);
+    try t.expectEqual(@as(usize, 7), shared.field_names.len);
 
     // Every state key appears in both emitters, with the same name and the same
     // type. Two hand-written copies of one key set is what this holds together:
     // a key added to `inspect` and not to `wait` would otherwise leave the two
     // verbs describing the same container differently.
-    inline for (shared) |f| {
+    inline for (shared.field_names, shared.field_types) |f_name, f_type| {
         var in_inspect = false;
         var in_wait = false;
-        inline for (inspect_fields) |g| {
-            if (comptime std.mem.eql(u8, f.name, g.name)) {
+        inline for (inspect_fields.field_names, inspect_fields.field_types) |g_name, g_type| {
+            if (comptime std.mem.eql(u8, f_name, g_name)) {
                 in_inspect = true;
-                try t.expect(f.type == g.type);
+                try t.expect(f_type == g_type);
             }
         }
-        inline for (wait_fields) |g| {
-            if (comptime std.mem.eql(u8, f.name, g.name)) {
+        inline for (wait_fields.field_names, wait_fields.field_types) |g_name, g_type| {
+            if (comptime std.mem.eql(u8, f_name, g_name)) {
                 in_wait = true;
-                try t.expect(f.type == g.type);
+                try t.expect(f_type == g_type);
             }
         }
         if (!in_inspect or !in_wait) {
-            std.debug.print("state key `{s}` is missing from one of the two documents\n", .{f.name});
+            std.debug.print("state key `{s}` is missing from one of the two documents\n", .{f_name});
             return error.DocumentsDisagreeAboutTheState;
         }
     }
@@ -733,15 +733,15 @@ test "gate: the published key sets are exactly these, and only two of them are p
         "finishedAt",     "detail",        "dockerSaid",     "transport", "daemonError",
     };
 
-    const inspect_fields = @typeInfo(docker.InspectJson).@"struct".fields;
-    const wait_fields = @typeInfo(docker.WaitJson).@"struct".fields;
+    const inspect_fields = @typeInfo(docker.InspectJson).@"struct";
+    const wait_fields = @typeInfo(docker.WaitJson).@"struct";
 
     // A count first, so a key added or dropped fails here rather than being
     // missed by a loop that only checks the ones it knows about.
-    try t.expectEqual(inspect_keys.len, inspect_fields.len);
-    try t.expectEqual(wait_keys.len, wait_fields.len);
-    inline for (inspect_fields, 0..) |f, i| try t.expectEqualStrings(inspect_keys[i], f.name);
-    inline for (wait_fields, 0..) |f, i| try t.expectEqualStrings(wait_keys[i], f.name);
+    try t.expectEqual(inspect_keys.len, inspect_fields.field_names.len);
+    try t.expectEqual(wait_keys.len, wait_fields.field_names.len);
+    inline for (inspect_fields.field_names, 0..) |f_name, i| try t.expectEqualStrings(inspect_keys[i], f_name);
+    inline for (wait_fields.field_names, 0..) |f_name, i| try t.expectEqualStrings(wait_keys[i], f_name);
 
     // The two prose keys, named. Everything else is a bool, a number, a null,
     // or a word from a closed vocabulary — so no agent has to parse a sentence
@@ -749,9 +749,9 @@ test "gate: the published key sets are exactly these, and only two of them are p
     // a decision fails the count above.
     const prose = [_][]const u8{ "detail", "dockerSaid" };
     var found: usize = 0;
-    inline for (inspect_fields) |f| {
+    inline for (inspect_fields.field_names) |f_name| {
         inline for (prose) |name| {
-            if (comptime std.mem.eql(u8, f.name, name)) found += 1;
+            if (comptime std.mem.eql(u8, f_name, name)) found += 1;
         }
     }
     try t.expectEqual(prose.len, found);
@@ -784,7 +784,7 @@ test "gate: every vocabulary key takes a word from its own closed list" {
             .finished_at = null,
         } },
     };
-    try t.expectEqual(@typeInfo(docker.Reading).@"union".fields.len, readings.len);
+    try t.expectEqual(@typeInfo(docker.Reading).@"union".field_names.len, readings.len);
 
     var checked: usize = 0;
     for (readings) |reading| {
@@ -798,8 +798,8 @@ test "gate: every vocabulary key takes a word from its own closed list" {
         );
         // `reading` is one of the union's own tags.
         var named = false;
-        inline for (@typeInfo(docker.Reading).@"union".fields) |f| {
-            if (std.mem.eql(u8, document.reading, f.name)) named = true;
+        inline for (@typeInfo(docker.Reading).@"union".field_names) |f_name| {
+            if (std.mem.eql(u8, document.reading, f_name)) named = true;
         }
         try t.expect(named);
         // `ok` is exactly "this is a state" and nothing else.
@@ -807,15 +807,15 @@ test "gate: every vocabulary key takes a word from its own closed list" {
         // `status` and `health` are either absent or members of their enums.
         if (document.status) |word| {
             var member = false;
-            inline for (@typeInfo(docker.Lifecycle).@"enum".fields) |f| {
-                if (std.mem.eql(u8, word, f.name)) member = true;
+            inline for (@typeInfo(docker.Lifecycle).@"enum".field_names) |f_name| {
+                if (std.mem.eql(u8, word, f_name)) member = true;
             }
             try t.expect(member);
         }
         if (document.health) |word| {
             var member = false;
-            inline for (@typeInfo(docker.Health).@"enum".fields) |f| {
-                if (std.mem.eql(u8, word, f.name)) member = true;
+            inline for (@typeInfo(docker.Health).@"enum".field_names) |f_name| {
+                if (std.mem.eql(u8, word, f_name)) member = true;
             }
             try t.expect(member);
         }

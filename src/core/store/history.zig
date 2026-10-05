@@ -354,8 +354,8 @@ test "gate: a redaction that could not be performed refuses rather than storing 
     // be the fallback that writes the secret.
     const set = @typeInfo(@typeInfo(@TypeOf(add)).@"fn".return_type.?).error_union.error_set;
     var carries_allocation_failure = false;
-    for (@typeInfo(set).error_set.?) |member| {
-        if (std.mem.eql(u8, member.name, "OutOfMemory")) carries_allocation_failure = true;
+    for (@typeInfo(set).error_set.error_names.?) |member_name| {
+        if (std.mem.eql(u8, member_name, "OutOfMemory")) carries_allocation_failure = true;
     }
     if (!carries_allocation_failure) {
         std.debug.print(

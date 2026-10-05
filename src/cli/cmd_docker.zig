@@ -494,8 +494,8 @@ pub const Target = enum { healthy, running };
 /// `Core.shell.kind_list` uses, for the same reason.
 pub const target_list = list: {
     var out: []const u8 = "";
-    for (@typeInfo(Target).@"enum".fields, 0..) |field, i| {
-        out = out ++ (if (i == 0) "" else "|") ++ field.name;
+    for (@typeInfo(Target).@"enum".field_names, 0..) |field_name, i| {
+        out = out ++ (if (i == 0) "" else "|") ++ field_name;
     }
     break :list out;
 };

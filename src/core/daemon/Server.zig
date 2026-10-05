@@ -519,15 +519,15 @@ test "gate: no wire field can turn on trust-on-first-use over the daemon" {
     //
     // Held against `@typeInfo` rather than by reading the struct, because a
     // field added later is exactly the change this is here to catch.
-    const pin_fields = @typeInfo(protocol.Request.Trust.Pin).@"struct".fields;
-    try testing.expectEqual(@as(usize, 2), pin_fields.len);
-    try testing.expectEqualStrings("key_type", pin_fields[0].name);
-    try testing.expectEqualStrings("fingerprint", pin_fields[1].name);
+    const pin_fields = @typeInfo(protocol.Request.Trust.Pin).@"struct";
+    try testing.expectEqual(@as(usize, 2), pin_fields.field_names.len);
+    try testing.expectEqualStrings("key_type", pin_fields.field_names[0]);
+    try testing.expectEqualStrings("fingerprint", pin_fields.field_names[1]);
 
-    const trust_members = @typeInfo(protocol.Request.Trust).@"union".fields;
-    try testing.expectEqual(@as(usize, 2), trust_members.len);
-    try testing.expectEqualStrings("none", trust_members[0].name);
-    try testing.expectEqualStrings("pins", trust_members[1].name);
+    const trust_members = @typeInfo(protocol.Request.Trust).@"union";
+    try testing.expectEqual(@as(usize, 2), trust_members.field_names.len);
+    try testing.expectEqualStrings("none", trust_members.field_names[0]);
+    try testing.expectEqualStrings("pins", trust_members.field_names[1]);
 
     // There was an assertion here that the root this file builds leaves the flag
     // false. It is gone, and deliberately: `host_key_test.zig`'s

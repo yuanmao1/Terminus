@@ -803,23 +803,24 @@ fn writeReceiptFatal(
 // failure differently, which is how `localRow` came to be missing from `job rm`'s.
 test "gate: the claim-reporting receipt envelope is the shared one plus the lease answer" {
     const t = std.testing;
-    const plain = @typeInfo(ReceiptFatalJson).@"struct".fields;
-    const with_claim = @typeInfo(ReceiptFatalWithClaimJson).@"struct".fields;
+    const plain = @typeInfo(ReceiptFatalJson).@"struct";
+    const with_claim = @typeInfo(ReceiptFatalWithClaimJson).@"struct";
 
     // `hint` is last on both, and the two lease keys sit immediately before it.
     const added = [_][]const u8{ "leaseRelease", "leaseReleaseError" };
-    try t.expectEqual(plain.len + added.len, with_claim.len);
-    try t.expectEqualStrings("hint", plain[plain.len - 1].name);
-    try t.expectEqualStrings("hint", with_claim[with_claim.len - 1].name);
+    try t.expectEqual(plain.field_names.len + added.len, with_claim.field_names.len);
+    try t.expectEqualStrings("hint", plain.field_names[plain.field_names.len - 1]);
+    try t.expectEqualStrings("hint", with_claim.field_names[with_claim.field_names.len - 1]);
 
     // Every key the shared envelope has before `hint`, in the same order and with
     // the same type. A key added to one and not the other lands here.
-    inline for (plain[0 .. plain.len - 1], 0..) |f, i| {
-        try t.expectEqualStrings(f.name, with_claim[i].name);
-        try t.expect(f.type == with_claim[i].type);
+    const before_hint = plain.field_names.len - 1;
+    inline for (plain.field_names[0..before_hint], plain.field_types[0..before_hint], 0..) |f_name, f_type, i| {
+        try t.expectEqualStrings(f_name, with_claim.field_names[i]);
+        try t.expect(f_type == with_claim.field_types[i]);
     }
     inline for (added, 0..) |name, k| {
-        try t.expectEqualStrings(name, with_claim[plain.len - 1 + k].name);
+        try t.expectEqualStrings(name, with_claim.field_names[plain.field_names.len - 1 + k]);
     }
 }
 
@@ -1098,7 +1099,7 @@ test "gate: the proved settlement records what it read at the result-record addr
     };
     // Every variant, or the loop is checking a subset of the seam it claims to
     // hold. `@typeInfo` counts them; the list above supplies the payloads.
-    try t.expectEqual(@typeInfo(Core.Tmux.SidecarReading).@"union".fields.len, readings.len);
+    try t.expectEqual(@typeInfo(Core.Tmux.SidecarReading).@"union".field_names.len, readings.len);
 
     for (readings) |reading| {
         const probe: Core.Tmux.JobProbe = .{
@@ -2109,7 +2110,7 @@ pub fn openStore(ctx: *Ctx, parsed: *const Args.Parsed) !Store {
 }
 
 fn dbPath(ctx: *Ctx, override: ?[]const u8) ![:0]u8 {
-    if (override) |p| return ctx.arena.dupeZ(u8, p);
+    if (override) |p| return ctx.arena.dupeSentinel(u8, p, 0);
     const dir = if (ctx.environ.get("APPDATA")) |appdata|
         try std.fs.path.join(ctx.arena, &.{ appdata, "terminus" })
     else if (ctx.environ.get("HOME")) |home|
@@ -2119,7 +2120,7 @@ fn dbPath(ctx: *Ctx, override: ?[]const u8) ![:0]u8 {
     std.Io.Dir.cwd().createDirPath(ctx.io, dir) catch |err|
         fail("cannot create {s}: {s}", .{ dir, @errorName(err) });
     const path = try std.fs.path.join(ctx.arena, &.{ dir, "terminus.db" });
-    return ctx.arena.dupeZ(u8, path);
+    return ctx.arena.dupeSentinel(u8, path, 0);
 }
 
 /// For unexpected sqlite failures: report the connection's message and exit.

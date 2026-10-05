@@ -185,7 +185,7 @@ fn succeeded(value: windows.BOOL) bool {
 }
 
 fn lastErrorCode() u32 {
-    return @intFromEnum(windows.GetLastError());
+    return @backingInt(windows.GetLastError());
 }
 
 /// A process and its Job Object.  The process handle is never replaced by a

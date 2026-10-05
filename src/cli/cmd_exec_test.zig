@@ -1778,13 +1778,13 @@ test "gate: every accepted shell has a supervisor wrapper and the rest are refus
     // Every accepted value, taken from the enum rather than from a list beside
     // it, so a member the parser takes cannot be missing here.
     var accepted: usize = 0;
-    inline for (@typeInfo(Core.shell.Kind).@"enum".fields) |field| {
+    inline for (@typeInfo(Core.shell.Kind).@"enum".field_names) |field_name| {
         accepted += 1;
-        const reading = try Cli.readKind(arena, field.name);
-        try t.expectEqual(std.meta.stringToEnum(Core.shell.Kind, field.name).?, reading.kind);
+        const reading = try Cli.readKind(arena, field_name);
+        try t.expectEqual(std.meta.stringToEnum(Core.shell.Kind, field_name).?, reading.kind);
         // And it is in the sentence a refusal prints, so a value the parser
         // takes cannot be missing from the list an operator is offered.
-        try t.expect(std.mem.indexOf(u8, Core.shell.kind_list, field.name) != null);
+        try t.expect(std.mem.indexOf(u8, Core.shell.kind_list, field_name) != null);
     }
     try t.expectEqual(@as(usize, 4), accepted);
 
@@ -2059,8 +2059,8 @@ test "gate: the ledger's shell word is the wrap that happened, session included"
     // that was sent is a login wrap. Not "the word is plausible" — both are
     // read off the same value and compared.
     var checked: usize = 0;
-    inline for (@typeInfo(Core.shell.Kind).@"enum".fields) |field| {
-        const kind = std.meta.stringToEnum(Core.shell.Kind, field.name).?;
+    inline for (@typeInfo(Core.shell.Kind).@"enum".field_names) |field_name| {
+        const kind = std.meta.stringToEnum(Core.shell.Kind, field_name).?;
         for ([_]bool{ false, true }) |login| {
             for ([_]bool{ false, true }) |strict| {
                 // `--shell none` never logins or stricts: those combinations

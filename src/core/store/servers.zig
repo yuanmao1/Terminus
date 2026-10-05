@@ -246,7 +246,7 @@ fn countRows(store: *Store, comptime table: []const u8, server_id: i64) Db.Error
 /// which a body fixed to this one type could be given no way to demonstrate.
 pub fn cascadeTotal(counts: anytype) i64 {
     var sum: i64 = 0;
-    inline for (@typeInfo(@TypeOf(counts)).@"struct".fields) |f| sum += @field(counts, f.name);
+    inline for (@typeInfo(@TypeOf(counts)).@"struct".field_names) |f_name| sum += @field(counts, f_name);
     return sum;
 }
 
@@ -254,18 +254,18 @@ pub fn cascadeTotal(counts: anytype) i64 {
 /// out: the eighth field has to be the eighth field of *this* struct, not of a
 /// transcription of it that could fall behind.
 fn WithAnotherCountedTable(comptime name: []const u8) type {
-    const existing = @typeInfo(CascadeCounts).@"struct".fields;
-    var names: [existing.len + 1][]const u8 = undefined;
-    var types: [existing.len + 1]type = undefined;
-    var attrs: [existing.len + 1]std.builtin.Type.StructField.Attributes = undefined;
-    for (existing, 0..) |f, i| {
-        names[i] = f.name;
-        types[i] = f.type;
-        attrs[i] = .{ .@"comptime" = f.is_comptime, .@"align" = f.alignment };
+    const existing = @typeInfo(CascadeCounts).@"struct";
+    var names: [existing.field_names.len + 1][]const u8 = undefined;
+    var types: [existing.field_names.len + 1]type = undefined;
+    var attrs: [existing.field_names.len + 1]std.builtin.Type.Struct.FieldAttributes = undefined;
+    for (existing.field_names, existing.field_types, existing.field_attrs, 0..) |f_name, f_type, f_attrs, i| {
+        names[i] = f_name;
+        types[i] = f_type;
+        attrs[i] = f_attrs;
     }
-    names[existing.len] = name;
-    types[existing.len] = i64;
-    attrs[existing.len] = .{};
+    names[existing.field_names.len] = name;
+    types[existing.field_names.len] = i64;
+    attrs[existing.field_names.len] = .{};
     const field_names = names;
     const field_types = types;
     const field_attrs = attrs;
@@ -280,12 +280,12 @@ fn WithAnotherCountedTable(comptime name: []const u8) type {
 // survived every other gate in this chain.
 test "gate: the cascade total counts every field, including one nobody has added yet" {
     const t = std.testing;
-    const fields = @typeInfo(CascadeCounts).@"struct".fields;
+    const fields = @typeInfo(CascadeCounts).@"struct";
 
     // The control: each counted table contributes exactly one.
     var one_each: CascadeCounts = undefined;
-    inline for (fields) |f| @field(one_each, f.name) = 1;
-    try t.expectEqual(@as(i64, @intCast(fields.len)), cascadeTotal(one_each));
+    inline for (fields.field_names) |f_name| @field(one_each, f_name) = 1;
+    try t.expectEqual(@as(i64, @intCast(fields.field_names.len)), cascadeTotal(one_each));
 
     // …and the case the hand-written sum got wrong. Everything the seven fields
     // count is empty; the only rows on this server belong to a table that joined
@@ -293,7 +293,7 @@ test "gate: the cascade total counts every field, including one nobody has added
     // that deletes them with no `--force` prompt and no sentence naming them.
     const Eighth = WithAnotherCountedTable("policy_pins");
     var only_the_eighth: Eighth = undefined;
-    inline for (@typeInfo(Eighth).@"struct".fields) |f| @field(only_the_eighth, f.name) = 0;
+    inline for (@typeInfo(Eighth).@"struct".field_names) |f_name| @field(only_the_eighth, f_name) = 0;
     only_the_eighth.policy_pins = 3;
     try t.expectEqual(@as(i64, 3), cascadeTotal(only_the_eighth));
 }

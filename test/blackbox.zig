@@ -6586,7 +6586,7 @@ fn jsonShape(
 ) !void {
     const entry = try into.getOrPut(arena, prefix);
     if (!entry.found_existing) entry.value_ptr.* = 0;
-    entry.value_ptr.* |= @intFromEnum(JsonKind.of(value));
+    entry.value_ptr.* |= @backingInt(JsonKind.of(value));
 
     switch (value) {
         .object => |obj| {
@@ -6626,7 +6626,7 @@ fn renderShape(arena: std.mem.Allocator, path: []const u8, kinds: u8) ![]const u
     try text.append(arena, ':');
     var first = true;
     for ([_]JsonKind{ .null, .bool, .number, .string, .object, .array }) |kind| {
-        if (kinds & @intFromEnum(kind) == 0) continue;
+        if (kinds & @backingInt(kind) == 0) continue;
         if (!first) try text.append(arena, '|');
         first = false;
         try text.appendSlice(arena, @tagName(kind));

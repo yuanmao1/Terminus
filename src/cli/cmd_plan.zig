@@ -205,5 +205,5 @@ fn emitShow(ctx: *Cli.Ctx, plan_run: Store.plans.Run, rows: []const Store.plans.
 test "sha validation is strict" {
     // Keep the test at the pure helper boundary; CLI process-fatal paths are
     // exercised by black-box command tests in the root build.
-    try std.testing.expectEqual(@as(usize, 64), ("a" ** 64).len);
+    try std.testing.expectEqual(@as(usize, 64), @as([64]u8, @splat('a')).len);
 }

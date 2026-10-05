@@ -196,20 +196,20 @@ test "gate: every verdict that is not a match refuses the connection" {
 
     // Exhaustive over the enum rather than over a list somebody maintains: a
     // sixth verdict added without a refusal fails here.
-    const fields = @typeInfo(Ssh.Verdict).@"enum".fields;
-    try t.expectEqual(@as(usize, 5), fields.len);
+    const fields = @typeInfo(Ssh.Verdict).@"enum";
+    try t.expectEqual(@as(usize, 5), fields.field_names.len);
 
     var admitted: usize = 0;
     var refused: usize = 0;
-    inline for (fields) |f| {
-        const v: Ssh.Verdict = @field(Ssh.Verdict, f.name);
+    inline for (fields.field_names) |f_name| {
+        const v: Ssh.Verdict = @field(Ssh.Verdict, f_name);
         // The two answers have to agree: `admits` is what the prose says and
         // `refusalFor` is what `connect` obeys, and a verdict where they parted
         // would be a session opened over a refusal or the reverse.
         if (v.admits()) {
             admitted += 1;
             if (Ssh.refusalFor(v) != null) {
-                std.debug.print("\nverdict `{s}` admits a session and also refuses one\n", .{f.name});
+                std.debug.print("\nverdict `{s}` admits a session and also refuses one\n", .{f_name});
                 return error.VerdictDisagreesWithItself;
             }
         } else {
@@ -220,7 +220,7 @@ test "gate: every verdict that is not a match refuses the connection" {
                     \\verdict `{s}` refuses a session and `refusalFor` has no error for it, so
                     \\`connect` would return a live `Client` over it.
                     \\
-                , .{f.name});
+                , .{f_name});
                 return error.RefusedVerdictOpensASession;
             }
         }
@@ -242,12 +242,12 @@ test "gate: the trust root has no member that opens a session without a pin" {
     // Two members, and that is the structural claim: one checks, the other
     // refuses. A third — a `.trust_anything`, an `.insecure`, a
     // `.skip_verification` — fails this gate before it can be used anywhere.
-    const members = @typeInfo(Ssh.TrustRoot).@"union".fields;
-    try t.expectEqual(@as(usize, 2), members.len);
+    const members = @typeInfo(Ssh.TrustRoot).@"union";
+    try t.expectEqual(@as(usize, 2), members.field_names.len);
     var named: usize = 0;
-    inline for (members) |m| {
+    inline for (members.field_names) |m_name| {
         named += 1;
-        const known = std.mem.eql(u8, m.name, "pins") or std.mem.eql(u8, m.name, "none");
+        const known = std.mem.eql(u8, m_name, "pins") or std.mem.eql(u8, m_name, "none");
         if (!known) {
             std.debug.print(
                 \\
@@ -256,7 +256,7 @@ test "gate: the trust root has no member that opens a session without a pin" {
                 \\is a way to open a session nothing checked; give it a `Verdict` and a refusal
                 \\rather than widening this gate.
                 \\
-            , .{m.name});
+            , .{m_name});
             return error.TrustRootGrewAMember;
         }
     }
@@ -272,9 +272,9 @@ test "gate: the trust root has no member that opens a session without a pin" {
     //
     // Three fields and no more, for the same reason the union has two members:
     // a fourth would be another dial on the one thing that can widen the check.
-    try t.expectEqual(@as(usize, 3), @typeInfo(Ssh.TrustRoot.Pins).@"struct".fields.len);
+    try t.expectEqual(@as(usize, 3), @typeInfo(Ssh.TrustRoot.Pins).@"struct".field_names.len);
     const tofu = std.meta.fieldInfo(Ssh.TrustRoot.Pins, .trust_on_first_use);
-    const default = tofu.default_value_ptr orelse return error.FirstUseHasNoDefault;
+    const default = tofu.attrs.default_value_ptr orelse return error.FirstUseHasNoDefault;
     try t.expectEqual(false, @as(*const bool, @ptrCast(default)).*);
 
     // **The lookup cannot see what it will be compared against.** This is what
@@ -285,9 +285,9 @@ test "gate: the trust root has no member that opens a session without a pin" {
     // cannot be arranged to agree with it. A second parameter of type
     // `HostKey`, or a `[32]u8`, or the fingerprint text, would end that.
     const recorded = @typeInfo(@typeInfo(std.meta.fieldInfo(Ssh.TrustRoot.Pins, .recorded).type).pointer.child).@"fn";
-    try t.expectEqual(@as(usize, 2), recorded.params.len);
-    try t.expectEqual(@as(?type, *anyopaque), recorded.params[0].type);
-    try t.expectEqual(@as(?type, []const u8), recorded.params[1].type);
+    try t.expectEqual(@as(usize, 2), recorded.param_types.len);
+    try t.expectEqual(@as(?type, *anyopaque), recorded.param_types[0]);
+    try t.expectEqual(@as(?type, []const u8), recorded.param_types[1]);
     try t.expectEqual(@as(?type, ?[]const u8), recorded.return_type);
 }
 
@@ -328,10 +328,10 @@ test "gate: no session is constructed without naming a trust root" {
     // default, no second entry point, and no overload — so a new caller cannot
     // open a session without deciding what it is checked against, and the only
     // two things it can decide are "this store" and "refuse".
-    const params = @typeInfo(@TypeOf(Ssh.connect)).@"fn".params;
+    const params = @typeInfo(@TypeOf(Ssh.connect)).@"fn".param_types;
     try t.expectEqual(@as(usize, 4), params.len);
-    try t.expectEqual(@as(?type, Ssh.TrustRoot), params[2].type);
-    try t.expectEqual(@as(?type, *?Ssh.HostKey), params[3].type);
+    try t.expectEqual(@as(?type, Ssh.TrustRoot), params[2]);
+    try t.expectEqual(@as(?type, *?Ssh.HostKey), params[3]);
 
     // The census half. Two sites exist in this tree and the gate says which,
     // because "two" on its own would also be satisfied by two copies in one

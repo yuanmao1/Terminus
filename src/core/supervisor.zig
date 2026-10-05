@@ -322,7 +322,7 @@ pub const wire = struct {
                 Kind.exited => {
                     if (payload.len != 5) return error.EndedFrameWrongSize;
                     try ended.append(arena, .{
-                        .how = @enumFromInt(payload[0]),
+                        .how = @fromBackingInt(@intCast(payload[0])),
                         .status = std.mem.readInt(i32, payload[1..5], .little),
                     });
                 },
@@ -522,9 +522,9 @@ test "gate: the host's wire constants are the helper's own" {
     try t.expectEqual(@as(u8, 0x85), wire.Kind.failed);
     try t.expectEqual(@as(u8, 0x86), wire.Kind.state);
     try t.expectEqual(@as(u8, 0x87), wire.Kind.truncated);
-    try t.expectEqual(@as(u8, 2), @intFromEnum(wire.How.timed_out_killed));
-    try t.expectEqual(@as(u8, 3), @intFromEnum(wire.How.timed_out_unconfirmed));
-    try t.expectEqual(@as(u8, 4), @intFromEnum(wire.How.cancelled));
+    try t.expectEqual(@as(u8, 2), @backingInt(wire.How.timed_out_killed));
+    try t.expectEqual(@as(u8, 3), @backingInt(wire.How.timed_out_unconfirmed));
+    try t.expectEqual(@as(u8, 4), @backingInt(wire.How.cancelled));
 }
 
 test "gate: a request too large for the helper is refused before it is sent" {
@@ -567,7 +567,7 @@ test "gate: a reply that ends mid-frame is not a reply that said nothing" {
     std.mem.writeInt(u32, &head, 25, .little);
     try stream.appendSlice(arena, &head);
     try stream.append(arena, wire.Kind.started);
-    try stream.appendSlice(arena, &[_]u8{0} ** 24);
+    try stream.appendSlice(arena, &@as([24]u8, @splat(0)));
     // Then a header promising five bytes, with two arriving.
     std.mem.writeInt(u32, &head, 6, .little);
     try stream.appendSlice(arena, &head);

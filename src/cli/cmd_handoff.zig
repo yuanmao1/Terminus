@@ -403,8 +403,8 @@ pub const Package = struct {
     /// exhaustive over the struct's fields — so a seventh section cannot be
     /// added without this answering for it.
     pub fn complete(p: Package) bool {
-        inline for (@typeInfo(Sections).@"struct".fields) |f| {
-            if (!@field(p.sections, f.name).answered) return false;
+        inline for (@typeInfo(Sections).@"struct".field_names) |f_name| {
+            if (!@field(p.sections, f_name).answered) return false;
         }
         return true;
     }
@@ -945,14 +945,14 @@ fn printHandoff(ctx: *Cli.Ctx, d: HandoffJson) !void {
         d.server, d.schemaVersion, if (d.complete) "yes" else "NO",
     });
     if (d.workspace) |cwd| try ctx.out.print("workspace: {s}\n", .{cwd});
-    inline for (@typeInfo(Sections).@"struct".fields) |f| {
-        const r = @field(d.sections, f.name);
+    inline for (@typeInfo(Sections).@"struct".field_names) |f_name| {
+        const r = @field(d.sections, f_name);
         if (r.answered) {
             try ctx.out.print("  {s}: {d} row(s), source {s}, observed {?d}\n", .{
-                f.name, r.count, r.source orelse "-", r.observedAt,
+                f_name, r.count, r.source orelse "-", r.observedAt,
             });
         } else {
-            try ctx.out.print("  {s}: UNREAD (see errors)\n", .{f.name});
+            try ctx.out.print("  {s}: UNREAD (see errors)\n", .{f_name});
         }
     }
     for (d.errors) |e| try ctx.out.print("error [{s}] {s}: {s}\n", .{ e.section, e.code, e.detail });

@@ -236,9 +236,9 @@ test "gate: the statuses Zig calls scope-blocking are the ones the barrier query
     // and a status that is supposed to block a same-scope mutation blocks
     // nothing. Every status is walked here, driven through the real writers, so
     // the two definitions cannot part company without this failing.
-    inline for (@typeInfo(op_state.Status).@"enum".fields) |field| {
-        const status: op_state.Status = @enumFromInt(field.value);
-        const rid = testId("bs" ++ field.name);
+    inline for (@typeInfo(op_state.Status).@"enum".field_names, @typeInfo(op_state.Status).@"enum".field_values) |field_name, field_value| {
+        const status: op_state.Status = @fromBackingInt(@intCast(field_value));
+        const rid = testId("bs" ++ field_name);
         const request_id: []const u8 = &rid;
         try Store.operations.create(&store, .{
             .request_id = request_id,
@@ -511,7 +511,7 @@ test "gate: pre-release drift is detected in the schema's shape, not just its co
             try weakened.appendSlice(t.allocator, ";\n");
             try weakened.appendSlice(t.allocator, migrate.checkpoints_index_ddl);
             try weakened.append(t.allocator, ';');
-            const sql = try t.allocator.dupeZ(u8, weakened.items);
+            const sql = try t.allocator.dupeSentinel(u8, weakened.items, 0);
             defer t.allocator.free(sql);
             try db.exec(sql);
         }
@@ -1082,11 +1082,11 @@ test "gate: the observation sources Zig can write are the ones the memories colu
     // — so `reconcile` is absent by decision. Asserting *which* member is absent,
     // rather than only how many, is what makes a new `Source` member land here as
     // a question instead of passing as one more exclusion.
-    const source_fields = @typeInfo(Store.receipts.Source).@"enum".fields;
-    try t.expectEqual(@as(usize, 5), source_fields.len);
+    const source_fields = @typeInfo(Store.receipts.Source).@"enum";
+    try t.expectEqual(@as(usize, 5), source_fields.field_names.len);
     var excluded: usize = 0;
-    inline for (source_fields) |field| {
-        const source: Store.receipts.Source = @enumFromInt(field.value);
+    inline for (source_fields.field_values) |field_value| {
+        const source: Store.receipts.Source = @fromBackingInt(@intCast(field_value));
         var included = false;
         for (Store.memories.observed_sources) |member| {
             if (member == source) included = true;
@@ -1134,7 +1134,7 @@ test "gate: half a trust grant cannot be stored" {
     // a CHECK written with a bare `trusted_by <> ''` instead of an `IS NOT NULL`
     // would admit exactly the rows where the missing column makes the expression
     // NULL, and a NULL CHECK expression *passes*.
-    const digest_64 = "a" ** 64;
+    const digest_64: *const [64]u8 = &@splat('a');
     const partials = [_][:0]const u8{
         "UPDATE memories SET trusted_at = 200",
         "UPDATE memories SET trusted_by = 'ops'",
@@ -1307,8 +1307,8 @@ test "gate: a pre-release v13 missing a column is named rather than failing late
 fn resolvedStatusSqlList() []const u8 {
     comptime {
         var out: []const u8 = "";
-        for (@typeInfo(Store.op_state.ResolvedStatus).@"enum".fields, 0..) |f, i| {
-            out = out ++ (if (i == 0) "" else ",") ++ "'" ++ f.name ++ "'";
+        for (@typeInfo(Store.op_state.ResolvedStatus).@"enum".field_names, 0..) |f_name, i| {
+            out = out ++ (if (i == 0) "" else ",") ++ "'" ++ f_name ++ "'";
         }
         return out;
     }
@@ -1677,10 +1677,10 @@ test "gate: the server cascade set is declared and the schema is held to it" {
     // here. Both directions: a field added there for a table that does not
     // cascade is counting something a removal does not destroy, and a cascading
     // table dropped from it goes from advisory to silent with nothing to notice.
-    const counted = @typeInfo(Store.servers.CascadeCounts).@"struct".fields;
-    inline for (counted) |field| {
+    const counted = @typeInfo(Store.servers.CascadeCounts).@"struct";
+    inline for (counted.field_names) |field_name| {
         for (server_cascade) |entry| {
-            if (!std.mem.eql(u8, entry.name, field.name)) continue;
+            if (!std.mem.eql(u8, entry.name, field_name)) continue;
             if (entry.counted) break;
             std.debug.print(
                 \\
@@ -1690,7 +1690,7 @@ test "gate: the server cascade set is declared and the schema is held to it" {
                 \\on the same table does not stand in for it, because a barrier is
                 \\about rows somebody is holding and the count is about the rest.
                 \\
-            , .{field.name});
+            , .{field_name});
             return error.ServerCascadeGuardDisagreesWithTheVolumeWarning;
         } else {
             std.debug.print(
@@ -1699,15 +1699,15 @@ test "gate: the server cascade set is declared and the schema is held to it" {
                 \\not destroy it. The number `server rm` shows an operator is then
                 \\about rows the removal leaves alone.
                 \\
-            , .{field.name});
+            , .{field_name});
             return error.VolumeWarningCountsATableTheCascadeDoesNotDestroy;
         }
     }
     for (server_cascade) |entry| {
         if (!entry.counted) continue;
         var in_struct = false;
-        inline for (counted) |field| {
-            if (std.mem.eql(u8, entry.name, field.name)) in_struct = true;
+        inline for (counted.field_names) |field_name| {
+            if (std.mem.eql(u8, entry.name, field_name)) in_struct = true;
         }
         if (in_struct) continue;
         std.debug.print(
@@ -1740,7 +1740,7 @@ test "gate: the server cascade set is declared and the schema is held to it" {
     }
     try t.expectEqual(@as(usize, 1), barriered);
     try t.expectEqual(@as(usize, server_cascade_count), counted_n);
-    try t.expectEqual(@as(usize, server_cascade_count), counted.len);
+    try t.expectEqual(@as(usize, server_cascade_count), counted.field_names.len);
     for (server_cascade) |entry| {
         if (!entry.barrier) continue;
         try t.expectEqualStrings("leases", entry.name);

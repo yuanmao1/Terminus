@@ -479,7 +479,7 @@ fn supervise(pid: i32, out_fd: i32, err_fd: i32, deadline_ms: u64, grace_ms: u64
         exit(0);
     }
 
-    const code: linux.CLD = @enumFromInt(info.code);
+    const code: linux.CLD = @fromBackingInt(@intCast(info.code));
     const status = info.fields.common.second.sigchld.status;
 
     payload[0] = if (timed_out)
@@ -564,7 +564,7 @@ fn groupGone(pgid: i64) bool {
     if (pgid <= 0) return false;
     // Signal 0 is the existence-and-permission probe; there is no `SIG` name
     // for it because it is not a signal.
-    const rc = linux.kill(@intCast(-pgid), @enumFromInt(0));
+    const rc = linux.kill(@intCast(-pgid), @fromBackingInt(@intCast(0)));
     return fail(rc) and errno(rc) == .SRCH;
 }
 
@@ -616,7 +616,7 @@ fn validRequestId(id: []const u8) bool {
 }
 
 fn statePath(into: []u8, request_id: []const u8, suffix: []const u8) ?[:0]u8 {
-    return std.fmt.bufPrintZ(into, ".terminus/operations/{s}.state{s}", .{ request_id, suffix }) catch null;
+    return std.mem.printSentinel(into, ".terminus/operations/{s}.state{s}", .{ request_id, suffix }, 0) catch null;
 }
 
 fn ensureStateDir() bool {
@@ -833,7 +833,7 @@ fn control(request_id: []const u8, cancel: bool, grace_ms: u64) void {
 /// the last complete boundary.
 fn readDetached(request_id: []const u8, offset: u64, max_bytes: u32) void {
     var path_buf: [160]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, ".terminus/operations/{s}.frames", .{request_id}) catch {
+    const path = std.mem.printSentinel(&path_buf, ".terminus/operations/{s}.frames", .{request_id}, 0) catch {
         failFrame("StatePathTooLong");
         return;
     };
@@ -987,7 +987,7 @@ fn failFrame(message: []const u8) void {
 fn auditAccepted(request: audit.Request) void {
     var payload: [35]u8 = undefined;
     payload[0] = audit.version;
-    payload[1] = @intFromEnum(request.check);
+    payload[1] = @backingInt(request.check);
     payload[2] = @intFromBool(request.use_sudo);
     const manifest = audit.manifestDigest();
     @memcpy(payload[3..35], &manifest);

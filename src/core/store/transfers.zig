@@ -697,8 +697,8 @@ fn predecessorList(comptime to: State, comptime route: Route) []const u8 {
 fn membersWhere(comptime E: type, comptime role: fn (E) bool) []const E {
     comptime {
         var out: []const E = &[_]E{};
-        for (@typeInfo(E).@"enum".fields) |field| {
-            const member: E = @enumFromInt(field.value);
+        for (@typeInfo(E).@"enum".field_values) |field_value| {
+            const member: E = @fromBackingInt(@intCast(field_value));
             if (role(member)) out = out ++ &[_]E{member};
         }
         return out;
@@ -3383,8 +3383,8 @@ test canTransition {
     // of the rename, and nowhere else — in particular not back into a state
     // where bytes could start moving again under an artifact that may already
     // be published.
-    inline for (@typeInfo(State).@"enum".fields) |field| {
-        const to: State = @enumFromInt(field.value);
+    inline for (@typeInfo(State).@"enum".field_values) |field_value| {
+        const to: State = @fromBackingInt(@intCast(field_value));
         try t.expect(!canTransition(.published, to));
         try t.expect(!canTransition(.superseded, to));
         try t.expectEqual(to == .superseded, canTransition(.failed_no_space, to));
@@ -3406,14 +3406,14 @@ test "the three writers partition the graph and none can reach another's edges" 
     // would make a state unreachable by anyone, and one that shared an edge
     // would put `setState` back where it started — able to record a verdict on
     // a rename nobody watched, or to clear its own failed attempt's path.
-    inline for (@typeInfo(State).@"enum".fields) |to_field| {
-        const to: State = @enumFromInt(to_field.value);
+    inline for (@typeInfo(State).@"enum".field_values) |to_field_value| {
+        const to: State = @fromBackingInt(@intCast(to_field_value));
         var seen: usize = 0;
-        inline for (@typeInfo(State).@"enum".fields) |from_field| {
-            const from: State = @enumFromInt(from_field.value);
+        inline for (@typeInfo(State).@"enum".field_values) |from_field_value| {
+            const from: State = @fromBackingInt(@intCast(from_field_value));
             var owners: usize = 0;
-            inline for (@typeInfo(Route).@"enum".fields) |route_field| {
-                const route: Route = @enumFromInt(route_field.value);
+            inline for (@typeInfo(Route).@"enum".field_values) |route_field_value| {
+                const route: Route = @fromBackingInt(@intCast(route_field_value));
                 if (routeAllows(route, from, to)) owners += 1;
             }
             try t.expect(owners <= 1);
@@ -3477,8 +3477,8 @@ test "the seven role predicates are not one predicate wearing seven hats" {
     // superseded must hold one too — releasing a hold that does not exist is
     // not an operation — while never being adoptable, because a row a resume
     // could pick up is not one an operator is being asked to discard.
-    inline for (@typeInfo(State).@"enum".fields) |field| {
-        const s: State = @enumFromInt(field.value);
+    inline for (@typeInfo(State).@"enum".field_values) |field_value| {
+        const s: State = @fromBackingInt(@intCast(field_value));
         if (s.isAdoptable()) try t.expect(s.holdsDestination());
         if (s.acceptsOffset()) try t.expect(s.holdsDestination());
         if (s.beforeFirstByte()) try t.expect(s.acceptsOffset());
@@ -3499,8 +3499,8 @@ test "the seven role predicates are not one predicate wearing seven hats" {
     // process is: `acceptsVerifiedHash` is the same two states, because being
     // able to hash the result is what it means to be in the middle of finishing
     // one.
-    inline for (@typeInfo(State).@"enum".fields) |field| {
-        const s: State = @enumFromInt(field.value);
+    inline for (@typeInfo(State).@"enum".field_values) |field_value| {
+        const s: State = @fromBackingInt(@intCast(field_value));
         try t.expect(!(s.isRecoverable() and s.isAdoptable()));
         if (s.abandonedNormalisation()) |target| {
             try t.expect(s.holdsDestination());
@@ -3544,8 +3544,8 @@ test "the seven role predicates are not one predicate wearing seven hats" {
     // "declared in advance" versus "read off the result" means. A state where
     // both were writable would let one transfer commit to a digest and satisfy
     // its own commitment without anything happening in between.
-    inline for (@typeInfo(State).@"enum".fields) |field| {
-        const s: State = @enumFromInt(field.value);
+    inline for (@typeInfo(State).@"enum".field_values) |field_value| {
+        const s: State = @fromBackingInt(@intCast(field_value));
         try t.expect(!(s.beforeFirstByte() and s.acceptsVerifiedHash()));
     }
 
@@ -3560,8 +3560,8 @@ test "the seven role predicates are not one predicate wearing seven hats" {
     // stopped being a claim and became the artifact. Every failure keeps it —
     // that is the rule `supersedeLocked` exists to be the one way out of — and
     // `superseded` is what being let out looks like.
-    inline for (@typeInfo(State).@"enum".fields) |field| {
-        const s: State = @enumFromInt(field.value);
+    inline for (@typeInfo(State).@"enum".field_values) |field_value| {
+        const s: State = @fromBackingInt(@intCast(field_value));
         const releases = switch (s) {
             .published, .completed_unverified, .superseded => true,
             else => false,
@@ -3582,8 +3582,8 @@ test "only the states that claim something about a digest carry an evidence conj
     // Three targets carry one, and each names a different relationship between
     // the two digest columns: `published` says they agree, `completed_unverified`
     // says neither exists, `failed_hash_mismatch` says they do not agree.
-    inline for (@typeInfo(State).@"enum".fields) |field| {
-        const s: State = @enumFromInt(field.value);
+    inline for (@typeInfo(State).@"enum".field_values) |field_value| {
+        const s: State = @fromBackingInt(@intCast(field_value));
         const clause = comptime evidenceClause(s);
         switch (s) {
             .published, .completed_unverified, .failed_hash_mismatch => try t.expect(clause.len > 0),

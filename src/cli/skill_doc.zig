@@ -291,8 +291,8 @@ pub fn expectVocabulary(
 ) (DriftError || std.mem.Allocator.Error)!void {
     var actual: std.ArrayList([]const u8) = .empty;
     defer actual.deinit(gpa);
-    inline for (@typeInfo(namespace).@"struct".decls) |decl| {
-        try actual.append(gpa, @field(namespace, decl.name));
+    inline for (@typeInfo(namespace).@"struct".decl_names) |decl_name| {
+        try actual.append(gpa, @field(namespace, decl_name));
     }
     try expectList(what, documented, actual.items);
 }
@@ -314,17 +314,17 @@ pub fn expectKeySet(
     never_null_what: []const u8,
     nullable_what: []const u8,
 ) !void {
-    const fields = @typeInfo(T).@"struct".fields;
+    const fields = @typeInfo(T).@"struct";
 
     var never_null: std.ArrayList([]const u8) = .empty;
     defer never_null.deinit(gpa);
     var nullable: std.ArrayList([]const u8) = .empty;
     defer nullable.deinit(gpa);
-    inline for (fields) |f| {
+    inline for (fields.field_names, fields.field_types) |f_name, f_type| {
         // From the type. A hand-kept list of which keys are optional would be
         // exactly the drift this gate exists to catch.
-        const bucket = if (@typeInfo(f.type) == .optional) &nullable else &never_null;
-        try bucket.append(gpa, f.name);
+        const bucket = if (@typeInfo(f_type) == .optional) &nullable else &never_null;
+        try bucket.append(gpa, f_name);
     }
 
     const para = try paragraphAfter(heading, "the key-set paragraph it opens");
@@ -349,13 +349,13 @@ pub fn expectKeySet(
         , .{ line, para[0..keys_at], count_suffix });
         return error.SkillCountUnreadable;
     };
-    if (claimed != fields.len) {
+    if (claimed != fields.field_names.len) {
         std.debug.print(
             \\
             \\skill/SKILL.md says "{s}{d}{s}"; the struct has {d} fields. This is the
             \\exact drift the gate was added for.
             \\
-        , .{ line, claimed, count_suffix, fields.len });
+        , .{ line, claimed, count_suffix, fields.field_names.len });
         return error.SkillKeySetDrifted;
     }
 

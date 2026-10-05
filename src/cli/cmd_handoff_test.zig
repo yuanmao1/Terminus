@@ -399,14 +399,14 @@ test "gate: every section is answered with its own observedAt, and only errors i
     // Every section answered, counted so a section that silently vanished fails
     // here rather than being passed over.
     var answered: usize = 0;
-    inline for (@typeInfo(handoff.Sections).@"struct".fields) |f| {
-        const reading = @field(doc.sections, f.name);
+    inline for (@typeInfo(handoff.Sections).@"struct".field_names) |f_name| {
+        const reading = @field(doc.sections, f_name);
         if (!reading.answered) {
-            std.debug.print("\nsection `{s}` was not answered\n", .{f.name});
+            std.debug.print("\nsection `{s}` was not answered\n", .{f_name});
             return error.SectionUnanswered;
         }
         if (reading.source == null) {
-            std.debug.print("\nsection `{s}` is answered with no source\n", .{f.name});
+            std.debug.print("\nsection `{s}` is answered with no source\n", .{f_name});
             return error.AnsweredSectionHasNoSource;
         }
         answered += 1;
@@ -449,10 +449,10 @@ test "gate: every section is answered with its own observedAt, and only errors i
     // asked the host anything — the offline guarantee as a property of the
     // document rather than a promise in a comment.
     var live: usize = 0;
-    inline for (@typeInfo(handoff.Sections).@"struct".fields) |f| {
-        if (std.mem.eql(u8, @field(doc.sections, f.name).source.?, "live")) {
+    inline for (@typeInfo(handoff.Sections).@"struct".field_names) |f_name| {
+        if (std.mem.eql(u8, @field(doc.sections, f_name).source.?, "live")) {
             live += 1;
-            try t.expectEqualStrings("errors", f.name);
+            try t.expectEqualStrings("errors", f_name);
         }
     }
     try t.expectEqual(@as(usize, 1), live);
@@ -468,12 +468,12 @@ test "gate: every section is answered with its own observedAt, and only errors i
     // Every source word is one of the ledger's own, never a vocabulary this file
     // invented.
     var vocabulary: usize = 0;
-    inline for (@typeInfo(handoff.Sections).@"struct".fields) |f| {
-        const word = @field(doc.sections, f.name).source.?;
+    inline for (@typeInfo(handoff.Sections).@"struct".field_names) |f_name| {
+        const word = @field(doc.sections, f_name).source.?;
         if (std.meta.stringToEnum(Store.receipts.Source, word) == null) {
             std.debug.print(
                 "\nsection `{s}` reports source `{s}`, which is not a receipts.Source\n",
-                .{ f.name, word },
+                .{ f_name, word },
             );
             return error.SourceOutsideVocabulary;
         }
@@ -612,17 +612,17 @@ test "gate: a section this build refuses to read leaves complete false and names
 
     // Every `Section` has its own cost sentence: which one failed decides what
     // the reader may still do, so a shared sentence would lose that.
-    const names = @typeInfo(handoff.Section).@"enum".fields;
-    try t.expectEqual(@as(usize, 6), names.len);
+    const names = @typeInfo(handoff.Section).@"enum";
+    try t.expectEqual(@as(usize, 6), names.field_names.len);
     var pairs: usize = 0;
-    inline for (names, 0..) |a, i| {
-        inline for (names, 0..) |b, j| {
+    inline for (names.field_names, names.field_values, 0..) |a_name, a_value, i| {
+        inline for (names.field_names, names.field_values, 0..) |b_name, b_value, j| {
             if (i >= j) continue;
             pairs += 1;
-            const first: handoff.Section = @enumFromInt(a.value);
-            const second: handoff.Section = @enumFromInt(b.value);
+            const first: handoff.Section = @fromBackingInt(@intCast(a_value));
+            const second: handoff.Section = @fromBackingInt(@intCast(b_value));
             if (std.mem.eql(u8, first.cost(), second.cost())) {
-                std.debug.print("\n`{s}` and `{s}` share one cost sentence\n", .{ a.name, b.name });
+                std.debug.print("\n`{s}` and `{s}` share one cost sentence\n", .{ a_name, b_name });
                 return error.SharedSectionCost;
             }
         }
@@ -699,12 +699,12 @@ test "gate: a handoff reaches no host, so an offline one answers every section" 
     // arena, a server id, a server name, a window and a clock. No executor, no
     // connection, no `std.Io` — a round trip cannot be added without changing
     // this list, and this is where that change stops.
-    const params = @typeInfo(@TypeOf(handoff.gather)).@"fn".params;
+    const params = @typeInfo(@TypeOf(handoff.gather)).@"fn".param_types;
     try t.expectEqual(@as(usize, 6), params.len);
     var scanned: usize = 0;
     inline for (params) |p| {
         scanned += 1;
-        const T = p.type.?;
+        const T = p.?;
         const carries_transport = T == Core.Executor or T == Core.Ssh or
             T == *Core.Ssh or T == std.Io;
         if (carries_transport) {
@@ -898,8 +898,8 @@ test "gate: a secret in every reachable column reaches no field of the document"
     // for it. Held both ways — the shape of the struct, and the text of the
     // rendered document.
     var command_keys: usize = 0;
-    inline for (@typeInfo(handoff.JobEntry).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "command")) command_keys += 1;
+    inline for (@typeInfo(handoff.JobEntry).@"struct".field_names) |f_name| {
+        if (comptime std.mem.eql(u8, f_name, "command")) command_keys += 1;
     }
     try t.expectEqual(@as(usize, 0), command_keys);
     try t.expect(std.mem.indexOf(u8, rendered, "\"command\"") == null);
@@ -996,17 +996,17 @@ test "gate: the published key set is exactly this, and the section names are the
 
     var pinned: usize = 0;
     inline for (cases) |case| {
-        const struct_fields = @typeInfo(case[0]).@"struct".fields;
+        const struct_fields = @typeInfo(case[0]).@"struct";
         const expected: []const []const u8 = case[1];
         // A count first, so a key added or dropped fails here rather than being
         // missed by a loop that only checks the ones it knows about.
-        try t.expectEqual(expected.len, struct_fields.len);
-        inline for (struct_fields, 0..) |f, i| {
+        try t.expectEqual(expected.len, struct_fields.field_names.len);
+        inline for (struct_fields.field_names, 0..) |f_name, i| {
             // `resume` is a Zig keyword, so the field is `@"resume"` and the
             // published key is `resume`. Compared against the published name.
-            try t.expectEqualStrings(expected[i], f.name);
+            try t.expectEqualStrings(expected[i], f_name);
         }
-        pinned += struct_fields.len;
+        pinned += struct_fields.field_names.len;
     }
     try t.expectEqual(@as(usize, 10), cases.len);
     try t.expectEqual(@as(usize, 103), pinned);
@@ -1014,11 +1014,11 @@ test "gate: the published key set is exactly this, and the section names are the
     // `Sections` is the `Section` enum, field for field and in order. Two lists
     // that could drift is how a section ends up with a name nothing reports
     // under.
-    const members = @typeInfo(handoff.Section).@"enum".fields;
-    const section_fields = @typeInfo(handoff.Sections).@"struct".fields;
-    try t.expectEqual(members.len, section_fields.len);
-    inline for (members, section_fields) |m, f| try t.expectEqualStrings(m.name, f.name);
-    try t.expectEqual(@as(usize, 6), members.len);
+    const members = @typeInfo(handoff.Section).@"enum";
+    const section_fields = @typeInfo(handoff.Sections).@"struct";
+    try t.expectEqual(members.field_names.len, section_fields.field_names.len);
+    inline for (members.field_names, section_fields.field_names) |m_name, f_name| try t.expectEqualStrings(m_name, f_name);
+    try t.expectEqual(@as(usize, 6), members.field_names.len);
 
     // The no-defaults rule this document follows is held for all thirteen
     // published documents by `gate: no published document has a field with a
@@ -1207,11 +1207,11 @@ test "gate: no published document has a field with a default, in any of the six 
             std.debug.print("\n`{s}` is reachable from here and the scan did not find it\n", .{pair[0]});
             return error.ReachableDocumentWasNotScanned;
         };
-        const compiled = @typeInfo(pair[1]).@"struct".fields;
-        try t.expectEqual(compiled.len, doc.fields.len);
-        inline for (compiled, 0..) |f, i| {
-            try t.expectEqualStrings(f.name, documentFieldName(doc.fields[i]));
-            try t.expect(f.default_value_ptr == null);
+        const compiled = @typeInfo(pair[1]).@"struct";
+        try t.expectEqual(compiled.field_names.len, doc.fields.len);
+        inline for (compiled.field_names, compiled.field_attrs, 0..) |f_name, f_attrs, i| {
+            try t.expectEqualStrings(f_name, documentFieldName(doc.fields[i]));
+            try t.expect(f_attrs.default_value_ptr == null);
         }
         cross_checked += 1;
     }

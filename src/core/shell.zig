@@ -362,8 +362,8 @@ pub const Kind = enum {
 /// parser accepts cannot be left out of the message that lists them.
 pub const kind_list = list: {
     var out: []const u8 = "";
-    for (@typeInfo(Kind).@"enum".fields, 0..) |field, i| {
-        out = out ++ (if (i == 0) "" else "|") ++ field.name;
+    for (@typeInfo(Kind).@"enum".field_names, 0..) |field_name, i| {
+        out = out ++ (if (i == 0) "" else "|") ++ field_name;
     }
     break :list out;
 };

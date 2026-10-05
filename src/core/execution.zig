@@ -2774,8 +2774,8 @@ test "gate: every ending maps to one terminal, and a deadline we could not confi
     try t.expectEqual(@as(usize, 5), mapped);
     // And exhaustive over the union, so a sixth arm cannot be added with no case
     // above naming it. A `switch` on the tag with no `else` is the check.
-    inline for (@typeInfo(supervisor.Ending).@"union".fields) |f| {
-        const covered = switch (@field(std.meta.Tag(supervisor.Ending), f.name)) {
+    inline for (@typeInfo(supervisor.Ending).@"union".field_names) |f_name| {
+        const covered = switch (@field(std.meta.Tag(supervisor.Ending), f_name)) {
             .exited, .signalled, .timed_out, .timed_out_unconfirmed, .unknown => true,
         };
         try t.expect(covered);

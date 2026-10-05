@@ -537,17 +537,17 @@ test "gate: no wire type or insert option can carry a trust grant" {
     // would otherwise find no offender and pass. The numbers are the point of
     // failure when somebody adds a field: they have to come here and say what it
     // is.
-    const doc_fields = @typeInfo(export_import.MemoryDoc).@"struct".fields;
-    try t.expectEqual(@as(usize, 7), doc_fields.len);
-    const add_fields = @typeInfo(Store.memories.AddOptions).@"struct".fields;
-    try t.expectEqual(@as(usize, 7), add_fields.len);
+    const doc_fields = @typeInfo(export_import.MemoryDoc).@"struct";
+    try t.expectEqual(@as(usize, 7), doc_fields.field_names.len);
+    const add_fields = @typeInfo(Store.memories.AddOptions).@"struct";
+    try t.expectEqual(@as(usize, 7), add_fields.field_names.len);
 
     const forbidden = [_][]const u8{ "trust", "grant", "sha256", "authoris", "authoriz" };
     var checked: usize = 0;
     inline for (.{ doc_fields, add_fields }) |fields| {
-        inline for (fields) |field| {
+        inline for (fields.field_names) |field_name| {
             for (forbidden) |needle| {
-                if (std.mem.indexOf(u8, field.name, needle) != null) {
+                if (std.mem.indexOf(u8, field_name, needle) != null) {
                     std.debug.print(
                         \\
                         \\`{s}` is a field on a type that crosses the import boundary, and its
@@ -557,7 +557,7 @@ test "gate: no wire type or insert option can carry a trust grant" {
                         \\writer a potential granter. `memories.grantTrust` is the one writer
                         \\of the three trust columns; keep it that way.
                         \\
-                    , .{field.name});
+                    , .{field_name});
                     return error.TrustCrossedTheImportBoundary;
                 }
             }
@@ -566,7 +566,7 @@ test "gate: no wire type or insert option can carry a trust grant" {
     }
     // A scan that inspected nothing would have found nothing.
     try t.expectEqual(@as(usize, 14), checked);
-    try t.expectEqual(doc_fields.len + add_fields.len, checked);
+    try t.expectEqual(doc_fields.field_names.len + add_fields.field_names.len, checked);
 }
 
 // --- freshness ----------------------------------------------------------------

@@ -104,8 +104,8 @@ pub const Status = enum {
 fn statusesWhere(comptime role: fn (Status) bool) []const Status {
     comptime {
         var out: []const Status = &[_]Status{};
-        for (@typeInfo(Status).@"enum".fields) |field| {
-            const s: Status = @enumFromInt(field.value);
+        for (@typeInfo(Status).@"enum".field_values) |field_value| {
+            const s: Status = @fromBackingInt(@intCast(field_value));
             if (role(s)) out = out ++ &[_]Status{s};
         }
         return out;
@@ -613,8 +613,8 @@ test "advance cannot express a terminal" {
     const t = std.testing;
     // Exhaustive: every LiveStatus maps to a non-terminal Status, so
     // `operations.advance` has no way to write one.
-    inline for (@typeInfo(LiveStatus).@"enum".fields) |field| {
-        const live: LiveStatus = @enumFromInt(field.value);
+    inline for (@typeInfo(LiveStatus).@"enum".field_values) |field_value| {
+        const live: LiveStatus = @fromBackingInt(@intCast(field_value));
         try t.expect(!live.toStatus().isTerminal());
     }
 }
@@ -624,8 +624,8 @@ test "terminals are frozen" {
     const terminals = [_]Status{ .completed, .failed, .timed_out, .cancelled, .indeterminate };
     for (terminals) |from| {
         try t.expect(from.isTerminal());
-        inline for (@typeInfo(Status).@"enum".fields) |field| {
-            const to: Status = @enumFromInt(field.value);
+        inline for (@typeInfo(Status).@"enum".field_values) |field_value| {
+            const to: Status = @fromBackingInt(@intCast(field_value));
             // Nothing may follow a terminal — reconciliation records
             // `resolved_status` beside the observation instead of moving it.
             try t.expect(!canTransition(from, to));
@@ -741,8 +741,8 @@ test "beforeSubmission is the advance-commitment window, and holds no terminal" 
     // the ones worth naming: `failed` via `never_submitted` and `cancelled` via
     // `local_abandon` both leave from inside the window, and neither is still
     // in it afterwards. A settled attempt has nothing left to commit to.
-    inline for (@typeInfo(Status).@"enum".fields) |field| {
-        const s: Status = @enumFromInt(field.value);
+    inline for (@typeInfo(Status).@"enum".field_values) |field_value| {
+        const s: Status = @fromBackingInt(@intCast(field_value));
         try t.expect(!(s.beforeSubmission() and s.isTerminal()));
     }
     try t.expect(!Status.failed.beforeSubmission());
