@@ -2422,9 +2422,9 @@ pub fn probeJob(
     };
 }
 
-/// The pipe-pane log is a raw terminal stream: it carries CSI/OSC escape
-/// sequences (bracketed paste, shell integration beacons) and CR line
-/// endings. Strip them so agents get plain text.
+/// The pipe-pane log is a raw terminal stream: it carries CSI and string
+/// escape sequences (bracketed paste, shell integration beacons, window
+/// titles) and CR line endings. Strip them so agents get plain text.
 pub fn stripTerminalNoise(arena: Allocator, raw: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -2439,8 +2439,13 @@ pub fn stripTerminalNoise(arena: Allocator, raw: []const u8) Allocator.Error![]u
                 if (i < raw.len) i += 1;
                 continue;
             }
-            if (kind == ']') {
-                // OSC: ESC ] ... (BEL | ESC \)
+            if (kind == ']' or kind == 'k' or kind == 'P' or kind == '_' or kind == '^' or kind == 'X') {
+                // String sequences, ended by BEL or ST (ESC \): OSC (ESC ]),
+                // DCS (ESC P), APC (ESC _), PM (ESC ^), SOS (ESC X), and the
+                // screen/tmux title ESC k ... — which zsh's termsupport emits
+                // before every command under TERM=tmux*/screen*. Left in, its
+                // text lands in front of the command's next line, so a
+                // sentinel that starts a line no longer does.
                 i += 2;
                 while (i < raw.len) {
                     if (raw[i] == 0x07) {
@@ -2478,6 +2483,16 @@ test stripTerminalNoise {
         "\x1b[?2004l\r\x1b]3008;start=abc\x07hello\r\n\x1b[0mworld\n",
     );
     try t.expectEqualStrings("hello\nworld\n", cleaned);
+
+    // zsh under tmux sets the window title to the command right before its
+    // output (taken from a real pane log). The result line must still start
+    // with the sentinel, and the title text must not reach the output.
+    const titled = try stripTerminalNoise(
+        arena_state.allocator(),
+        "\x1bk'cd'\x1b\\__X__:0\r\n\x1bPtmux;x\x1b\\\x1b_apc\x07done\n",
+    );
+    try t.expectEqualStrings("__X__:0\ndone\n", titled);
+    try t.expectEqual(@as(i32, 0), findSentinel(titled, "__X__").?.exit_code);
 }
 
 const SentinelHit = struct {
