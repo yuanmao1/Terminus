@@ -34,6 +34,38 @@ const libssh2_sources = [_][]const u8{
     "version.c",
 };
 
+// mbedTLS 3.6's `src_crypto` list (library/CMakeLists.txt): the libmbedcrypto
+// half. libssh2 needs no TLS or X.509.
+const mbedcrypto_sources = [_][]const u8{
+    "aes.c",                                  "aesni.c",              "aesce.c",
+    "aria.c",                                 "asn1parse.c",          "asn1write.c",
+    "base64.c",                               "bignum.c",             "bignum_core.c",
+    "bignum_mod.c",                           "bignum_mod_raw.c",     "block_cipher.c",
+    "camellia.c",                             "ccm.c",                "chacha20.c",
+    "chachapoly.c",                           "cipher.c",             "cipher_wrap.c",
+    "constant_time.c",                        "cmac.c",               "ctr_drbg.c",
+    "des.c",                                  "dhm.c",                "ecdh.c",
+    "ecdsa.c",                                "ecjpake.c",            "ecp.c",
+    "ecp_curves.c",                           "entropy.c",            "entropy_poll.c",
+    "error.c",                                "gcm.c",                "hkdf.c",
+    "hmac_drbg.c",                            "lmots.c",              "lms.c",
+    "md.c",                                   "md5.c",                "memory_buffer_alloc.c",
+    "nist_kw.c",                              "oid.c",                "padlock.c",
+    "pem.c",                                  "pk.c",                 "pk_ecc.c",
+    "pk_wrap.c",                              "pkcs12.c",             "pkcs5.c",
+    "pkparse.c",                              "pkwrite.c",            "platform.c",
+    "platform_util.c",                        "poly1305.c",           "psa_crypto.c",
+    "psa_crypto_aead.c",                      "psa_crypto_cipher.c",  "psa_crypto_client.c",
+    "psa_crypto_driver_wrappers_no_static.c", "psa_crypto_ecp.c",     "psa_crypto_ffdh.c",
+    "psa_crypto_hash.c",                      "psa_crypto_mac.c",     "psa_crypto_pake.c",
+    "psa_crypto_rsa.c",                       "psa_crypto_random.c",  "psa_crypto_se.c",
+    "psa_crypto_slot_management.c",           "psa_crypto_storage.c", "psa_its_file.c",
+    "psa_util.c",                             "ripemd160.c",          "rsa.c",
+    "rsa_alt_helpers.c",                      "sha1.c",               "sha256.c",
+    "sha512.c",                               "sha3.c",               "threading.c",
+    "timing.c",                               "version.c",            "version_features.c",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -107,28 +139,70 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    if (target.result.os.tag != .windows) {
-        // M5 adds an OpenSSL-backed build for Linux/macOS.
-        const fail = b.addFail("Terminus currently builds Windows-only (libssh2 WinCNG backend); Linux/macOS lands in M5");
-        b.getInstallStep().dependOn(&fail.step);
-        return;
+    switch (target.result.os.tag) {
+        .windows, .linux, .macos => {},
+        else => {
+            const fail = b.addFail("Terminus builds for Windows, Linux and macOS only");
+            b.getInstallStep().dependOn(&fail.step);
+            return;
+        },
     }
     mod.addIncludePath(b.path("vendor/libssh2/include"));
     mod.addIncludePath(b.path("vendor/libssh2/src"));
-    mod.addCSourceFiles(.{
-        .root = b.path("vendor/libssh2/src"),
-        .files = &libssh2_sources,
-        // ECDSA_WINCNG: enables ecdh kex + ECDSA host/user keys (needed by
-        // modern servers). Note WinCNG cannot do ed25519 at all — switching
-        // to an OpenSSL/wolfSSL backend for that is tracked in PLAN §8.
-        .flags = &.{
-            "-DLIBSSH2_WINCNG",
-            "-DLIBSSH2_ECDSA_WINCNG",
-        },
-    });
-    mod.linkSystemLibrary("ws2_32", .{});
-    mod.linkSystemLibrary("bcrypt", .{});
-    mod.linkSystemLibrary("crypt32", .{});
+    mod.addIncludePath(b.path("vendor"));
+    mod.addCSourceFile(.{ .file = b.path("vendor/terminus_ssh.c") });
+    mod.addCSourceFile(.{ .file = b.path("vendor/terminus_sqlite.c") });
+    if (target.result.os.tag == .windows) {
+        mod.addCSourceFiles(.{
+            .root = b.path("vendor/libssh2/src"),
+            .files = &libssh2_sources,
+            // ECDSA_WINCNG: enables ecdh kex + ECDSA host/user keys (needed by
+            // modern servers). Note WinCNG cannot do ed25519 at all — switching
+            // to an OpenSSL/wolfSSL backend for that is tracked in PLAN §8.
+            .flags = &.{
+                "-DLIBSSH2_WINCNG",
+                "-DLIBSSH2_ECDSA_WINCNG",
+            },
+        });
+        mod.linkSystemLibrary("ws2_32", .{});
+        mod.linkSystemLibrary("bcrypt", .{});
+        mod.linkSystemLibrary("crypt32", .{});
+    } else {
+        // Linux/macOS: the mbedTLS backend over a vendored mbedTLS 3.6 LTS
+        // (crypto half only), so the binary keeps zero runtime dependencies.
+        // libssh2 has no hand-crafted config for POSIX, so the HAVE_* set its
+        // CMake would detect on both libcs is spelled out here.
+        const mbedtls_config = "-DMBEDTLS_USER_CONFIG_FILE=\"terminus_config.h\"";
+        mod.addIncludePath(b.path("vendor/mbedtls/include"));
+        mod.addIncludePath(b.path("vendor/mbedtls"));
+        mod.addCSourceFiles(.{
+            .root = b.path("vendor/mbedtls/library"),
+            .files = &mbedcrypto_sources,
+            .flags = &.{mbedtls_config},
+        });
+        mod.addCSourceFiles(.{
+            .root = b.path("vendor/libssh2/src"),
+            .files = &libssh2_sources,
+            .flags = &.{
+                "-DLIBSSH2_MBEDTLS",
+                mbedtls_config,
+                "-DHAVE_UNISTD_H",
+                "-DHAVE_INTTYPES_H",
+                "-DHAVE_SYS_TIME_H",
+                "-DHAVE_SYS_SOCKET_H",
+                "-DHAVE_SYS_SELECT_H",
+                "-DHAVE_SYS_IOCTL_H",
+                "-DHAVE_SYS_UIO_H",
+                "-DHAVE_SYS_UN_H",
+                "-DHAVE_POLL",
+                "-DHAVE_SELECT",
+                "-DHAVE_O_NONBLOCK",
+                "-DHAVE_GETTIMEOFDAY",
+                "-DHAVE_SNPRINTF",
+                "-DHAVE_STRTOLL",
+            },
+        });
+    }
     // Skill text ships inside the binary (`terminus setup`).
     mod.addAnonymousImport("terminus_skill", .{
         .root_source_file = b.path("skill/SKILL.md"),

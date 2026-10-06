@@ -1359,13 +1359,18 @@ resume is the row's and not your argument's.
 
 ## Setup (once per machine)
 
-**Key requirement: PKCS#1 PEM RSA only** — the file must start with
-`-----BEGIN RSA PRIVATE KEY-----`. OPENSSH-format (`ssh-keygen` default since
-2018), EC/ECDSA and PKCS#8 keys are rejected before the auth call, with
-conversion instructions. The limit comes from the Windows crypto backend, but
-the check is not OS-gated: it refuses the same formats on every platform (an
-ed25519 key is caught as OPENSSH-format). When in doubt, generate a dedicated
-key:
+**Key requirement depends on the platform the CLI runs on.** ed25519 keys are
+never usable.
+
+- **Windows: PKCS#1 PEM RSA only** — the file must start with
+  `-----BEGIN RSA PRIVATE KEY-----` and must not be passphrase-protected.
+  OPENSSH-format (`ssh-keygen` default since 2018), EC/ECDSA and PKCS#8 keys
+  are rejected before the auth call, with conversion instructions.
+- **Linux/macOS: RSA or ECDSA, in OPENSSH, PEM or PKCS#8 form**, with or
+  without a passphrase. An ed25519 key is refused at `key add`.
+
+Unsupported formats are refused at `key add` with instructions. When in doubt,
+generate a dedicated key that works everywhere:
 
 ```bash
 ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key   # then add .pub to the server

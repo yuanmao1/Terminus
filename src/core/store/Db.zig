@@ -29,9 +29,10 @@ pub const Error = error{
 };
 
 /// SQLITE_TRANSIENT: sqlite copies the buffer before returning from bind.
-/// The macro casts -1 to a function pointer, which translate-c cannot
-/// express as a constant, so it is reproduced here.
-const transient: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+/// The macro casts -1 to a function pointer, which Zig rejects as misaligned
+/// on aarch64, so `vendor/terminus_sqlite.c` defines it.
+extern const terminus_sqlite_transient: c.sqlite3_destructor_type;
+const transient = &terminus_sqlite_transient;
 
 /// Opens a connection without changing anything the file records about itself.
 ///
@@ -203,7 +204,7 @@ pub const Stmt = struct {
 
     /// Parameter indexes are 1-based.
     pub fn bindText(s: *Stmt, index: c_int, value: []const u8) Error!void {
-        if (c.sqlite3_bind_text(s.handle, index, value.ptr, @intCast(value.len), transient) != c.SQLITE_OK)
+        if (c.sqlite3_bind_text(s.handle, index, value.ptr, @intCast(value.len), transient.*) != c.SQLITE_OK)
             return s.failure();
     }
 
@@ -212,7 +213,7 @@ pub const Stmt = struct {
     }
 
     pub fn bindBlob(s: *Stmt, index: c_int, value: []const u8) Error!void {
-        if (c.sqlite3_bind_blob(s.handle, index, value.ptr, @intCast(value.len), transient) != c.SQLITE_OK)
+        if (c.sqlite3_bind_blob(s.handle, index, value.ptr, @intCast(value.len), transient.*) != c.SQLITE_OK)
             return s.failure();
     }
 

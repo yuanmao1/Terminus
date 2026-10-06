@@ -7,7 +7,7 @@ npm install -g terminus-shell
 terminus setup          # install the agent skill into Claude Code / Codex
 ```
 
-Written in Zig 0.17. Single ~3 MB binary, zero runtime dependencies — SQLite and libssh2 (WinCNG backend) are compiled in. Windows x64 today; Linux/macOS planned.
+Written in Zig 0.17. Single binary, zero runtime dependencies — SQLite and libssh2 are compiled in (WinCNG crypto backend on Windows, vendored mbedTLS on Linux/macOS). Prebuilt for Windows x64, Linux x64/arm64 (static musl) and macOS x64/arm64.
 
 ---
 
@@ -31,9 +31,10 @@ recalled memory    > re-discovery
 ## Quick start
 
 ```bash
-# Keys: the Windows crypto backend needs PKCS#1 PEM RSA
-# ("-----BEGIN RSA PRIVATE KEY-----"). Other formats are rejected with
-# conversion instructions. Simplest: generate a dedicated key.
+# Keys: on Windows Terminus needs PKCS#1 PEM RSA without a passphrase
+# ("-----BEGIN RSA PRIVATE KEY-----"); on Linux/macOS any RSA or ECDSA key
+# (OpenSSH, PEM or PKCS#8). ed25519 is not supported. Unusable keys are
+# rejected with conversion instructions. Simplest: generate a dedicated key.
 ssh-keygen -t rsa -b 4096 -m PEM -f terminus_key
 
 terminus key add mykey --kind rsa --private-file ./terminus_key
@@ -160,12 +161,22 @@ agent / human
 
 ## Building from source
 
-Requires Zig 0.17.0 on Windows. All C dependencies are vendored:
+Requires Zig 0.17.0 (Windows, Linux or macOS host). All C dependencies are vendored:
 
 ```bash
 zig build              # debug
 zig build test         # unit tests
 zig build -Doptimize=ReleaseSafe
+```
+
+Cross-compiling the npm binaries from any host (`npm/bin/` names in brackets):
+
+```bash
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows   # Terminus.exe
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl  -p out/linux-x64     # terminus-linux-x64
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl -p out/linux-arm64   # terminus-linux-arm64
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos       -p out/darwin-x64    # terminus-darwin-x64
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos      -p out/darwin-arm64  # terminus-darwin-arm64
 ```
 
 `zig build test` additionally needs a POSIX shell on `PATH`: two black-box gates run generated shell text through a real `sh` instead of trusting a reading of it, and they fail rather than skip when none is found. Git for Windows supplies one; if yours lives elsewhere, point the build at it with `zig build test -Dposix-sh=<path-to-sh>`.
@@ -183,7 +194,7 @@ Planned: DPAPI key encryption, known-hosts pinning, destructive-command policies
 ## Roadmap
 
 - **M4** — Windows ConPTY local sessions, key encryption (`shell` / `attach` for human takeover have landed)
-- **M5** — Linux/macOS (OpenSSL/wolfSSL backend for ed25519), MCP server adapter
+- **M5** — Linux/macOS (landed, mbedTLS backend); ed25519 keys, MCP server adapter
 
 ## License
 

@@ -64,7 +64,7 @@ terminus setup cursor windsurf agents   # .cursor/rules, .windsurf/rules, AGENTS
 
 ## Platform
 
-Windows x64 (prebuilt, zero dependencies — SQLite and libssh2 are compiled in). Linux/macOS planned.
+Windows x64, Linux x64/arm64 and macOS x64/arm64 (prebuilt, zero dependencies — SQLite and libssh2 are compiled in).
 
 Currently no known-hosts verification and keys are stored unencrypted locally — treat it as a dev tool, not a production credential store, until those land.
 

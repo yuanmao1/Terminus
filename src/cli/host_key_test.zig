@@ -410,7 +410,7 @@ test "gate: connect judges the key it read before it hands back a session" {
     // And the two `errdefer`s really are above it, so the refusal below them
     // frees the session and closes the socket rather than leaking both.
     const frees = std.mem.indexOf(u8, body, "errdefer _ = c.libssh2_session_free(session);").?;
-    const closes = std.mem.indexOf(u8, body, "errdefer _ = c.closesocket(socket);").?;
+    const closes = std.mem.indexOf(u8, body, "errdefer closeSocket(socket);").?;
     try t.expect(frees < judged);
     try t.expect(closes < judged);
 

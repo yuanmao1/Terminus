@@ -7,9 +7,9 @@
 //! key nobody looked at. See the host key section below for why the check is
 //! shaped that way.
 //!
-//! The TCP socket is created with winsock directly rather than
-//! std.Io.net: on Windows the std Io implementation hands out raw AFD
-//! device handles, which libssh2's internal send()/recv() cannot use.
+//! The TCP socket is created with the C socket API (winsock on Windows)
+//! rather than std.Io.net: on Windows the std Io implementation hands out raw
+//! AFD device handles, which libssh2's internal send()/recv() cannot use.
 //! Blocking mode throughout — fine for the M1 CLI process model. The M3
 //! daemon revisits this with long-lived sessions.
 const std = @import("std");
@@ -38,13 +38,15 @@ session: *c.LIBSSH2_SESSION,
 /// flag suffices.
 var libssh2_ready = false;
 
-/// Process-wide libssh2/Winsock initialization. The daemon calls this on its
+/// Process-wide libssh2 (and, on Windows, Winsock) initialization. The daemon calls this on its
 /// main thread before it accepts concurrent clients; direct CLI processes reach
 /// it lazily from `connect`.
 pub fn initialize() ConnectError!void {
     if (libssh2_ready) return;
-    var wsa: c.WSADATA = undefined;
-    if (c.WSAStartup((2 << 8) | 2, &wsa) != 0) return error.Libssh2Init;
+    if (builtin.os.tag == .windows) {
+        var wsa: c.WSADATA = undefined;
+        if (c.WSAStartup((2 << 8) | 2, &wsa) != 0) return error.Libssh2Init;
+    }
     if (c.libssh2_init(0) != 0) return error.Libssh2Init;
     libssh2_ready = true;
 }
@@ -375,7 +377,7 @@ pub fn connect(
     try initialize();
 
     const socket = try tcpConnect(host, port);
-    errdefer _ = c.closesocket(socket);
+    errdefer closeSocket(socket);
 
     const session = c.libssh2_session_init_ex(null, null, null, null) orelse
         return error.OutOfMemory;
@@ -416,7 +418,7 @@ pub fn deinit(client: *Client) void {
     c.libssh2_session_set_timeout(client.session, teardown_timeout_ms);
     _ = c.libssh2_session_disconnect_ex(client.session, c.SSH_DISCONNECT_BY_APPLICATION, "bye", "");
     _ = c.libssh2_session_free(client.session);
-    _ = c.closesocket(client.socket);
+    closeSocket(client.socket);
     client.* = undefined;
 }
 
@@ -440,20 +442,37 @@ pub const Auth = union(enum) {
 
 pub const AuthError = error{ AuthFailed, UnsupportedKeyFormat };
 
-/// What the WinCNG backend can actually parse. Everything else must be
-/// rejected *before* reaching libssh2: feeding it any other format does
-/// not fail cleanly — it wedges the session (observed with OPENSSH-format
-/// RSA and PEM EC keys: the auth call never returns and ignores the
-/// session timeout). Empirically only PKCS#1 PEM RSA works end-to-end.
+/// Private key formats, and which ones the crypto backend this binary was
+/// built with can use.
+///
+/// **Windows (WinCNG): PKCS#1 PEM RSA only.** Everything else must be rejected
+/// *before* reaching libssh2: feeding it any other format does not fail
+/// cleanly — it wedges the session (observed with OPENSSH-format RSA and PEM
+/// EC keys: the auth call never returns and ignores the session timeout).
+///
+/// **Linux/macOS (mbedTLS): RSA and ECDSA in PEM, PKCS#8 or OpenSSH form.**
+/// mbedTLS fails cleanly on what it cannot read. ed25519 is out on both
+/// backends; an OpenSSH file names its key type in clear (even when the key is
+/// passphrase-protected), so that refusal happens at `key add`, not at auth.
 pub const KeyFormat = enum {
-    pem_rsa, // -----BEGIN RSA PRIVATE KEY----- (PKCS#1) — the ONLY supported format
-    pem_ec, // -----BEGIN EC PRIVATE KEY----- — wedges WinCNG (expects openssh-key-v1)
-    openssh, // -----BEGIN OPENSSH PRIVATE KEY----- — wedges WinCNG
-    pkcs8, // -----BEGIN (ENCRYPTED) PRIVATE KEY----- — unsupported
+    pem_rsa, // -----BEGIN RSA PRIVATE KEY----- (PKCS#1)
+    pem_ec, // -----BEGIN EC PRIVATE KEY----- (SEC1)
+    pkcs8, // -----BEGIN (ENCRYPTED) PRIVATE KEY-----
+    openssh_rsa, // -----BEGIN OPENSSH PRIVATE KEY-----, ssh-rsa
+    openssh_ecdsa, // ..., ecdsa-sha2-nistp256/384/521
+    openssh_ed25519, // ..., ssh-ed25519 — no backend supports it
+    openssh_other, // ..., anything else, or a file that does not parse
     unknown,
 
     pub fn detect(key_bytes: []const u8) KeyFormat {
-        if (std.mem.indexOf(u8, key_bytes, "BEGIN OPENSSH PRIVATE KEY") != null) return .openssh;
+        if (std.mem.indexOf(u8, key_bytes, "BEGIN OPENSSH PRIVATE KEY") != null) {
+            var buffer: [openssh_decode_max]u8 = undefined;
+            const key = OpensshPublic.read(key_bytes, &buffer) orelse return .openssh_other;
+            if (std.mem.eql(u8, key.type, "ssh-rsa")) return .openssh_rsa;
+            if (std.mem.startsWith(u8, key.type, "ecdsa-sha2-nistp")) return .openssh_ecdsa;
+            if (std.mem.eql(u8, key.type, "ssh-ed25519")) return .openssh_ed25519;
+            return .openssh_other;
+        }
         if (std.mem.indexOf(u8, key_bytes, "BEGIN RSA PRIVATE KEY") != null) return .pem_rsa;
         if (std.mem.indexOf(u8, key_bytes, "BEGIN EC PRIVATE KEY") != null) return .pem_ec;
         if (std.mem.indexOf(u8, key_bytes, "BEGIN ENCRYPTED PRIVATE KEY") != null) return .pkcs8;
@@ -462,13 +481,29 @@ pub const KeyFormat = enum {
     }
 
     pub fn supported(format: KeyFormat) bool {
-        return format == .pem_rsa;
+        if (builtin.os.tag == .windows) return format == .pem_rsa;
+        return switch (format) {
+            .pem_rsa, .pem_ec, .pkcs8, .openssh_rsa, .openssh_ecdsa => true,
+            .openssh_ed25519, .openssh_other, .unknown => false,
+        };
     }
 
     /// User-facing conversion instructions for unsupported formats.
     pub fn adviceFor(format: KeyFormat) []const u8 {
+        if (builtin.os.tag != .windows) return switch (format) {
+            .openssh_ed25519 =>
+            \\ed25519 keys are not supported by Terminus's crypto backend. Generate a
+            \\dedicated ECDSA (or RSA) key for Terminus and add its .pub to the server:
+            \\  ssh-keygen -t ecdsa -b 256 -f terminus_key
+            ,
+            else =>
+            \\Unrecognized private key. Terminus reads RSA and ECDSA keys in OpenSSH,
+            \\PEM or PKCS#8 form (ed25519 is not supported). Generate one:
+            \\  ssh-keygen -t ecdsa -b 256 -f terminus_key
+            ,
+        };
         return switch (format) {
-            .openssh =>
+            .openssh_rsa, .openssh_ecdsa, .openssh_ed25519, .openssh_other =>
             \\OPENSSH-format private keys are not supported by the Windows crypto backend.
             \\If this is an RSA key, convert a COPY to PEM (rewrites the file in place):
             \\  copy id_rsa id_rsa.pem && ssh-keygen -p -m PEM -f id_rsa.pem -N ""
@@ -494,12 +529,144 @@ pub const KeyFormat = enum {
     }
 };
 
+/// Upper bound on a decoded "openssh-key-v1" file. A 16384-bit RSA key with a
+/// passphrase is under 10 KiB; anything larger is not a key this reads.
+const openssh_decode_max = 16 * 1024;
+
+/// Longest key passphrase `authenticate` will hand libssh2.
+const passphrase_max = 1024;
+
+/// The public half of an "openssh-key-v1" private key file. It sits in clear
+/// ahead of the (possibly encrypted) private section, so reading it needs no
+/// passphrase and no crypto.
+const OpensshPublic = struct {
+    type: []const u8,
+    blob: []const u8,
+
+    /// `buffer` receives the decoded file; the result points into it.
+    fn read(file: []const u8, buffer: *[openssh_decode_max]u8) ?OpensshPublic {
+        const begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+        const start = (std.mem.indexOf(u8, file, begin) orelse return null) + begin.len;
+        const stop = std.mem.indexOfPos(u8, file, start, "-----END") orelse return null;
+        var text: [openssh_decode_max * 4 / 3 + 4]u8 = undefined;
+        var text_len: usize = 0;
+        for (file[start..stop]) |ch| {
+            if (std.ascii.isWhitespace(ch)) continue;
+            if (text_len == text.len) return null;
+            text[text_len] = ch;
+            text_len += 1;
+        }
+        const decoder = std.base64.standard.Decoder;
+        const size = decoder.calcSizeForSlice(text[0..text_len]) catch return null;
+        if (size > buffer.len) return null;
+        decoder.decode(buffer[0..size], text[0..text_len]) catch return null;
+        var rest: []const u8 = buffer[0..size];
+
+        const magic = "openssh-key-v1\x00";
+        if (!std.mem.startsWith(u8, rest, magic)) return null;
+        rest = rest[magic.len..];
+        _ = sshString(&rest) orelse return null; // cipher
+        _ = sshString(&rest) orelse return null; // kdf
+        _ = sshString(&rest) orelse return null; // kdf options
+        if (rest.len < 4 or std.mem.readInt(u32, rest[0..4], .big) != 1) return null;
+        rest = rest[4..];
+        const blob = sshString(&rest) orelse return null;
+        var in_blob = blob;
+        const key_type = sshString(&in_blob) orelse return null;
+        return .{ .type = key_type, .blob = blob };
+    }
+
+    fn sshString(rest: *[]const u8) ?[]const u8 {
+        if (rest.len < 4) return null;
+        const len = std.mem.readInt(u32, rest.*[0..4], .big);
+        if (rest.len - 4 < len) return null;
+        const value = rest.*[4 .. 4 + len];
+        rest.* = rest.*[4 + len ..];
+        return value;
+    }
+
+    /// The `.pub` line libssh2 reads: "<type> <base64 blob>".
+    fn line(key: OpensshPublic, out: []u8) ?[]const u8 {
+        const encoder = std.base64.standard.Encoder;
+        const need = key.type.len + 1 + encoder.calcSize(key.blob.len);
+        if (need > out.len) return null;
+        @memcpy(out[0..key.type.len], key.type);
+        out[key.type.len] = ' ';
+        _ = encoder.encode(out[key.type.len + 1 .. need], key.blob);
+        return out[0..need];
+    }
+};
+
+test "an OpenSSH private key names its type and yields the .pub line ssh-keygen wrote" {
+    const t = std.testing;
+    // Throwaway keys generated for this test, authorized nowhere.
+    const ecdsa =
+        \\-----BEGIN OPENSSH PRIVATE KEY-----
+        \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+        \\1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQTKemYTyL79pY8QZAMhc1R13US9pK45
+        \\yvaazlxPgj93YcCt+bdxYzrVDUTwuhOsRkAknm/T1VusernnAvYMMJu6AAAAmNr12rba9d
+        \\q2AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBMp6ZhPIvv2ljxBk
+        \\AyFzVHXdRL2krjnK9prOXE+CP3dhwK35t3FjOtUNRPC6E6xGQCSeb9PVW6x6uecC9gwwm7
+        \\oAAAAgCVvQJJdevbz93TDCHnSFBKxBCq3F9ZD/BE591vbfVH4AAAAA
+        \\-----END OPENSSH PRIVATE KEY-----
+        \\
+    ;
+    const ed25519 =
+        \\-----BEGIN OPENSSH PRIVATE KEY-----
+        \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+        \\QyNTUxOQAAACDSZCG8x7UJHNr8iwRtqflJfpz8/wozt0ITnFwZusITHAAAAIgHMKrTBzCq
+        \\0wAAAAtzc2gtZWQyNTUxOQAAACDSZCG8x7UJHNr8iwRtqflJfpz8/wozt0ITnFwZusITHA
+        \\AAAECWHtsV4yssU4Jp5f4uj9BJVh+ruVQ+u24FndkYHSF2b9JkIbzHtQkc2vyLBG2p+Ul+
+        \\nPz/CjO3QhOcXBm6whMcAAAAAAECAwQF
+        \\-----END OPENSSH PRIVATE KEY-----
+        \\
+    ;
+    try t.expectEqual(KeyFormat.openssh_ecdsa, KeyFormat.detect(ecdsa));
+    try t.expectEqual(KeyFormat.openssh_ed25519, KeyFormat.detect(ed25519));
+    try t.expect(!KeyFormat.openssh_ed25519.supported());
+    try t.expectEqual(
+        builtin.os.tag != .windows,
+        KeyFormat.openssh_ecdsa.supported(),
+    );
+    // A damaged body is still an OpenSSH file, and is refused rather than guessed.
+    try t.expectEqual(KeyFormat.openssh_other, KeyFormat.detect(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+    ));
+
+    var decoded: [openssh_decode_max]u8 = undefined;
+    var out: [512]u8 = undefined;
+    const key = OpensshPublic.read(ecdsa, &decoded).?;
+    try t.expectEqualStrings(
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBMp6ZhPIvv2ljxBkAyFzVHXdRL2krjnK9prOXE+CP3dhwK35t3FjOtUNRPC6E6xGQCSeb9PVW6x6uecC9gwwm7o=",
+        key.line(&out).?,
+    );
+}
+
 pub fn authenticate(client: *Client, username: []const u8, auth: Auth) AuthError!void {
     if (auth == .key) {
         // Guard: see KeyFormat docs — unsupported formats wedge libssh2.
         if (!KeyFormat.detect(auth.key.private).supported())
             return error.UnsupportedKeyFormat;
     }
+    // libssh2's mbedTLS backend derives a public key only from PEM/PKCS#8, so
+    // an OpenSSH file with no separate .pub gets its own public half passed in.
+    var decoded: [openssh_decode_max]u8 = undefined;
+    var public_line: [openssh_decode_max * 4 / 3 + 64]u8 = undefined;
+    const public: ?[]const u8 = switch (auth) {
+        .password => null,
+        .key => |key| key.public orelse derived: {
+            const found = OpensshPublic.read(key.private, &decoded) orelse break :derived null;
+            break :derived found.line(&public_line);
+        },
+    };
+    // libssh2 takes the passphrase as a C string and measures it with strlen;
+    // the stored one is a slice with no terminator after it.
+    var passphrase_z: [passphrase_max:0]u8 = undefined;
+    const passphrase: ?[*:0]const u8 = switch (auth) {
+        .password => null,
+        .key => |key| if (key.passphrase) |p| (std.fmt.bufPrintSentinel(&passphrase_z, "{s}", .{p}, 0) catch
+            return error.AuthFailed).ptr else null,
+    };
     const rc = switch (auth) {
         .password => |password| c.libssh2_userauth_password_ex(
             client.session,
@@ -513,11 +680,11 @@ pub fn authenticate(client: *Client, username: []const u8, auth: Auth) AuthError
             client.session,
             username.ptr,
             username.len,
-            if (key.public) |p| p.ptr else null,
-            if (key.public) |p| p.len else 0,
+            if (public) |p| p.ptr else null,
+            if (public) |p| p.len else 0,
             key.private.ptr,
             key.private.len,
-            if (key.passphrase) |p| p.ptr else null,
+            passphrase,
         ),
     };
     if (rc != 0) return error.AuthFailed;
@@ -1754,11 +1921,11 @@ pub fn scpRecvBytes(
     remote_path: [:0]const u8,
 ) (TransferError || Allocator.Error)![]u8 {
     _ = io;
-    var sb: c.libssh2_struct_stat = undefined;
-    const channel = c.libssh2_scp_recv2(client.session, remote_path.ptr, &sb) orelse
+    var size: c.libssh2_int64_t = 0;
+    const channel = c.terminus_scp_recv(client.session, remote_path.ptr, &size) orelse
         return error.ChannelOpenFailed;
     defer _ = c.libssh2_channel_free(channel);
-    const total: u64 = @intCast(@max(sb.st_size, 0));
+    const total: u64 = @intCast(@max(size, 0));
 
     const data = try arena.alloc(u8, total);
     var received: usize = 0;
@@ -1787,11 +1954,11 @@ pub fn scpRecv(
     moved: *Moved,
 ) TransferError!u64 {
     moved.* = .{};
-    var sb: c.libssh2_struct_stat = undefined;
-    const channel = c.libssh2_scp_recv2(client.session, remote_path.ptr, &sb) orelse
+    var size: c.libssh2_int64_t = 0;
+    const channel = c.terminus_scp_recv(client.session, remote_path.ptr, &size) orelse
         return error.ChannelOpenFailed;
     defer _ = c.libssh2_channel_free(channel);
-    const total: u64 = @intCast(@max(sb.st_size, 0));
+    const total: u64 = @intCast(@max(size, 0));
     moved.expected = total;
 
     const cwd = std.Io.Dir.cwd();
@@ -1845,14 +2012,18 @@ fn tcpConnect(host: []const u8, port: u16) ConnectError!c.libssh2_socket_t {
     var it = info;
     while (it != null) : (it = it.*.ai_next) {
         const socket = c.socket(it.*.ai_family, it.*.ai_socktype, it.*.ai_protocol);
-        if (socket == c.INVALID_SOCKET) continue;
+        if (socket == c.LIBSSH2_INVALID_SOCKET) continue;
         if (c.connect(socket, it.*.ai_addr, @intCast(it.*.ai_addrlen)) == 0) {
             tuneSocket(socket);
             return socket;
         }
-        _ = c.closesocket(socket);
+        closeSocket(socket);
     }
     return error.ConnectFailed;
+}
+
+fn closeSocket(socket: c.libssh2_socket_t) void {
+    if (builtin.os.tag == .windows) _ = c.closesocket(socket) else _ = c.close(socket);
 }
 
 /// TCP_NODELAY + large SO_RCVBUF. Without NODELAY, libssh2's small
@@ -1860,12 +2031,17 @@ fn tcpConnect(host: []const u8, port: u16) ConnectError!c.libssh2_socket_t {
 /// ~40-200 ms per round trip — which turns a many-packet bulk transfer
 /// into minutes. A big receive buffer lets the kernel pull whole windows.
 fn tuneSocket(socket: c.libssh2_socket_t) void {
-    // IPPROTO_TCP = 6, TCP_NODELAY = 1, SOL_SOCKET = 0xffff, SO_RCVBUF = 0x1002
-    // (Winsock constants; translate-c can't render the macros).
+    // IPPROTO_TCP = 6 and TCP_NODELAY = 1 everywhere. SOL_SOCKET/SO_RCVBUF are
+    // 0xffff/0x1002 on Winsock and macOS, 1/8 on Linux (translate-c can't
+    // render the Winsock macros, so all four are spelled out).
+    const sol_socket: c_int, const so_rcvbuf: c_int = switch (builtin.os.tag) {
+        .linux => .{ 1, 8 },
+        else => .{ 0xffff, 0x1002 },
+    };
     var one: c_int = 1;
     _ = c.setsockopt(socket, 6, 1, @ptrCast(&one), @sizeOf(c_int));
     var rcvbuf: c_int = 4 * 1024 * 1024;
-    _ = c.setsockopt(socket, 0xffff, 0x1002, @ptrCast(&rcvbuf), @sizeOf(c_int));
+    _ = c.setsockopt(socket, sol_socket, so_rcvbuf, @ptrCast(&rcvbuf), @sizeOf(c_int));
 }
 
 test "direct tunnel input queue is bounded and preserves ring order" {

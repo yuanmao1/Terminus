@@ -404,10 +404,12 @@ fn readPidFile(io: std.Io, arena: std.mem.Allocator, environ: *std.process.Envir
 }
 
 /// Terminates a process by pid. Returns true on a successful kill (or if
-/// the process was already gone). Windows-only for now (M4); POSIX kill(2)
-/// arrives with the POSIX daemon in M5.
+/// the process was already gone).
 fn terminatePid(pid: u32) bool {
-    if (@import("builtin").os.tag != .windows) return false;
+    if (@import("builtin").os.tag != .windows) {
+        std.posix.kill(@intCast(pid), .KILL) catch |err| return err == error.ProcessNotFound;
+        return true;
+    }
     const windows = std.os.windows;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const handle = OpenProcess(PROCESS_TERMINATE, 0, pid);

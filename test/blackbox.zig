@@ -912,23 +912,11 @@ test "blackbox: an unknown outcome is never reported as a plain failure" {
 fn scratchHomeEnvironment(allocator: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     var map = switch (builtin.os.tag) {
         .windows => try (std.process.Environ{ .block = .global }).createMap(allocator),
-        // Not quietly degraded to an empty environment. There is no portable
-        // way to read this process's own environment without the
-        // `std.process.Init` a test does not get, and running the binary with
-        // nothing in its environment would gate on a machine that does not
-        // exist. The daemon transport these gates drive is itself Windows-only
-        // until M5.
-        else => {
-            std.debug.print(
-                \\
-                \\this gate points the binary's home at a scratch directory, which needs a
-                \\snapshot of this process's own environment; only the Windows path is
-                \\implemented, and the daemon transport it drives is Windows-only until M5.
-                \\
-                \\
-            , .{});
-            return error.ScratchHomeNeedsWindows;
-        },
+        // This test links libc, so libc's own `environ` is this process's
+        // environment without the `std.process.Init` a test does not get.
+        else => try (std.process.Environ{ .block = .{
+            .slice = @ptrCast(std.mem.span(std.c.environ)),
+        } }).createMap(allocator),
     };
     errdefer map.deinit();
     try map.put("USERPROFILE", home);

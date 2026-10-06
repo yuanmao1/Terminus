@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 npm/bin/Terminus.exe
+npm/bin/terminus-*
 npm/*.tgz
 CLAUDE.md
 __pycache__/

@@ -410,6 +410,9 @@ extern "kernel32" fn LockFile(
 ) callconv(.winapi) std.os.windows.BOOL;
 
 test "gate: a local disk that fills mid-transfer keeps the destination and confirms no more than it took" {
+    // The mechanism is Windows' mandatory byte-range lock; POSIX locks are
+    // advisory and would not make the write fail.
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();

@@ -1,4 +1,5 @@
-//! 本地 Windows 控制台的 raw 模式,以及它的还原保证。
+//! 本地终端的 raw 模式,以及它的还原保证。Windows 走控制台 API,
+//! Linux/macOS 走 termios。
 //!
 //! **还原是这个模块存在的理由。** 本地终端被留在 raw 模式里是这个功能
 //! 唯一不可接受的故障:用户的 shell 会变成一个不回显、不换行、Ctrl-C
@@ -28,8 +29,17 @@ pub const Size = struct {
     rows: u16,
 };
 
+const is_windows = builtin.os.tag == .windows;
+
 /// 进入前的全部状态。还原就是把这几项写回去。
-pub const Saved = struct {
+pub const Saved = if (is_windows) WindowsSaved else PosixSaved;
+
+const PosixSaved = struct {
+    fd: std.posix.fd_t,
+    termios: std.posix.termios,
+};
+
+const WindowsSaved = struct {
     in_handle: windows.HANDLE,
     out_handle: windows.HANDLE,
     in_mode: windows.DWORD,
@@ -52,9 +62,13 @@ var handler_installed: bool = false;
 /// 每一步都忽略返回值并继续:这是唯一一条"失败了也必须往下走"的路径,
 /// 在这里提前返回会因为输入模式没还原成功就放弃还原代码页。
 pub fn restoreActive() void {
-    if (comptime builtin.os.tag != .windows) return;
     const s = active orelse return;
     active = null; // 先清,保证并发的第二次调用是空操作
+    if (comptime !is_windows) {
+        // tcsetattr 是 async-signal-safe 的,信号处理器里也走这里。
+        std.posix.tcsetattr(s.fd, .FLUSH, s.termios) catch {};
+        return;
+    }
     _ = SetConsoleMode(s.in_handle, s.in_mode);
     _ = SetConsoleMode(s.out_handle, s.out_mode);
     _ = SetConsoleCP(s.in_cp);
@@ -117,9 +131,67 @@ fn ctrlHandler(ctrl_type: windows.DWORD) callconv(.winapi) windows.BOOL {
     return .FALSE;
 }
 
+/// POSIX 上对应 `ctrlHandler` 的三个信号:SIGHUP(关窗口)、SIGTERM、
+/// 以及 raw 模式以外的 SIGINT(raw 模式下 ISIG 已清,Ctrl-C 是字节 0x03)。
+///
+/// 和 Windows 不同,信号处理器打断的可能正是会话循环所在的线程,所以这里
+/// **不能等** `abortHandled` —— 等就是自己等自己。第一次只置标志,会话循环
+/// 收完尾后自己退出;第二次说明收尾没走通,还原终端后立刻结束进程。
+fn signalHandler(sig: std.posix.SIG) callconv(.c) void {
+    if (sig == .INT and child_owns_ctrl_c.load(.acquire)) return;
+    if (abort_flag.swap(true, .acq_rel)) {
+        restoreActive();
+        std.c._exit(128 + @as(c_int, @intCast(@backingInt(sig))));
+    }
+}
+
+fn enterPosix() Error!void {
+    const in_fd = std.Io.File.stdin().handle;
+    const out_fd = std.Io.File.stdout().handle;
+    // tcgetattr 对非终端失败,这就是 TTY 检测本身。
+    const original = std.posix.tcgetattr(in_fd) catch return error.NotATerminal;
+    _ = std.posix.tcgetattr(out_fd) catch return error.NotATerminal;
+
+    // cfmakeraw 的同一组位,和 OpenSSH 客户端进入交互会话时一样:回显、
+    // 行编辑、信号键、输出加工都交给远端 PTY。
+    var raw = original;
+    raw.iflag.IGNBRK = false;
+    raw.iflag.BRKINT = false;
+    raw.iflag.PARMRK = false;
+    raw.iflag.ISTRIP = false;
+    raw.iflag.INLCR = false;
+    raw.iflag.IGNCR = false;
+    raw.iflag.ICRNL = false;
+    raw.iflag.IXON = false;
+    raw.oflag.OPOST = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.ECHONL = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.ISIG = false;
+    raw.lflag.IEXTEN = false;
+    raw.cflag.CSIZE = .CS8;
+    raw.cflag.PARENB = false;
+    raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+    raw.cc[@backingInt(std.posix.V.TIME)] = 0;
+    std.posix.tcsetattr(in_fd, .FLUSH, raw) catch return error.ConsoleModeUnavailable;
+
+    active = .{ .fd = in_fd, .termios = original };
+    if (!handler_installed) {
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.HUP, &action, null);
+        std.posix.sigaction(.TERM, &action, null);
+        std.posix.sigaction(.INT, &action, null);
+        handler_installed = true;
+    }
+}
+
 /// 进入 raw 模式,并登记还原状态。
 pub fn enter() Error!void {
-    if (comptime builtin.os.tag != .windows) return error.NotATerminal;
+    if (comptime !is_windows) return enterPosix();
     const in_handle = std.Io.File.stdin().handle;
     const out_handle = std.Io.File.stdout().handle;
 
@@ -179,7 +251,8 @@ pub fn enter() Error!void {
 /// 代价是跳过 CRT 的收尾(atexit、stdio flush),所以调用方必须自己先把
 /// 该刷的都刷了。这条路径上要落的盘 —— 收据和数据库 —— 在更早就已经完成。
 pub fn exitNow(code: u8) noreturn {
-    if (comptime builtin.os.tag != .windows) std.process.exit(code);
+    // POSIX 的 exit 不等其他线程,读线程随进程一起消失。
+    if (comptime !is_windows) std.process.exit(code);
     _ = TerminateProcess(GetCurrentProcess(), code);
     unreachable; // TerminateProcess 不会返回给自己
 }
@@ -203,7 +276,13 @@ pub fn writeDirect(io: std.Io, bytes: []const u8) void {
 /// 取的是 `srWindow`(可见窗口)而不是 `dwSize`(缓冲区):远端 PTY 要的是
 /// 用户看得见的那块,缓冲区通常比它高得多。
 pub fn size() ?Size {
-    if (comptime builtin.os.tag != .windows) return null;
+    if (comptime !is_windows) {
+        var ws: std.posix.winsize = undefined;
+        const request: c_int = @bitCast(@as(u32, @intCast(std.posix.T.IOCGWINSZ)));
+        if (std.c.ioctl(std.Io.File.stdout().handle, request, &ws) != 0) return null;
+        if (ws.col == 0 or ws.row == 0) return null;
+        return .{ .cols = ws.col, .rows = ws.row };
+    }
     var info: ConsoleScreenBufferInfo = undefined;
     if (!GetConsoleScreenBufferInfo(std.Io.File.stdout().handle, &info).toBool()) return null;
     const cols = @as(i32, info.srWindow.Right) - info.srWindow.Left + 1;

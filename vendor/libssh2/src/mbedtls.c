@@ -497,6 +497,48 @@ _libssh2_mbedtls_rsa_new_private(libssh2_rsa_ctx **rsa,
     return 0;
 }
 
+/* Terminus: an "openssh-key-v1" RSA private key, which 1.11.1 (and upstream)
+   cannot read under mbedTLS — mbedtls_pk_parse_key knows only PEM/DER.
+   Fields after the key type: n, e, d, iqmp, p, q. */
+static int
+terminus_parse_openssh_rsa(libssh2_rsa_ctx *rsa,
+                           LIBSSH2_SESSION *session,
+                           const char *filedata,
+                           size_t filedata_len,
+                           const unsigned char *passphrase)
+{
+    struct string_buf *decrypted = NULL;
+    unsigned char *name, *n, *e, *d, *iqmp, *p, *q;
+    size_t name_len, n_len, e_len, d_len, iqmp_len, p_len, q_len;
+    int ret = -1;
+
+    if(_libssh2_openssh_pem_parse_memory(session, passphrase,
+                                         filedata, filedata_len,
+                                         &decrypted))
+        return -1;
+
+    if(_libssh2_get_string(decrypted, &name, &name_len) ||
+       name_len != 7 || memcmp(name, "ssh-rsa", 7) ||
+       _libssh2_get_bignum_bytes(decrypted, &n, &n_len) ||
+       _libssh2_get_bignum_bytes(decrypted, &e, &e_len) ||
+       _libssh2_get_bignum_bytes(decrypted, &d, &d_len) ||
+       _libssh2_get_bignum_bytes(decrypted, &iqmp, &iqmp_len) ||
+       _libssh2_get_bignum_bytes(decrypted, &p, &p_len) ||
+       _libssh2_get_bignum_bytes(decrypted, &q, &q_len))
+        goto cleanup;
+
+    mbedtls_rsa_init(rsa);
+    if(mbedtls_rsa_import_raw(rsa, n, n_len, p, p_len, q, q_len,
+                              d, d_len, e, e_len) == 0 &&
+       mbedtls_rsa_complete(rsa) == 0 &&
+       mbedtls_rsa_check_privkey(rsa) == 0)
+        ret = 0;
+
+cleanup:
+    _libssh2_string_buf_free(session, decrypted);
+    return ret;
+}
+
 int
 _libssh2_mbedtls_rsa_new_private_frommemory(libssh2_rsa_ctx **rsa,
                                             LIBSSH2_SESSION *session,
@@ -542,6 +584,9 @@ _libssh2_mbedtls_rsa_new_private_frommemory(libssh2_rsa_ctx **rsa,
 
     if(ret || mbedtls_pk_get_type(&pkey) != MBEDTLS_PK_RSA) {
         mbedtls_pk_free(&pkey);
+        if(terminus_parse_openssh_rsa(*rsa, session, filedata, filedata_len,
+                                      passphrase) == 0)
+            return 0;
         mbedtls_rsa_free(*rsa);
         LIBSSH2_FREE(session, *rsa);
         *rsa = NULL;
@@ -706,7 +751,9 @@ gen_publickey_from_rsa(LIBSSH2_SESSION *session,
     unsigned char *p;
 
     e_bytes = (uint32_t)mbedtls_mpi_size(&rsa->MBEDTLS_PRIVATE(E));
-    n_bytes = (uint32_t)mbedtls_mpi_size(&rsa->MBEDTLS_PRIVATE(N));
+    /* Terminus: upstream fix, missing in 1.11.1 — n is an mpint and its top
+       bit is set, so it needs a leading zero byte. */
+    n_bytes = (uint32_t)mbedtls_mpi_size(&rsa->MBEDTLS_PRIVATE(N)) + 1;
 
     /* Key form is "ssh-rsa" + e + n. */
     len = 4 + 7 + 4 + e_bytes + 4 + n_bytes;
@@ -727,14 +774,94 @@ gen_publickey_from_rsa(LIBSSH2_SESSION *session,
     _libssh2_htonu32(p, e_bytes);
     p += 4;
     mbedtls_mpi_write_binary(&rsa->MBEDTLS_PRIVATE(E), p, e_bytes);
+    p += e_bytes; /* Terminus: upstream fix, missing in 1.11.1 */
 
     _libssh2_htonu32(p, n_bytes);
     p += 4;
     mbedtls_mpi_write_binary(&rsa->MBEDTLS_PRIVATE(N), p, n_bytes);
+    p += n_bytes; /* Terminus: upstream fix, missing in 1.11.1 */
 
     *keylen = (size_t)(p - key);
     return key;
 }
+
+#if LIBSSH2_ECDSA
+/* Terminus: the public half of a PEM/PKCS#8 EC private key, which 1.11.1
+   (and upstream) cannot derive under mbedTLS. SSH form:
+   string "ecdsa-sha2-<curve>", string "<curve>", string Q (uncompressed). */
+static int
+terminus_pub_priv_eckey(LIBSSH2_SESSION *session,
+                        unsigned char **method,
+                        size_t *method_len,
+                        unsigned char **pubkeydata,
+                        size_t *pubkeydata_len,
+                        const mbedtls_ecp_keypair *ec)
+{
+    static const char prefix[] = "ecdsa-sha2-";
+    const char *curve;
+    unsigned char point[1 + 2 * 66]; /* uncompressed P-521, the largest */
+    size_t point_len, curve_len, name_len, len;
+    unsigned char *key, *mth, *p;
+
+    switch(ec->MBEDTLS_PRIVATE(grp).id) {
+    case MBEDTLS_ECP_DP_SECP256R1:
+        curve = "nistp256";
+        break;
+    case MBEDTLS_ECP_DP_SECP384R1:
+        curve = "nistp384";
+        break;
+    case MBEDTLS_ECP_DP_SECP521R1:
+        curve = "nistp521";
+        break;
+    default:
+        return _libssh2_error(session, LIBSSH2_ERROR_FILE,
+                              "EC curve not supported");
+    }
+
+    if(mbedtls_ecp_point_write_binary(&ec->MBEDTLS_PRIVATE(grp),
+                                      &ec->MBEDTLS_PRIVATE(Q),
+                                      MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                      &point_len, point, sizeof(point)))
+        return _libssh2_error(session, LIBSSH2_ERROR_FILE,
+                              "Unable to write EC public key");
+
+    curve_len = strlen(curve);
+    name_len = sizeof(prefix) - 1 + curve_len;
+    len = 4 + name_len + 4 + curve_len + 4 + point_len;
+
+    mth = LIBSSH2_ALLOC(session, name_len);
+    key = LIBSSH2_ALLOC(session, len);
+    if(!mth || !key) {
+        if(mth)
+            LIBSSH2_FREE(session, mth);
+        if(key)
+            LIBSSH2_FREE(session, key);
+        return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                              "Unable to allocate EC public key");
+    }
+    memcpy(mth, prefix, sizeof(prefix) - 1);
+    memcpy(mth + sizeof(prefix) - 1, curve, curve_len);
+
+    p = key;
+    _libssh2_htonu32(p, (uint32_t)name_len);
+    p += 4;
+    memcpy(p, mth, name_len);
+    p += name_len;
+    _libssh2_htonu32(p, (uint32_t)curve_len);
+    p += 4;
+    memcpy(p, curve, curve_len);
+    p += curve_len;
+    _libssh2_htonu32(p, (uint32_t)point_len);
+    p += 4;
+    memcpy(p, point, point_len);
+
+    *method = mth;
+    *method_len = name_len;
+    *pubkeydata = key;
+    *pubkeydata_len = len;
+    return 0;
+}
+#endif
 
 static int
 _libssh2_mbedtls_pub_priv_key(LIBSSH2_SESSION *session,
@@ -746,8 +873,15 @@ _libssh2_mbedtls_pub_priv_key(LIBSSH2_SESSION *session,
 {
     unsigned char *key = NULL, *mth = NULL;
     size_t keylen = 0, mthlen = 0;
-    int ret;
+    int ret = 0; /* Terminus: upstream fix, uninitialized in 1.11.1 */
     mbedtls_rsa_context *rsa;
+
+#if LIBSSH2_ECDSA
+    if(mbedtls_pk_get_type(pkey) == MBEDTLS_PK_ECKEY)
+        return terminus_pub_priv_eckey(session, method, method_len,
+                                       pubkeydata, pubkeydata_len,
+                                       mbedtls_pk_ec(*pkey));
+#endif
 
     if(mbedtls_pk_get_type(pkey) != MBEDTLS_PK_RSA) {
         mbedtls_pk_free(pkey);

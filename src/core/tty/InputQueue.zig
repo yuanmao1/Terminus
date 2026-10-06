@@ -103,6 +103,12 @@ pub const InputQueue = struct {
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
     }
+
+    fn stopRequested(self: *InputQueue) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.stop;
+    }
 };
 
 /// Move local stdin into the queue, one underlying read at a time.
@@ -126,6 +132,9 @@ pub fn inputPump(queue: *InputQueue, input: std.Io.File) void {
     var chunk: [tunnel_buffer_bytes]u8 = undefined;
     var reader = input.readerStreaming(queue.io, &read_buffer);
     while (true) {
+        if (comptime builtin.os.tag != .windows) {
+            if (reader.interface.bufferedLen() == 0 and !awaitReadable(queue, input)) return;
+        }
         var data: [1][]u8 = .{&chunk};
         const n = reader.interface.readVec(&data) catch |err| {
             // End of stream is an ordinary finish; anything else is a failure
@@ -138,11 +147,26 @@ pub fn inputPump(queue: *InputQueue, input: std.Io.File) void {
     }
 }
 
+/// POSIX: wait for input in short polls so a stop request is seen without a
+/// byte arriving. A blocked read cannot be interrupted here — std retries it on
+/// EINTR — so the pump never enters one until poll says it will not block.
+/// Returns false once a stop was requested.
+fn awaitReadable(queue: *InputQueue, input: std.Io.File) bool {
+    const poll_ms = 100;
+    while (!queue.stopRequested()) {
+        var fds = [_]std.posix.pollfd{.{ .fd = input.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        // An error or POLLHUP/POLLERR is returned as readable: the read that
+        // follows reports it (or EOF) through the ordinary path.
+        const ready = std.posix.poll(&fds, poll_ms) catch return true;
+        if (ready != 0) return true;
+    }
+    return false;
+}
+
 /// Interrupt a local synchronous stdin read before joining the input thread.
 /// On Windows this is the same cancellation primitive used by the threaded IO
-/// backend.  POSIX builds currently do not ship this libssh2 backend; retaining
-/// the branch makes the intent explicit rather than pretending an arbitrary
-/// detached thread is safe.
+/// backend. POSIX needs nothing: `inputPump` only reads once poll reports
+/// input, and it sees the stop request between polls.
 pub fn cancelInputRead(thread: *std.Thread) void {
     if (comptime builtin.os.tag == .windows) {
         var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;

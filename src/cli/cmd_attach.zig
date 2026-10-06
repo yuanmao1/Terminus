@@ -351,11 +351,15 @@ fn pause(ctx: *Cli.Ctx, local: *Pump.Local, tick: ?Pump.Tick) MenuEnd {
 
 /// 本进程的可执行文件路径。
 ///
-/// **`std.fs.selfExePath` 在 Zig 0.16 里整个被删了**(0.14 还有),所以这里
-/// 直接问 Win32。走 PATH 找 `terminus` 不行:npm 装的那份可能是另一个版本,
-/// 而这次传输必须由**正在跑的这个二进制**完成。
-fn selfExePath(buf: []u8) ?[]const u8 {
-    if (comptime @import("builtin").os.tag != .windows) return null;
+/// **`std.fs.selfExePath` 在 Zig 0.16 里整个被删了**(0.14 还有),所以
+/// Windows 上直接问 Win32;其他平台用 0.17 的 `std.process.executablePath`。
+/// 走 PATH 找 `terminus` 不行:npm 装的那份可能是另一个版本,而这次传输
+/// 必须由**正在跑的这个二进制**完成。
+fn selfExePath(io: std.Io, buf: []u8) ?[]const u8 {
+    if (comptime @import("builtin").os.tag != .windows) {
+        const n = std.process.executablePath(io, buf) catch return null;
+        return buf[0..n];
+    }
     var wide: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
     const len = GetModuleFileNameW(null, &wide, wide.len);
     if (len == 0 or len >= wide.len) return null;
@@ -375,6 +379,28 @@ extern "kernel32" fn WaitForSingleObject(
 ) callconv(.winapi) std.os.windows.DWORD;
 
 const wait_timeout: std.os.windows.DWORD = 0x102;
+
+fn waitTicking(io: std.Io, child: *std.process.Child, tick: ?Pump.Tick) @TypeOf(child.wait(io)) {
+    const Waiter = struct {
+        io: std.Io,
+        child: *std.process.Child,
+        result: @TypeOf(child.wait(io)) = undefined,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(w: *@This()) void {
+            w.result = w.child.wait(w.io);
+            w.done.store(true, .release);
+        }
+    };
+    var waiter: Waiter = .{ .io = io, .child = child };
+    const thread = std.Thread.spawn(.{}, Waiter.run, .{&waiter}) catch return child.wait(io);
+    while (!waiter.done.load(.acquire)) {
+        std.Io.sleep(io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+        if (tick) |t| _ = t.call(t.context);
+    }
+    thread.join();
+    return waiter.result;
+}
 
 /// `p` 与 `g`:提示两个路径,然后**作为子进程**跑 `terminus push/pull`。
 ///
@@ -416,7 +442,7 @@ fn runTransfer(
     };
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = selfExePath(&exe_buf) orelse {
+    const exe = selfExePath(ctx.io, &exe_buf) orelse {
         Console.writeDirect(ctx.io, "\r\n\r\n找不到本程序的路径,无法启动传输。\r\n");
         return pause(ctx, local, tick);
     };
@@ -453,7 +479,13 @@ fn runTransfer(
             if (tick) |t| _ = t.call(t.context);
         }
     }
-    const term = child.wait(ctx.io) catch |err| {
+    // POSIX 没有"等一个 pid 但不收尸"的可移植调用,所以 `wait` 放到一条
+    // 线程里,这边照样每 200ms 续一次租。
+    const waited = if (comptime @import("builtin").os.tag == .windows)
+        child.wait(ctx.io)
+    else
+        waitTicking(ctx.io, &child, tick);
+    const term = waited catch |err| {
         var msg: [160]u8 = undefined;
         Console.writeDirect(ctx.io, std.fmt.bufPrint(
             &msg,
