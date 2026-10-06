@@ -173,8 +173,8 @@ Cross-compiling the npm binaries from any host (`npm/bin/` names in brackets):
 
 ```bash
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows   # Terminus.exe
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl  -p out/linux-x64     # terminus-linux-x64
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl -p out/linux-arm64   # terminus-linux-arm64
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl  -Dstrip -p out/linux-x64     # terminus-linux-x64
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl -Dstrip -p out/linux-arm64   # terminus-linux-arm64
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos       -p out/darwin-x64    # terminus-darwin-x64
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos      -p out/darwin-arm64  # terminus-darwin-arm64
 ```

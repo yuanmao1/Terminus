@@ -69,6 +69,9 @@ const mbedcrypto_sources = [_][]const u8{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Release binaries for npm: without it a static Linux build carries ~19 MB
+    // of DWARF (Windows and macOS keep theirs out of the executable anyway).
+    const strip = b.option(bool, "strip", "Omit debug info from the CLI");
 
     // Linux supervisor shipped inside the Windows CLI. Declared before the
     // library module so its emitted bytes can be an anonymous @embedFile import
@@ -122,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .link_libc = true,
         .imports = &.{
             // Named (not createModule) so ZLS can resolve the imports.
@@ -245,6 +249,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "Terminus", .module = mod },
             },
