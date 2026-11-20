@@ -118,19 +118,13 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     var store = try Cli.openStore(ctx, &parsed);
     defer store.close();
     const resolved = Cli.resolveServer(ctx, &store, target.server);
-    var helper_digest_buf: [Core.digest.hex_len]u8 = undefined;
-    const helper_digest = Core.digest.hex(Core.supervisor.helper_executable, &helper_digest_buf);
-    const installed_helper = Store.facts.get(
-        &store,
-        ctx.arena,
-        resolved.server.id,
-        Core.supervisor.helper_fact_key,
-    ) catch |err| Cli.storeFatal(&store, err);
-    // Command stdin and live tmux sessions have their own input semantics;
-    // the helper protocol owns stdin for its framed request, so those two stay
-    // on the explicitly weaker shell capability.
-    const use_helper = target.session == null and input == null and inv.kind != .powershell and
-        (if (installed_helper) |installed| std.mem.eql(u8, installed, helper_digest) else false);
+    const use_helper = helper: {
+        if (target.session != null or input != null or inv.kind == .powershell) break :helper false;
+        const installed = (Store.facts.get(&store, ctx.arena, resolved.server.id, Core.supervisor.helper_fact_key) catch |err|
+            Cli.storeFatal(&store, err)) orelse break :helper false;
+        var hex: [Core.digest.hex_len]u8 = undefined;
+        break :helper std.mem.eql(u8, installed, Core.digest.hex(Core.supervisor.helper_executable, &hex));
+    };
     const detach = parsed.boolean("detach");
     if (detach and target.session != null)
         fatal("--detach is a one-shot helper execution; persistent session targets already have their own lifetime. Drop ':{s}'", .{target.session.?});
@@ -222,7 +216,7 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             else
                 Cli.tryConnect(ctx, &parsed, resolved.server, resolved.auth)) orelse
                 reportBlocked(blocker);
-            Cli.settleProvableBlocker(ctx, &store, conn_slot.?.executor(), blocker);
+            Cli.settleProvableBlocker(ctx, &store, conn_slot.?.executor(), blocker, .blocking);
             const second = Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
                 Cli.storeFatal(&store, err);
             break :retry switch (second) {
@@ -255,16 +249,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     var conn = &conn_slot.?;
     const executor = conn.executor();
 
-    // The guard waved this launch through while something else still holds an
-    // overlapping scope (`--force`, or read-only work). If that something is a
-    // job which already finished, read its exit status now. Opportunistic and
-    // one-way: it can only settle a blocker whose evidence is sitting on the
-    // host, and the authoritative check inside `submitted()` runs regardless.
-    //
-    // The blocked path above already handled its own blocker; this covers the
-    // launches `begin` let through while still reporting one, where `advisory`
-    // is the only place that blocker surfaces.
-    Cli.settleProvableBlocker(ctx, &store, executor, execution.advisory);
+    // A read cannot be refused by this peer. Leave its remote evidence to
+    // job status/watch or the next writer instead of polling on every read.
+    if (begin_opts.mutating)
+        Cli.settleProvableBlocker(ctx, &store, executor, execution.advisory, .advisory);
 
     const outcome = if (target.session) |session_name|
         try runInSession(ctx, &store, &execution, executor, inv, session_name, timeout_ms)
@@ -330,8 +318,10 @@ pub fn run(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             // stdout, and this line is for the person watching.
             if (truncationNotice(ctx, outcome.output)) |note|
                 std.debug.print("terminus: {s}\n", .{note});
-            if (advisoryText(ctx, execution.advisory)) |note|
-                std.debug.print("note: {s}\n", .{note});
+            if (begin_opts.mutating) {
+                if (advisoryText(ctx, execution.advisory)) |note|
+                    std.debug.print("note: {s}\n", .{note});
+            }
             if (outcome.exit_code) |code| {
                 if (code != 0) std.debug.print("(exit {d})\n", .{code});
             }

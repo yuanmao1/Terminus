@@ -1216,6 +1216,7 @@ pub fn settleProvableBlocker(
     store: *Store,
     executor: Executor,
     advisory: ?Core.execution.Blocker,
+    context: enum { blocking, advisory },
 ) void {
     const blocker = advisory orelse return;
     // One definition of "worth going to look at", shared with the launch
@@ -1273,11 +1274,11 @@ pub fn settleProvableBlocker(
                     "It stays blocked until reconciled: terminus request reconcile {s}\n",
                 .{ attempt.job_name, op.request_id, declined.sentinel_exit_code, op.request_id },
             );
-        } else {
+        } else if (context == .blocking) {
             std.debug.print(
                 "terminus: blocking job '{s}' ({s}) has recorded no exit status yet — no result record and no log " ++
-                    "sentinel — so it may still be running; it stays blocked. Check with 'terminus job status {s}'\n",
-                .{ attempt.job_name, op.request_id, attempt.job_name },
+                    "sentinel — so it may still be running; it stays blocked. Check with 'terminus job status {s} {s}'\n",
+                .{ attempt.job_name, op.request_id, op.server_name, attempt.job_name },
             );
         }
         return;

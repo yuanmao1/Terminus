@@ -14,7 +14,7 @@ description: >-
 Terminus gives you durable remote shell workspaces instead of one-shot SSH
 commands. Everything supports `--json` for reliable parsing.
 
-**Requires terminus >= 0.2.1.** If a documented flag is rejected, the
+**Requires terminus >= 0.4.1.** If a documented flag is rejected, the
 installed binary is older than this document: check `terminus version`
 and upgrade with `npm install -g terminus-shell@latest`.
 
@@ -186,6 +186,8 @@ shell command does. For a command you know is genuinely read-only, declare it:
 ```bash
 terminus exec <server> --read-only --cmd 'psql -c "SELECT now()"'
 ```
+
+An overlapping read reports the recorded peer in JSON `runningAlongside` and executes without probing that job. To check its current state or reconcile conflicting evidence, use `job status <server> <name>`. A plain one-shot mutation covers the whole server. For independent work in an existing named tmux session, target `server:session`; commands in that session share its scope.
 
 Read-only execs may run alongside overlapping operations and each other. Do not
 use `--read-only` for a command that can write: the declaration is the safety
@@ -436,6 +438,7 @@ terminus run <server> --name build -- npm run build
 # status: submitted | remote_started | completed | failed | indeterminate
 terminus job status <server> build --json     # + exitCode; exits 75 when outcomeProven is false
 terminus job read <server> build --from-cursor --json
+terminus job watch <server> build --interval 15s --max 4 --json  # bounded observation
 terminus job watch <server> build --interval 30s --json  # block until it ends
 terminus job kill <server> build               # 75 if unprovable, 1 if the kill was refused
 terminus job ls <server> --active --limit 20 --json

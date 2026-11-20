@@ -224,7 +224,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
             if (!Cli.blockerMayBeProvable(blocker)) return reportBlocked(blocker);
             conn_slot = Cli.tryConnect(ctx, &parsed, resolved.server, resolved.auth) orelse
                 return reportBlocked(blocker);
-            Cli.settleProvableBlocker(ctx, &store, conn_slot.?.executor(), blocker);
+            Cli.settleProvableBlocker(ctx, &store, conn_slot.?.executor(), blocker, .blocking);
             const second = Core.execution.begin(&store, ctx.arena, ctx.io, begin_opts) catch |err|
                 Cli.storeFatal(&store, err);
             break :retry switch (second) {
@@ -292,7 +292,7 @@ pub fn runCmd(ctx: *Cli.Ctx, raw_args: []const []const u8) !void {
     // The blocked path above has already done this for its own blocker; this
     // call covers the launches `begin` let through while still reporting one
     // (`--force`), where `advisory` is the only place the blocker appears.
-    Cli.settleProvableBlocker(ctx, &store, executor, execution.advisory);
+    Cli.settleProvableBlocker(ctx, &store, executor, execution.advisory, .advisory);
 
     const session = try jobSessionName(ctx.arena, job_name);
     const nonce: u64 = @intCast(@mod(std.Io.Timestamp.now(ctx.io, .real).nanoseconds, 1_000_000_007));

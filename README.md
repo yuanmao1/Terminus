@@ -61,6 +61,7 @@ terminus exec prod -- git status         # runs in /srv/app
 terminus run prod --name build -- npm run build
 # status: submitted | remote_started | completed | failed | indeterminate (+ exitCode)
 terminus job status prod build --json    # exits 75 while the outcome is unknown
+terminus job watch prod build --interval 15s --max 4 --json  # initial probe, then at most four more
 terminus job read prod build --from-cursor --json
 terminus job kill prod build             # 75 unless the process tree is proven gone
 

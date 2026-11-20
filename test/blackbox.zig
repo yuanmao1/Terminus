@@ -809,6 +809,51 @@ test "blackbox: the scope guard refuses a second launch and says nothing was sen
     try other.expectSaysNot("refused: request");
 }
 
+test "blackbox: a running job is advisory for reads and blocks a conflicting write" {
+    var f = try Fixture.init(std.testing.allocator, "read_alongside");
+    defer f.deinit();
+    try f.seedServer();
+    try seedRunningJob(&f, in_flight_id, "uplink", "__END_UPLINK__");
+
+    var rules = [_]FakeHost.Rule{
+        .{ .needle = probe_split, .stdout = "\n" ++ probe_split ++ "\n0\n" },
+        .{ .needle = "has-session", .exit_code = 0 },
+        .{ .needle = "echo read-ok", .stdout = "read-ok\n$EXIT_MARKER code=0\n" },
+    };
+    var host = try FakeHost.start(&f, &rules);
+    defer host.stop();
+    var environ = try host.environment();
+    defer environ.deinit();
+
+    for (0..2) |i| {
+        const args = [_][]const u8{ "exec", "box", "--read-only", "--cmd", "echo read-ok", "--db", f.db, "--json" };
+        var read = try runWithEnvironment(&f, if (i == 0) &args else args[0 .. args.len - 1], &environ);
+        defer read.deinit(f.allocator);
+        try read.expectCode(0);
+        try read.expectSays("read-ok");
+        try read.expectSaysNot("no exit status yet");
+        if (i == 0) {
+            try read.expectSays("runningAlongside");
+            try read.expectSays(in_flight_id);
+        } else try read.expectSaysNot("reconcile it before changing anything");
+    }
+
+    // Count commands delivered to the remote executor, independent of local
+    // SSH/daemon handshakes. Each read needs only its own shell command.
+    {
+        host.seen_lock.lockUncancelable(host.io);
+        defer host.seen_lock.unlock(host.io);
+        try std.testing.expectEqual(@as(usize, 2), host.seen.items.len);
+    }
+
+    var write = try runWithEnvironment(&f, &.{ "exec", "box", "--cmd", "touch write-marker", "--db", f.db }, &environ);
+    defer write.deinit(f.allocator);
+    try write.expectCode(1);
+    try write.expectSays("terminus job status box uplink");
+    try write.expectSays("nothing was sent");
+    try host.expectNeverSent("touch write-marker");
+}
+
 test "blackbox: a blocker with nothing to read is refused without dialling" {
     const t = std.testing;
     var f = try Fixture.init(t.allocator, "guard_no_dial");
@@ -1415,10 +1460,16 @@ const FakeHost = struct {
             .ok = false,
             .@"error" = message,
         };
+        // The shell wrapper chooses a fresh nonce for every real submission.
+        const stdout = if (std.mem.indexOf(u8, scripted.stdout, "$EXIT_MARKER") != null) stdout: {
+            const marker_at = std.mem.indexOf(u8, request.command, "__TERMINUS_EXIT_") orelse return error.MissingExitMarker;
+            const end = std.mem.indexOfPos(u8, request.command, marker_at, " code=") orelse return error.MissingExitMarker;
+            break :stdout try std.mem.replaceOwned(u8, arena, scripted.stdout, "$EXIT_MARKER", request.command[marker_at..end]);
+        } else try arena.dupe(u8, scripted.stdout);
         var retained: Ssh.Retained = .{};
         const served = try Ssh.retain(arena, .{
             .exit_code = scripted.exit_code,
-            .stdout = try arena.dupe(u8, scripted.stdout),
+            .stdout = stdout,
             .stderr = try arena.alloc(u8, 0),
         }, &retained, Ssh.read_bytes);
         return protocol.execResponse(
